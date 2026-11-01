@@ -12,7 +12,7 @@ import { execFile } from 'node:child_process'
 import { lookup } from 'node:dns/promises'
 import { networkInterfaces } from 'node:os'
 import { readFile } from 'node:fs/promises'
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join, dirname, extname, normalize, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomBytes } from 'node:crypto'
@@ -24,6 +24,11 @@ const PORT = Number(process.env.PORT || 8787)
 // 默认监听所有网卡，手机 / 局域网其它机器才能打开订阅页与订阅链接。
 // 只想本机使用时启动加 `HOST=127.0.0.1`。
 const HOST = process.env.HOST || '0.0.0.0'
+// Docker 容器内看到的网卡地址不是宿主机地址；用这个变量覆盖导出页的局域网地址。
+const PUBLIC_URL = (() => {
+  const raw = (process.env.TOWER_PUBLIC_URL || '').trim().replace(/\/+$/, '')
+  return /^https?:\/\/\S+$/i.test(raw) ? raw : ''
+})()
 const distDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist')
 const publicRulesetsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'public', 'rulesets')
 const distRulesetsDir = join(distDir, 'rulesets')
@@ -139,7 +144,10 @@ async function buildRuleSetArtifact(query) {
   }
 }
 // 订阅落盘，服务端重启后仍可用（本地文件，不出本机）。
-const SUBS_FILE = join(dirname(fileURLToPath(import.meta.url)), 'subscriptions.json')
+// Docker 部署通过 TOWER_DATA_DIR 指向挂载卷；普通运行仍写 server/subscriptions.json。
+// 容器内的网卡地址不是宿主机地址，TOWER_PUBLIC_URL 用于覆盖 /api/network 的局域网地址。
+const DATA_DIR = process.env.TOWER_DATA_DIR || dirname(fileURLToPath(import.meta.url))
+const SUBS_FILE = join(DATA_DIR, 'subscriptions.json')
 
 function loadSubscriptions() {
   try {
@@ -165,6 +173,7 @@ function loadSubscriptions() {
 
 function persistSubscriptions() {
   try {
+    mkdirSync(DATA_DIR, { recursive: true })
     // 先写临时文件再替换，避免进程在写入中途退出时留下半截 JSON。
     const temp = `${SUBS_FILE}.tmp`
     writeFileSync(temp, JSON.stringify(Object.fromEntries(subscriptions)), 'utf8')
@@ -871,10 +880,13 @@ const server = createServer(async (req, res) => {
 
     // 供前端把「手机可用的订阅地址」显示出来：列出真实网卡的局域网地址。
     if (url.pathname === '/api/network') {
+      const lan = []
+      if (PUBLIC_URL) lan.push(PUBLIC_URL)
+      if (HOST === '0.0.0.0') lan.push(...lanUrls(PORT))
       return json(res, 200, {
         host: HOST,
         port: PORT,
-        lan: HOST === '0.0.0.0' ? lanUrls(PORT) : [],
+        lan,
         local: `http://127.0.0.1:${PORT}`,
       })
     }

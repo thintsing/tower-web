@@ -1,0 +1,29 @@
+# source control / CI
+.git
+.github
+
+# build output & dependencies
+node_modules
+dist
+*.tsbuildinfo
+
+# local runtime data / secrets
+server/subscriptions.json
+server/subscriptions.json.tmp
+server/subscriptions.json.corrupt-*
+.env
+.env.*
+
+# tests, docs, design artifacts
+scripts
+docs
+.tmp*
+.taste-skill
+coverage
+
+# editor / OS
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+*.log

@@ -9,6 +9,7 @@
 本地优先 · 无需账号 · 所有处理都在本机
 
 [![CI](https://github.com/thintsing/tower-web/actions/workflows/ci.yml/badge.svg)](https://github.com/thintsing/tower-web/actions/workflows/ci.yml)
+[![Docker](https://github.com/thintsing/tower-web/actions/workflows/docker.yml/badge.svg)](https://github.com/thintsing/tower-web/actions/workflows/docker.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-1e7b4f?style=flat-square)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D20.19-339933?style=flat-square)](https://nodejs.org/)
 [![React](https://img.shields.io/badge/react-19-61DAFB?style=flat-square)](https://react.dev/)
@@ -83,6 +84,44 @@ npm start
 
 生产模式打开 <http://127.0.0.1:8787>。本项目需要 Node 运行环境，不能只靠静态托管：订阅发布、规则集托管和 TCP / ICMP 测速都依赖 `server/index.mjs`。
 
+### Docker
+
+镜像发布在 GHCR，支持 linux/amd64 与 linux/arm64：
+
+```bash
+docker run -d --name tower-web \
+  -p 8787:8787 \
+  -v tower-data:/app/data \
+  ghcr.io/thintsing/tower-web:latest
+```
+
+或用仓库内的编排文件：
+
+```bash
+docker compose up -d
+```
+
+容器默认 `HOST=0.0.0.0`、`PORT=8787`，打开 <http://127.0.0.1:8787>。已发布订阅保存在数据卷 `/app/data`，重建容器前请保留该卷；也可以用 `TOWER_DATA_DIR` 改路径。ICMP 测速依赖镜像内的 `ping`，不可用时自动回退 TCP。
+
+Docker 内看到的网卡地址不是宿主机地址；如果从本机打开页面又要复制订阅地址给手机，请把 `TOWER_PUBLIC_URL` 设为宿主机的局域网地址：
+
+```bash
+docker run -d --name tower-web \
+  -p 8787:8787 \
+  -v tower-data:/app/data \
+  -e TOWER_PUBLIC_URL=http://192.168.1.10:8787 \
+  ghcr.io/thintsing/tower-web:latest
+```
+
+推送 `v*.*.*` tag 后，GitHub Actions 会自动构建双架构镜像、推送 GHCR 并创建 Release：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+> 镜像同样没有鉴权，`-p 8787:8787` 会暴露到局域网，只建议在可信网络使用。
+
 ### 局域网 / 手机访问
 
 服务端默认监听 `0.0.0.0`，导出页会显示局域网订阅地址。只允许本机访问时：
@@ -99,7 +138,7 @@ $env:HOST='127.0.0.1'; npm start
 ## 数据与隐私
 
 - 订阅、节点、规则选择和设置保存在浏览器 `localStorage`。
-- 已发布订阅保存在 `server/subscriptions.json`，已加入 `.gitignore`；**不要提交包含真实机场节点、密码或 token 的文件**。
+- 已发布订阅保存在 `server/subscriptions.json`（Docker 下为 `/app/data/subscriptions.json`，可用 `TOWER_DATA_DIR` 改路径），已加入 `.gitignore`；**不要提交包含真实机场节点、密码或 token 的文件**。
 - 测速由本机 TCP / ICMP 完成；IP 国家 / ASN 查询使用随包离线数据库；二维码的生成、识别和相机画面都不离开本机。
 - Tailscale Auth Key 单独保存在本机 localStorage，不进入主快照；下载或发布配置时会写入支持的客户端。
 
@@ -171,6 +210,7 @@ src/      React 前端（订阅、节点、规则、导出、地图）
 server/   Node 本地服务（订阅抓取、测速、离线 IP / ASN、订阅持久化）
 scripts/  自检脚本
 public/   客户端图标、ACL4SSR 规则、地图数据
+Dockerfile / docker-compose.yml  容器镜像与本地编排
 ```
 
 ## 上游与许可
@@ -195,6 +235,7 @@ public/   客户端图标、ACL4SSR 规则、地图数据
 <div align="center">
 
 [GitHub 仓库](https://github.com/thintsing/tower-web) ·
+[版本发布](https://github.com/thintsing/tower-web/releases) ·
 [反馈问题](https://github.com/thintsing/tower-web/issues) ·
 [塔台 Tower（iOS / macOS）](https://github.com/pengchujin/tower) ·
 [安全策略](SECURITY.md) ·

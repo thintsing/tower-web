@@ -1,0 +1,19 @@
+services:
+  tower-web:
+    image: ${TOWER_IMAGE:-ghcr.io/thintsing/tower-web:latest}
+    container_name: tower-web
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8787"
+      # 从宿主机本机打开页面、又要复制给手机时，填宿主机的局域网地址；
+      # 容器内网卡地址默认对手机不可达。
+      # TOWER_PUBLIC_URL: http://192.168.1.10:8787
+    volumes:
+      # 已发布订阅保存在这里；删除卷会让客户端已保存的订阅链接失效。
+      - tower-data:/app/data
+
+volumes:
+  tower-data:
