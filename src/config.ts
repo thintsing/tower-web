@@ -1,7 +1,7 @@
 // GitHub link shown at the bottom of the sidebar (repository or profile).
 // VITE_GITHUB_REPO_URL in `.env.local` overrides this fallback.
 // Leave the fallback empty to keep the icon as a non-clickable placeholder.
-const FALLBACK_GITHUB_REPO_URL = 'https://github.com/thintsing'
+const FALLBACK_GITHUB_REPO_URL = 'https://github.com/thintsing/tower-web'
 
 function normalizeRepoURL(raw: string | undefined): string {
   const value = (raw ?? '').trim()
