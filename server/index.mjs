@@ -1,0 +1,1044 @@
+// Tower Web local companion server.
+// - GET  /api/fetch?url=…[&ua=…][&doh=…]  subscription fetch proxy (solves CORS);
+//                           custom per-subscription UA / DoH, content never leaves
+//                           this machine.
+// - POST /api/share         store generated config, returns a token.
+// - GET  /api/s/:token      one-shot 3-minute temporary import link.
+// - GET  /*                 serves dist/ in production mode.
+import { createServer, request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
+import { connect, isIP } from 'node:net'
+import { execFile } from 'node:child_process'
+import { lookup } from 'node:dns/promises'
+import { networkInterfaces } from 'node:os'
+import { readFile } from 'node:fs/promises'
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { join, dirname, extname, normalize, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { randomBytes } from 'node:crypto'
+import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib'
+import { convertRuleSet, RuleSetConversionError } from './ruleset-convert.mjs'
+import { loadIPASNData, organizationForAddress } from './ip-asn.mjs'
+
+const PORT = Number(process.env.PORT || 8787)
+// 默认监听所有网卡，手机 / 局域网其它机器才能打开订阅页与订阅链接。
+// 只想本机使用时启动加 `HOST=127.0.0.1`。
+const HOST = process.env.HOST || '0.0.0.0'
+const distDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist')
+const publicRulesetsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'public', 'rulesets')
+const distRulesetsDir = join(distDir, 'rulesets')
+
+/** 虚拟网卡（VMware / VirtualBox / Hyper-V / Tailscale …）排在真实网卡之后。 */
+const VIRTUAL_IFACE = /(vmware|virtualbox|vethernet|hyper-v|wsl|docker|tailscale|zerotier|loopback)/i
+
+function lanUrls(port) {
+  const found = []
+  for (const [name, addrs] of Object.entries(networkInterfaces())) {
+    for (const addr of addrs ?? []) {
+      if (addr.family !== 'IPv4' || addr.internal) continue
+      found.push({ score: VIRTUAL_IFACE.test(name) ? 0 : 1, url: `http://${addr.address}:${port}` })
+    }
+  }
+  return found.sort((a, b) => b.score - a.score).map((x) => x.url)
+}
+
+/** token -> { body, contentType, expiresAt, used } */
+const shares = new Map()
+const SHARE_TTL_MS = 3 * 60 * 1000
+
+/** token -> { formats, updatedAt, title } */
+const subscriptions = new Map()
+
+/** 转换后的规则集产物：key -> { body, contentType, ruleCount, updatedAt } */
+const rulesetArtifacts = new Map()
+const RULESET_CACHE_MS = 60 * 60 * 1000
+const RULESET_CACHE_MAX = 128
+
+function cachedRuleSet(key) {
+  const hit = rulesetArtifacts.get(key)
+  if (!hit) return undefined
+  if (Date.now() - hit.updatedAt > RULESET_CACHE_MS) {
+    rulesetArtifacts.delete(key)
+    return undefined
+  }
+  return hit
+}
+
+function cacheRuleSet(key, artifact) {
+  while (rulesetArtifacts.size >= RULESET_CACHE_MAX) {
+    const oldest = rulesetArtifacts.keys().next().value
+    if (!oldest) break
+    rulesetArtifacts.delete(oldest)
+  }
+  rulesetArtifacts.set(key, { ...artifact, updatedAt: Date.now() })
+}
+
+function ruleSetCacheKey(query) {
+  const format = String(query.get('format') ?? '').toLowerCase()
+  const file = query.get('file')
+  const remote = query.get('url')
+  if (!format || (!file && !remote)) return ''
+  return `${format}|${file ? `file:${file}` : `url:${remote}`}`
+}
+
+/** 读取内置规则文件或抓取远程列表，再转换成目标客户端方言。 */
+async function buildRuleSetArtifact(query) {
+  const format = String(query.get('format') ?? '').toLowerCase()
+  if (!['quanx', 'egern', 'singbox', 'sing-box'].includes(format)) {
+    throw new RuleSetConversionError('format 必须是 quanx / egern / singbox')
+  }
+  const file = query.get('file')
+  const remote = query.get('url')
+  if (!file && !remote) throw new RuleSetConversionError('缺少 file 或 url 参数')
+  if (file && remote) throw new RuleSetConversionError('file 与 url 只能二选一')
+  let sourceText
+  if (file) {
+    const safeName = String(file)
+    if (!/^[A-Za-z0-9_.-]+\.list$/.test(safeName) || safeName.includes('..')) {
+      throw new RuleSetConversionError('规则集文件名无效', 400)
+    }
+    try {
+      sourceText = await readFile(join(publicRulesetsDir, safeName), 'utf8')
+    } catch {
+      try {
+        sourceText = await readFile(join(distRulesetsDir, safeName), 'utf8')
+      } catch {
+        throw new RuleSetConversionError('内置规则集不存在', 404)
+      }
+    }
+  } else {
+    let target
+    try {
+      target = new URL(String(remote))
+    } catch {
+      throw new RuleSetConversionError('规则集地址无效', 400)
+    }
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+      throw new RuleSetConversionError('只支持 http/https 规则集地址', 400)
+    }
+    let response
+    try {
+      response = await fetchWithDoH(target, 'clash-verge/v2.4.2', undefined)
+    } catch (error) {
+      throw new RuleSetConversionError(`规则集抓取失败：${error.message}`, 502)
+    }
+    if (response.status < 200 || response.status >= 300) {
+      throw new RuleSetConversionError(`规则集返回 HTTP ${response.status}`, 502)
+    }
+    if (response.body.length > 8 * 1024 * 1024) {
+      throw new RuleSetConversionError('规则集内容过大', 422)
+    }
+    sourceText = response.body.toString('utf8')
+  }
+  const artifact = convertRuleSet(sourceText, format)
+  return {
+    key: `${format}|${file ? `file:${file}` : `url:${remote}`}`,
+    body: artifact.text,
+    contentType: artifact.contentType,
+    ruleCount: artifact.ruleCount,
+  }
+}
+// 订阅落盘，服务端重启后仍可用（本地文件，不出本机）。
+const SUBS_FILE = join(dirname(fileURLToPath(import.meta.url)), 'subscriptions.json')
+
+function loadSubscriptions() {
+  try {
+    const data = JSON.parse(readFileSync(SUBS_FILE, 'utf8'))
+    for (const [token, rec] of Object.entries(data)) {
+      if (rec && typeof rec === 'object' && rec.formats) subscriptions.set(token, rec)
+    }
+    console.log(`[tower] 已载入 ${subscriptions.size} 个持久订阅`)
+  } catch (err) {
+    // 首次运行没有文件是正常情况。文件损坏时先备份，避免下一次发布覆盖掉
+    // 还能人工恢复的旧订阅。
+    if (err?.code !== 'ENOENT') {
+      const backup = `${SUBS_FILE}.corrupt-${Date.now()}`
+      try {
+        renameSync(SUBS_FILE, backup)
+        console.error(`[tower] 订阅文件损坏，已备份为 ${backup}:`, err?.message ?? err)
+      } catch {
+        console.error('[tower] 订阅文件读取失败，且无法备份:', err?.message ?? err)
+      }
+    }
+  }
+}
+
+function persistSubscriptions() {
+  try {
+    // 先写临时文件再替换，避免进程在写入中途退出时留下半截 JSON。
+    const temp = `${SUBS_FILE}.tmp`
+    writeFileSync(temp, JSON.stringify(Object.fromEntries(subscriptions)), 'utf8')
+    renameSync(temp, SUBS_FILE)
+  } catch (err) {
+    console.error('[tower] 订阅落盘失败:', err.message)
+  }
+}
+
+loadSubscriptions()
+
+setInterval(() => {
+  const now = Date.now()
+  for (const [token, share] of shares) {
+    if (share.used || share.expiresAt < now) shares.delete(token)
+  }
+}, 30_000).unref()
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.yaml': 'text/yaml; charset=utf-8',
+  '.list': 'text/plain; charset=utf-8',
+  '.ini': 'text/plain; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
+  '.txt': 'text/plain; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+}
+
+// 订阅支持的载体格式：同一 token 下按客户端取对应格式。
+// surge / loon / quanx 三者同为 ini 文件但语法互不兼容，必须各自独立。
+const SUB_FORMATS = ['yaml', 'egern', 'surge', 'loon', 'quanx', 'json', 'base64']
+// 兼容旧链接 / 旧请求里的简写
+const SUB_ALIAS = {
+  ini: 'surge',
+  singbox: 'json',
+  clash: 'yaml',
+  surfboard: 'surge',
+  stash: 'yaml',
+}
+const SUB_TARGET_FORMAT = {
+  clash: 'yaml',
+  'clash-apple': 'yaml',
+  'clash-mi': 'yaml',
+  clashmi: 'yaml',
+  karing: 'yaml',
+  'clash-verge': 'yaml',
+  clashverge: 'yaml',
+  clashmac: 'yaml',
+  flclash: 'yaml',
+  'mihomo-party': 'yaml',
+  openclash: 'yaml',
+  nikki: 'yaml',
+  mihomo: 'yaml',
+  stash: 'yaml',
+  egern: 'egern',
+  surge: 'surge',
+  'surge-mac': 'surge',
+  surfboard: 'surge',
+  shadowrocket: 'yaml',
+  'shadow-rocket': 'yaml',
+  v2box: 'base64',
+  anywhere: 'base64',
+  loon: 'loon',
+  quanx: 'quanx',
+  quantumult: 'quanx',
+  'quantumult-x': 'quanx',
+  quantumultx: 'quanx',
+  hiddify: 'json',
+  'sing-box': 'json',
+  singbox: 'json',
+}
+
+/** 客户端 target → 订阅里可选的目标专属变体 key。 */
+const SUB_TARGET_CANONICAL = {
+  surge: 'surge',
+  'surge-mac': 'surge-mac',
+  clash: 'clash',
+  stash: 'clash',
+  'clash-apple': 'clash-apple',
+  'clash-verge': 'clash-verge',
+  clashverge: 'clash-verge',
+  clashmac: 'clashmac',
+  flclash: 'flclash',
+  'mihomo-party': 'mihomo-party',
+  'clash-mi': 'clash-mi',
+  clashmi: 'clash-mi',
+  karing: 'karing',
+  shadowrocket: 'shadowrocket',
+  'shadow-rocket': 'shadowrocket',
+  v2box: 'v2box',
+  anywhere: 'anywhere',
+  loon: 'loon',
+  quanx: 'quanx',
+  quantumult: 'quanx',
+  'quantumult-x': 'quanx',
+  quantumultx: 'quanx',
+  hiddify: 'hiddify',
+  'sing-box': 'sing-box',
+  singbox: 'sing-box',
+  egern: 'egern',
+}
+
+function canonicalSubTarget(value) {
+  const key = String(value ?? '').trim().toLowerCase()
+  return key && key !== 'auto' ? SUB_TARGET_CANONICAL[key] ?? null : null
+}
+
+/** User-Agent 只用来挑选目标专属变体；格式仍由 resolveSubFormat 决定。 */
+function subTargetFromUserAgent(userAgent) {
+  const agent = String(userAgent ?? '').toLowerCase()
+  if (!agent) return null
+  if (agent.includes('shadowrocket')) return 'shadowrocket'
+  if (agent.includes('quantumult') || agent.includes('quanx')) return 'quanx'
+  if (agent.includes('hiddify')) return 'hiddify'
+  if (agent.includes('sing-box') || agent.includes('singbox')) return 'sing-box'
+  if (agent.includes('stash')) return 'clash'
+  if (agent.includes('karing')) return 'karing'
+  if (agent.includes('egern')) return 'egern'
+  if (agent.includes('surfboard')) return 'surge'
+  if (agent.includes('surge')) return 'surge'
+  if (agent.includes('loon')) return 'loon'
+  return null
+}
+
+/** 局域网通用订阅：显式 format > target > User-Agent。 */
+function resolveSubFormat(formatParam, targetParam, userAgent) {
+  const format = String(formatParam ?? '').trim().toLowerCase()
+  if (format) return SUB_FORMATS.includes(format) ? format : SUB_ALIAS[format] ?? 'base64'
+  const target = String(targetParam ?? '').trim().toLowerCase()
+  if (target && target !== 'auto') {
+    return SUB_TARGET_FORMAT[target] ?? null
+  }
+  const canonical = subTargetFromUserAgent(userAgent)
+  if (canonical) return SUB_TARGET_FORMAT[canonical]
+  const agent = String(userAgent ?? '').toLowerCase()
+  if (!agent) return 'base64'
+  if (agent.includes('openclash') || agent.includes('nikki') || agent.includes('clash') || agent.includes('mihomo')) return 'yaml'
+  return 'base64'
+}
+const SUB_MIME = {
+  yaml: 'text/yaml; charset=utf-8',
+  egern: 'text/yaml; charset=utf-8',
+  surge: 'text/plain; charset=utf-8',
+  loon: 'text/plain; charset=utf-8',
+  quanx: 'text/plain; charset=utf-8',
+  json: 'application/json; charset=utf-8',
+  base64: 'text/plain; charset=utf-8',
+}
+const SUB_EXT = { yaml: 'yaml', egern: 'yaml', surge: 'conf', loon: 'conf', quanx: 'conf', json: 'json', base64: 'txt' }
+
+// ---------- offline IP country database (sapics/ip-location-db, PDDL-1.0) ----------
+const IP_COUNTRY_DIR = join(dirname(fileURLToPath(import.meta.url)), 'ip-country')
+const IP_ASN_DIR = join(dirname(fileURLToPath(import.meta.url)), 'ip-asn')
+let ipASNData
+function loadIPASNDatabase() {
+  if (ipASNData !== undefined) return ipASNData
+  ipASNData = loadIPASNData(IP_ASN_DIR)
+  return ipASNData
+}
+let ipCountryData
+function loadIPCountryData() {
+  if (ipCountryData !== undefined) return ipCountryData
+  try {
+    ipCountryData = {
+      v4: readFileSync(join(IP_COUNTRY_DIR, 'IPCountryIPv4.bin')),
+      v6: readFileSync(join(IP_COUNTRY_DIR, 'IPCountryIPv6.bin')),
+    }
+  } catch {
+    ipCountryData = null
+  }
+  return ipCountryData
+}
+
+function ipv4Value(address) {
+  const parts = address.split('.')
+  if (parts.length !== 4) return null
+  let value = 0
+  for (const part of parts) {
+    const n = Number(part)
+    if (!Number.isInteger(n) || n < 0 || n > 255) return null
+    value = value * 256 + n
+  }
+  return value
+}
+
+function ipv6Bytes(address) {
+  const [head, tail] = address.toLowerCase().split('::')
+  if (tail === undefined && head.split(':').length !== 8) return null
+  const left = head ? head.split(':') : []
+  const right = tail ? tail.split(':') : []
+  const missing = 8 - left.length - right.length
+  if (missing < 0) return null
+  const groups = [...left, ...Array(missing).fill('0'), ...right]
+  if (groups.length !== 8) return null
+  const buffer = Buffer.alloc(16)
+  for (let i = 0; i < 8; i++) {
+    const value = parseInt(groups[i], 16)
+    if (!Number.isInteger(value) || value < 0 || value > 0xffff) return null
+    buffer.writeUInt16BE(value, i * 2)
+  }
+  return buffer
+}
+
+function countryCodeForAddress(address) {
+  const data = loadIPCountryData()
+  if (!data) return null
+  if (isIP(address) === 4) {
+    const value = ipv4Value(address)
+    if (value === null) return null
+    let low = 0
+    let high = data.v4.length / 10 - 1
+    while (low <= high) {
+      const record = low + Math.floor((high - low) / 2)
+      const offset = record * 10
+      const start = data.v4.readUInt32BE(offset)
+      const end = data.v4.readUInt32BE(offset + 4)
+      if (value < start) high = record - 1
+      else if (value > end) low = record + 1
+      else return data.v4.toString('ascii', offset + 8, offset + 10)
+    }
+    return null
+  }
+  if (isIP(address) === 6) {
+    const bytes = ipv6Bytes(address)
+    if (!bytes) return null
+    let low = 0
+    let high = data.v6.length / 34 - 1
+    while (low <= high) {
+      const record = low + Math.floor((high - low) / 2)
+      const offset = record * 34
+      const start = data.v6.subarray(offset, offset + 16)
+      const end = data.v6.subarray(offset + 16, offset + 32)
+      if (bytes.compare(start) < 0) high = record - 1
+      else if (bytes.compare(end) > 0) low = record + 1
+      else return data.v6.toString('ascii', offset + 32, offset + 34)
+    }
+  }
+  return null
+}
+
+const ipCountryCache = new Map()
+async function handleIPCountry(url, res) {
+  const rawHost = url.searchParams.get('host')?.trim()
+  if (!rawHost) return json(res, 400, { error: '缺少 host 参数' })
+  if (rawHost.length > 2048) return json(res, 400, { error: 'host 过长' })
+  const cached = ipCountryCache.get(rawHost)
+  if (cached && Date.now() - cached.at < 24 * 60 * 60 * 1000) {
+    return json(res, 200, {
+      country: cached.country,
+      address: cached.address,
+      asn: cached.asn,
+      organization: cached.organization,
+      cached: true,
+    })
+  }
+  const host = rawHost.replace(/^\[|\]$/g, '')
+  let address = isIP(host) ? host : null
+  if (!address) {
+    try {
+      address = (await lookup(host, { verbatim: true })).address
+    } catch {
+      address = null
+    }
+  }
+  const country = address ? countryCodeForAddress(address) : null
+  const network = address ? organizationForAddress(loadIPASNDatabase(), address) : null
+  if (address) {
+    ipCountryCache.set(rawHost, {
+      country,
+      address,
+      asn: network?.asn,
+      organization: network?.organization,
+      at: Date.now(),
+    })
+  }
+  return json(res, 200, {
+    country,
+    address,
+    asn: network?.asn ?? null,
+    organization: network?.organization ?? null,
+  })
+}
+
+function send(res, status, body, headers = {}) {
+  res.writeHead(status, headers)
+  res.end(body)
+}
+
+/** 订阅文本里的托管规则集地址跟随请求的局域网/域名 origin。 */
+function rewriteRuleSetOrigins(payload, origin) {
+  if (typeof payload !== 'string' || !origin) return payload
+  return payload.replace(
+    /(?:https?:\/\/[^/\s"']+)?(\/api\/ruleset\?[^\s"',]+)/g,
+    `${origin}$1`,
+  )
+}
+
+function json(res, status, value) {
+  send(res, status, JSON.stringify(value), { 'content-type': 'application/json; charset=utf-8' })
+}
+
+function sanitizeUserAgent(value) {
+  return String(value ?? '').replace(/[\r\n]/g, '').trim().slice(0, 400)
+}
+
+/** 订阅可选 DoH：只接受 https 地址，避免把本机变成任意协议转发器。 */
+function validatedDoHURL(value) {
+  const raw = String(value ?? '').trim()
+  if (!raw) return null
+  let endpoint
+  try {
+    endpoint = new URL(raw)
+  } catch {
+    throw new Error('DoH 地址无效，应填写 https://…/dns-query 形式的地址')
+  }
+  if (endpoint.protocol !== 'https:' || !endpoint.hostname || endpoint.username || endpoint.password) {
+    throw new Error('DoH 地址必须使用 https://，且不能包含账号密码')
+  }
+  return endpoint
+}
+
+/** RFC 8484 的 JSON 接口（Cloudflare / NextDNS 等公共 DoH 均支持）。 */
+async function resolveViaDoH(hostname, endpoint) {
+  const query = new URL(endpoint.href)
+  query.searchParams.set('name', hostname)
+  const response = await fetch(query, {
+    headers: { accept: 'application/dns-json' },
+    signal: AbortSignal.timeout(8000),
+  })
+  if (!response.ok) throw new Error(`DoH 返回 HTTP ${response.status}`)
+  const payload = await response.json()
+  if (payload?.Status !== undefined && payload.Status !== 0) {
+    throw new Error(`DoH 解析失败（Status ${payload.Status}）`)
+  }
+  const addresses = []
+  const seen = new Set()
+  for (const answer of Array.isArray(payload?.Answer) ? payload.Answer : []) {
+    if ((answer?.type !== 1 && answer?.type !== 28) || typeof answer.data !== 'string') continue
+    if (seen.has(answer.data)) continue
+    seen.add(answer.data)
+    addresses.push({ address: answer.data, family: answer.type === 1 ? 4 : 6 })
+  }
+  if (addresses.length === 0) throw new Error(`DoH 未返回 ${hostname} 的地址`)
+  // 优先 IPv4，避免只有 AAAA 记录时在 IPv4-only 网络里直接失败。
+  addresses.sort((a, b) => a.family - b.family)
+  return addresses
+}
+
+/** 给 http(s).request 注入自定义 DNS，证书校验和 SNI 仍按原始域名。 */
+function dohLookup(endpoint) {
+  return (hostname, options, callback) => {
+    const literal = isIP(hostname)
+    if (literal) {
+      if (typeof options === 'object' && options.all) {
+        callback(null, [{ address: hostname, family: literal }])
+      } else {
+        callback(null, hostname, literal)
+      }
+      return
+    }
+    const family = typeof options === 'object' ? Number(options.family || 0) : 0
+    const all = typeof options === 'object' && options.all
+    resolveViaDoH(hostname, endpoint).then((addresses) => {
+      const candidates = family ? addresses.filter((a) => a.family === family) : addresses
+      if (candidates.length === 0) throw new Error(`DoH 没有 ${hostname} 的 IPv${family} 地址`)
+      if (all) callback(null, candidates)
+      else callback(null, candidates[0].address, candidates[0].family)
+    }).catch((error) => callback(error))
+  }
+}
+
+function headerValue(headers, name) {
+  if (!headers) return null
+  if (typeof headers.get === 'function') return headers.get(name)
+  const value = headers[name.toLowerCase()]
+  return Array.isArray(value) ? value[0] : (value ?? null)
+}
+
+function requestOnce(target, userAgent, dohEndpoint) {
+  return new Promise((resolve, reject) => {
+    const transport = target.protocol === 'https:' ? httpsRequest : httpRequest
+    const req = transport({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || (target.protocol === 'https:' ? 443 : 80),
+      path: `${target.pathname}${target.search}`,
+      method: 'GET',
+      agent: false,
+      lookup: dohEndpoint ? dohLookup(dohEndpoint) : undefined,
+      headers: {
+        // Airports switch payloads on the UA; ask for the raw subscription.
+        'user-agent': userAgent || 'clash-verge/v2.4.2',
+        accept: '*/*',
+        'accept-encoding': 'gzip, deflate, br',
+      },
+    }, (upstream) => {
+      const chunks = []
+      upstream.on('data', (chunk) => chunks.push(chunk))
+      upstream.on('error', reject)
+      upstream.on('end', () => {
+        let body = Buffer.concat(chunks)
+        try {
+          const encoding = String(headerValue(upstream.headers, 'content-encoding') ?? '').toLowerCase()
+          if (encoding.includes('br')) body = brotliDecompressSync(body)
+          else if (encoding.includes('gzip')) body = gunzipSync(body)
+          else if (encoding.includes('deflate')) body = inflateSync(body)
+        } catch (error) {
+          reject(new Error(`订阅响应解压失败：${error.message}`))
+          return
+        }
+        resolve({ status: upstream.statusCode ?? 0, headers: upstream.headers, body })
+      })
+    })
+    req.setTimeout(30_000, () => req.destroy(new Error('订阅地址响应超时')))
+    req.on('error', reject)
+    req.end()
+  })
+}
+
+async function fetchWithDoH(target, userAgent, dohEndpoint) {
+  let current = target
+  for (let hop = 0; hop < 6; hop++) {
+    const result = await requestOnce(current, userAgent, dohEndpoint)
+    const location = headerValue(result.headers, 'location')
+    if ([301, 302, 303, 307, 308].includes(result.status) && location) {
+      const next = new URL(location, current)
+      if (next.protocol !== 'http:' && next.protocol !== 'https:') {
+        throw new Error('订阅地址重定向到了不支持的协议')
+      }
+      current = next
+      continue
+    }
+    return result
+  }
+  throw new Error('订阅地址重定向次数过多')
+}
+
+async function handleFetch(url, options, res) {
+  let target
+  try {
+    target = new URL(url)
+  } catch {
+    return json(res, 400, { error: '订阅地址无效' })
+  }
+  if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+    return json(res, 400, { error: '只支持 http/https 订阅地址' })
+  }
+
+  const userAgent = sanitizeUserAgent(options?.userAgent) || 'clash-verge/v2.4.2'
+  let dohEndpoint
+  try {
+    dohEndpoint = validatedDoHURL(options?.doh)
+  } catch (error) {
+    return json(res, 400, { error: error.message })
+  }
+
+  let upstream
+  if (dohEndpoint) {
+    // Node 的 fetch 不暴露自定义 DNS，使用 http(s).request + lookup 才能
+    // 真正按 DoH 返回的地址连接，同时保留原域名的 TLS 校验。
+    try {
+      upstream = await fetchWithDoH(target, userAgent, dohEndpoint)
+    } catch (error) {
+      return json(res, 502, { error: `订阅服务器无法访问：${error?.message ?? '网络错误'}` })
+    }
+  } else {
+    const response = await fetch(target, {
+      headers: { 'user-agent': userAgent, accept: '*/*' },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(30_000),
+    }).catch((error) => ({ error }))
+    if ('error' in response) {
+      return json(res, 502, { error: `订阅服务器无法访问：${response.error?.message ?? '网络错误'}` })
+    }
+    upstream = {
+      status: response.status,
+      headers: response.headers,
+      body: Buffer.from(await response.arrayBuffer()),
+    }
+  }
+
+  if (upstream.status < 200 || upstream.status >= 300) {
+    return json(res, 502, { error: `订阅服务器返回 HTTP ${upstream.status}` })
+  }
+  const headers = {
+    'content-type': headerValue(upstream.headers, 'content-type') ?? 'text/plain; charset=utf-8',
+  }
+  const userinfo = headerValue(upstream.headers, 'subscription-userinfo')
+  if (userinfo) headers['x-subscription-userinfo'] = userinfo
+  const title = headerValue(upstream.headers, 'profile-title')
+  if (title) headers['x-profile-title'] = title
+  const interval = headerValue(upstream.headers, 'profile-update-interval')
+  if (interval) headers['x-profile-update-interval'] = interval
+  send(res, 200, upstream.body, headers)
+}
+
+/** TCP handshake latency. Abortable; default timeout 5s (cold DNS + 专线首包常 >2s). */
+function probeTCP(host, port, timeoutMs = 5000, signal) {
+  return new Promise((resolve) => {
+    if (!host || !port) return resolve({ ok: false, error: 'invalid' })
+    let settled = false
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+    const start = performance.now()
+    const sock = connect(port, host, () => {
+      const ms = Math.max(1, Math.round(performance.now() - start))
+      sock.destroy()
+      finish({ ok: true, ms })
+    })
+    const onAbort = () => { sock.destroy(new Error('aborted')) }
+    signal?.addEventListener('abort', onAbort)
+    sock.setTimeout(timeoutMs, () => { sock.destroy(new Error('timeout')) })
+    sock.on('error', (err) => finish({ ok: false, error: err.code ?? err.message }))
+    sock.on('close', () => {
+      signal?.removeEventListener('abort', onAbort)
+      // If we got here without settling, treat as unreachable.
+      if (!settled) finish({ ok: false, error: 'closed' })
+    })
+  })
+}
+
+/** ICMP 通过系统 ping；无权限或命令不可用时由调用方回退 TCP。 */
+function probeICMP(host, timeoutMs = 1200) {
+  return new Promise((resolve) => {
+    if (!host || !/^[A-Za-z0-9._:-]+$/.test(host)) return resolve({ ok: false, error: 'invalid' })
+    const args = process.platform === 'win32'
+      ? ['-n', '1', '-w', String(timeoutMs), host]
+      : process.platform === 'darwin'
+        ? ['-c', '1', '-W', String(timeoutMs), host]
+        : ['-c', '1', '-W', String(Math.max(1, Math.ceil(timeoutMs / 1000))), host]
+    execFile('ping', args, { timeout: timeoutMs + 300, windowsHide: true }, (err, stdout) => {
+      if (err) return resolve({ ok: false, error: 'icmp_timeout' })
+      const match = String(stdout).match(/(\d+(?:\.\d+)?)\s*ms/i)
+      if (!match) return resolve({ ok: false, error: 'icmp_timeout' })
+      resolve({ ok: true, ms: Math.max(1, Math.round(Number(match[1]))), method: 'icmp' })
+    })
+  })
+}
+
+// 首次探测常碰上 DNS 冷解析 / 运营商首包丢包，重试一次能把误判降下来。
+const RETRYABLE_PROBE_ERRORS = new Set(['timeout', 'ETIMEDOUT', 'ENOTFOUND', 'ESERVFAIL', 'ECONNRESET', 'closed'])
+
+async function probeOnce(host, port, timeout, signal) {
+  try {
+    return await Promise.race([
+      probeTCP(host, port, timeout, signal),
+      new Promise((r) => setTimeout(() => r({ ok: false, error: 'timeout' }), timeout + 200)),
+    ])
+  } catch (err) {
+    return { ok: false, error: String(err?.message ?? err) }
+  }
+}
+
+async function handleProbe(url, res) {
+  const host = url.searchParams.get('host')?.trim()
+  const portText = url.searchParams.get('port')
+  const requested = Number(url.searchParams.get('timeout') ?? 5000) || 5000
+  const timeout = Math.min(Math.max(requested, 1000), 10000)
+  const port = Number(portText)
+  const mode = (url.searchParams.get('mode') ?? 'tcp').toLowerCase()
+  if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
+    return json(res, 400, { ok: false, error: 'host/port 无效' })
+  }
+  try {
+    if (mode === 'icmp') {
+      const result = await probeICMP(host, Math.min(timeout, 1500))
+      return result.ok
+        ? json(res, 200, { ok: true, ms: result.ms, method: 'icmp', attempts: 1 })
+        : json(res, 200, { ok: false, error: result.error, attempts: 1 })
+    }
+    let attempts = 0
+    if (mode === 'automatic') {
+      const icmp = await probeICMP(host, Math.min(timeout, 1500))
+      if (icmp.ok) return json(res, 200, { ok: true, ms: icmp.ms, method: 'icmp', attempts: 1 })
+      attempts = 1
+    }
+    // TCP：先按正常阈值；失败且属可重试错误时放宽阈值再探一次。
+    let result = await probeOnce(host, port, timeout, res.destroyed ? AbortSignal.timeout(0) : undefined)
+    attempts += 1
+    if (!result.ok && RETRYABLE_PROBE_ERRORS.has(result.error) && !res.destroyed) {
+      attempts += 1
+      result = await probeOnce(host, port, Math.min(timeout * 2, 10000), undefined)
+    }
+    if (result.ok) {
+      json(res, 200, { ok: true, ms: result.ms, method: 'tcp', attempts })
+    } else {
+      json(res, 200, { ok: false, error: result.error, attempts })
+    }
+  } catch (err) {
+    json(res, 200, { ok: false, error: String(err?.message ?? err) })
+  }
+}
+
+async function readBody(req) {
+  const chunks = []
+  let size = 0
+  for await (const chunk of req) {
+    size += chunk.length
+    if (size > 8 * 1024 * 1024) throw new Error('内容过大')
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks)
+}
+
+const server = createServer(async (req, res) => {
+  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+  try {
+    if (url.pathname === '/api/fetch' && req.method === 'GET') {
+      const target = url.searchParams.get('url')
+      if (!target) return json(res, 400, { error: '缺少 url 参数' })
+      return await handleFetch(target, {
+        userAgent: url.searchParams.get('ua') ?? '',
+        doh: url.searchParams.get('doh') ?? '',
+      }, res)
+    }
+
+    // 规则集转换：把经典 Clash 列表托管成 QuanX / Egern / sing-box source 方言。
+    // 客户端配置里的 RULE-SET 地址指向这里，因此不需要安装额外的转换服务。
+    if (url.pathname === '/api/ruleset' && req.method === 'GET') {
+      try {
+        const cacheKey = ruleSetCacheKey(url.searchParams)
+        let artifact = cacheKey ? cachedRuleSet(cacheKey) : undefined
+        if (!artifact) {
+          artifact = await buildRuleSetArtifact(url.searchParams)
+          cacheRuleSet(artifact.key, artifact)
+        }
+        return send(res, 200, artifact.body, {
+          'content-type': artifact.contentType,
+          'cache-control': 'public, max-age=3600',
+          'x-tower-ruleset-format': url.searchParams.get('format') ?? '',
+          'x-tower-ruleset-rules': String(artifact.ruleCount),
+        })
+      } catch (error) {
+        const status = error instanceof RuleSetConversionError ? error.status : 500
+        return send(res, status, String(error?.message ?? error), {
+          'content-type': 'text/plain; charset=utf-8',
+          'cache-control': 'no-store',
+        })
+      }
+    }
+
+    if (url.pathname === '/api/probe' && req.method === 'GET') {
+      return await handleProbe(url, res)
+    }
+
+    if (url.pathname === '/api/ip-country' && req.method === 'GET') {
+      return await handleIPCountry(url, res)
+    }
+
+    if (url.pathname === '/api/share' && req.method === 'POST') {
+      const body = await readBody(req)
+      if (body.length === 0) return json(res, 400, { error: '内容为空' })
+      const token = randomBytes(12).toString('base64url')
+      shares.set(token, {
+        body,
+        contentType: req.headers['content-type'] ?? 'text/plain; charset=utf-8',
+        expiresAt: Date.now() + SHARE_TTL_MS,
+        used: false,
+      })
+      const name = url.searchParams.get('name') ?? ''
+      return json(res, 200, {
+        token,
+        url: `/api/s/${token}${name ? `?name=${encodeURIComponent(name)}` : ''}`,
+        expiresIn: 180,
+      })
+    }
+
+    const shareMatch = url.pathname.match(/^\/api\/s\/([A-Za-z0-9_-]+)$/)
+    if (shareMatch && req.method === 'GET') {
+      const share = shares.get(shareMatch[1])
+      if (!share || share.used || share.expiresAt < Date.now()) {
+        return send(res, 410, '链接已失效（临时导入链接 3 分钟内有效，且只能使用一次）', {
+          'content-type': 'text/plain; charset=utf-8',
+        })
+      }
+      share.used = true
+      return send(res, 200, share.body, {
+        'content-type': share.contentType,
+        'cache-control': 'no-store',
+      })
+    }
+
+    if (url.pathname === '/api/health') {
+      return json(res, 200, {
+        ok: true,
+        formats: SUB_FORMATS,
+        subscriptions: subscriptions.size,
+        uptimeSec: Math.round(process.uptime()),
+      })
+    }
+
+    // 供前端把「手机可用的订阅地址」显示出来：列出真实网卡的局域网地址。
+    if (url.pathname === '/api/network') {
+      return json(res, 200, {
+        host: HOST,
+        port: PORT,
+        lan: HOST === '0.0.0.0' ? lanUrls(PORT) : [],
+        local: `http://127.0.0.1:${PORT}`,
+      })
+    }
+
+    // --- Persistent subscription URL: browser POSTs current node list,
+    // returns a durable URL any proxy client can import. Everything stays local;
+    // subscriptions are persisted to server/subscriptions.json so a restart
+    // does not invalidate links clients already saved.
+    if (url.pathname === '/api/subscribe' && req.method === 'POST') {
+      const raw = await readBody(req)
+      if (raw.length === 0) return json(res, 400, { error: '内容为空' })
+      if (raw.length > 16 * 1024 * 1024) return json(res, 400, { error: '订阅过大（>16MB）' })
+      const contentType = String(req.headers['content-type'] ?? '')
+      let title = url.searchParams.get('title') ?? 'tower'
+      let formats
+      let targets = {}
+      if (contentType.includes('application/json')) {
+        let parsed
+        try {
+          parsed = JSON.parse(raw.toString('utf8'))
+        } catch {
+          return json(res, 400, { error: 'JSON 解析失败' })
+        }
+        if (typeof parsed?.title === 'string' && parsed.title) title = parsed.title
+        const src = parsed?.formats ?? {}
+        formats = {}
+        for (const key of SUB_FORMATS) {
+          if (typeof src[key] === 'string' && src[key].length > 0) formats[key] = src[key]
+        }
+        if (Object.keys(formats).length === 0) return json(res, 400, { error: '没有可用格式' })
+        // 目标专属变体（Stash / Surge Mac / 不支持 Tailscale 的客户端）。
+        const srcTargets = parsed?.targets
+        if (srcTargets && typeof srcTargets === 'object' && !Array.isArray(srcTargets)) {
+          for (const [rawKey, value] of Object.entries(srcTargets)) {
+            const key = canonicalSubTarget(rawKey)
+            if (key && typeof value === 'string' && value.length > 0) targets[key] = value
+          }
+        }
+      } else {
+        // 兼容旧客户端：纯文本 body 视为 base64 节点列表
+        formats = { base64: raw.toString('utf8') }
+      }
+      let token = url.searchParams.get('token')
+      const isRefresh = !!token
+      if (!token) token = randomBytes(16).toString('base64url')
+      subscriptions.set(token, {
+        formats,
+        targets,
+        updatedAt: Date.now(),
+        title,
+      })
+      persistSubscriptions()
+      return json(res, 200, {
+        token,
+        url: `/api/sub/${token}?name=${encodeURIComponent(title)}`,
+        formats: Object.keys(formats),
+        refreshed: isRefresh,
+      })
+    }
+
+    const subMatch = url.pathname.match(/^\/api\/sub\/([A-Za-z0-9_-]+)$/)
+    if (subMatch && req.method === 'GET') {
+      const sub = subscriptions.get(subMatch[1])
+      if (!sub) {
+        return send(res, 404, '订阅地址无效。请到塔台 Tower Web 重新生成订阅链接。', {
+          'content-type': 'text/plain; charset=utf-8',
+        })
+      }
+      const fmt = resolveSubFormat(
+        url.searchParams.get('format'),
+        url.searchParams.get('target'),
+        req.headers['user-agent'],
+      )
+      if (!fmt) {
+        return send(res, 400, '无法识别客户端。请在链接中使用 target=clash、surge、surfboard、loon、quanx、shadowrocket、sing-box、hiddify 或 egern。', {
+          'content-type': 'text/plain; charset=utf-8',
+        })
+      }
+      // 明确请求了某个格式却没有该载体时返回 406，而不是悄悄给 base64
+      // （Clash 收到 base64 会报“订阅创建失败”，错误信息反而不如 406 清楚）。
+      const requestedTarget = canonicalSubTarget(url.searchParams.get('target'))
+        ?? subTargetFromUserAgent(req.headers['user-agent'])
+      const variant = requestedTarget && SUB_TARGET_FORMAT[requestedTarget] === fmt
+        ? sub.targets?.[requestedTarget]
+        : undefined
+      // 旧版 Egern 链接请求的是 yaml，新链接请求 egern；旧发布记录没有
+      // egern 载体时回退到 yaml，避免升级后旧链接直接 406。
+      let payload = variant ?? sub.formats[fmt]
+      let servedFormat = fmt
+      if (!payload && fmt === 'egern' && sub.formats.yaml) {
+        payload = sub.formats.yaml
+        servedFormat = 'yaml'
+      }
+      if (!payload) {
+        return send(res, 406, `该订阅不包含 ${fmt} 格式，可用：${Object.keys(sub.formats).join(', ') || '无'}`, {
+          'content-type': 'text/plain; charset=utf-8',
+        })
+      }
+      const name = url.searchParams.get('name') ?? sub.title ?? 'tower'
+      // HTTP 头只接受 latin1；中文标题会触发 ERR_INVALID_CHAR，这里做 ASCII 兜底。
+      const asciiName = String(name).replace(/[^\x20-\x7E]/g, '').trim() || 'tower'
+      return send(res, 200, rewriteRuleSetOrigins(payload, url.origin), {
+        'content-type': SUB_MIME[servedFormat],
+        'cache-control': 'no-store',
+        'x-tower-format': servedFormat,
+        'profile-title': asciiName,
+        'profile-update-interval': '24',
+        // 让客户端识别这是订阅而非普通文本
+        'content-disposition': `attachment; filename="${encodeURIComponent(name)}.${SUB_EXT[servedFormat]}"`,
+      })
+    }
+
+    const subDeleteMatch = url.pathname.match(/^\/api\/sub\/([A-Za-z0-9_-]+)$/)
+    if (subDeleteMatch && req.method === 'DELETE') {
+      subscriptions.delete(subDeleteMatch[1])
+      persistSubscriptions()
+      return json(res, 200, { ok: true })
+    }
+
+    // 未匹配的 /api/* 一律返回 JSON 404，绝不能回落成 index.html
+    // （否则客户端拿到 HTML 会报「订阅创建失败」，且难以排查）
+    if (url.pathname.startsWith('/api/')) {
+      return json(res, 404, { error: '接口不存在', path: url.pathname })
+    }
+
+    // Static files (production build).
+    if (existsSync(distDir)) {
+      let filePath = normalize(join(distDir, decodeURIComponent(url.pathname)))
+      // 使用 sep 校验，避免 dist-evil 之类的同前缀兄弟目录被误判为 dist 内部。
+      if (filePath !== distDir && !filePath.startsWith(distDir + sep)) {
+        return send(res, 403, 'forbidden')
+      }
+      if (!existsSync(filePath) || url.pathname === '/' || url.pathname.endsWith('/')) {
+        filePath = join(distDir, 'index.html')
+      }
+      try {
+        const content = await readFile(filePath)
+        const isIndex = extname(filePath) === '.html'
+        // 只有 Vite 生成的 /assets/* 带内容哈希；logo / 客户端图标等可能被替换，
+        // 不能用 immutable 缓存，否则用户换图后一年都看不到新文件。
+        const isHashedAsset = url.pathname.startsWith('/assets/')
+        return send(res, 200, content, {
+          'content-type': MIME[extname(filePath)] ?? 'application/octet-stream',
+          'cache-control': isIndex || !isHashedAsset
+            ? 'no-cache, must-revalidate'
+            : 'public, max-age=31536000, immutable',
+        })
+      } catch {
+        return send(res, 404, 'not found')
+      }
+    }
+
+    json(res, 404, { error: 'not found' })
+  } catch (error) {
+    json(res, 500, { error: String(error?.message ?? error) })
+  }
+})
+
+server.listen(PORT, HOST, () => {
+  console.log(`[tower-web] companion server on http://127.0.0.1:${PORT}`)
+  if (HOST === '0.0.0.0') {
+    for (const u of lanUrls(PORT)) console.log(`[tower-web] 局域网可访问: ${u}`)
+    console.log('[tower-web] 局域网访问无身份验证，请只在可信网络开启；关闭用 HOST=127.0.0.1')
+  } else {
+    console.log('[tower-web] 仅本机可访问（HOST=0.0.0.0 可开放局域网）')
+  }
+})

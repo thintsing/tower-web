@@ -1,0 +1,7314 @@
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { renderSVG } from 'uqr'
+import { CLIENTS, PROXY_KIND_TITLES, subFormatFor, type ClientInfo, type ClientTarget, type ExportContentMode, type LatencyTestMode, type LocalRuleSet, type NodeNameFilterSettings, type PolicyGroup, type ProxyKind, type ProxyNode, type RemoteSubscriptionEntry, type RoutingRule, type RuleScheme, type RuleSetFormat, type SchemeRuleSet, type SubFormat, type SubscriptionSource, type TailnetConnection, type TailnetExport } from './models/types'
+import { allRegions, regionForName, regionForNode } from './models/region'
+import { defaultTailnetConnection, normalizeTailnetAuthKey, normalizeTailnetControlURL, normalizeTailnetDeviceName, normalizeTailnetMagicDNSSuffix, normalizeTailnetSubnets, tailnetPolicyName, TailnetValidationError } from './models/tailnet'
+import {
+  DNS_MODE_SUMMARIES,
+  DNS_MODE_TITLES,
+  NetworkSettingsError,
+  networkSettingsDraft,
+  validateNetworkSettingsDraft,
+  type NetworkSettingsDraft,
+} from './models/networkSettings'
+import { enabledNodes, isSourceEnabled, nodeExactKey, persistedSnapshot, useStore } from './store'
+import { backupCounts, backupFileName, createBackup, MAX_BACKUP_BYTES, parseBackup, type BackupFile } from './backup'
+import {
+  backupHistoryItems,
+  MAX_BACKUP_HISTORY,
+  readBackupHistory,
+  removeBackupHistory,
+  saveBackupHistory,
+  BackupHistoryError,
+  type BackupHistoryItem,
+} from './backupHistory'
+import { BUILTIN_SCHEMES, allSchemeMetas, loadScheme, parseRuleList } from './rules/scheme'
+import { detectRuleSchemeFormat, parseRuleSchemeText, RULE_SCHEME_FORMAT_TITLES } from './rules/importers'
+import { fetchRuleSet, parseRuleSetText, RULE_SET_FORMAT_TITLES, type RuleSetRule } from './rules/ruleSets'
+import { matchingGroupNames, matchingOrderAfterDragging } from './rules/matchingOrder'
+import { ONLINE_RULE_CATALOG } from './rules/ruleCatalog'
+import type { ManualNodeImportResult } from './manualNodes'
+import { MAX_BATCH_SUBSCRIPTIONS, splitSubscriptionURLs, subscriptionLabel } from './batchSubscriptions'
+import { WorldMapSVG } from './worldmap/WorldMapSVG'
+import { generateConfig, generateSubscriptionFormats } from './generator'
+import { analyzeRuleCompatibility } from './generator/compatibility'
+import { formatSupportsProxyCollections, prepareSchemeForExport } from './generator/groups'
+import { maskTailnetAuthKeys, tailnetSupports } from './generator/tailnet'
+import { copyToClipboard, newID } from './util/browser'
+import { normalizeRemoteTextURL } from './util/remoteURL'
+import { GITHUB_REPO_URL } from './config'
+import { RouteIllustration } from './components/RouteIllustration'
+import { GroupIcon, groupDisplayName } from './components/GroupIcon'
+import { TailnetIllustration } from './components/TailnetIllustration'
+import { ManualNodeEditorDialog } from './components/ManualNodeEditorDialog'
+import { QrScanner } from './components/QrScanner'
+
+/** 顶部工作区。跨页面跳转（上手流程 / 导出补救）需要它。 */
+type TabKey = 'sub' | 'rules' | 'tailnet' | 'export'
+
+function formatBytes(bytes?: number): string {
+  if (bytes === undefined) return ''
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let v = bytes
+  let i = 0
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++ }
+  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`
+}
+
+function formatDate(ts?: number): string {
+  if (!ts) return ''
+  return new Date(ts).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+/** 高级请求设置：只影响这一条订阅的抓取请求。 */
+function requestOptionsFrom(userAgent: string, doh: string) {
+  const ua = userAgent.replace(/[\r\n]/g, '').trim()
+  const rawDoH = doh.trim()
+  if (rawDoH) {
+    let endpoint: URL
+    try {
+      endpoint = new URL(rawDoH)
+    } catch {
+      throw new Error('DoH 地址无效，应填写 https://…/dns-query 形式的地址')
+    }
+    if (endpoint.protocol !== 'https:' || !endpoint.hostname) {
+      throw new Error('DoH 地址必须使用 https://')
+    }
+  }
+  return {
+    userAgent: ua || undefined,
+    dnsOverHTTPSURL: rawDoH || undefined,
+  }
+}
+
+function useScheme(): RuleScheme | undefined {
+  const selectedSchemeID = useStore((s) => s.selectedSchemeID)
+  const customSchemes = useStore((s) => s.customSchemes)
+  const [scheme, setScheme] = useState<RuleScheme | undefined>()
+  useEffect(() => {
+    const custom = customSchemes.find((c) => c.id === selectedSchemeID)
+    if (custom) { setScheme(custom); return }
+    // 切换方案时先清空，避免旧方案的预览继续显示。
+    setScheme(undefined)
+    const meta = BUILTIN_SCHEMES.find((m) => m.id === selectedSchemeID) ?? BUILTIN_SCHEMES[0]
+    let cancelled = false
+    loadScheme(meta)
+      .then((s) => { if (!cancelled) setScheme(s) })
+      .catch(() => { if (!cancelled) setScheme(undefined) })
+    return () => { cancelled = true }
+  }, [selectedSchemeID, customSchemes])
+  return scheme
+}
+
+// ---------------- 通用小组件 ----------------
+
+/** 搜索结果高亮：命中片段用浅色底标出，其余文字不变。 */
+function Highlight({ text, needle }: { text: string; needle: string }) {
+  if (!needle) return <>{text}</>
+  const at = text.toLowerCase().indexOf(needle.toLowerCase())
+  if (at < 0) return <>{text}</>
+  return (
+    <>
+      {text.slice(0, at)}
+      <mark>{text.slice(at, at + needle.length)}</mark>
+      {text.slice(at + needle.length)}
+    </>
+  )
+}
+
+/** 统一的确认弹窗，替代 window.confirm（可用键盘与读屏器操作）。 */
+function ConfirmDialog({
+  open,
+  title,
+  body,
+  confirmLabel = '确认',
+  danger = false,
+  onConfirm,
+  onCancel,
+}: {
+  open: boolean
+  title: string
+  body: ReactNode
+  confirmLabel?: string
+  danger?: boolean
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  useEffect(() => {
+    if (open) ref.current?.showModal()
+    else ref.current?.close()
+  }, [open])
+  return (
+    <dialog ref={ref} onClose={onCancel} className="confirm">
+      <h3>{title}</h3>
+      <p className="confirm-body">{body}</p>
+      <div className="actions">
+        <button className={`btn ${danger ? 'danger' : 'primary'}`} onClick={onConfirm}>{confirmLabel}</button>
+        <button className="btn ghost" autoFocus onClick={onCancel}>取消</button>
+      </div>
+    </dialog>
+  )
+}
+
+/** 订阅链接二维码：完全在本机生成，不请求第三方二维码服务。 */
+function QRCodeDialog({
+  open,
+  url,
+  title,
+  hint,
+  onClose,
+}: {
+  open: boolean
+  url: string
+  title: string
+  hint: string
+  onClose: () => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const [copied, setCopied] = useState(false)
+  useEffect(() => {
+    if (open) ref.current?.showModal()
+    else ref.current?.close()
+  }, [open])
+  useEffect(() => {
+    if (!open) setCopied(false)
+  }, [open])
+  const svg = useMemo(() => {
+    if (!open || !url) return ''
+    try {
+      return renderSVG(url, {
+        ecc: 'M',
+        border: 2,
+        pixelSize: 4,
+        blackColor: '#141815',
+        whiteColor: '#ffffff',
+      })
+    } catch {
+      return ''
+    }
+  }, [open, url])
+  const copy = async () => {
+    if (await copyToClipboard(url)) {
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1600)
+    }
+  }
+  return (
+    <dialog ref={ref} className="qr-dialog" onClose={onClose}>
+      <h3>{title} · 扫码导入</h3>
+      {svg ? (
+        <div className="qr-code" dangerouslySetInnerHTML={{ __html: svg }} />
+      ) : (
+        <div className="hint">二维码生成失败，请直接复制订阅地址。</div>
+      )}
+      <div className="qr-hint">{hint}</div>
+      <input
+        readOnly
+        className="input qr-url"
+        value={url}
+        aria-label="二维码对应的订阅地址"
+        onFocus={(e) => e.currentTarget.select()}
+      />
+      <div className="actions">
+        <button className="btn primary" onClick={copy}>{copied ? '已复制' : '复制链接'}</button>
+        <button className="btn ghost" onClick={onClose}>关闭</button>
+      </div>
+    </dialog>
+  )
+}
+
+/** 手动标记节点地区；自动识别会回到“节点名 > 离线 IP”的顺序。 */
+function NodeCountryDialog({
+  node,
+  onClose,
+}: {
+  node: ProxyNode | null
+  onClose: () => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const setNodeCountryOverride = useStore((s) => s.setNodeCountryOverride)
+  const [search, setSearch] = useState('')
+  useEffect(() => {
+    if (node) {
+      setSearch('')
+      ref.current?.showModal()
+    } else {
+      ref.current?.close()
+    }
+  }, [node])
+  const regions = useMemo(() => {
+    const needle = search.trim().toLowerCase()
+    const all = allRegions()
+    if (!needle) return all
+    return all.filter((region) =>
+      region.name.toLowerCase().includes(needle)
+      || region.code.toLowerCase().includes(needle)
+      || region.flag.includes(search.trim()),
+    )
+  }, [search])
+  const current = node ? regionForNode(node) : undefined
+  const sourceLabel = node?.countryOverride
+    ? '手动标记'
+    : node?.detectedCountry && !regionForName(node.name)
+      ? '离线 IP 识别'
+      : '节点名称识别'
+  return (
+    <dialog ref={ref} onClose={onClose} className="country-dialog">
+      <h3>设置节点地区</h3>
+      {node && (
+        <div className="country-current">
+          <span className="flag">{current?.flag ?? '·'}</span>
+          <div>
+            <strong>{node.name}</strong>
+            <small>{current?.name ?? '未识别'} · {sourceLabel}</small>
+          </div>
+        </div>
+      )}
+      <div className="search-wrap country-search">
+        <input
+          className="input"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="搜索国家、地区或代码…"
+          aria-label="搜索国家或地区"
+        />
+        {search && (
+          <button className="search-clear" aria-label="清空地区搜索" onClick={() => setSearch('')}>×</button>
+        )}
+      </div>
+      <div className="country-list">
+        <button
+          type="button"
+          className={`country-option${node?.countryOverride ? '' : ' active'}`}
+          onClick={() => {
+            if (node) setNodeCountryOverride(node.id, undefined)
+            onClose()
+          }}
+        >
+          <span className="country-auto">自动</span>
+          <span>按节点名优先，其次使用离线 IP 识别</span>
+        </button>
+        {regions.map((region) => (
+          <button
+            type="button"
+            key={region.code}
+            className={`country-option${node?.countryOverride === region.code ? ' active' : ''}`}
+            onClick={() => {
+              if (node) setNodeCountryOverride(node.id, region.code)
+              onClose()
+            }}
+          >
+            <span className="flag">{region.flag}</span>
+            <span>{region.name}</span>
+            <span className="country-code">{region.code}</span>
+          </button>
+        ))}
+        {regions.length === 0 && <div className="hint">没有匹配的国家或地区。</div>}
+      </div>
+      <div className="actions">
+        <button className="btn ghost" onClick={onClose}>取消</button>
+      </div>
+    </dialog>
+  )
+}
+
+/** 配置文件名：去掉 Windows / macOS 不允许的路径字符。 */
+function configFileStem(name: string): string {
+  const cleaned = name.trim().replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ')
+  return cleaned || 'tower'
+}
+
+/** 自定义方案名可能已带“· 自定义”后缀，展示时只保留一次。 */
+function stripSchemeCustomSuffix(name: string): string {
+  return name.replace(/(?:\s*·\s*自定义)+\s*$/u, '').trim() || name
+}
+
+function schemeDisplayName(name: string, custom?: boolean): string {
+  const base = stripSchemeCustomSuffix(name)
+  return custom ? `${base} · 自定义` : base
+}
+
+/** 全局节点名称筛选：关键词按行，或切换为正则。 */
+function filterNodesByName(
+  nodes: ProxyNode[],
+  settings: NodeNameFilterSettings,
+): { nodes: ProxyNode[]; error?: string } {
+  const compile = (text: string) => {
+    const lines = text.split('\n').map((line) => line.trim()).filter(Boolean)
+    const regexes: RegExp[] = []
+    for (const line of lines) {
+      try {
+        regexes.push(new RegExp(
+          settings.useRegex ? line : line.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+          settings.caseSensitive ? '' : 'i',
+        ))
+      } catch {
+        return { error: `筛选表达式无效：${line}` }
+      }
+    }
+    return { regexes }
+  }
+  const included = compile(settings.include)
+  if (included.error) return { nodes: [], error: included.error }
+  const excluded = compile(settings.exclude)
+  if (excluded.error) return { nodes: [], error: excluded.error }
+  const include = included.regexes ?? []
+  const exclude = excluded.regexes ?? []
+  return {
+    nodes: nodes.filter((node) => {
+      if (exclude.some((regex) => regex.test(node.name))) return false
+      return include.length === 0 || include.some((regex) => regex.test(node.name))
+    }),
+  }
+}
+
+function effectiveContentMode(
+  client: ClientInfo,
+  modes: Partial<Record<ClientTarget, ExportContentMode>>,
+  fallback: ExportContentMode,
+): ExportContentMode {
+  if (client.contentMode === 'nodes') return 'nodes'
+  return modes[client.target] ?? fallback
+}
+
+/** 客户端顺序：保留用户排序，新版本新增的客户端自动排在末尾。 */
+function clientsInOrder(order: ClientTarget[]): ClientInfo[] {
+  const known = new Map(CLIENTS.map((client) => [client.target, client]))
+  const result: ClientInfo[] = []
+  const seen = new Set<ClientTarget>()
+  for (const target of order) {
+    const client = known.get(target)
+    if (!client || seen.has(target)) continue
+    seen.add(target)
+    result.push(client)
+  }
+  for (const client of CLIENTS) {
+    if (!seen.has(client.target)) result.push(client)
+  }
+  return result
+}
+
+// SVG icons (inline — no external icon lib)
+const Icon = {
+  Subscriptions: () => (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" className="icn">
+      <rect x="2" y="3" width="12" height="10" rx="1.5" />
+      <path d="M5 7h6M5 10h4" />
+    </svg>
+  ),
+  Rules: () => (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" className="icn">
+      <path d="M3 4h10M3 8h10M3 12h10" />
+      <circle cx="5" cy="4" r="1" fill="currentColor" stroke="none" />
+      <circle cx="5" cy="8" r="1" fill="currentColor" stroke="none" />
+      <circle cx="5" cy="12" r="1" fill="currentColor" stroke="none" />
+    </svg>
+  ),
+  Export: () => (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" className="icn">
+      <path d="M8 2v7M5.5 6.5 8 9l2.5-2.5M3 13h10" />
+    </svg>
+  ),
+  Network: () => (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" className="icn">
+      <circle cx="4" cy="4" r="1.7" />
+      <circle cx="12" cy="4" r="1.7" />
+      <circle cx="8" cy="12" r="1.7" />
+      <path d="M5.3 4.9 7 10.3M10.7 4.9 9 10.3M5.7 4h4.6" />
+    </svg>
+  ),
+  Menu: () => (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+      <path d="M3.5 4h9M3.5 8h9M3.5 12h9" />
+    </svg>
+  ),
+  Close: () => (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+      <path d="M4 4l8 8M12 4l-8 8" />
+    </svg>
+  ),
+  Github: () => (
+    <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" className="icn">
+      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
+    </svg>
+  ),
+}
+
+// ---------------- 订阅 Tab ----------------
+
+interface SourceAddFailure {
+  label: string
+  message: string
+}
+
+interface SourceAddResult {
+  /** 本批实际解析到的节点总数。 */
+  count: number
+  /** 用于提示的成功摘要，例如「2 个订阅」。 */
+  name: string
+  /** 批量添加时失败的订阅；成功的仍会保留。 */
+  failures?: SourceAddFailure[]
+}
+
+function AddSourceDialog({
+  open,
+  onClose,
+  onAdded,
+}: {
+  open: boolean
+  onClose: () => void
+  /** 添加 / 刷新成功后把结果反馈到订阅页，避免弹窗关掉就“什么都没发生”。 */
+  onAdded?: (result: SourceAddResult) => void
+}) {
+  const [url, setURL] = useState('')
+  const [mode, setMode] = useState<'url' | 'text' | 'uri' | 'scan'>('url')
+  const [name, setName] = useState('')
+  const [text, setText] = useState('')
+  const [userAgent, setUserAgent] = useState('')
+  const [doh, setDoh] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [scanNotice, setScanNotice] = useState('')
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null)
+  const ref = useRef<HTMLDialogElement>(null)
+  const addSourceFromURL = useStore((s) => s.addSourceFromURL)
+  const addSourceFromText = useStore((s) => s.addSourceFromText)
+  const urlBatch = useMemo(() => splitSubscriptionURLs(url), [url])
+
+  useEffect(() => {
+    if (open) {
+      ref.current?.showModal()
+      setURL(''); setText(''); setName(''); setError(''); setScanNotice(''); setUserAgent(''); setDoh(''); setProgress(null); setMode('url')
+      navigator.clipboard?.readText?.().then((clip) => {
+        const c = clip.trim()
+        // 多行订阅链接也直接填入 URL 模式；只有全部行都是订阅地址时才这样判断。
+        const clipBatch = splitSubscriptionURLs(c)
+        const clipLines = c.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#'))
+        if (clipBatch.urls.length > 0 && clipBatch.urls.length === clipLines.length) {
+          setURL((v) => v || c); setMode('url')
+        } else if (/^(ss|ssr|vmess|vless|trojan|hysteria2?|hy2?|tuic|wireguard|wg|snell|ssh|anytls|socks5?|http|https):\/\/\S+/i.test(c)) {
+          // 名称用函数式更新：读剪贴板是异步的，闭包里的 name 已经不是最新值。
+          setText((v) => v || c); setMode('uri'); setName((v) => v || '单节点')
+        }
+      }).catch(() => {})
+    } else {
+      ref.current?.close()
+    }
+  }, [open])
+
+  /** 新订阅必须真的解析出节点；否则回滚，避免留下一张空卡片。 */
+  const requireNodes = (sourceID: string) => {
+    const state = useStore.getState()
+    const real = state.nodes.filter((n) => n.sourceID === sourceID && !n.isSubscriptionMetadata)
+    if (real.length === 0) {
+      state.removeSource(sourceID)
+      throw new Error('没有解析到可用节点，请检查订阅内容或地址')
+    }
+  }
+
+  const handleScan = (value: string) => {
+    const trimmed = value.trim()
+    if (!trimmed) {
+      setError('二维码内容为空')
+      return
+    }
+    setError('')
+    if (/^https?:\/\//i.test(trimmed)) {
+      // http(s) 同时是订阅和 HTTP 代理节点的 scheme；带用户信息或空路径端口的按节点处理。
+      const batch = splitSubscriptionURLs(trimmed)
+      if (batch.urls.length === 0 && batch.proxyCount > 0) {
+        setText(trimmed)
+        setName('扫码节点')
+        setMode('uri')
+        setScanNotice('已识别 HTTP(S) 节点链接，并填入单节点 URI。请检查后点击添加。')
+        return
+      }
+      setURL(trimmed)
+      setMode('url')
+      setScanNotice('已识别扫码内容，并填入订阅地址。请检查后点击添加。')
+      return
+    }
+    if (/^(ss|ssr|vmess|vless|trojan|anytls|hysteria2?|hy2?|tuic|wireguard|wg|snell|ssh|socks5?|http|https):\/\/\S+/i.test(trimmed)) {
+      setText(trimmed)
+      setName('扫码节点')
+      setMode('uri')
+      setScanNotice('已识别节点链接，并填入单节点 URI。请检查后点击添加。')
+      return
+    }
+    setText(trimmed)
+    setName('扫码导入')
+    setMode('text')
+    setScanNotice('已识别扫码内容，并填入粘贴内容。请检查后点击添加。')
+  }
+
+  const submit = async () => {
+    setBusy(true); setError(''); setProgress(null)
+    let addedCount = 0
+    let addedName = ''
+    try {
+      if (mode === 'url') {
+        const batch = urlBatch
+        if (batch.truncated > 0) {
+          throw new Error(`一次最多添加 ${MAX_BATCH_SUBSCRIPTIONS} 个订阅链接，请分批导入`)
+        }
+        if (batch.urls.length === 0) {
+          if (batch.proxyCount > 0) {
+            throw new Error('这些地址更像 HTTP 代理节点，请改用「单节点 URI」或「粘贴内容」')
+          }
+          throw new Error('请输入有效的 http(s) 订阅地址，每行一条')
+        }
+        const requestOptions = requestOptionsFrom(userAgent, doh)
+        const collectedFailures: SourceAddFailure[] = []
+        const successNames: string[] = []
+        let successSources = 0
+        for (let index = 0; index < batch.urls.length; index += 1) {
+          const targetURL = batch.urls[index]
+          setProgress({ done: index + 1, total: batch.urls.length })
+          const beforeIDs = new Set(useStore.getState().sources.map((item) => item.id))
+          await addSourceFromURL(targetURL, requestOptions)
+          const state = useStore.getState()
+          const source = state.sources.find((item) => item.url === targetURL)
+          if (!source) {
+            collectedFailures.push({ label: subscriptionLabel(targetURL), message: '添加失败，订阅没有保存' })
+            continue
+          }
+          const isNew = !beforeIDs.has(source.id)
+          const sourceError = state.errors[source.id]
+          if (sourceError) {
+            // 新建订阅拉取失败就回滚；已有的订阅保留下来，错误显示在卡片上。
+            if (isNew) state.removeSource(source.id)
+            collectedFailures.push({ label: subscriptionLabel(targetURL), message: sourceError })
+            continue
+          }
+          const real = state.nodes.filter((node) => node.sourceID === source.id && !node.isSubscriptionMetadata)
+          if (real.length === 0) {
+            if (isNew) state.removeSource(source.id)
+            collectedFailures.push({ label: subscriptionLabel(targetURL), message: '没有解析到可用节点' })
+            continue
+          }
+
+          successSources += 1
+          addedCount += real.length
+          const preferredName = name.replace(/[\r\n]+/g, ' ').trim()
+          let finalName = source.name
+          if (isNew) {
+            finalName = preferredName
+              ? (batch.urls.length === 1 ? preferredName : `${preferredName} ${successSources}`)
+              : (batch.urls.length === 1 ? source.name : subscriptionLabel(targetURL))
+            state.updateSource(source.id, { name: finalName })
+          }
+          successNames.push(finalName)
+        }
+
+        if (batch.invalid > 0) {
+          collectedFailures.push({ label: '未识别行', message: `${batch.invalid} 行不是 http(s) 订阅地址` })
+        }
+        if (batch.proxyCount > 0) {
+          collectedFailures.push({ label: '未识别行', message: `${batch.proxyCount} 行更像 HTTP 代理节点，未按订阅添加` })
+        }
+        if (successSources === 0) {
+          throw new Error(collectedFailures.map((failure) => `${failure.label}：${failure.message}`).join('；'))
+        }
+        addedName = successSources === 1 ? successNames[0] : `${successSources} 个订阅`
+        if (collectedFailures.length > 0) {
+          onAdded?.({ count: addedCount, name: addedName, failures: collectedFailures })
+          onClose()
+          return
+        }
+      } else if (mode === 'uri') {
+        if (!/^(ss|ssr|vmess|vless|trojan|hysteria2?|hy2?|tuic|wireguard|wg|snell|ssh|anytls|socks5?|http|https):\/\/\S+/i.test(text.trim()))
+          throw new Error('请输入有效的节点 URI（如 ss://、vless:// 等）')
+        addSourceFromText(name.trim() || '单节点', text.trim())
+        const state = useStore.getState()
+        const source = state.sources.at(-1)!
+        requireNodes(source.id)
+        addedCount = state.nodes.filter((n) => n.sourceID === source.id && !n.isSubscriptionMetadata).length
+        addedName = source.name
+      } else {
+        if (!text.trim()) throw new Error('请粘贴订阅内容')
+        addSourceFromText(name, text)
+        const state = useStore.getState()
+        const source = state.sources.at(-1)!
+        requireNodes(source.id)
+        addedCount = state.nodes.filter((n) => n.sourceID === source.id && !n.isSubscriptionMetadata).length
+        addedName = source.name
+      }
+      onAdded?.({ count: addedCount, name: addedName })
+      onClose()
+    } catch (e) {
+      setError(String((e as Error).message))
+    } finally {
+      setBusy(false)
+      setProgress(null)
+    }
+  }
+
+  return (
+    <dialog ref={ref} onClose={onClose}>
+      <h3>添加订阅</h3>
+      <form
+        className="dialog-form"
+        onSubmit={(e) => {
+          e.preventDefault()
+          if (!busy) void submit()
+        }}
+      >
+        <div className="row" style={{ gap: 14, marginTop: 8, marginBottom: 16 }}>
+          <label style={{ fontSize: 13, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+            <input type="radio" disabled={busy} checked={mode === 'url'} onChange={() => { setMode('url'); setScanNotice('') }} /> 订阅地址
+          </label>
+          <label style={{ fontSize: 13, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+            <input type="radio" disabled={busy} checked={mode === 'uri'} onChange={() => { setMode('uri'); setScanNotice('') }} /> 单节点 URI
+          </label>
+          <label style={{ fontSize: 13, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+            <input type="radio" disabled={busy} checked={mode === 'text'} onChange={() => { setMode('text'); setScanNotice('') }} /> 粘贴内容
+          </label>
+          <label style={{ fontSize: 13, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+            <input type="radio" disabled={busy} checked={mode === 'scan'} onChange={() => { setMode('scan'); setScanNotice('') }} /> 扫码
+          </label>
+        </div>
+        {mode === 'url' ? (
+          <>
+            <div className="field">
+              <label>名称（可选）</label>
+              <input
+                type="text"
+                className="field"
+                disabled={busy}
+                placeholder="多个订阅会自动追加序号"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label>订阅 URL（每行一条）</label>
+              <textarea
+                className="field"
+                rows={4}
+                disabled={busy}
+                placeholder={'https://…\nhttps://…'}
+                value={url}
+                onChange={(e) => setURL(e.target.value)}
+                autoFocus
+                style={{ fontFamily: '"IBM Plex Mono", ui-monospace, monospace', fontSize: 12 }}
+              />
+              <div className="hint">
+                {url.trim()
+                  ? (urlBatch.urls.length > 0
+                    ? `已识别 ${urlBatch.urls.length} 个订阅链接`
+                    : '等待有效的 http(s) 订阅地址')
+                  : '可一次粘贴多条链接，每行一条；空行和 # 注释会被忽略。'}
+                {urlBatch.duplicates > 0 ? ` · 跳过 ${urlBatch.duplicates} 行重复` : ''}
+                {urlBatch.invalid > 0 ? ` · ${urlBatch.invalid} 行格式无效` : ''}
+                {urlBatch.proxyCount > 0 ? ` · ${urlBatch.proxyCount} 行像 HTTP 代理节点` : ''}
+                {urlBatch.truncated > 0 ? ` · 超过 ${MAX_BATCH_SUBSCRIPTIONS} 个上限` : ''}
+              </div>
+            </div>
+            <details className="advanced-request">
+              <summary>高级请求设置（可选）</summary>
+              <div className="field">
+                <label>自定义 User-Agent</label>
+                <input
+                  type="text"
+                  className="field"
+                  disabled={busy}
+                  placeholder="clash-verge/v2.4.2"
+                  value={userAgent}
+                  onChange={(e) => setUserAgent(e.target.value)}
+                />
+              </div>
+              <div className="field">
+                <label>DNS-over-HTTPS 地址</label>
+                <input
+                  type="url"
+                  className="field"
+                  disabled={busy}
+                  placeholder="https://…/dns-query"
+                  value={doh}
+                  onChange={(e) => setDoh(e.target.value)}
+                />
+                <div className="hint">对这一批订阅生效，仅接受 https 地址，且 DoH 服务需支持 JSON 接口。</div>
+              </div>
+            </details>
+          </>
+        ) : mode === 'scan' ? (
+          <QrScanner onDecoded={handleScan} />
+        ) : mode === 'uri' ? (
+          <>
+            <div className="field">
+              <label>名称（可选）</label>
+              <input type="text" className="field" disabled={busy} placeholder="单节点" value={name} onChange={(e) => setName(e.target.value)} />
+            </div>
+            <div className="field">
+              <label>节点 URI（ss://, vless://, vmess://, trojan://, hysteria2://, tuic://, wireguard:// …）</label>
+              <input type="text" className="field" disabled={busy} placeholder="ss://YWVzLTI1Ni1nY206…#我的节点" value={text} onChange={(e) => setText(e.target.value)} style={{ fontFamily: '"IBM Plex Mono", ui-monospace, monospace', fontSize: 12 }} />
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="field">
+              <label>名称（可选）</label>
+              <input type="text" className="field" disabled={busy} value={name} onChange={(e) => setName(e.target.value)} />
+            </div>
+            <div className="field">
+              <label>Base64 / URI 列表 / Clash YAML</label>
+              <textarea className="field" disabled={busy} value={text} onChange={(e) => setText(e.target.value)} />
+            </div>
+          </>
+        )}
+        {scanNotice && <div className="inline-notice" role="status">{scanNotice}</div>}
+        <div className="local-note">
+          <i aria-hidden="true" />
+          {mode === 'url'
+            ? '订阅由本机服务抓取并解析；地址、节点和凭据不会上传到第三方。'
+            : mode === 'scan'
+              ? '二维码图片或相机画面只在本机解码，不会上传到第三方。'
+              : '节点内容只在本机解析，不会上传到第三方。'}
+        </div>
+        {busy && (
+          <div className="form-progress" role="status" aria-live="polite">
+            <span className="spinner" aria-hidden="true" />
+            {mode === 'url'
+              ? progress && progress.total > 1
+                ? `正在读取订阅 ${progress.done}/${progress.total}…`
+                : '正在拉取并解析订阅…'
+              : '正在解析节点…'}
+          </div>
+        )}
+        {error && (
+          <div className="form-error" role="alert">
+            <strong>添加失败</strong>
+            <span>{error}</span>
+            <small>检查订阅地址或内容后重试。</small>
+          </div>
+        )}
+        <div className="actions">
+          {mode !== 'scan' && (
+            <button type="submit" className="btn primary" disabled={busy}>
+              {busy
+                ? '处理中…'
+                : mode === 'url' && urlBatch.urls.length > 1
+                  ? `添加 ${urlBatch.urls.length} 个订阅`
+                  : '添加订阅'}
+            </button>
+          )}
+          <button type="button" className="btn ghost" onClick={onClose} disabled={busy}>
+            {mode === 'scan' ? '关闭' : '取消'}
+          </button>
+        </div>
+      </form>
+    </dialog>
+  )
+}
+
+/** 自有节点：链接 / Base64 / Clash YAML / Surge 配置片段，一次可导入多个。 */
+function AddManualNodesDialog({
+  open,
+  onClose,
+  onAdded,
+  onManualCreate,
+}: {
+  open: boolean
+  onClose: () => void
+  onAdded?: (result: ManualNodeImportResult) => void
+  onManualCreate?: () => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const fileRef = useRef<HTMLInputElement>(null)
+  const addManualNodes = useStore((s) => s.addManualNodes)
+  const [name, setName] = useState('')
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    if (open) {
+      ref.current?.showModal()
+      setName('')
+      setText('')
+      setBusy(false)
+      setError('')
+    } else {
+      ref.current?.close()
+    }
+  }, [open])
+
+  const importFile = async (file: File | undefined) => {
+    if (!file) return
+    setBusy(true)
+    setError('')
+    try {
+      if (file.size > 8 * 1024 * 1024) throw new Error('文件大于 8 MB')
+      const body = await file.text()
+      setText(body)
+      if (!name.trim()) setName(file.name.replace(/\.[^.]+$/, ''))
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const submit = () => {
+    setError('')
+    if (!text.trim()) {
+      setError('请粘贴节点链接或配置内容')
+      return
+    }
+    const result = addManualNodes(text, name)
+    if (result.nodes.length === 0) {
+      setError(result.duplicates > 0
+        ? '这些节点已经在「自有节点」里了'
+        : '没有解析到可用节点，请检查链接或配置内容')
+      return
+    }
+    onAdded?.(result)
+    onClose()
+  }
+
+  return (
+    <dialog ref={ref} onClose={onClose} className="manual-node-dialog">
+      <h3>添加自有节点</h3>
+      <form
+        className="dialog-form"
+        onSubmit={(e) => {
+          e.preventDefault()
+          if (!busy) submit()
+        }}
+      >
+        <div className="field">
+          <label>名称（可选）</label>
+          <input
+            type="text"
+            className="field"
+            disabled={busy}
+            placeholder="只导入一个节点时生效；留空则使用节点自带名称"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+        </div>
+        <div className="field">
+          <div className="row between" style={{ marginBottom: 6 }}>
+            <label>节点内容</label>
+            <button type="button" className="btn ghost" disabled={busy} onClick={() => fileRef.current?.click()}>
+              从文件导入
+            </button>
+          </div>
+          <textarea
+            className="field"
+            rows={8}
+            disabled={busy}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder={'ss://…\n或粘贴 Base64 / Clash YAML / Surge [Proxy] 段落'}
+            style={{ fontFamily: '"IBM Plex Mono", ui-monospace, monospace', fontSize: 12 }}
+          />
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".txt,.yaml,.yml,.conf,.json,.list"
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              const file = e.target.files?.[0]
+              e.target.value = ''
+              void importFile(file)
+            }}
+          />
+        </div>
+        <div className="hint">
+          自有节点不随订阅刷新，删除订阅也不会移除；支持一次粘贴多条节点链接。导入后可在「自有节点」里改名、停用或删除。
+        </div>
+        {busy && (
+          <div className="form-progress" role="status" aria-live="polite">
+            <span className="spinner" aria-hidden="true" />
+            正在读取文件…
+          </div>
+        )}
+        {error && (
+          <div className="form-error" role="alert">
+            <strong>添加失败</strong>
+            <span>{error}</span>
+          </div>
+        )}
+        <div className="actions">
+          <button type="submit" className="btn primary" disabled={busy}>添加节点</button>
+          {onManualCreate && (
+            <button
+              type="button"
+              className="btn ghost"
+              disabled={busy}
+              onClick={() => {
+                onClose()
+                onManualCreate()
+              }}
+            >手动填写</button>
+          )}
+          <button type="button" className="btn ghost" onClick={onClose} disabled={busy}>取消</button>
+        </div>
+      </form>
+    </dialog>
+  )
+}
+
+/** 只改显示名称；不会重新解析节点，也不影响已有的订阅节点。 */
+function RenameManualNodeDialog({
+  node,
+  onClose,
+  onSaved,
+}: {
+  node: ProxyNode
+  onClose: () => void
+  onSaved?: (message: string) => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const updateManualNode = useStore((s) => s.updateManualNode)
+  const [name, setName] = useState(node.name)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    ref.current?.showModal()
+  }, [])
+
+  const submit = () => {
+    const clean = name.replace(/[\r\n]+/g, ' ').trim()
+    if (!clean) {
+      setError('名称不能为空')
+      return
+    }
+    updateManualNode(node.id, { name: clean })
+    onSaved?.(`已重命名为「${clean}」。`)
+    onClose()
+  }
+
+  return (
+    <dialog ref={ref} onClose={onClose} className="manual-node-dialog">
+      <h3>重命名自有节点</h3>
+      <form
+        className="dialog-form"
+        onSubmit={(e) => {
+          e.preventDefault()
+          submit()
+        }}
+      >
+        <div className="field">
+          <label>节点名称</label>
+          <input
+            type="text"
+            className="field"
+            autoFocus
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+        </div>
+        {error && <div className="form-error" role="alert"><span>{error}</span></div>}
+        <div className="actions">
+          <button type="submit" className="btn primary">保存名称</button>
+          <button type="button" className="btn ghost" onClick={onClose}>取消</button>
+        </div>
+      </form>
+    </dialog>
+  )
+}
+
+// ---------------- 编辑订阅 ----------------
+
+function EditSourceDialog({
+  source,
+  onClose,
+  onSaved,
+}: {
+  source: SubscriptionSource
+  onClose: () => void
+  onSaved?: (message: string) => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const updateSource = useStore((s) => s.updateSource)
+  const refreshSource = useStore((s) => s.refreshSource)
+  const [name, setName] = useState(source.name)
+  const [url, setURL] = useState(source.url)
+  const [userAgent, setUserAgent] = useState(source.userAgent ?? '')
+  const [doh, setDoh] = useState(source.dnsOverHTTPSURL ?? '')
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    ref.current?.showModal()
+  }, [])
+
+  const submit = () => {
+    const trimmedName = name.trim()
+    if (!trimmedName) {
+      setError('请填写订阅名称')
+      return
+    }
+
+    let nextURL = source.url
+    let nextUA = source.userAgent ?? ''
+    let nextDoH = source.dnsOverHTTPSURL ?? ''
+    if (source.url) {
+      nextURL = url.trim()
+      let parsed: URL
+      try {
+        parsed = new URL(nextURL)
+      } catch {
+        setError('请输入有效的 http(s) 订阅地址')
+        return
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        setError('只支持 http(s) 订阅地址')
+        return
+      }
+      try {
+        const options = requestOptionsFrom(userAgent, doh)
+        nextUA = options.userAgent ?? ''
+        nextDoH = options.dnsOverHTTPSURL ?? ''
+      } catch (e) {
+        setError((e as Error).message)
+        return
+      }
+    }
+
+    updateSource(source.id, {
+      name: trimmedName,
+      ...(source.url
+        ? {
+            url: nextURL,
+            // 空字符串表示清除旧设置。
+            userAgent: nextUA,
+            dnsOverHTTPSURL: nextDoH,
+          }
+        : {}),
+    })
+
+    const requestsChanged = source.url
+      && (nextURL !== source.url
+        || nextUA !== (source.userAgent ?? '')
+        || nextDoH !== (source.dnsOverHTTPSURL ?? ''))
+    if (requestsChanged) {
+      void refreshSource(source.id)
+      onSaved?.(`「${trimmedName}」已保存，正在按新设置重新拉取订阅…`)
+    } else {
+      onSaved?.(`「${trimmedName}」的订阅设置已保存。`)
+    }
+    ref.current?.close()
+  }
+
+  return (
+    <dialog ref={ref} onClose={onClose}>
+      <h3>编辑订阅</h3>
+      <form
+        className="dialog-form"
+        onSubmit={(e) => {
+          e.preventDefault()
+          submit()
+        }}
+      >
+        <div className="field">
+          <label>名称</label>
+          <input
+            type="text"
+            className="field"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            autoFocus
+          />
+        </div>
+
+        {source.url ? (
+          <>
+            <div className="field">
+              <label>订阅 URL</label>
+              <input
+                type="url"
+                className="field"
+                value={url}
+                onChange={(e) => setURL(e.target.value)}
+              />
+            </div>
+            <div className="advanced-request is-open">
+              <div className="advanced-request-title">
+                高级请求设置
+                <span>只对这一条订阅生效</span>
+              </div>
+              <div className="field">
+                <label>自定义 User-Agent</label>
+                <input
+                  type="text"
+                  className="field"
+                  placeholder="clash-verge/v2.4.2"
+                  value={userAgent}
+                  onChange={(e) => setUserAgent(e.target.value)}
+                />
+              </div>
+              <div className="field">
+                <label>DNS-over-HTTPS 地址</label>
+                <input
+                  type="url"
+                  className="field"
+                  placeholder="https://…/dns-query"
+                  value={doh}
+                  onChange={(e) => setDoh(e.target.value)}
+                />
+                <div className="hint">仅接受 https 地址，且 DoH 服务需支持 JSON 接口；留空则使用系统 DNS。</div>
+              </div>
+            </div>
+          </>
+        ) : (
+          <div className="hint">这条订阅来自粘贴内容，没有订阅地址，只能修改名称。</div>
+        )}
+
+        <div className="local-note">
+          <i aria-hidden="true" />
+          请求仍由本机服务发起；地址、节点和凭据不会上传到第三方。
+        </div>
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <div className="actions">
+          <button type="submit" className="btn primary">保存</button>
+          <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
+        </div>
+      </form>
+    </dialog>
+  )
+}
+
+function SubscriptionSettingsDialog({
+  open,
+  onClose,
+  onRestored,
+}: {
+  open: boolean
+  onClose: () => void
+  onRestored?: (message: string) => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const backupRef = useRef<HTMLInputElement>(null)
+  const autoRefreshOnOpen = useStore((s) => s.autoRefreshOnOpen)
+  const setAutoRefreshOnOpen = useStore((s) => s.setAutoRefreshOnOpen)
+  const autoRefreshRuleSetsOnOpen = useStore((s) => s.autoRefreshRuleSetsOnOpen)
+  const setAutoRefreshRuleSetsOnOpen = useStore((s) => s.setAutoRefreshRuleSetsOnOpen)
+  const filterSubscriptionInfoNodes = useStore((s) => s.filterSubscriptionInfoNodes)
+  const setFilterSubscriptionInfoNodes = useStore((s) => s.setFilterSubscriptionInfoNodes)
+  const renewalRemindersEnabled = useStore((s) => s.renewalRemindersEnabled)
+  const setRenewalRemindersEnabled = useStore((s) => s.setRenewalRemindersEnabled)
+  const latencyTestMode = useStore((s) => s.latencyTestMode)
+  const setLatencyTestMode = useStore((s) => s.setLatencyTestMode)
+  const restoreBackup = useStore((s) => s.restoreBackup)
+  const [pendingBackup, setPendingBackup] = useState<BackupFile | null>(null)
+  const [backupBusy, setBackupBusy] = useState(false)
+  const [backupError, setBackupError] = useState('')
+  const [backupNotice, setBackupNotice] = useState('')
+  const [history, setHistory] = useState<BackupHistoryItem[]>([])
+
+  const refreshHistory = () => setHistory(backupHistoryItems(readBackupHistory()))
+
+  useEffect(() => {
+    if (open) {
+      ref.current?.showModal()
+      setPendingBackup(null)
+      setBackupBusy(false)
+      setBackupError('')
+      setBackupNotice('')
+      refreshHistory()
+    } else {
+      ref.current?.close()
+    }
+  }, [open])
+
+  const downloadBackup = (file: BackupFile) => {
+    const blob = new Blob([JSON.stringify(file, null, 2)], { type: 'application/json' })
+    const anchor = document.createElement('a')
+    anchor.href = URL.createObjectURL(blob)
+    anchor.download = backupFileName(new Date(file.exportedAt))
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    window.setTimeout(() => URL.revokeObjectURL(anchor.href), 1000)
+  }
+
+  const exportBackup = () => {
+    const data = persistedSnapshot(useStore.getState())
+    const file = createBackup(data)
+    downloadBackup(file)
+    const counts = backupCounts(data)
+    setBackupError('')
+    setBackupNotice(`已导出 ${counts.sources} 个订阅、${counts.nodes} 个节点（含 ${counts.manualNodes} 个自有节点）、${counts.schemes} 个自定义方案和 ${counts.ruleSets} 个规则集。请妥善保管备份文件。`)
+  }
+
+  const saveHistoryVersion = () => {
+    try {
+      saveBackupHistory(persistedSnapshot(useStore.getState()), '手动保存')
+      refreshHistory()
+      setBackupError('')
+      setBackupNotice('已保存当前版本到本机历史。恢复备份前也会自动保存一份。')
+    } catch (e) {
+      setBackupNotice('')
+      setBackupError(e instanceof BackupHistoryError ? e.message : '无法保存版本历史')
+    }
+  }
+
+  const deleteHistoryVersion = (id: string) => {
+    try {
+      removeBackupHistory(id)
+      refreshHistory()
+      setBackupError('')
+    } catch (e) {
+      setBackupError(e instanceof BackupHistoryError ? e.message : '无法删除版本')
+    }
+  }
+
+  const readBackup = async (file: File | undefined) => {
+    if (!file) return
+    setBackupBusy(true)
+    setBackupError('')
+    setBackupNotice('')
+    try {
+      if (file.size > MAX_BACKUP_BYTES) throw new Error('备份文件大于 20 MB')
+      const parsed = parseBackup(await file.text())
+      setPendingBackup(parsed)
+    } catch (e) {
+      setPendingBackup(null)
+      setBackupError((e as Error).message)
+    } finally {
+      setBackupBusy(false)
+    }
+  }
+
+  const applyBackup = () => {
+    if (!pendingBackup) return
+    const counts = backupCounts(pendingBackup.data)
+    // 覆盖恢复不可撤销，先把当前数据存一份到本机历史。
+    try {
+      saveBackupHistory(persistedSnapshot(useStore.getState()), '恢复前自动保存')
+    } catch {
+      // 空间不足时仍然允许恢复，历史只是额外保障。
+    }
+    restoreBackup(pendingBackup.data)
+    setPendingBackup(null)
+    refreshHistory()
+    onRestored?.(`已恢复 ${counts.sources} 个订阅、${counts.nodes} 个节点（含 ${counts.manualNodes} 个自有节点）、${counts.schemes} 个自定义方案和 ${counts.ruleSets} 个规则集。`)
+  }
+
+  const pendingCounts = pendingBackup ? backupCounts(pendingBackup.data) : null
+
+  return (
+    <dialog ref={ref} onClose={onClose}>
+      <h3>订阅设置</h3>
+      <div className="settings-body">
+        <label className="setting-toggle">
+          <input
+            type="checkbox"
+            checked={autoRefreshOnOpen}
+            onChange={(e) => setAutoRefreshOnOpen(e.target.checked)}
+          />
+          <span>
+            <strong>打开塔台时刷新订阅</strong>
+            <small>每次打开页面时，自动刷新所有已启用且带订阅地址的条目；关闭时只在你手动刷新时联网。</small>
+          </span>
+        </label>
+        <label className="setting-toggle">
+          <input
+            type="checkbox"
+            checked={autoRefreshRuleSetsOnOpen}
+            onChange={(e) => setAutoRefreshRuleSetsOnOpen(e.target.checked)}
+          />
+          <span>
+            <strong>打开塔台时刷新在线规则集</strong>
+            <small>只刷新「我的规则集」里带地址且未暂停的订阅快照；方案里的远程规则集由客户端自行更新。</small>
+          </span>
+        </label>
+        <label className="setting-toggle">
+          <input
+            type="checkbox"
+            checked={filterSubscriptionInfoNodes}
+            onChange={(e) => setFilterSubscriptionInfoNodes(e.target.checked)}
+          />
+          <span>
+            <strong>隐藏订阅信息节点</strong>
+            <small>隐藏流量、到期、官网、客服等信息节点，只保留可用节点。</small>
+          </span>
+        </label>
+        <label className="setting-toggle">
+          <input
+            type="checkbox"
+            checked={renewalRemindersEnabled}
+            onChange={(e) => {
+              const enabled = e.target.checked
+              setRenewalRemindersEnabled(enabled)
+              if (enabled && 'Notification' in window && Notification.permission === 'default') {
+                try {
+                  void Notification.requestPermission().catch(() => {})
+                } catch {
+                  // 浏览器禁用通知 API 时保留应用内提醒。
+                }
+              }
+            }}
+          />
+          <span>
+            <strong>到期与流量提醒</strong>
+            <small>订阅即将到期或流量接近上限时，在订阅页提示；允许通知后，塔台打开期间还会发系统通知。</small>
+          </span>
+        </label>
+        <div className="field">
+          <label htmlFor="latency-test-mode">测速方式</label>
+          <select
+            id="latency-test-mode"
+            className="input"
+            value={latencyTestMode}
+            onChange={(e) => setLatencyTestMode(e.target.value as LatencyTestMode)}
+          >
+            <option value="tcp">TCP 端口握手（默认）</option>
+            <option value="automatic">自动：ICMP 优先，失败回退 TCP</option>
+            <option value="icmp">仅 ICMP</option>
+          </select>
+          <div className="hint">ICMP 测的是服务器网络可达性；UDP 节点在仅 TCP 模式下会提示不适用。</div>
+        </div>
+        <div className="local-note">
+          <i aria-hidden="true" />
+          自动刷新同样由本机服务发起，不会经过第三方转换服务。
+        </div>
+
+        <div className="settings-divider" />
+        <div className="settings-data-head">
+          <div>
+            <strong>数据备份</strong>
+            <small>导出或恢复订阅、自有节点、自定义规则方案、规则集和导出设置。</small>
+          </div>
+          <div className="row" style={{ gap: 6 }}>
+            <button type="button" className="btn ghost" disabled={backupBusy} onClick={exportBackup}>
+              导出备份
+            </button>
+            <button type="button" className="btn ghost" disabled={backupBusy} onClick={() => backupRef.current?.click()}>
+              {backupBusy ? '读取中…' : '恢复备份'}
+            </button>
+          </div>
+        </div>
+        <input
+          ref={backupRef}
+          type="file"
+          accept=".json,application/json"
+          style={{ display: 'none' }}
+          onChange={(e) => {
+            const file = e.target.files?.[0]
+            e.target.value = ''
+            void readBackup(file)
+          }}
+        />
+        <div className="hint">
+          备份文件包含订阅地址、节点凭据和规则，请妥善保管；不包含 Tailscale Auth Key、测速结果和已发布的订阅 token。
+          恢复后请回导出页重新同步已发布的订阅链接，旧链接仍会返回恢复前的内容。
+        </div>
+        <div className="settings-data-head backup-history-head">
+          <div>
+            <strong>版本历史</strong>
+            <small>本机保留最近 {MAX_BACKUP_HISTORY} 份快照；覆盖恢复前会自动保存当前数据。</small>
+          </div>
+          <button type="button" className="btn ghost" onClick={saveHistoryVersion}>保存当前版本</button>
+        </div>
+        {history.length > 0 ? (
+          <ul className="backup-history-list">
+            {history.map((item) => (
+              <li key={item.id}>
+                <div className="backup-history-main">
+                  <strong>{item.label}</strong>
+                  <span className="hint">
+                    {new Date(item.createdAt).toLocaleString('zh-CN')} · {item.counts.sources} 个订阅 · {item.counts.nodes} 个节点 · {Math.max(1, Math.round(item.bytes / 1024))} KB
+                  </span>
+                </div>
+                <div className="row" style={{ gap: 6 }}>
+                  <button
+                    type="button"
+                    className="btn ghost"
+                    onClick={() => {
+                      const entry = readBackupHistory().find((value) => value.id === item.id)
+                      if (entry) setPendingBackup(entry.file)
+                    }}
+                  >恢复</button>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    title="下载这份快照"
+                    aria-label={`下载版本 ${item.label}`}
+                    onClick={() => {
+                      const entry = readBackupHistory().find((value) => value.id === item.id)
+                      if (entry) downloadBackup(entry.file)
+                    }}
+                  >↓</button>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    title="删除这份快照"
+                    aria-label={`删除版本 ${item.label}`}
+                    onClick={() => deleteHistoryVersion(item.id)}
+                  >×</button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div className="hint">还没有本机版本。导出前或恢复前可以先保存一份当前数据。</div>
+        )}
+        {backupError && <div className="form-error" role="alert"><span>{backupError}</span></div>}
+        {backupNotice && <div className="inline-notice" role="status">{backupNotice}</div>}
+        {pendingBackup && pendingCounts && (
+          <div className="restore-confirm" role="alert">
+            <div>
+              <strong>确认覆盖当前数据？</strong>
+              <small>
+                备份导出时间：{pendingBackup.exportedAt
+                  ? new Date(pendingBackup.exportedAt).toLocaleString('zh-CN')
+                  : '未记录'}。
+                将恢复 {pendingCounts.sources} 个订阅、{pendingCounts.nodes} 个节点（含 {pendingCounts.manualNodes} 个自有节点）、
+                {pendingCounts.schemes} 个自定义方案和 {pendingCounts.ruleSets} 个规则集。当前数据会被覆盖，且不可撤销。
+              </small>
+            </div>
+            <div className="row" style={{ gap: 8 }}>
+              <button type="button" className="btn danger" onClick={applyBackup}>覆盖恢复</button>
+              <button type="button" className="btn ghost" onClick={() => setPendingBackup(null)}>取消</button>
+            </div>
+          </div>
+        )}
+      </div>
+      <div className="actions">
+        <button className="btn primary" onClick={onClose}>完成</button>
+      </div>
+    </dialog>
+  )
+}
+
+function TailnetRow({
+  connection,
+  onEdit,
+}: {
+  connection: TailnetConnection
+  onEdit: () => void
+}) {
+  const tailnetAuthKeys = useStore((s) => s.tailnetAuthKeys)
+  const setTailnetEnabled = useStore((s) => s.setTailnetEnabled)
+  const detail = [
+    connection.magicDNSSuffix ?? (connection.controlURLString ? '自建控制服务器' : '官方 Tailscale'),
+    connection.subnets.length > 0 ? `${connection.subnets.length} 个子网` : '',
+    tailnetAuthKeys[connection.id] ? '已保存 Auth Key' : '',
+  ].filter(Boolean).join(' · ')
+
+  return (
+    <div className={`tailnet-row${connection.isEnabled ? '' : ' is-off'}`}>
+      <span className="tailnet-mark" aria-hidden="true"><Icon.Network /></span>
+      <div className="tailnet-main">
+        <div className="tailnet-name">{tailnetPolicyName(connection)}</div>
+        <div className="tailnet-detail">{detail}</div>
+      </div>
+      <button type="button" className="btn ghost" onClick={onEdit}>编辑</button>
+      <label className="tailnet-switch">
+        <input
+          type="checkbox"
+          checked={connection.isEnabled}
+          onChange={(e) => setTailnetEnabled(connection.id, e.target.checked)}
+          aria-label={`启用 ${tailnetPolicyName(connection)}`}
+        />
+        <span>{connection.isEnabled ? '已启用' : '已停用'}</span>
+      </label>
+    </div>
+  )
+}
+
+function TailnetEditorDialog({
+  item,
+  onClose,
+}: {
+  item: { connection: TailnetConnection; isNew: boolean }
+  onClose: () => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const tailnets = useStore((s) => s.tailnets)
+  const tailnetAuthKeys = useStore((s) => s.tailnetAuthKeys)
+  const addTailnet = useStore((s) => s.addTailnet)
+  const updateTailnet = useStore((s) => s.updateTailnet)
+  const deleteTailnet = useStore((s) => s.deleteTailnet)
+  const setTailnetAuthKey = useStore((s) => s.setTailnetAuthKey)
+  const savedAuthKey = tailnetAuthKeys[item.connection.id] ?? ''
+  const [name, setName] = useState(item.connection.name)
+  const [controlURL, setControlURL] = useState(item.connection.controlURLString ?? '')
+  const [authKey, setAuthKey] = useState(savedAuthKey)
+  const [revealKey, setRevealKey] = useState(false)
+  const [subnets, setSubnets] = useState(item.connection.subnets.join('\n'))
+  const [magicDNS, setMagicDNS] = useState(item.connection.magicDNSSuffix ?? '')
+  const [deviceName, setDeviceName] = useState(item.connection.deviceName ?? '')
+  const [error, setError] = useState('')
+  const [confirmDelete, setConfirmDelete] = useState(false)
+
+  useEffect(() => {
+    ref.current?.showModal()
+    return () => ref.current?.close()
+  }, [])
+
+  const save = () => {
+    setError('')
+    try {
+      const connection: TailnetConnection = {
+        ...item.connection,
+        name: (name.trim() || 'Tailscale').slice(0, 80),
+        controlURLString: normalizeTailnetControlURL(controlURL),
+        subnets: normalizeTailnetSubnets(subnets),
+        magicDNSSuffix: normalizeTailnetMagicDNSSuffix(magicDNS),
+        deviceName: normalizeTailnetDeviceName(deviceName),
+      }
+      const key = normalizeTailnetAuthKey(authKey)
+      if (item.isNew) addTailnet(connection)
+      else updateTailnet(connection)
+      if (key !== (savedAuthKey || undefined)) setTailnetAuthKey(connection.id, key)
+      onClose()
+    } catch (e) {
+      const message = e instanceof TailnetValidationError
+        ? e.field === 'controlURL'
+          ? '控制服务器必须是 HTTPS 地址。'
+          : e.field === 'subnet'
+            ? `无法识别的子网“${e.value}”，请用 192.168.1.0/24 这样的格式。`
+            : e.field === 'magicDNSSuffix'
+              ? 'MagicDNS 后缀格式不对，例如 tail1234.ts.net。'
+              : 'Auth Key 不能包含空格、引号或逗号。'
+        : '保存失败，请重试。'
+      setError(message)
+    }
+  }
+
+  const rows = tailnets.filter((connection) => connection.id !== item.connection.id).map((connection) => connection.name).join('、')
+
+  return (
+    <dialog ref={ref} onClose={onClose} className="tailnet-dialog">
+      <h3>{item.isNew ? '添加 Tailscale 内网' : '编辑 Tailscale 内网'}</h3>
+      <div className="settings-body">
+        <div className="tailnet-field-grid">
+          <div className="field" style={{ gridColumn: '1 / -1' }}>
+            <label htmlFor="tailnet-name">名称</label>
+            <input
+              id="tailnet-name"
+              className="input"
+              value={name}
+              maxLength={80}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="例如 家里"
+            />
+            <div className="hint">导出后在客户端里显示的策略名；不会加入任何策略组。</div>
+          </div>
+          <div className="field" style={{ gridColumn: '1 / -1' }}>
+            <label htmlFor="tailnet-control">控制服务器（留空为官方 Tailscale）</label>
+            <input
+              id="tailnet-control"
+              className="input"
+              value={controlURL}
+              maxLength={2048}
+              onChange={(e) => setControlURL(e.target.value)}
+              placeholder="https://headscale.example.com"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+            />
+            <div className="hint">自建 Headscale 时填写它的 HTTPS 地址。</div>
+          </div>
+          <div className="field" style={{ gridColumn: '1 / -1' }}>
+            <label htmlFor="tailnet-auth-key">Auth Key（可选）</label>
+            <div className="secret-row">
+              <input
+                id="tailnet-auth-key"
+                className="input"
+                type={revealKey ? 'text' : 'password'}
+                value={authKey}
+                maxLength={512}
+                onChange={(e) => setAuthKey(e.target.value)}
+                placeholder="tskey-auth-…"
+                autoComplete="off"
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+              />
+              {authKey && (
+                <button type="button" className="btn ghost" onClick={() => setRevealKey((v) => !v)}>
+                  {revealKey ? '隐藏' : '显示'}
+                </button>
+              )}
+            </div>
+            <div className="hint">
+              Stash、Clash / mihomo 和 sing-box MT 需要它；Surge 在客户端里登录，不写 Key。
+              生成时打开 Reusable，设备加入后关闭 Key Expiry；只保存本机，不同步。
+            </div>
+          </div>
+          <div className="field" style={{ gridColumn: '1 / -1' }}>
+            <label htmlFor="tailnet-subnets">家里子网（可选）</label>
+            <textarea
+              id="tailnet-subnets"
+              className="input"
+              rows={3}
+              value={subnets}
+              onChange={(e) => setSubnets(e.target.value)}
+              placeholder={'例如 192.168.1.0/24\nfd00:1::/64'}
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+            />
+            <div className="hint">每行一个 CIDR；需家里设备在 Tailscale 发布并批准该子网。</div>
+          </div>
+          <div className="field">
+            <label htmlFor="tailnet-magic-dns">MagicDNS 后缀</label>
+            <input
+              id="tailnet-magic-dns"
+              className="input"
+              value={magicDNS}
+              maxLength={253}
+              onChange={(e) => setMagicDNS(e.target.value)}
+              placeholder="tail1234.ts.net"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+            />
+            <div className="hint">在 Tailscale DNS 页面查看；Stash 必填。</div>
+          </div>
+          <div className="field">
+            <label htmlFor="tailnet-device-name">设备名</label>
+            <input
+              id="tailnet-device-name"
+              className="input"
+              value={deviceName}
+              maxLength={40}
+              onChange={(e) => setDeviceName(e.target.value)}
+              placeholder="tower"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+            />
+            <div className="hint">每个客户端会注册成单独设备，例如 tower-stash。</div>
+          </div>
+        </div>
+        <div className="local-note">
+          <i aria-hidden="true" />
+          Auth Key 只存本机，会写入配置（预览打码）。修改或删除后请回导出页同步订阅。
+        </div>
+        {rows && <div className="hint">其他内网：{rows}。每份各写一条策略。</div>}
+        {error && <div className="form-error" role="alert">{error}</div>}
+        {!item.isNew && (
+          <div className="tailnet-delete">
+            {confirmDelete ? (
+              <>
+                <span>删除后这份内网与本机 Auth Key 都会移除；已发布订阅需回导出页同步，才会去掉旧 Key。</span>
+                <button
+                  type="button"
+                  className="btn danger"
+                  onClick={() => {
+                    deleteTailnet(item.connection.id)
+                    onClose()
+                  }}
+                >
+                  确认删除
+                </button>
+                <button type="button" className="btn ghost" onClick={() => setConfirmDelete(false)}>取消删除</button>
+              </>
+            ) : (
+              <button type="button" className="btn ghost" onClick={() => setConfirmDelete(true)}>删除这个内网</button>
+            )}
+          </div>
+        )}
+      </div>
+      <div className="actions">
+        <button type="button" className="btn primary" onClick={save}>保存</button>
+        <button type="button" className="btn ghost" onClick={onClose}>取消</button>
+      </div>
+    </dialog>
+  )
+}
+
+function TailnetTab() {
+  const tailnets = useStore((s) => s.tailnets)
+  const tailnetAuthKeys = useStore((s) => s.tailnetAuthKeys)
+  const [editing, setEditing] = useState<{ connection: TailnetConnection; isNew: boolean } | null>(null)
+  const enabledCount = tailnets.filter((connection) => connection.isEnabled).length
+  const keyCount = tailnets.filter((connection) => tailnetAuthKeys[connection.id]).length
+
+  return (
+    <div>
+      <div className="page-head">
+        <div>
+          <div className="eyebrow">内网连接 · 02</div>
+          <h1>Tailscale 内网</h1>
+          <div className="sub">开着代理时，也能按规则访问家里设备和子网。</div>
+        </div>
+        <div className="row page-actions" style={{ gap: 8 }}>
+          <button className="btn primary" onClick={() => setEditing({ connection: defaultTailnetConnection(), isNew: true })}>
+            + 添加内网
+          </button>
+        </div>
+      </div>
+
+      <div className="card tailnet-intro">
+        <div className="card-head">
+          <h3>它是什么</h3>
+          <span className="meta">不是节点 · 不加入策略组</span>
+        </div>
+        <div className="tailnet-intro-body">
+          <div className="tailnet-copy">
+            <p className="tailnet-lead">把 Tailscale 当成一条独立出口。</p>
+            <ul className="tailnet-points">
+              <li><b>独立策略</b>：不进入节点选择、自动选择或测速。</li>
+              <li><b>只走内网</b>：置顶写 Tailscale 地址段、MagicDNS 与家里子网规则。</li>
+              <li><b>不回退直连</b>：不在内网的目标直接失败，不会绕回普通节点。</li>
+            </ul>
+            <details className="tailnet-details">
+              <summary>支持的客户端与注意事项</summary>
+              <ul>
+                <li>支持 Surge（iOS 5.21 / Mac 6.8 起）、Stash 3.4 起、Clash / mihomo（内核 1.19.25 起）和 sing-box MT。</li>
+                <li>其余客户端（Shadowrocket、Loon、QuanX、Egern、Hiddify、Karing）会跳过并提示。</li>
+                <li>只写「完整配置」，「仅节点」不含它。</li>
+              </ul>
+            </details>
+          </div>
+          <div className="tailnet-visual">
+            <TailnetIllustration />
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-head">
+          <h3>已添加的内网</h3>
+          <span className="meta">
+            {tailnets.length === 0 ? '尚未添加' : `${enabledCount} 个已启用 · ${keyCount} 个已保存 Auth Key`}
+          </span>
+        </div>
+        {tailnets.length === 0 ? (
+          <div className="preview-empty tailnet-empty">
+            <strong>还没有 Tailscale 内网</strong>
+            <span>添加后只在「完整配置」中写入受支持的客户端。</span>
+          </div>
+        ) : (
+          <div className="tailnet-list">
+            {tailnets.map((connection) => (
+              <TailnetRow
+                key={connection.id}
+                connection={connection}
+                onEdit={() => setEditing({ connection, isNew: false })}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="card">
+        <div className="card-head">
+          <h3>导出规则</h3>
+          <span className="meta">置顶写入</span>
+        </div>
+        <div className="tailnet-routes">
+          <span><b>DOMAIN-SUFFIX</b> MagicDNS 后缀，填了才写</span>
+          <span><b>IP-CIDR</b> 100.64.0.0/10</span>
+          <span><b>IP-CIDR6</b> fd7a:115c:a1e0::/48</span>
+          <span><b>IP-CIDR</b> 你填写的家里子网</span>
+        </div>
+        <p className="tailnet-lead">只写完整配置，排在其他规则之前；不进节点组或测速。</p>
+        <details className="tailnet-details">
+          <summary>自动路由与 Stash 注意事项</summary>
+          <p>
+            Surge 5.21+ / Stash 3.6+ 会自动路由，重复规则无害；Stash 3.4、mihomo 和 sing-box 仍依赖它们。
+            Stash 默认跳过 Tailscale 与局域网网段，建议用 MagicDNS 设备名访问。
+          </p>
+        </details>
+      </div>
+
+      {editing && (
+        <TailnetEditorDialog
+          key={`${editing.connection.id}-${editing.isNew ? 'new' : 'edit'}`}
+          item={editing}
+          onClose={() => setEditing(null)}
+        />
+      )}
+    </div>
+  )
+}
+
+
+interface NetworkOrganization {
+  asn?: number
+  organization?: string
+}
+
+const networkOrgCache = new Map<string, Promise<NetworkOrganization | null>>()
+
+/** 服务器 IP 的网络组织；只查本机离线库，失败时静默返回 null。 */
+function networkOrganizationForHost(host: string): Promise<NetworkOrganization | null> {
+  const cached = networkOrgCache.get(host)
+  if (cached) return cached
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), 5000)
+  const request = fetch(`/api/ip-country?host=${encodeURIComponent(host)}`, { signal: controller.signal })
+    .then(async (res) => {
+      if (!res.ok) return null
+      const data = await res.json() as { asn?: number; organization?: string }
+      return data.organization ? { asn: data.asn, organization: data.organization } : null
+    })
+    .catch(() => null)
+    .finally(() => window.clearTimeout(timer))
+  networkOrgCache.set(host, request)
+  return request
+}
+
+/** 只有真正可分享的协议链接才允许复制 / 生成二维码。 */
+function shareableNodeURI(node: ProxyNode): string | undefined {
+  const uri = node.rawURI?.trim()
+  if (!uri || uri.startsWith('clash://local/')) return undefined
+  return /^(ss|ssr|vmess|vless|trojan|anytls|hysteria2?|hy2?|tuic|wireguard|wg|snell|ssh|socks5|http|https):\/\/\S+/i.test(uri)
+    ? uri
+    : undefined
+}
+
+/** 订阅页与自有节点的统一搜索条件；公告 / 配额伪节点永远不命中。 */
+function nodeMatchesKeyword(node: ProxyNode, needle: string): boolean {
+  if (node.isSubscriptionMetadata) return false
+  const region = regionForNode(node)
+  return [
+    node.name,
+    node.server,
+    node.kind,
+    PROXY_KIND_TITLES[node.kind] ?? '',
+    region?.name ?? '',
+    region?.code ?? '',
+  ].join(' ').toLowerCase().includes(needle)
+}
+
+function NodeRow({
+  node,
+  onCountryClick,
+  onEditCountry,
+  keyword = '',
+  showKind = true,
+  onRenameManual,
+  onEditManual,
+  onDeleteManual,
+}: {
+  node: ProxyNode
+  onCountryClick?: (code: string | null) => void
+  onEditCountry?: (node: ProxyNode) => void
+  keyword?: string
+  /** 订阅里所有节点同一协议时隐藏协议列，减少噪声。 */
+  showKind?: boolean
+  onRenameManual?: (node: ProxyNode) => void
+  onEditManual?: (node: ProxyNode) => void
+  onDeleteManual?: (node: ProxyNode) => void
+}) {
+  const toggle = useStore((s) => s.toggleNodeExcluded)
+  const updateManualNode = useStore((s) => s.updateManualNode)
+  const sources = useStore((s) => s.sources)
+  const latencyMap = useStore((s) => s.latencyByNodeId)
+  const latencyMethodMap = useStore((s) => s.latencyMethodByNodeId)
+  const probeErrors = useStore((s) => s.probeErrorByNodeId)
+  const testingIds = useStore((s) => s.testingNodeIds)
+
+  const excluded = useMemo(() => {
+    if (node.isManual) return node.isEnabled === false
+    const src = sources.find((s) => s.id === node.sourceID)
+    if (!src || src.excludedNodeKeys.length === 0) return false
+    return src.excludedNodeKeys.includes(nodeExactKey(node))
+  }, [sources, node])
+  const latency = latencyMap[node.id]
+  const probeError = probeErrors[node.id]
+  const testing = testingIds.includes(node.id)
+  const region = regionForNode(node)
+  const [expanded, setExpanded] = useState(false)
+  const [copiedURI, setCopiedURI] = useState(false)
+  const [qrOpen, setQrOpen] = useState(false)
+  const [networkOrg, setNetworkOrg] = useState<NetworkOrganization | null | undefined>(undefined)
+
+  useEffect(() => {
+    if (!expanded || !node.server) return
+    let cancelled = false
+    setNetworkOrg(undefined)
+    void networkOrganizationForHost(node.server).then((result) => {
+      if (!cancelled) setNetworkOrg(result)
+    })
+    return () => { cancelled = true }
+  }, [expanded, node.server])
+
+  if (node.isSubscriptionMetadata) {
+    return <div className="notice">{node.name}</div>
+  }
+
+  const sourceName = node.sourceID
+    ? sources.find((source) => source.id === node.sourceID)?.name
+    : node.isManual ? '自有节点' : '本地节点'
+  const regionSource = node.countryOverride
+    ? '手动标记'
+    : regionForName(node.name)
+      ? '节点名称'
+      : node.detectedCountry ? '离线 IP' : '未知'
+  const shareURI = shareableNodeURI(node)
+  const method = latencyMethodMap[node.id]
+  const latencyText = latency === undefined
+    ? (testing ? '测速中' : '未测')
+    : latency === null
+      ? `不可达（${probeError ?? 'unknown'}）`
+      : `${latency} ms · ${method === 'icmp' ? 'ICMP' : 'TCP'}`
+  const copyShareURI = async () => {
+    if (!shareURI) return
+    if (await copyToClipboard(shareURI)) {
+      setCopiedURI(true)
+      window.setTimeout(() => setCopiedURI(false), 1600)
+    }
+  }
+
+  const needle = keyword.trim().toLowerCase()
+  const nameMatches = !!(needle && node.name.toLowerCase().includes(needle))
+  // 搜索命中不在名称里时，用一行灰字告诉用户命中的是哪个字段。
+  const matchHint = (() => {
+    if (!needle || nameMatches) return ''
+    if (node.server.toLowerCase().includes(needle)) return `服务器 ${node.server}`
+    if ((region?.name ?? '').toLowerCase().includes(needle) || (region?.code ?? '').toLowerCase().includes(needle)) {
+      return `地区 ${region?.name ?? ''}`
+    }
+    if (node.kind.toLowerCase().includes(needle) || (PROXY_KIND_TITLES[node.kind] ?? '').toLowerCase().includes(needle)) {
+      return `协议 ${PROXY_KIND_TITLES[node.kind] ?? node.kind}`
+    }
+    return ''
+  })()
+
+  // 三档语义色：良好 / 需关注 / 失败；悬停给出具体等级与握手耗时。
+  const latencyBadge = (() => {
+    if (latency === undefined) {
+      return testing
+        ? <span className="latency testing" title="正在测速">测速中</span>
+        : <span className="latency untested" title="尚未测速">未测</span>
+    }
+    if (latency === null) {
+      if (probeError === 'tcp_not_applicable') {
+        return (
+          <span className="latency untested" title="UDP 节点不适用 TCP 测速，请改用 ICMP / 自动">
+            不适用
+          </span>
+        )
+      }
+      return (
+        <span className="latency" style={{ color: 'var(--negative)' }} title={`失败 · 不可达（${probeError ?? 'unknown'}）`}>
+          —
+        </span>
+      )
+    }
+    const grade = latency < 100 ? '良好' : latency < 300 ? '一般' : '较差'
+    const color = grade === '良好' ? 'var(--positive)' : grade === '一般' ? 'var(--warning)' : 'var(--negative)'
+    const method = latencyMethodMap[node.id]
+    const methodLabel = method === 'icmp' ? 'ICMP' : 'TCP'
+    return (
+      <span className="latency" style={{ color }} title={`${grade} · ${methodLabel} ${latency}ms`}>
+        {latency}<span className="unit">ms</span>
+      </span>
+    )
+  })()
+
+  return (
+    <>
+      <div
+        className={`node-row ${excluded ? 'off' : ''} ${onCountryClick ? 'clickable' : ''} ${testing ? 'is-testing' : ''}`}
+        onClick={() => onCountryClick?.(region?.code ?? null)}
+      >
+      <input
+        type="checkbox"
+        checked={!excluded}
+        onClick={(e) => e.stopPropagation()}
+        onChange={() => {
+          if (node.isManual) {
+            updateManualNode(node.id, { isEnabled: node.isEnabled === false })
+          } else {
+            toggle(node)
+          }
+        }}
+        title="包含在生成的配置中"
+        aria-label={`包含在生成的配置中：${node.name}`}
+      />
+      {onEditCountry ? (
+        <button
+          type="button"
+          className={`flag flag-button${node.countryOverride ? ' is-manual' : ''}`}
+          onClick={(e) => {
+            e.stopPropagation()
+            onEditCountry(node)
+          }}
+          aria-label={`设置地区：${node.name}`}
+          title={region ? `${region.name} · 点击修改地区` : '点击设置地区'}
+        >
+          {region?.flag ?? '·'}
+        </button>
+      ) : (
+        <span className="flag">{region?.flag ?? '·'}</span>
+      )}
+      <button
+        type="button"
+        className="name node-name-toggle"
+        title={expanded ? '收起节点详情' : '展开节点详情'}
+        aria-expanded={expanded}
+        onClick={(event) => {
+          event.stopPropagation()
+          setExpanded((value) => !value)
+        }}
+      >
+        <span className="node-name-text"><Highlight text={node.name} needle={needle} /></span>
+        <span className="node-disclosure" aria-hidden="true">{expanded ? '▾' : '▸'}</span>
+      </button>
+      {matchHint && <span className="node-match" title={matchHint}>{matchHint}</span>}
+      {latencyBadge}
+      {showKind && <span className="kind">{PROXY_KIND_TITLES[node.kind] ?? node.kind}</span>}
+      {node.isManual && (onRenameManual || onEditManual || onDeleteManual) && (
+        <details className="menu node-row-menu" onClick={(event) => event.stopPropagation()}>
+          <summary className="icon-btn" aria-label={`自有节点操作：${node.name}`} title="自有节点操作">⋯</summary>
+          <div className="menu-panel">
+            {onEditManual && (
+              <button onClick={(event) => {
+                event.currentTarget.closest('details')?.removeAttribute('open')
+                onEditManual(node)
+              }}>编辑节点</button>
+            )}
+            {onRenameManual && (
+              <button onClick={(event) => {
+                event.currentTarget.closest('details')?.removeAttribute('open')
+                onRenameManual(node)
+              }}>重命名</button>
+            )}
+            <button onClick={(event) => {
+              event.currentTarget.closest('details')?.removeAttribute('open')
+              updateManualNode(node.id, { isEnabled: node.isEnabled === false })
+            }}>
+              {node.isEnabled === false ? '启用节点' : '停用节点'}
+            </button>
+            {onDeleteManual && (
+              <button className="danger" onClick={(event) => {
+                event.currentTarget.closest('details')?.removeAttribute('open')
+                onDeleteManual(node)
+              }}>删除节点</button>
+            )}
+          </div>
+        </details>
+      )}
+      </div>
+      {expanded && (
+        <div className="node-detail">
+          <div className="node-detail-grid">
+            <span>服务器</span>
+            <code>{node.server.includes(':') ? `[${node.server}]` : node.server}:{node.port}</code>
+            <span>协议</span>
+            <span>{PROXY_KIND_TITLES[node.kind] ?? node.kind}</span>
+            <span>来源</span>
+            <span>{sourceName ?? '未知'}</span>
+            <span>地区</span>
+            <span>{region ? `${region.flag} ${region.name}` : '未识别'} · {regionSource}</span>
+            <span>网络组织</span>
+            <span>
+              {networkOrg === undefined
+                ? '查询本机离线库…'
+                : networkOrg?.organization
+                  ? `AS${networkOrg.asn} · ${networkOrg.organization}`
+                  : '未知'}
+            </span>
+            <span>延迟</span>
+            <span>{latencyText}</span>
+            {node.transport && node.transport !== 'tcp' && (
+              <>
+                <span>传输</span>
+                <span>{node.transport}{node.hostHeader ? ` · ${node.hostHeader}` : ''}{node.path ? ` · ${node.path}` : ''}</span>
+              </>
+            )}
+            {node.tls && (
+              <>
+                <span>TLS</span>
+                <span>开启{node.sni ? ` · SNI ${node.sni}` : ''}{node.skipCertificateVerification ? ' · 跳过证书校验' : ''}</span>
+              </>
+            )}
+            {node.alpn && (
+              <>
+                <span>ALPN</span>
+                <span>{node.alpn}</span>
+              </>
+            )}
+            {(node.realityPublicKey || node.fingerprint) && (
+              <>
+                <span>指纹 / REALITY</span>
+                <span>{node.fingerprint ?? '未设置指纹'}{node.realityPublicKey ? ' · REALITY' : ''}</span>
+              </>
+            )}
+            {node.flow && (
+              <>
+                <span>VLESS Flow</span>
+                <span>{node.flow}</span>
+              </>
+            )}
+            {node.trustTunnel && (
+              <>
+                <span>TrustTunnel</span>
+                <span>{node.trustTunnel.quic ? 'HTTP/3 · QUIC' : 'HTTP/2 + TLS'}</span>
+              </>
+            )}
+            {node.kind === 'masque' && (
+              <>
+                <span>MASQUE</span>
+                <span>
+                  {node.masque?.mode === 'basicConnectIP' ? (
+                    <>
+                      basic-connect-IP · HTTP/{node.masque.httpVersion ?? 3}
+                      {node.username ? ` · ${node.username}` : ''}
+                      {node.path ? ` · ${node.path}` : ''}
+                      {node.masque.mtu ? ` · MTU ${node.masque.mtu}` : ''}
+                    </>
+                  ) : node.masque?.mode === 'keyConnectIP' ? (
+                    <>
+                      CONNECT-IP 密钥模式
+                      {node.masque.network ? ` · ${node.masque.network}` : ''}
+                      {node.masque.ipv4 ? ` · ${node.masque.ipv4}` : node.masque.ipv6 ? ` · ${node.masque.ipv6}` : ''}
+                      {node.masque.mtu ? ` · MTU ${node.masque.mtu}` : ''}
+                    </>
+                  ) : (
+                    <>
+                      Surge Basic-auth CONNECT
+                      {node.username ? ` · ${node.username}` : ''}
+                    </>
+                  )}
+                </span>
+              </>
+            )}
+            {node.ssh && (node.ssh.hostKeys?.length ?? 0) > 0 && (
+              <>
+                <span>SSH Host Key</span>
+                <span>已固定 {node.ssh.hostKeys!.length} 个</span>
+              </>
+            )}
+          </div>
+          {shareURI ? (
+            <div className="node-detail-link">
+              <input
+                readOnly
+                className="input"
+                value={shareURI}
+                aria-label={`${node.name} 的分享链接`}
+                onFocus={(event) => event.currentTarget.select()}
+              />
+              <button className="btn ghost" onClick={() => void copyShareURI()}>
+                {copiedURI ? '已复制' : '复制链接'}
+              </button>
+              <button className="btn ghost" onClick={() => setQrOpen(true)}>二维码</button>
+            </div>
+          ) : (
+            <div className="hint">这个节点来自 Clash 配置，没有原始分享链接；它仍会正常写入导出配置。</div>
+          )}
+          <div className="node-detail-actions">
+            {onEditCountry && (
+              <button className="btn ghost" onClick={() => onEditCountry(node)}>设置地区</button>
+            )}
+            <span className="hint">IP 地区与网络组织来自服务器地址，不代表实际出口。</span>
+          </div>
+        </div>
+      )}
+      {qrOpen && shareURI && (
+        <QRCodeDialog
+          open={qrOpen}
+          url={shareURI}
+          title={node.name}
+          hint="扫码可在其他设备导入这个节点；链接包含节点凭据，请只在可信设备使用。"
+          onClose={() => setQrOpen(false)}
+        />
+      )}
+    </>
+  )
+}
+
+function ManualNodesCard({
+  nodes,
+  keyword,
+  onCountryClick,
+  onEditCountry,
+  onAdd,
+  onCreate,
+  onEditNode,
+  onRename,
+  onRequestDelete,
+}: {
+  nodes: ProxyNode[]
+  keyword: string
+  onCountryClick?: (code: string | null) => void
+  onEditCountry?: (node: ProxyNode) => void
+  onAdd: () => void
+  onCreate: () => void
+  onEditNode: (node: ProxyNode) => void
+  onRename: (node: ProxyNode) => void
+  onRequestDelete: (node: ProxyNode) => void
+}) {
+  const needle = keyword.trim().toLowerCase()
+  const visible = useMemo(
+    () => needle ? nodes.filter((node) => nodeMatchesKeyword(node, needle)) : nodes,
+    [nodes, needle],
+  )
+  const enabledCount = nodes.filter((node) => node.isEnabled !== false).length
+  if (needle && visible.length === 0) return null
+
+  return (
+    <div className="card source-card manual-card">
+      <div className="row between">
+        <div className="row" style={{ gap: 12 }}>
+          <div>
+            <div className="source-title-row">
+              <h3 style={{ margin: 0 }}>自有节点</h3>
+              <span className="pill">手动</span>
+            </div>
+            <div className="meta" style={{ marginTop: 2 }}>
+              <span className="num">{nodes.length}</span> 个节点 · <span className="num">{enabledCount}</span> 个启用
+              {needle ? ` · 匹配 ${visible.length}/${nodes.length}` : ''}
+            </div>
+          </div>
+        </div>
+        <div className="row card-actions">
+          <button className="btn ghost" onClick={onAdd}>+ 添加节点</button>
+          <button className="btn ghost" onClick={onCreate}>+ 新建节点</button>
+        </div>
+      </div>
+      <div className="hint manual-node-hint">
+        只保存在本机；不随订阅刷新，删除订阅也不会移除。取消勾选后不会进入导出配置。
+      </div>
+      <div className={`node-list${visible.length >= 12 ? ' dense' : ''}`} style={{ marginTop: 10 }}>
+        {visible.map((node) => (
+          <NodeRow
+            key={node.id}
+            node={node}
+            onCountryClick={onCountryClick}
+            onEditCountry={onEditCountry}
+            keyword={needle}
+            onRenameManual={onRename}
+            onEditManual={onEditNode}
+            onDeleteManual={onRequestDelete}
+          />
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function SourceCard({
+  id,
+  onCountryClick,
+  onEditCountry,
+  manageMode = false,
+  checked = false,
+  onToggleChecked,
+  keyword = '',
+  onRequestDelete,
+  onEdit,
+}: {
+  id: string
+  onCountryClick?: (code: string | null) => void
+  onEditCountry?: (node: ProxyNode) => void
+  manageMode?: boolean
+  checked?: boolean
+  onToggleChecked?: () => void
+  /** 订阅页的搜索词，用于过滤本卡片里的节点行。 */
+  keyword?: string
+  /** 低频操作（删除订阅）交给页面统一弹确认框。 */
+  onRequestDelete?: (id: string, name: string) => void
+  /** 修改名称、地址和请求设置。 */
+  onEdit?: () => void
+}) {
+  const source = useStore((s) => s.sources.find((x) => x.id === id))
+  const allNodes = useStore((s) => s.nodes)
+  const nodes = useMemo(() => allNodes.filter((n) => n.sourceID === id), [allNodes, id])
+  const loading = useStore((s) => s.loadingSourceIDs.includes(id))
+  const error = useStore((s) => s.errors[id])
+  const latencyMap = useStore((s) => s.latencyByNodeId)
+  const testingIds = useStore((s) => s.testingNodeIds)
+  const refresh = useStore((s) => s.refreshSource)
+  const setExclusions = useStore((s) => s.setSourceExclusions)
+  const setSourceEnabled = useStore((s) => s.setSourceEnabled)
+  const startTesting = useStore((s) => s.startTesting)
+  const stopTesting = useStore((s) => s.stopTesting)
+  const filterInfoNodes = useStore((s) => s.filterSubscriptionInfoNodes)
+  // 订阅卡片默认收起；搜索时自动展开，方便直接看到命中的节点行。
+  const [expanded, setExpanded] = useState(false)
+  const [sortByLatency, setSortByLatency] = useState(false)
+  const menuRef = useRef<HTMLDetailsElement>(null)
+  const legendRef = useRef<HTMLDetailsElement>(null)
+  const selectAllRef = useRef<HTMLInputElement>(null)
+
+  // 点击菜单 / 图例外时收起（details 默认不会自动关闭）
+  useEffect(() => {
+    const onDocClick = (e: MouseEvent) => {
+      const target = e.target as Node
+      for (const ref of [menuRef, legendRef]) {
+        const el = ref.current
+        if (el?.open && !el.contains(target)) el.open = false
+      }
+    }
+    document.addEventListener('click', onDocClick)
+    return () => document.removeEventListener('click', onDocClick)
+  }, [])
+
+  const needle = keyword.trim().toLowerCase()
+  useEffect(() => {
+    if (needle) setExpanded(true)
+  }, [needle])
+  // 搜索词命中订阅名时展示全部节点（否则只保留命中的节点行）。
+  const sourceNameMatches = !!source && needle.length > 0 && source.name.toLowerCase().includes(needle)
+  const visibleNodes = useMemo(() => {
+    let list = filterInfoNodes ? nodes.filter((node) => !node.isSubscriptionMetadata) : nodes
+    if (needle && !sourceNameMatches) {
+      list = list.filter((n) => nodeMatchesKeyword(n, needle))
+    }
+    if (sortByLatency) {
+      const rank = (n: ProxyNode) => {
+        const v = latencyMap[n.id]
+        return v === undefined || v === null ? Number.POSITIVE_INFINITY : v
+      }
+      list = [...list].sort((a, b) => rank(a) - rank(b))
+    }
+    return list
+  }, [nodes, needle, sourceNameMatches, sortByLatency, latencyMap, filterInfoNodes])
+  const visibleRealCount = visibleNodes.filter((n) => !n.isSubscriptionMetadata).length
+
+  // 节点启用状态（排除列表）与“全选”三态复选框
+  const excludedKeys = new Set(source?.excludedNodeKeys ?? [])
+  const realAll = nodes.filter((n) => !n.isSubscriptionMetadata)
+  const includedAll = realAll.filter((n) => !excludedKeys.has(nodeExactKey(n)))
+  const allIncluded = realAll.length > 0 && includedAll.length === realAll.length
+  const someIncluded = includedAll.length > 0 && !allIncluded
+  useEffect(() => {
+    if (selectAllRef.current) selectAllRef.current.indeterminate = someIncluded
+    // 卡片默认收起时 ref 还是 null；展开 / 搜索自动展开后才挂载复选框，需要再同步一次。
+  }, [someIncluded, expanded])
+
+  if (!source) return null
+  const sourceEnabled = isSourceEnabled(source)
+  const real = realAll
+  const u = source.usage
+  const usedBytes = (u?.upload ?? 0) + (u?.download ?? 0)
+  const thisSourceIds = real.map((n) => n.id)
+  const testingThisSource = testingIds.some((tid) => thisSourceIds.includes(tid))
+  const testedCount = thisSourceIds.filter((id) => latencyMap[id] !== undefined).length
+  // 本轮已完成数 = 总数 - 队列里剩余数（比「累计已测」更能反映进度）
+  const remainingThisSource = thisSourceIds.filter((id) => testingIds.includes(id)).length
+  const doneThisRun = real.length - remainingThisSource
+  // 同一订阅里协议都相同时不显示协议列（例如整份都是 SSR）。
+  const showKind = new Set(real.map((n) => n.kind)).size > 1
+  const currentTestingId = testingIds.find((tid) => thisSourceIds.includes(tid) && latencyMap[tid] === undefined)
+  const currentTestingNode = currentTestingId ? real.find((n) => n.id === currentTestingId) : undefined
+
+  const closeMenu = () => { if (menuRef.current) menuRef.current.open = false }
+  const toggleAllNodes = () => setExclusions(id, allIncluded ? real.map(nodeExactKey) : [])
+
+  return (
+    <div className={`card source-card${sourceEnabled ? '' : ' is-disabled'}`}>
+      <div className="row between">
+        <div className="row" style={{ gap: 12 }}>
+          {manageMode && (
+            <input
+              type="checkbox"
+              checked={checked}
+              onChange={() => onToggleChecked?.()}
+              aria-label={`选择订阅「${source.name}」`}
+              style={{ width: 18, height: 18 }}
+            />
+          )}
+          <div>
+            <div className="source-title-row">
+              <h3 style={{ margin: 0 }}>{source.name}</h3>
+              {!sourceEnabled && <span className="pill source-status">已停用</span>}
+            </div>
+            <div className="meta" style={{ marginTop: 2 }}>
+              <span className="num">{real.length}</span> 个节点{source.updatedAt ? ` · 更新于 ${formatDate(source.updatedAt)}` : ''}
+              {testedCount > 0 ? ` · 已测 ${testedCount}/${real.length}` : ''}
+              {testingThisSource ? ' · 测速中' : ''}
+              {source.userAgent ? ' · 自定义 UA' : ''}
+              {source.dnsOverHTTPSURL ? ' · DoH' : ''}
+              {needle && !sourceNameMatches ? ` · 匹配 ${visibleRealCount}/${real.length}` : ''}
+            </div>
+            {(u?.total !== undefined || u?.expire !== undefined) && (
+              <div className="usage">
+                {u?.total !== undefined && <span>已用 {formatBytes(usedBytes)} / {formatBytes(u.total)}</span>}
+                {u?.expire !== undefined && <span>到期 {new Date(u.expire * 1000).toLocaleDateString('zh-CN')}</span>}
+              </div>
+            )}
+          </div>
+        </div>
+        {!manageMode && (
+          <div className="row card-actions">
+            <button
+              type="button"
+              role="switch"
+              aria-checked={sourceEnabled}
+              aria-label={sourceEnabled ? `停用订阅「${source.name}」` : `启用订阅「${source.name}」`}
+              title={sourceEnabled ? '停用后，节点不会进入生成的配置' : '启用后，节点会重新进入生成的配置'}
+              className={`source-switch${sourceEnabled ? ' is-on' : ''}`}
+              onClick={() => setSourceEnabled(id, !sourceEnabled)}
+            >
+              <span className="switch-track" aria-hidden="true"><span className="switch-thumb" /></span>
+              <span className="switch-label">{sourceEnabled ? '已启用' : '已停用'}</span>
+            </button>
+            {sourceEnabled && (
+              <button className="btn" disabled={testingThisSource} onClick={() => startTesting(thisSourceIds)}>
+                {testingThisSource ? `测速中 ${doneThisRun}/${real.length}` : '全部测速'}
+              </button>
+            )}
+            {sourceEnabled && testingThisSource && <button className="btn ghost" onClick={() => stopTesting()}>取消</button>}
+            {source.url && (
+              <button className="btn ghost" disabled={loading} onClick={() => refresh(id)}>
+                {loading ? '刷新中…' : '刷新'}
+              </button>
+            )}
+            <button className="btn ghost" aria-expanded={expanded} aria-controls={`nodes-${id}`} onClick={() => setExpanded(!expanded)}>
+              {expanded ? '收起' : '展开'}
+            </button>
+            <details className="menu" ref={menuRef}>
+              <summary className="icon-btn" aria-label="更多操作" title="更多操作">⋯</summary>
+              <div className="menu-panel">
+                <button onClick={() => { closeMenu(); onEdit?.() }}>编辑订阅</button>
+                <button onClick={() => { setSourceEnabled(id, !sourceEnabled); closeMenu() }}>
+                  {sourceEnabled ? '停用订阅' : '启用订阅'}
+                </button>
+                <button onClick={() => { setSortByLatency((v) => !v); closeMenu() }}>
+                  延迟排序{sortByLatency ? '（已开启）' : ''}
+                </button>
+                <button onClick={() => { setExclusions(id, []); closeMenu() }}>恢复默认（全部启用）</button>
+                <button className="danger" onClick={() => { closeMenu(); onRequestDelete?.(id, source.name) }}>删除订阅</button>
+              </div>
+            </details>
+          </div>
+        )}
+      </div>
+      {!sourceEnabled && (
+        <div className="source-off-note" role="status">
+          已停用：这 {real.length} 个节点不会进入配置，也不会计入健康统计。刷新仍可更新节点，需要时再启用。
+        </div>
+      )}
+      {sourceEnabled && testingThisSource && real.length > 0 && (
+        <div className="test-block">
+          <div
+            className="test-progress"
+            role="progressbar"
+            aria-label="测速进度"
+            aria-valuemin={0}
+            aria-valuemax={real.length}
+            aria-valuenow={doneThisRun}
+          >
+            <span style={{ width: `${Math.round((doneThisRun / real.length) * 100)}%` }} />
+          </div>
+          <div className="test-caption">
+            {currentTestingNode ? `正在测：${currentTestingNode.name}` : '正在测速'}
+            {' · 可随时取消，已完成的结果会保留'}
+          </div>
+        </div>
+      )}
+      {loading && (
+        <div className="source-progress" role="status" aria-live="polite">
+          <span className="spinner" aria-hidden="true" />
+          正在拉取并解析订阅…
+        </div>
+      )}
+      {error && (
+        <div className="source-error" role="alert">
+          <span>{error}</span>
+          {source.url && (
+            <button className="btn ghost" disabled={loading} onClick={() => void refresh(id)}>重试</button>
+          )}
+        </div>
+      )}
+      {expanded && !manageMode && (
+        <div id={`nodes-${id}`} className={`node-list${real.length >= 12 ? ' dense' : ''}`} style={{ marginTop: 10 }}>
+          {real.length > 0 && (
+            <div className="node-toolbar">
+              <label className="node-select">
+                <input
+                  ref={selectAllRef}
+                  type="checkbox"
+                  checked={allIncluded}
+                  onChange={toggleAllNodes}
+                  aria-label="全选或全不选：节点是否包含在生成的配置中"
+                />
+                <span>
+                  包含在配置 <span className="num">{includedAll.length}</span>/<span className="num">{real.length}</span>
+                </span>
+              </label>
+              <details className="legend" ref={legendRef}>
+                <summary className="legend-trigger">图例</summary>
+                <div className="legend-body">
+                  <div className="legend-row">
+                    <span className="legend-label">延迟</span>
+                    <span><i style={{ background: 'var(--positive)' }} />良好 &lt;100ms</span>
+                    <span><i style={{ background: 'var(--warning)' }} />一般 100–299ms</span>
+                    <span><i style={{ background: 'var(--negative)' }} />较差 ≥300ms</span>
+                  </div>
+                  <div className="legend-row">
+                    <span className="legend-label">状态</span>
+                    <span><i className="swatch-untested" />未测</span>
+                    <span><i className="swatch-testing" />测速中</span>
+                    <span><i style={{ background: 'var(--negative)' }} />失败</span>
+                    <span><i className="swatch-off" />已排除</span>
+                  </div>
+                </div>
+              </details>
+            </div>
+          )}
+          {visibleNodes.some((n) => !n.isSubscriptionMetadata) && (
+            <div className="node-head" aria-hidden="true">
+              <span className="cb-space" />
+              <span className="flag" />
+              <span className="name">节点</span>
+              <span className="latency">延迟</span>
+              {showKind && <span className="kind">协议</span>}
+            </div>
+          )}
+          {visibleNodes.map((n) => (
+            <NodeRow
+              key={n.id}
+              node={n}
+              onCountryClick={onCountryClick}
+              onEditCountry={onEditCountry}
+              keyword={needle}
+              showKind={showKind}
+            />
+          ))}
+          {visibleNodes.length === 0 && needle && !sourceNameMatches && (
+            <div className="node-empty">该订阅里没有匹配「{keyword.trim()}」的节点</div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
+  const sources = useStore((s) => s.sources)
+  const loadingSourceIDs = useStore((s) => s.loadingSourceIDs)
+  const refreshSource = useStore((s) => s.refreshSource)
+  const setSourcesEnabled = useStore((s) => s.setSourcesEnabled)
+  const allNodes = useStore((s) => s.nodes)
+  const selectedSchemeID = useStore((s) => s.selectedSchemeID)
+  const customSchemes = useStore((s) => s.customSchemes)
+  const latencyRecord = useStore((s) => s.latencyByNodeId)
+  const latencyMap = useMemo(() => new Map(Object.entries(latencyRecord)) as Map<string, number | null>, [latencyRecord])
+  const probeErrors = useStore((s) => s.probeErrorByNodeId)
+  const testingIds = useStore((s) => s.testingNodeIds)
+  const startTesting = useStore((s) => s.startTesting)
+  const stopTesting = useStore((s) => s.stopTesting)
+  const renewalRemindersEnabled = useStore((s) => s.renewalRemindersEnabled)
+  const setNodeDetectedCountries = useStore((s) => s.setNodeDetectedCountries)
+  const [adding, setAdding] = useState(false)
+  const [selectedCode, setSelectedCode] = useState<string | null>(null)
+  const [searchText, setSearchText] = useState('')
+  const [manageMode, setManageMode] = useState(false)
+  const [checkedSources, setCheckedSources] = useState<Set<string>>(new Set())
+  const [pendingDelete, setPendingDelete] = useState<{ ids: string[]; label: string } | null>(null)
+  const [setupDismissed, setSetupDismissed] = useState(() => localStorage.getItem('tower-setup-dismissed') === '1')
+  const [issuesOpen, setIssuesOpen] = useState(false)
+  const [flash, setFlash] = useState('')
+  const [editingSource, setEditingSource] = useState<SubscriptionSource | null>(null)
+  const [editingCountryNode, setEditingCountryNode] = useState<ProxyNode | null>(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [addingManual, setAddingManual] = useState(false)
+  const [manualEditor, setManualEditor] = useState<{ node?: ProxyNode } | null>(null)
+  const [renamingManualNode, setRenamingManualNode] = useState<ProxyNode | null>(null)
+  const [pendingManualDelete, setPendingManualDelete] = useState<ProxyNode | null>(null)
+  const [batchFailures, setBatchFailures] = useState<SourceAddFailure[] | null>(null)
+  const removeManualNode = useStore((s) => s.removeManualNode)
+
+  // 手动「刷新全部」和打开时自动刷新都只处理启用中的 URL 订阅。
+  const refreshableSources = useMemo(
+    () => sources.filter((s) => s.url && isSourceEnabled(s)),
+    [sources],
+  )
+  const refreshing = refreshableSources.some((s) => loadingSourceIDs.includes(s.id))
+  const refreshAll = async () => {
+    await Promise.all(refreshableSources.map((s) => refreshSource(s.id)))
+  }
+  const selectedSources = sources.filter((s) => checkedSources.has(s.id))
+  const selectedAllEnabled = selectedSources.length > 0 && selectedSources.every(isSourceEnabled)
+  const selectedAllDisabled = selectedSources.length > 0 && selectedSources.every((s) => !isSourceEnabled(s))
+
+  const keyword = searchText.trim().toLowerCase()
+  const filteredSources = useMemo(() => {
+    if (!keyword) return sources
+    return sources.filter((s) => {
+      if (s.name.toLowerCase().includes(keyword)) return true
+      const srcNodes = allNodes.filter((n) => n.sourceID === s.id)
+      return srcNodes.some((n) => nodeMatchesKeyword(n, keyword))
+    })
+  }, [sources, allNodes, keyword])
+
+  const manualNodes = useMemo(
+    () => allNodes.filter((node) => node.isManual),
+    [allNodes],
+  )
+  const matchingManualNodes = useMemo(
+    () => keyword ? manualNodes.filter((node) => nodeMatchesKeyword(node, keyword)) : manualNodes,
+    [manualNodes, keyword],
+  )
+  const hasContent = sources.length > 0 || manualNodes.length > 0
+
+  const toggleSource = (id: string) => {
+    setCheckedSources((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+  const exitManageMode = () => {
+    setManageMode(false)
+    setCheckedSources(new Set())
+  }
+
+  /** 只统计会进入配置的节点；排除项不参与可用数、地区和状态汇总。 */
+  const enabled = useMemo(() => enabledNodes({ sources, nodes: allNodes }), [sources, allNodes])
+  const enabledIds = useMemo(() => enabled.map((n) => n.id), [enabled])
+  const nodeCountries = useMemo(() => {
+    const set = new Set<string>()
+    for (const n of enabled) {
+      const r = regionForNode(n)
+      if (r?.code) set.add(r.code)
+    }
+    return set.size
+  }, [enabled])
+
+  const health = useMemo(() => {
+    const ok: ProxyNode[] = []
+    const failed: ProxyNode[] = []
+    const untested: ProxyNode[] = []
+    const failedRegions = new Map<string, { code: string; name: string; flag: string; count: number }>()
+    for (const n of enabled) {
+      const latency = latencyRecord[n.id]
+      if (latency === undefined) { untested.push(n); continue }
+      if (latency === null) {
+        failed.push(n)
+        const region = regionForNode(n)
+        const code = region?.code ?? '—'
+        const rec = failedRegions.get(code) ?? {
+          code,
+          name: region?.name ?? '未知地区',
+          flag: region?.flag ?? '·',
+          count: 0,
+        }
+        rec.count++
+        failedRegions.set(code, rec)
+      } else {
+        ok.push(n)
+      }
+    }
+    return {
+      ok,
+      failed,
+      untested,
+      failedIds: failed.map((n) => n.id),
+      failedRegions: [...failedRegions.values()].sort((a, b) => b.count - a.count),
+    }
+  }, [enabled, latencyRecord, probeErrors])
+
+  const needsTest = health.untested.length > 0
+  const testingAny = testingIds.length > 0
+  const allHealthy = health.failed.length === 0 && health.untested.length === 0
+
+  useEffect(() => {
+    if (health.failed.length === 0) setIssuesOpen(false)
+  }, [health.failed.length])
+
+  useEffect(() => {
+    if (!flash) return
+    const timer = window.setTimeout(() => setFlash(''), 4200)
+    return () => window.clearTimeout(timer)
+  }, [flash])
+
+  // 节点名称没有给出地区时，用本机离线 IP 库补全；按服务器缓存，刷新节点后直接复用。
+  const countryByHostRef = useRef<Record<string, string>>({})
+  const pendingCountryHosts = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    const cachedByHost: Record<string, string> = {}
+    const hosts = new Set<string>()
+    for (const node of allNodes) {
+      if (node.isSubscriptionMetadata || node.countryOverride || node.detectedCountry) continue
+      if (regionForName(node.name) || !node.server) continue
+      const cached = countryByHostRef.current[node.server]
+      if (cached) {
+        cachedByHost[node.server] = cached
+        continue
+      }
+      if (pendingCountryHosts.current.has(node.server)) continue
+      hosts.add(node.server)
+    }
+    if (Object.keys(cachedByHost).length > 0) setNodeDetectedCountries(cachedByHost)
+    if (hosts.size === 0) return
+    for (const host of hosts) pendingCountryHosts.current.add(host)
+    void Promise.all([...hosts].map(async (host) => {
+      try {
+        const res = await fetch(`/api/ip-country?host=${encodeURIComponent(host)}`)
+        if (!res.ok) return [host, ''] as const
+        const data = await res.json() as { country?: string }
+        return [host, data.country ?? ''] as const
+      } catch {
+        return [host, ''] as const
+      }
+    })).then((results) => {
+      const byHost: Record<string, string> = {}
+      for (const [host, country] of results) {
+        if (!country) continue
+        countryByHostRef.current[host] = country
+        byHost[host] = country
+      }
+      if (Object.keys(byHost).length > 0) setNodeDetectedCountries(byHost)
+    })
+  }, [allNodes, setNodeDetectedCountries])
+
+  const renewalAlerts = useMemo(() => {
+    if (!renewalRemindersEnabled) return []
+    const now = Date.now()
+    return sources.flatMap((source) => {
+      if (!isSourceEnabled(source)) return []
+      const usage = source.usage
+      const alerts: { id: string; name: string; text: string; tone: 'warning' | 'error' }[] = []
+      if (usage?.expire) {
+        const days = Math.ceil((usage.expire * 1000 - now) / 86_400_000)
+        if (days <= 7) {
+          alerts.push({
+            id: `${source.id}-expire`,
+            name: source.name,
+            text: days <= 0 ? '订阅已到期' : `将在 ${days} 天后到期`,
+            tone: days <= 0 ? 'error' : 'warning',
+          })
+        }
+      }
+      if (usage?.total && usage.total > 0) {
+        const ratio = ((usage.upload ?? 0) + (usage.download ?? 0)) / usage.total
+        if (ratio >= 0.9) {
+          alerts.push({
+            id: `${source.id}-usage`,
+            name: source.name,
+            text: `流量已用 ${Math.round(ratio * 100)}%`,
+            tone: ratio >= 1 ? 'error' : 'warning',
+          })
+        }
+      }
+      return alerts
+    })
+  }, [renewalRemindersEnabled, sources])
+
+  // 系统通知只在页面打开时能发送；同一天同一项只提醒一次。
+  useEffect(() => {
+    if (renewalAlerts.length === 0) return
+    if (!('Notification' in window) || Notification.permission !== 'granted') return
+    const day = new Date().toISOString().slice(0, 10)
+    for (const alert of renewalAlerts) {
+      const key = `tower-renewal-notified:${alert.id}:${day}`
+      if (localStorage.getItem(key)) continue
+      try {
+        new Notification(`塔台 · ${alert.name}`, { body: alert.text, tag: alert.id })
+        localStorage.setItem(key, '1')
+      } catch {
+        // 浏览器不允许构造通知时保留应用内提示即可。
+      }
+    }
+  }, [renewalAlerts])
+
+  // 上手引导：只有「添加订阅 → 导出 / 发布」是必做两步；
+  // 规则方案有可用默认值，作为可选的查看入口，不再计入进度。
+  const schemeLabel =
+    customSchemes.find((c) => c.id === selectedSchemeID)?.name ??
+    BUILTIN_SCHEMES.find((m) => m.id === selectedSchemeID)?.name ??
+    'ACL4SSR 默认'
+  const ruleConfirmed = selectedSchemeID !== 'acl4ssr-online' || customSchemes.length > 0
+  const hasLink = !!localStorage.getItem('tower-sub-token')
+  const setupSteps: {
+    key: TabKey
+    title: string
+    desc: string
+    done: boolean
+    action: string
+    run: () => void
+    required: boolean
+  }[] = [
+    {
+      key: 'sub', done: sources.length > 0, required: true,
+      title: '添加订阅', desc: '支持订阅 URL、Base64、Clash YAML 或单节点 URI',
+      action: '+ 添加订阅', run: () => setAdding(true),
+    },
+    {
+      key: 'rules', done: ruleConfirmed, required: false,
+      title: '规则方案', desc: `当前：${schemeLabel} · 内置规则可直接使用，需要时再调整`,
+      action: '查看规则方案', run: () => onGo?.('rules'),
+    },
+    {
+      key: 'export', done: hasLink, required: true,
+      title: '导出 / 发布', desc: '生成客户端配置，或发布订阅链接给手机',
+      action: '去导出', run: () => onGo?.('export'),
+    },
+  ]
+  const requiredSteps = setupSteps.filter((s) => s.required)
+  const setupDone = requiredSteps.filter((s) => s.done).length
+  const setupTotal = requiredSteps.length
+  const nextSetup = requiredSteps.find((s) => !s.done)
+
+  // 流程走完后清掉「稍后」记录，下次不会因为旧标记而看不到提示。
+  useEffect(() => {
+    if (!nextSetup) localStorage.removeItem('tower-setup-dismissed')
+  }, [nextSetup])
+
+  // 全局测速时显示「正在测哪一个」，让进度有上下文。
+  const testingNode = useMemo(() => {
+    if (!testingIds.length) return undefined
+    const inFlight = testingIds.find((id) => latencyRecord[id] === undefined)
+    return allNodes.find((n) => n.id === (inFlight ?? testingIds[0]))
+  }, [testingIds, latencyRecord, allNodes])
+
+  return (
+    <div>
+      <div className="page-head">
+        <div>
+          <div className="eyebrow">订阅与节点 · 01</div>
+          <h1>管理订阅与节点</h1>
+          <div className="sub">添加订阅或自有节点、测速，并决定哪些节点进入配置</div>
+        </div>
+        <div className="row page-actions" style={{ gap: 8 }}>
+          {nextSetup && setupDismissed && (
+            <button
+              className="btn ghost"
+              onClick={() => { setSetupDismissed(false); localStorage.removeItem('tower-setup-dismissed') }}
+            >
+              上手进度 {setupDone}/{setupTotal}
+            </button>
+          )}
+          {sources.length > 0 && !manageMode && (
+            <button className="btn ghost" onClick={() => setSettingsOpen(true)}>订阅设置</button>
+          )}
+          {sources.length > 0 && !manageMode && (
+            <button className="btn ghost" onClick={() => setManageMode(true)}>管理</button>
+          )}
+          {manageMode && (
+            <>
+              <button
+                className="btn ghost"
+                onClick={() => {
+                  setCheckedSources(
+                    checkedSources.size === sources.length
+                      ? new Set()
+                      : new Set(sources.map((s) => s.id)),
+                  )
+                }}
+              >
+                {checkedSources.size === sources.length && sources.length > 0 ? '取消全选' : '全选'}
+              </button>
+              {checkedSources.size > 0 && <span className="select-count">已选 <b>{checkedSources.size}</b></span>}
+              {checkedSources.size > 0 && (
+                <button
+                  className="btn"
+                  disabled={selectedAllEnabled}
+                  onClick={() => {
+                    setSourcesEnabled([...checkedSources], true)
+                    setFlash(`已启用 ${checkedSources.size} 个订阅。`)
+                  }}
+                >启用选中</button>
+              )}
+              {checkedSources.size > 0 && (
+                <button
+                  className="btn"
+                  disabled={selectedAllDisabled}
+                  onClick={() => {
+                    setSourcesEnabled([...checkedSources], false)
+                    setFlash(`已停用 ${checkedSources.size} 个订阅，节点不会再进入配置。`)
+                  }}
+                >停用选中</button>
+              )}
+              {checkedSources.size > 0 && (
+                <button
+                  className="btn danger"
+                  onClick={() => setPendingDelete({ ids: [...checkedSources], label: `${checkedSources.size} 个订阅` })}
+                >删除选中</button>
+              )}
+              <button className="btn ghost" onClick={exitManageMode}>取消</button>
+            </>
+          )}
+          {!manageMode && (
+            <button className="btn ghost" onClick={() => setAddingManual(true)}>+ 自有节点</button>
+          )}
+          {!manageMode && hasContent && (
+            <button className="btn primary" onClick={() => setAdding(true)}>+ 添加订阅</button>
+          )}
+        </div>
+      </div>
+
+      {flash && <div className="flash" role="status" aria-live="polite">{flash}</div>}
+
+      {batchFailures && (
+        <div className="batch-report" role="alert">
+          <div className="batch-report-head">
+            <strong>部分内容未添加</strong>
+            <button className="btn ghost" onClick={() => setBatchFailures(null)}>关闭</button>
+          </div>
+          <ul>
+            {batchFailures.map((failure, index) => (
+              <li key={`${failure.label}-${index}`}>
+                <span>{failure.label}</span>
+                <small>{failure.message}</small>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {hasContent && nextSetup && !setupDismissed && (
+        <div className="setup-banner">
+          <div className="setup-banner-text">
+            <span className="setup-progress">上手进度 {setupDone}/{setupTotal}</span>
+            <span className="setup-next">下一步：{nextSetup.title} · {nextSetup.desc}</span>
+          </div>
+          <div className="row" style={{ gap: 6 }}>
+            <button className="btn" onClick={nextSetup.run}>{nextSetup.action}</button>
+            <button className="btn ghost" onClick={() => { setSetupDismissed(true); localStorage.setItem('tower-setup-dismissed', '1') }}>稍后</button>
+          </div>
+        </div>
+      )}
+
+      {renewalAlerts.length > 0 && (
+        <div className="renewal-alert" role="status">
+          <div className="renewal-alert-title">订阅提醒</div>
+          <div className="renewal-alert-list">
+            {renewalAlerts.map((alert) => (
+              <span key={alert.id} className={`renewal-alert-item ${alert.tone}`}>
+                <b>{alert.name}</b> {alert.text}
+              </span>
+            ))}
+          </div>
+          <button className="btn ghost" onClick={() => setSettingsOpen(true)}>订阅设置</button>
+        </div>
+      )}
+
+      {hasContent && (
+        <div className="stat-strip" role="list">
+          <div className="stat-cell" role="listitem">
+            <span className="stat-label">订阅</span>
+            <span className="stat-value num">{sources.length}</span>
+          </div>
+          {manualNodes.length > 0 && (
+            <div className="stat-cell" role="listitem">
+              <span className="stat-label">自有节点</span>
+              <span className="stat-value num">{manualNodes.length}</span>
+            </div>
+          )}
+          <div className="stat-cell" role="listitem">
+            <span className="stat-label">可用节点</span>
+            <span className="stat-value num">{enabled.length}</span>
+          </div>
+          <div className="stat-cell" role="listitem">
+            <span className="stat-label">地区</span>
+            <span className="stat-value num">{nodeCountries}</span>
+          </div>
+        </div>
+      )}
+
+      {enabled.length > 0 && (
+        <section className={`health-bar${testingAny ? ' is-testing' : ''}`} aria-label="节点健康状态">
+          <div className="health-main">
+            <div className="health-kicker">节点健康</div>
+            <div className="health-title">
+              <strong>{enabled.length}</strong>
+              <span>个节点已启用</span>
+            </div>
+            <div className="health-counts" aria-live="polite">
+              <span className="health-status ok"><i aria-hidden="true" />正常 <b>{health.ok.length}</b></span>
+              <span className="health-status bad"><i aria-hidden="true" />异常 <b>{health.failed.length}</b></span>
+              <span className="health-status unknown"><i aria-hidden="true" />未测 <b>{health.untested.length}</b></span>
+            </div>
+            {health.failedRegions.length > 0 && (
+              <div className="health-regions">
+                <span className="health-regions-label">异常地区</span>
+                {health.failedRegions.map((r) => (
+                  <span className="region-chip" key={r.code}>
+                    <span aria-hidden="true">{r.flag}</span>
+                    {r.name} <b>{r.count}</b>
+                  </span>
+                ))}
+              </div>
+            )}
+            {testingAny && (
+              <div className="health-testing">
+                <span className="spinner" aria-hidden="true" />
+                {testingNode ? `正在测：${testingNode.name}` : '正在测速'}
+                <span> · 剩余 {testingIds.length} 个</span>
+              </div>
+            )}
+            {!testingAny && allHealthy && (
+              <div className="health-message ok">全部节点正常，可以导出配置。</div>
+            )}
+            {!testingAny && !allHealthy && health.failed.length > 0 && (
+              <div className="health-message bad">有节点不可达，查看异常或重测失败节点。</div>
+            )}
+          </div>
+          <div className="health-actions">
+            <button
+              className={`btn ${testingAny || needsTest ? 'primary' : ''}`}
+              onClick={() => {
+                if (testingAny) stopTesting()
+                else startTesting(enabledIds)
+              }}
+            >
+              {testingAny ? '取消测速' : needsTest ? '全部测速' : '重新测速'}
+            </button>
+            {health.failed.length > 0 && (
+              <button
+                className="btn"
+                aria-expanded={issuesOpen}
+                aria-controls="health-issues"
+                onClick={() => setIssuesOpen((v) => !v)}
+              >
+                {issuesOpen ? '收起异常' : `查看异常 (${health.failed.length})`}
+              </button>
+            )}
+            <button
+              className={`btn ${!testingAny && !needsTest ? 'primary' : 'ghost'}`}
+              onClick={() => onGo?.('export')}
+            >
+              去导出
+            </button>
+          </div>
+          {issuesOpen && health.failed.length > 0 && (
+            <div className="health-issues" id="health-issues">
+              <div className="health-issue-head">
+                <span>异常节点</span>
+                <button
+                  className="btn ghost"
+                  disabled={testingAny}
+                  onClick={() => startTesting(health.failedIds)}
+                >
+                  重测失败节点
+                </button>
+              </div>
+              <ul>
+                {health.failed.slice(0, 8).map((n) => (
+                  <li key={n.id}>
+                    <span className="issue-name">{n.name}</span>
+                    <code>{probeErrors[n.id] ?? '不可达'}</code>
+                  </li>
+                ))}
+              </ul>
+              {health.failed.length > 8 && (
+                <div className="health-issues-more">还有 {health.failed.length - 8} 个异常节点，已在地图和订阅列表中标记。</div>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
+      {hasContent && enabled.length === 0 && (
+        <div className="source-off-note global" role="status">
+          当前没有会进入配置的节点：请启用订阅或自有节点，或在订阅里勾选至少一个节点。
+        </div>
+      )}
+
+      {hasContent && (
+        <div className="list-tools">
+          <div className="search-wrap">
+            <input
+              className="input"
+              aria-label="搜索订阅与节点"
+              placeholder="搜索订阅、节点名称、服务器或协议…"
+              value={searchText}
+              onChange={(e) => setSearchText(e.target.value)}
+            />
+            {searchText && (
+              <button className="search-clear" aria-label="清空搜索" onClick={() => setSearchText('')}>×</button>
+            )}
+          </div>
+          {refreshableSources.length > 0 && (
+            <button
+              className="btn ghost refresh-all"
+              onClick={() => void refreshAll()}
+              disabled={refreshing}
+            >
+              {refreshing ? '刷新中…' : `刷新全部（${refreshableSources.length}）`}
+            </button>
+          )}
+        </div>
+      )}
+
+      {!hasContent && (
+        <section className="first-run" aria-labelledby="first-run-title">
+          <div className="first-run-copy">
+            <div className="first-run-kicker">第一次使用</div>
+            <h2 id="first-run-title">从一条订阅开始</h2>
+            <p className="first-run-lead-p">
+              粘贴订阅地址、节点内容或一条 <span className="mono">ss://</span> 链接。
+              塔台在本机完成拉取、解析、测速与配置生成。
+            </p>
+            <div className="first-run-action">
+              <button className="btn primary first-run-cta" onClick={() => setAdding(true)}>
+                + 添加订阅
+              </button>
+              <span className="first-run-hint">只需要这一步</span>
+            </div>
+            <p className="local-note">
+              <i aria-hidden="true" />
+              订阅和节点只在本机处理，不上传第三方服务。
+            </p>
+            <div className="first-run-later" aria-label="订阅后的后续步骤">
+              <span className="later-label">订阅之后</span>
+              <span className="later-step"><b>02</b> 规则方案 <em>可选</em></span>
+              <span className="later-arrow">→</span>
+              <span className="later-step"><b>03</b> 导出 / 发布</span>
+            </div>
+          </div>
+          <div className="first-run-visual">
+            <RouteIllustration />
+            <div className="route-legend">
+              <span>示意图</span><span>·</span><span>订阅源</span><span>→</span><span>本地解析</span><span>→</span><span>节点</span><span>→</span><span>导出</span>
+            </div>
+          </div>
+          <div className="first-run-foot">
+            <span>支持 {CLIENTS.length} 种客户端</span>
+            <span>·</span>
+            <span>无需账号</span>
+            <span>·</span>
+            <span>本机处理</span>
+          </div>
+        </section>
+      )}
+
+      {filteredSources.length === 0 && matchingManualNodes.length === 0 && hasContent && (
+        <div className="empty">
+          没有匹配「{searchText}」的订阅或节点
+          <button className="btn ghost" style={{ marginLeft: 10 }} onClick={() => setSearchText('')}>清空搜索</button>
+        </div>
+      )}
+
+      {filteredSources.map((s) => (
+        <SourceCard
+          key={s.id}
+          id={s.id}
+          keyword={searchText}
+          onCountryClick={setSelectedCode}
+          onEditCountry={setEditingCountryNode}
+          manageMode={manageMode}
+          checked={checkedSources.has(s.id)}
+          onToggleChecked={() => toggleSource(s.id)}
+          onRequestDelete={(id, name) => setPendingDelete({ ids: [id], label: `「${name}」` })}
+          onEdit={() => setEditingSource(s)}
+        />
+      ))}
+      {manualNodes.length > 0 && (
+        <ManualNodesCard
+          nodes={manualNodes}
+          keyword={searchText}
+          onCountryClick={setSelectedCode}
+          onEditCountry={setEditingCountryNode}
+          onAdd={() => setAddingManual(true)}
+          onCreate={() => setManualEditor({})}
+          onEditNode={(node) => setManualEditor({ node })}
+          onRename={setRenamingManualNode}
+          onRequestDelete={setPendingManualDelete}
+        />
+      )}
+      <AddSourceDialog
+        open={adding}
+        onClose={() => setAdding(false)}
+        onAdded={(result) => {
+          setFlash(`${result.name || '订阅'}：解析到 ${result.count} 个节点，已加入配置池。`)
+          setBatchFailures(result.failures?.length ? result.failures : null)
+        }}
+      />
+      <AddManualNodesDialog
+        open={addingManual}
+        onClose={() => setAddingManual(false)}
+        onManualCreate={() => setManualEditor({})}
+        onAdded={(result) => {
+          const parts = [`已添加 ${result.nodes.length} 个自有节点`]
+          if (result.duplicates > 0) parts.push(`跳过 ${result.duplicates} 个重复节点`)
+          if (result.rejected > 0) parts.push(`${result.rejected} 行无法识别`)
+          setFlash(`${parts.join('；')}。`)
+        }}
+      />
+      {manualEditor && (
+        <ManualNodeEditorDialog
+          key={manualEditor.node?.id ?? 'new-manual-node'}
+          node={manualEditor.node}
+          onClose={() => setManualEditor(null)}
+          onSaved={setFlash}
+        />
+      )}
+      {renamingManualNode && (
+        <RenameManualNodeDialog
+          key={renamingManualNode.id}
+          node={renamingManualNode}
+          onClose={() => setRenamingManualNode(null)}
+          onSaved={setFlash}
+        />
+      )}
+      {editingSource && (
+        <EditSourceDialog
+          key={editingSource.id}
+          source={editingSource}
+          onClose={() => setEditingSource(null)}
+          onSaved={setFlash}
+        />
+      )}
+      <SubscriptionSettingsDialog
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        onRestored={(message) => {
+          setSettingsOpen(false)
+          setFlash(message)
+        }}
+      />
+      <NodeCountryDialog
+        node={editingCountryNode}
+        onClose={() => setEditingCountryNode(null)}
+      />
+
+      {/* 地图只展示会进入配置的节点；所有节点被排除时不占用首屏 */}
+      {enabled.length > 0 && (
+        <div className="card">
+          <div className="card-head">
+            <h3>全球节点分布</h3>
+            <div className="meta">
+              {selectedCode ? `选中：${selectedCode} · 点击空白取消` : '点击国家查看'}
+            </div>
+          </div>
+          <WorldMapSVG
+            nodes={enabled}
+            latencyByNodeId={latencyMap}
+            selectedCode={selectedCode}
+            onSelect={setSelectedCode}
+          />
+        </div>
+      )}
+
+      <ConfirmDialog
+        open={!!pendingDelete}
+        title="删除订阅？"
+        body={<>将删除 <b>{pendingDelete?.label}</b> 及其全部节点，生成的配置会立即少掉这些节点。该操作不可撤销。</>}
+        confirmLabel="删除"
+        danger
+        onCancel={() => setPendingDelete(null)}
+        onConfirm={() => {
+          const ids = pendingDelete?.ids ?? []
+          setPendingDelete(null)
+          ids.forEach((id) => useStore.getState().removeSource(id))
+          exitManageMode()
+        }}
+      />
+
+      <ConfirmDialog
+        open={!!pendingManualDelete}
+        title="删除自有节点？"
+        body={<>将从导出配置中移除 <b>{pendingManualDelete?.name}</b>。订阅里的同名节点不受影响，该操作不可撤销。</>}
+        confirmLabel="删除"
+        danger
+        onCancel={() => setPendingManualDelete(null)}
+        onConfirm={() => {
+          const node = pendingManualDelete
+          setPendingManualDelete(null)
+          if (!node) return
+          removeManualNode(node.id)
+          setFlash(`已删除自有节点「${node.name}」。`)
+        }}
+      />
+    </div>
+  )
+}
+
+// ---------------- 规则 Tab ----------------
+
+// ---------------- 规则管理弹窗 ----------------
+
+const RULE_TYPE_OPTIONS: { value: string; label: string; placeholder: string; ip?: boolean }[] = [
+  { value: 'DOMAIN', label: '完整域名', placeholder: 'example.com' },
+  { value: 'DOMAIN-SUFFIX', label: '域名后缀', placeholder: 'example.com' },
+  { value: 'DOMAIN-KEYWORD', label: '域名关键词', placeholder: 'youtube' },
+  { value: 'IP-CIDR', label: 'IPv4 网段', placeholder: '192.168.1.0/24', ip: true },
+  { value: 'IP-CIDR6', label: 'IPv6 网段', placeholder: '2001:db8::/32', ip: true },
+  { value: 'GEOIP', label: '国家 / 地区代码', placeholder: 'CN' },
+]
+
+function policyTypeLabel(type: PolicyGroup['type']): string {
+  switch (type) {
+    case 'select': return '手动选择'
+    case 'url-test': return '自动测速'
+    case 'smart': return '智能选择'
+    case 'fallback': return '故障转移'
+    case 'load-balance': return '负载均衡'
+    case 'conditional': return '按网络选择'
+    case 'relay': return '链式代理'
+    case 'unsupported': return '未知策略'
+    default: return type
+  }
+}
+
+interface RuleLibraryEntry {
+  id: string
+  file?: string
+  title: string
+  category: string
+  provider: string
+  online: boolean
+  sourceURL?: string
+  aliases?: string[]
+}
+
+/** ACL4SSR 规则快照目录；规则文件随塔台打包，离线可用。 */
+const BUNDLED_RULE_LIBRARY: { file: string; title: string; category: string }[] = [
+  { file: 'ACL4SSR_BanAD.list', title: '广告拦截', category: '广告与净化' },
+  { file: 'ACL4SSR_BanProgramAD.list', title: '应用内广告', category: '广告与净化' },
+  { file: 'ACL4SSR_UnBan.list', title: '误杀放行', category: '广告与净化' },
+  { file: 'ACL4SSR_ProxyGFWlist.list', title: 'GFW 代理列表', category: '代理分流' },
+  { file: 'ACL4SSR_ProxyLite.list', title: '代理精简列表', category: '代理分流' },
+  { file: 'ACL4SSR_ProxyMedia.list', title: '媒体代理列表', category: '代理分流' },
+  { file: 'ACL4SSR_ChinaDomain.list', title: '国内域名', category: '国内与直连' },
+  { file: 'ACL4SSR_ChinaCompanyIp.list', title: '国内公司 IP', category: '国内与直连' },
+  { file: 'ACL4SSR_LocalAreaNetwork.list', title: '局域网地址', category: '国内与直连' },
+  { file: 'ACL4SSR_Apple.list', title: 'Apple 服务', category: '厂商服务' },
+  { file: 'ACL4SSR_Microsoft.list', title: 'Microsoft 服务', category: '厂商服务' },
+  { file: 'ACL4SSR_GoogleCN.list', title: 'Google 中国', category: '厂商服务' },
+  { file: 'ACL4SSR_OneDrive.list', title: 'OneDrive', category: '厂商服务' },
+  { file: 'ACL4SSR_Bing.list', title: 'Bing', category: '厂商服务' },
+  { file: 'ACL4SSR_Download.list', title: '下载服务', category: '厂商服务' },
+  { file: 'ACL4SSR_Telegram.list', title: 'Telegram', category: '媒体与服务' },
+  { file: 'ACL4SSR_Ruleset_GoogleFCM.list', title: 'Google FCM', category: '媒体与服务' },
+  { file: 'ACL4SSR_Ruleset_AI.list', title: 'AI 服务', category: '媒体与服务' },
+  { file: 'ACL4SSR_Ruleset_OpenAi.list', title: 'OpenAI', category: '媒体与服务' },
+  { file: 'ACL4SSR_Ruleset_Netflix.list', title: 'Netflix', category: '媒体与服务' },
+  { file: 'ACL4SSR_Ruleset_YouTube.list', title: 'YouTube', category: '媒体与服务' },
+  { file: 'ACL4SSR_Ruleset_Bilibili.list', title: '哔哩哔哩', category: '媒体与服务' },
+  { file: 'ACL4SSR_Ruleset_BilibiliHMT.list', title: '哔哩哔哩港澳台', category: '媒体与服务' },
+  { file: 'ACL4SSR_Ruleset_Steam.list', title: 'Steam', category: '媒体与服务' },
+  { file: 'ACL4SSR_Ruleset_SteamCN.list', title: 'Steam 国区', category: '媒体与服务' },
+  { file: 'ACL4SSR_Ruleset_Epic.list', title: 'Epic Games', category: '媒体与服务' },
+  { file: 'ACL4SSR_Ruleset_Nintendo.list', title: 'Nintendo', category: '媒体与服务' },
+  { file: 'ACL4SSR_Ruleset_Sony.list', title: 'Sony', category: '媒体与服务' },
+  { file: 'ACL4SSR_Ruleset_Bahamut.list', title: '巴哈姆特', category: '媒体与服务' },
+  { file: 'ACL4SSR_Ruleset_NetEaseMusic.list', title: '网易云音乐', category: '媒体与服务' },
+]
+
+const RULE_LIBRARY: RuleLibraryEntry[] = [
+  ...BUNDLED_RULE_LIBRARY.map((entry) => ({
+    id: entry.file,
+    file: entry.file,
+    title: entry.title,
+    category: entry.category,
+    provider: '内置快照',
+    online: false,
+  })),
+  ...ONLINE_RULE_CATALOG.map((entry) => ({
+    id: entry.id,
+    title: entry.title,
+    category: entry.category,
+    provider: entry.provider,
+    online: true,
+    sourceURL: entry.sourceURL,
+    aliases: entry.aliases,
+  })),
+]
+
+const ruleLibraryRules = new Map<string, RuleSetRule[]>()
+const ruleLibraryRequests = new Map<string, Promise<RuleSetRule[]>>()
+
+async function loadBundledRuleSet(file: string): Promise<RuleSetRule[]> {
+  const cached = ruleLibraryRules.get(file)
+  if (cached) return cached
+  const pending = ruleLibraryRequests.get(file)
+  if (pending) return pending
+  const request = fetch(`/rulesets/${encodeURIComponent(file)}`).then(async (res) => {
+    if (!res.ok) throw new Error(`规则集加载失败：HTTP ${res.status}`)
+    const rules = parseRuleList(await res.text())
+    ruleLibraryRules.set(file, rules)
+    ruleLibraryRequests.delete(file)
+    return rules
+  }).catch((error) => {
+    ruleLibraryRequests.delete(file)
+    throw error
+  })
+  ruleLibraryRequests.set(file, request)
+  return request
+}
+
+function ruleSetLine(rule: RuleSetRule): string {
+  if (rule.type === 'FINAL') return 'FINAL'
+  if (rule.raw) return rule.raw
+  const options = rule.options?.length
+    ? [...rule.options]
+    : rule.noResolve ? ['no-resolve'] : []
+  return [rule.type, rule.value ?? '', ...options].join(',')
+}
+
+function SchemeEditDialog({
+  scheme,
+  onClose,
+  onSave,
+}: {
+  scheme: RuleScheme
+  onClose: () => void
+  onSave: (next: RuleScheme) => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const [name, setName] = useState(scheme.name)
+  const [description, setDescription] = useState(scheme.description)
+  const [error, setError] = useState('')
+
+  useEffect(() => { ref.current?.showModal() }, [])
+
+  const save = () => {
+    if (!name.trim()) {
+      setError('请填写方案名称')
+      return
+    }
+    onSave({ ...scheme, name: name.trim(), description: description.trim() })
+    ref.current?.close()
+  }
+
+  return (
+    <dialog ref={ref} onClose={onClose}>
+      <h3>编辑规则方案</h3>
+      <form className="dialog-form" onSubmit={(e) => { e.preventDefault(); save() }}>
+        <div className="field">
+          <label>方案名称</label>
+          <input type="text" className="field" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
+        </div>
+        <div className="field">
+          <label>说明</label>
+          <textarea className="field" rows={3} value={description} onChange={(e) => setDescription(e.target.value)} />
+        </div>
+        {scheme.sourceURL && (
+          <div className="hint">来源地址：<span className="mono">{scheme.sourceURL}</span></div>
+        )}
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <div className="actions">
+          <button type="submit" className="btn primary">保存</button>
+          <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
+        </div>
+      </form>
+    </dialog>
+  )
+}
+
+function AddCustomRuleDialog({
+  scheme,
+  initialGroup,
+  onClose,
+  onSave,
+}: {
+  scheme: RuleScheme
+  initialGroup?: string
+  onClose: () => void
+  onSave: (rule: RoutingRule) => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const firstGroup = scheme.groups.find((g) => g.name === initialGroup)?.name ?? scheme.groups[0]?.name ?? ''
+  const [group, setGroup] = useState(firstGroup)
+  const [type, setType] = useState('DOMAIN-SUFFIX')
+  const [value, setValue] = useState('')
+  const [noResolve, setNoResolve] = useState(false)
+  const [error, setError] = useState('')
+  const typeInfo = RULE_TYPE_OPTIONS.find((t) => t.value === type) ?? RULE_TYPE_OPTIONS[0]
+
+  useEffect(() => { ref.current?.showModal() }, [])
+
+  const save = () => {
+    if (!group) { setError('方案里没有可用的策略组'); return }
+    let normalized = value.trim()
+    if (!normalized) { setError('请填写规则内容'); return }
+
+    if (/^https?:\/\//i.test(normalized)) {
+      try { normalized = new URL(normalized).hostname } catch { /* 保留原文本，让下面的格式校验给出错误 */ }
+    }
+    if (type === 'DOMAIN' || type === 'DOMAIN-SUFFIX') {
+      normalized = normalized.toLowerCase()
+      if (!/^[a-z0-9._-]+$/.test(normalized)) {
+        setError('域名只能包含字母、数字、点、下划线和连字符')
+        return
+      }
+    } else if (type === 'GEOIP') {
+      normalized = normalized.toUpperCase()
+      if (!/^[A-Z]{2}$/.test(normalized)) {
+        setError('GEOIP 需要两位国家或地区代码，例如 CN')
+        return
+      }
+    } else if (type === 'IP-CIDR' || type === 'IP-CIDR6') {
+      const v4 = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/
+      const v6 = /^[0-9a-f:]+(\/\d{1,3})?$/i
+      const octetsValid = type === 'IP-CIDR'
+        ? normalized.split('/')[0].split('.').map(Number).every((n) => n >= 0 && n <= 255)
+        : true
+      if (type === 'IP-CIDR' ? (!v4.test(normalized) || !octetsValid) : (!v6.test(normalized) || !normalized.includes(':'))) {
+        setError(type === 'IP-CIDR' ? '请输入有效的 IPv4 地址或 CIDR 网段' : '请输入有效的 IPv6 地址或 CIDR 网段')
+        return
+      }
+      const prefix = normalized.includes('/') ? Number(normalized.split('/')[1]) : (type === 'IP-CIDR' ? 32 : 128)
+      if ((type === 'IP-CIDR' && prefix > 32) || (type === 'IP-CIDR6' && prefix > 128)) {
+        setError('CIDR 前缀长度超出范围')
+        return
+      }
+    }
+
+    const duplicate = (scheme.customRules ?? []).some(
+      (r) => r.group === group && r.type === type && (r.value ?? '').toLowerCase() === normalized.toLowerCase(),
+    )
+    if (duplicate) {
+      setError('这个策略组里已经有相同的自定义规则')
+      return
+    }
+
+    onSave({
+      type,
+      value: normalized,
+      group,
+      ...(typeInfo.ip && noResolve ? { noResolve: true } : {}),
+    })
+    ref.current?.close()
+  }
+
+  return (
+    <dialog ref={ref} onClose={onClose}>
+      <h3>添加自定义规则</h3>
+      <form className="dialog-form" onSubmit={(e) => { e.preventDefault(); save() }}>
+        <div className="field">
+          <label>策略组</label>
+          <select className="input" value={group} onChange={(e) => setGroup(e.target.value)}>
+            {scheme.groups.map((g) => <option key={g.name} value={g.name}>{groupDisplayName(g.name)}</option>)}
+          </select>
+        </div>
+        <div className="field">
+          <label>匹配方式</label>
+          <select className="input" value={type} onChange={(e) => { setType(e.target.value); setNoResolve(false) }}>
+            {RULE_TYPE_OPTIONS.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
+          </select>
+        </div>
+        <div className="field">
+          <label>规则内容</label>
+          <input
+            type="text"
+            className="field mono"
+            value={value}
+            placeholder={typeInfo.placeholder}
+            onChange={(e) => setValue(e.target.value)}
+            autoFocus
+          />
+          {(type === 'DOMAIN' || type === 'DOMAIN-SUFFIX') && <div className="hint">可以直接粘贴网址，会自动取出域名。</div>}
+        </div>
+        {typeInfo.ip && (
+          <label className="check-line">
+            <input type="checkbox" checked={noResolve} onChange={(e) => setNoResolve(e.target.checked)} />
+            不解析 DNS（no-resolve）
+          </label>
+        )}
+        <div className="local-note">
+          <i aria-hidden="true" />
+          自定义规则会排在方案自带规则最前，优先匹配。
+        </div>
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <div className="actions">
+          <button type="submit" className="btn primary">添加规则</button>
+          <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
+        </div>
+      </form>
+    </dialog>
+  )
+}
+
+function GroupEditorDialog({
+  scheme,
+  group,
+  nodes,
+  rules,
+  customRules,
+  initialTab = 'settings',
+  onClose,
+  onSave,
+  onAddRule,
+}: {
+  scheme: RuleScheme
+  group: PolicyGroup
+  nodes: ProxyNode[]
+  rules: RoutingRule[]
+  customRules: RoutingRule[]
+  initialTab?: 'settings' | 'rules'
+  onClose: () => void
+  onSave: (updated: PolicyGroup) => void
+  onAddRule: (rule: RoutingRule) => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const [name, setName] = useState(group.name)
+  const [type, setType] = useState<PolicyGroup['type']>(group.type)
+  const [options, setOptions] = useState<string[]>(group.options)
+  const [newOption, setNewOption] = useState('')
+  const [nodeFilter, setNodeFilter] = useState(group.nodeFilter ?? '')
+  const [url, setURL] = useState(group.url ?? '')
+  const [algorithm, setAlgorithm] = useState(group.algorithm ?? '')
+  const [interval, setInterval] = useState(group.interval ? String(group.interval) : '')
+  const [tolerance, setTolerance] = useState(group.tolerance ? String(group.tolerance) : '')
+  const [error, setError] = useState('')
+  const [tab, setTab] = useState<'settings' | 'rules'>(initialTab)
+  const [ruleSearch, setRuleSearch] = useState('')
+  const [newDomain, setNewDomain] = useState('')
+  const [ruleNotice, setRuleNotice] = useState('')
+  const [addedRules, setAddedRules] = useState<RoutingRule[]>([])
+
+  useEffect(() => { ref.current?.showModal() }, [])
+
+  const referenceNames = scheme.groups
+    .filter((g) => g.name !== group.name)
+    .map((g) => g.name)
+  const trimmedFilter = nodeFilter.trim()
+  let filterError = ''
+  let matchedNodes = 0
+  if (trimmedFilter) {
+    try {
+      const regex = new RegExp(trimmedFilter)
+      matchedNodes = nodes.filter((node) => regex.test(node.name)).length
+    } catch {
+      filterError = '节点名称匹配不是有效的正则表达式'
+    }
+  }
+
+  const addOption = (value: string) => {
+    const trimmed = value.trim()
+    if (!trimmed) return
+    if (trimmed === name.trim()) {
+      setError('策略组不能把自己加入候选')
+      return
+    }
+    if (trimmed !== 'DIRECT' && trimmed !== 'REJECT' && !referenceNames.includes(trimmed)) {
+      setError('候选只能填其他策略组名、DIRECT 或 REJECT；节点请用名称匹配')
+      return
+    }
+    if (options.includes(trimmed)) {
+      setError('这个候选已经在列表里')
+      return
+    }
+    setOptions([...options, trimmed])
+    setNewOption('')
+    setError('')
+  }
+
+  const groupRules = rules.filter((rule) => rule.group === group.name)
+  const groupCustomRules = [
+    ...customRules.filter((rule) => rule.group === group.name),
+    ...addedRules,
+  ]
+  const ruleQuery = ruleSearch.trim().toLowerCase()
+  const visibleCustomRules = groupCustomRules.filter(
+    (rule) => !ruleQuery || `${rule.type} ${rule.value ?? ''} ${rule.sourceName ?? ''}`.toLowerCase().includes(ruleQuery),
+  )
+  const visibleRules = groupRules.filter(
+    (rule) => !ruleQuery || `${rule.type} ${rule.value ?? ''} ${rule.sourceName ?? ''}`.toLowerCase().includes(ruleQuery),
+  )
+  const totalGroupRules = groupCustomRules.length + groupRules.length
+  const visibleGroupRules = [...visibleCustomRules.map((rule) => ({ rule, custom: true })), ...visibleRules.map((rule) => ({ rule, custom: false }))]
+    .slice(0, 200)
+
+  const addDomainRule = () => {
+    let value = newDomain.trim()
+    if (!value) { setRuleNotice('请填写要加入这个组的域名'); return }
+    if (/^https?:\/\//i.test(value)) {
+      try { value = new URL(value).hostname } catch { /* 保留原文本，交给格式校验 */ }
+    }
+    value = value.toLowerCase()
+    if (!/^[a-z0-9._-]+$/.test(value)) {
+      setRuleNotice('域名只能包含字母、数字、点、下划线和连字符')
+      return
+    }
+    const duplicate = [...groupCustomRules, ...groupRules].some(
+      (rule) => rule.type === 'DOMAIN-SUFFIX' && (rule.value ?? '').toLowerCase() === value,
+    )
+    if (duplicate) {
+      setRuleNotice('这个组里已经有相同的域名规则')
+      return
+    }
+    const rule: RoutingRule = { type: 'DOMAIN-SUFFIX', value, group: group.name }
+    onAddRule(rule)
+    setAddedRules((current) => [...current, rule])
+    setNewDomain('')
+    setRuleNotice('已添加，会排在所有规则最前。')
+  }
+
+  const save = () => {
+    const trimmedName = name.trim()
+    if (!trimmedName) { setError('请填写策略组名称'); return }
+    if (scheme.groups.some((g) => g.name !== group.name && g.name === trimmedName)) {
+      setError('已经有同名策略组')
+      return
+    }
+    if (filterError) { setError(filterError); return }
+    const invalidCandidate = options.find(
+      (option) => option !== 'DIRECT' && option !== 'REJECT' && !referenceNames.includes(option),
+    )
+    if (invalidCandidate) {
+      setError(`候选「${invalidCandidate}」不存在；请移除，或改成其他策略组 / DIRECT / REJECT`)
+      return
+    }
+    if (new Set(options).size !== options.length) {
+      setError('候选策略里有重复项')
+      return
+    }
+    if (options.length === 0 && !trimmedFilter) {
+      setError('至少保留一个候选策略，或填写节点名称匹配')
+      return
+    }
+    const intervalValue = interval.trim() ? Number(interval) : undefined
+    const toleranceValue = tolerance.trim() ? Number(tolerance) : undefined
+    if (intervalValue !== undefined && (!Number.isFinite(intervalValue) || intervalValue <= 0)) {
+      setError('测速间隔需要大于 0 的数字')
+      return
+    }
+    if (toleranceValue !== undefined && (!Number.isFinite(toleranceValue) || toleranceValue < 0)) {
+      setError('容差需要是 0 或正数')
+      return
+    }
+    onSave({
+      ...group,
+      name: trimmedName,
+      type,
+      options,
+      nodeFilter: trimmedFilter || undefined,
+      algorithm: type === 'load-balance' ? algorithm.trim() || undefined : undefined,
+      ...(type !== 'select'
+        ? {
+            url: url.trim() || undefined,
+            interval: intervalValue,
+            tolerance: toleranceValue,
+          }
+        : { url: undefined, interval: undefined, tolerance: undefined }),
+    })
+    ref.current?.close()
+  }
+
+  return (
+    <dialog ref={ref} onClose={onClose} className="group-detail-dialog">
+      <h3>策略组详情</h3>
+      <form className="dialog-form" onSubmit={(e) => { e.preventDefault(); save() }}>
+        <div className="detail-tabs" role="tablist" aria-label="策略组详情">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === 'settings'}
+            className={`detail-tab${tab === 'settings' ? ' active' : ''}`}
+            onClick={() => setTab('settings')}
+          >设置</button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === 'rules'}
+            className={`detail-tab${tab === 'rules' ? ' active' : ''}`}
+            onClick={() => setTab('rules')}
+          >规则 {totalGroupRules}</button>
+        </div>
+        {tab === 'settings' && (
+        <>
+        <div className="field">
+          <label>名称</label>
+          <input type="text" className="field" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
+          <div className="hint">改名会同步更新规则绑定和其他策略组里的引用。</div>
+        </div>
+        <div className="field">
+          <label>策略类型</label>
+          <select className="input" value={type} onChange={(e) => setType(e.target.value as PolicyGroup['type'])}>
+            <option value="select">手动选择</option>
+            <option value="url-test">自动测速</option>
+            <option value="smart">智能选择</option>
+            <option value="fallback">故障转移</option>
+            <option value="load-balance">负载均衡</option>
+            <option value="conditional">按网络选择</option>
+            <option value="relay">链式代理</option>
+          </select>
+          {type === 'load-balance' && (
+            <input
+              type="text"
+              className="field mono"
+              value={algorithm}
+              placeholder="算法，留空由客户端决定"
+              onChange={(e) => setAlgorithm(e.target.value)}
+            />
+          )}
+          {(type === 'smart' || type === 'conditional' || type === 'relay') && (
+            <div className="hint">该类型只在部分客户端原样支持，其余客户端会按最接近的类型导出。</div>
+          )}
+        </div>
+        <div className="field">
+          <label>候选策略</label>
+          <div className="candidate-list">
+            {options.map((option) => (
+              <span className="candidate-chip" key={option}>
+                {groupDisplayName(option)}
+                <button
+                  type="button"
+                  aria-label={`移除候选 ${option}`}
+                  onClick={() => setOptions(options.filter((o) => o !== option))}
+                >×</button>
+              </span>
+            ))}
+            {options.length === 0 && <span className="hint">没有显式候选，节点将由名称匹配加入。</span>}
+          </div>
+          <div className="row candidate-add">
+            <input
+              className="input"
+              value={newOption}
+              placeholder="策略组名 / DIRECT / REJECT"
+              onChange={(e) => setNewOption(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  addOption(newOption)
+                }
+              }}
+            />
+            <button type="button" className="btn" onClick={() => addOption(newOption)}>添加</button>
+            {!options.includes('DIRECT') && <button type="button" className="btn ghost" onClick={() => addOption('DIRECT')}>+ DIRECT</button>}
+            {!options.includes('REJECT') && <button type="button" className="btn ghost" onClick={() => addOption('REJECT')}>+ REJECT</button>}
+          </div>
+        </div>
+        <div className="field">
+          <label>节点名称匹配（正则，可选）</label>
+          <input
+            type="text"
+            className="field mono"
+            value={nodeFilter}
+            placeholder=".* 或 香港|HK"
+            onChange={(e) => setNodeFilter(e.target.value)}
+          />
+          <div className={`hint${filterError ? ' is-error' : ''}`}>
+            {filterError || (trimmedFilter ? `当前匹配 ${matchedNodes} 个已启用节点` : '留空表示不按名称自动加入节点')}
+          </div>
+        </div>
+        {type !== 'select' && (
+          <div className="group-auto-fields">
+            <div className="field">
+              <label>测速地址</label>
+              <input type="text" className="field mono" value={url} placeholder="留空使用客户端默认" onChange={(e) => setURL(e.target.value)} />
+            </div>
+            <div className="field">
+              <label>测速间隔（秒）</label>
+              <input type="number" className="field" value={interval} placeholder="300" onChange={(e) => setInterval(e.target.value)} />
+            </div>
+            <div className="field">
+              <label>容差（毫秒）</label>
+              <input type="number" className="field" value={tolerance} placeholder="50" onChange={(e) => setTolerance(e.target.value)} />
+            </div>
+          </div>
+        )}
+        </>
+        )}
+        {tab === 'rules' && (
+          <div className="group-rules-panel">
+            <div className="hint">
+              {groupCustomRules.length} 条我添加的规则 · {groupRules.length} 条方案自带或规则集规则。
+              新添加的域名会排在所有规则最前，优先于其他组。
+            </div>
+            <input
+              type="search"
+              className="input"
+              aria-label="搜索这个组的规则"
+              placeholder="搜索域名、关键词或 IP…"
+              value={ruleSearch}
+              onChange={(e) => setRuleSearch(e.target.value)}
+            />
+            <div className="row candidate-add">
+              <input
+                className="input mono"
+                aria-label="添加域名到这个组"
+                placeholder="example.com"
+                value={newDomain}
+                onChange={(e) => { setNewDomain(e.target.value); setRuleNotice('') }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    addDomainRule()
+                  }
+                }}
+              />
+              <button type="button" className="btn" onClick={addDomainRule}>添加网站</button>
+            </div>
+            {ruleNotice && <div className="hint" role="status">{ruleNotice}</div>}
+            {visibleGroupRules.length > 0 ? (
+              <ul className="rule-list group-rule-list">
+                {visibleGroupRules.map(({ rule, custom }, index) => (
+                  <li key={`${rule.type}-${rule.value ?? ''}-${index}`}>
+                    {custom && <span className="pill">自定义</span>}
+                    {rule.sourceName && <span className="pill rule-source">{rule.sourceName}</span>}
+                    <span className="mono rule-type">{rule.type}</span>
+                    <span className="mono rule-value">{rule.value ?? '—'}</span>
+                    {rule.noResolve && <span className="hint">no-resolve</span>}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <div className="hint">
+                {ruleQuery ? '没有匹配的规则' : '方案里没有直接指向这个组的规则；它通常作为其他策略组的候选使用。'}
+              </div>
+            )}
+            {totalGroupRules > visibleGroupRules.length && (
+              <div className="hint">仅显示前 {visibleGroupRules.length} 条，请用搜索缩小范围。</div>
+            )}
+          </div>
+        )}
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <div className="actions">
+          {tab === 'settings' ? (
+            <>
+              <button type="submit" className="btn primary">保存</button>
+              <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
+            </>
+          ) : (
+            <button type="button" className="btn primary" onClick={() => ref.current?.close()}>关闭</button>
+          )}
+        </div>
+      </form>
+    </dialog>
+  )
+}
+
+function NetworkSettingsDialog({
+  scheme,
+  onClose,
+  onSave,
+}: {
+  scheme: RuleScheme
+  onClose: () => void
+  onSave: (next: RuleScheme) => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const [draft, setDraft] = useState<NetworkSettingsDraft>(() => networkSettingsDraft(scheme.networkSettings))
+  const [error, setError] = useState('')
+  useEffect(() => { ref.current?.showModal() }, [])
+
+  const save = () => {
+    try {
+      const networkSettings = validateNetworkSettingsDraft(draft)
+      onSave({ ...scheme, networkSettings })
+      ref.current?.close()
+    } catch (e) {
+      setError(e instanceof NetworkSettingsError ? e.message : 'DNS 设置无法保存')
+    }
+  }
+
+  const text = (values: string[]) => values.join('\n')
+  const lines = (value: string) => value.split('\n')
+
+  return (
+    <dialog ref={ref} className="dns-dialog" onClose={onClose}>
+      <h3>DNS 与网络</h3>
+      <form className="dialog-form" onSubmit={(e) => { e.preventDefault(); save() }}>
+        <div className="field">
+          <label>DNS 保护模式</label>
+          <select
+            className="input"
+            value={draft.dnsProtectionMode}
+            onChange={(e) => setDraft({ ...draft, dnsProtectionMode: e.target.value as NetworkSettingsDraft['dnsProtectionMode'] })}
+          >
+            {Object.entries(DNS_MODE_TITLES).map(([value, label]) => (
+              <option key={value} value={value}>{label}</option>
+            ))}
+          </select>
+          <div className="hint">{DNS_MODE_SUMMARIES[draft.dnsProtectionMode]}</div>
+          {draft.dnsProtectionMode === 'strict' && (
+            <div className="dns-warning">严格保护可能影响局域网、公共网络认证和使用域名的代理节点。</div>
+          )}
+        </div>
+
+        <div className="field">
+          <label>IPv6</label>
+          <select
+            className="input"
+            value={draft.ipv6Enabled === undefined ? 'default' : draft.ipv6Enabled ? 'on' : 'off'}
+            onChange={(e) => setDraft({
+              ...draft,
+              ipv6Enabled: e.target.value === 'default' ? undefined : e.target.value === 'on',
+            })}
+          >
+            <option value="default">跟随客户端默认</option>
+            <option value="on">开启</option>
+            <option value="off">关闭</option>
+          </select>
+        </div>
+
+        <div className="dns-grid">
+          <div className="field">
+            <label>普通 DNS（每行一个 IP）</label>
+            <textarea
+              className="field mono"
+              rows={3}
+              value={text(draft.dnsServers)}
+              onChange={(e) => setDraft({ ...draft, dnsServers: lines(e.target.value) })}
+              placeholder={'223.5.5.5\n119.29.29.29'}
+            />
+            <div className="hint">只接受 IPv4 / IPv6 字面量，用于解析加密 DNS 和代理节点域名。</div>
+          </div>
+          <div className="field">
+            <label>国内 DNS（直连）</label>
+            <textarea
+              className="field mono"
+              rows={3}
+              value={text(draft.encryptedDNSServers)}
+              onChange={(e) => setDraft({ ...draft, encryptedDNSServers: lines(e.target.value) })}
+              placeholder={'https://223.5.5.5/dns-query\nhttps://doh.pub/dns-query'}
+            />
+            <div className="hint">支持 https / h3 / tls / quic 地址，用于国内和直连解析。</div>
+          </div>
+          <div className="field">
+            <label>远程 DNS（经代理）</label>
+            <textarea
+              className="field mono"
+              rows={3}
+              value={text(draft.remoteDNSServers)}
+              onChange={(e) => setDraft({ ...draft, remoteDNSServers: lines(e.target.value) })}
+              placeholder={'https://8.8.8.8/dns-query\nhttps://1.1.1.1/dns-query'}
+            />
+            <div className="hint">只经代理访问，用于 sing-box 和 mihomo 系客户端。</div>
+          </div>
+        </div>
+
+        <div className="field">
+          <label>延迟测试地址</label>
+          <input
+            className="input mono"
+            value={draft.proxyTestURLString}
+            onChange={(e) => setDraft({ ...draft, proxyTestURLString: e.target.value })}
+            placeholder="http://www.gstatic.com/generate_204"
+          />
+          <div className="hint">URL 测速组未单独填写地址时使用；支持 http / https。</div>
+        </div>
+
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <div className="actions dns-actions">
+          <button type="submit" className="btn primary">保存</button>
+          <button type="button" className="btn" onClick={() => setDraft(networkSettingsDraft(undefined))}>
+            填入默认值
+          </button>
+          <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
+        </div>
+      </form>
+    </dialog>
+  )
+}
+
+interface RuleSetPayload {
+  name: string
+  group: string
+  rules: RuleSetRule[]
+  sourceKind: 'library' | 'local' | 'url'
+  sourceRef?: string
+  format?: RuleSetFormat
+}
+
+function RuleLibraryDialog({
+  scheme,
+  onClose,
+  onAdd,
+}: {
+  scheme: RuleScheme
+  onClose: () => void
+  onAdd: (payload: RuleSetPayload) => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const [group, setGroup] = useState(scheme.groups[0]?.name ?? '')
+  const [query, setQuery] = useState('')
+  const [category, setCategory] = useState('全部')
+  const [counts, setCounts] = useState<Record<string, number>>({})
+  const [busyFile, setBusyFile] = useState('')
+  const [error, setError] = useState('')
+  const [remoteURL, setRemoteURL] = useState('')
+  const [remoteName, setRemoteName] = useState('')
+  const [remoteBusy, setRemoteBusy] = useState(false)
+
+  useEffect(() => {
+    ref.current?.showModal()
+    let cancelled = false
+    Promise.all(BUNDLED_RULE_LIBRARY.map(async (entry) => {
+      try {
+        const rules = await loadBundledRuleSet(entry.file)
+        return [entry.file, rules.length] as const
+      } catch {
+        return [entry.file, -1] as const
+      }
+    })).then((rows) => {
+      if (!cancelled) setCounts(Object.fromEntries(rows))
+    })
+    return () => { cancelled = true }
+  }, [])
+
+  const LIBRARY_RENDER_LIMIT = 240
+  const categories = ['全部', ...new Set(RULE_LIBRARY.map((entry) => entry.category))]
+  const q = query.trim().toLowerCase()
+  const matching = RULE_LIBRARY.filter((entry) => {
+    if (category !== '全部' && entry.category !== category) return false
+    if (!q) return true
+    return `${entry.title} ${entry.file ?? ''} ${entry.category} ${entry.provider} ${entry.sourceURL ?? ''} ${(entry.aliases ?? []).join(' ')}`
+      .toLowerCase()
+      .includes(q)
+  })
+  const visible = matching.slice(0, LIBRARY_RENDER_LIMIT)
+  const hiddenCount = matching.length - visible.length
+
+  const addEntry = async (entry: RuleLibraryEntry) => {
+    if (!group) { setError('方案里没有可用的策略组'); return }
+    setBusyFile(entry.id); setError('')
+    try {
+      let rules: RuleSetRule[]
+      let format: RuleSetFormat = 'classical'
+      if (entry.sourceURL) {
+        const parsed = await fetchRuleSet(entry.sourceURL)
+        rules = parsed.rules
+        format = parsed.format
+      } else if (entry.file) {
+        rules = await loadBundledRuleSet(entry.file)
+      } else {
+        throw new Error('这个规则集没有可用的来源')
+      }
+      if (rules.length === 0) throw new Error('这个规则集没有可用的规则')
+      onAdd({
+        name: entry.title,
+        group,
+        rules,
+        sourceKind: entry.sourceURL ? 'url' : 'library',
+        sourceRef: entry.sourceURL ?? entry.file ?? entry.id,
+        format,
+      })
+      onClose()
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusyFile('')
+    }
+  }
+
+  const addRemote = async () => {
+    const url = normalizeRemoteTextURL(remoteURL)
+    if (!group) { setError('方案里没有可用的策略组'); return }
+    if (!/^https?:\/\//i.test(url)) { setError('请输入有效的 http(s) 规则列表地址'); return }
+    setRemoteBusy(true); setError('')
+    try {
+      const parsedRuleSet = await fetchRuleSet(url)
+      const fallbackName = (() => {
+        try {
+          const parsed = new URL(url)
+          return parsed.pathname.split('/').filter(Boolean).at(-1)?.replace(/\.[^.]+$/, '') || parsed.hostname
+        } catch {
+          return '在线规则列表'
+        }
+      })()
+      onAdd({
+        name: remoteName.trim() || fallbackName,
+        group,
+        rules: parsedRuleSet.rules,
+        sourceKind: 'url',
+        sourceRef: url,
+        format: parsedRuleSet.format,
+      })
+      onClose()
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setRemoteBusy(false)
+    }
+  }
+
+  return (
+    <dialog ref={ref} onClose={onClose} className="library-dialog">
+      <h3>规则库</h3>
+      <div className="meta">
+        内置 ACL4SSR 快照离线可用；在线目录收录 ACL4SSR 与 blackmatrix7 的 {ONLINE_RULE_CATALOG.length} 个列表，添加时从上游读取。
+      </div>
+      <div className="field">
+        <label>加入策略组</label>
+        <select className="input" value={group} onChange={(e) => setGroup(e.target.value)}>
+          {scheme.groups.map((g) => <option key={g.name} value={g.name}>{groupDisplayName(g.name)}</option>)}
+        </select>
+      </div>
+      <div className="library-toolbar">
+        <input
+          className="input"
+          type="search"
+          aria-label="搜索规则库"
+          placeholder="搜索规则库…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+        <div className="library-categories">
+          {categories.map((item) => (
+            <button
+              key={item}
+              className={`library-category${category === item ? ' active' : ''}`}
+              onClick={() => setCategory(item)}
+            >{item}</button>
+          ))}
+        </div>
+      </div>
+      <ul className="library-list">
+        {visible.map((entry) => {
+          const count = entry.file ? counts[entry.file] : undefined
+          return (
+            <li key={entry.id}>
+              <div>
+                <strong>{entry.title}</strong>
+                <span className="pill">{entry.provider}</span>
+                <span className="pill">{entry.category}</span>
+                <span className="hint">
+                  {entry.online
+                    ? '在线目录 · 添加时读取'
+                    : count === undefined ? '读取中…' : count < 0 ? '读取失败' : `${count} 条规则`}
+                  {!entry.online && count !== undefined && count > 1000 ? ' · 配置会明显变大' : ''}
+                </span>
+              </div>
+              <button
+                className="btn ghost"
+                disabled={!!busyFile || remoteBusy}
+                onClick={() => void addEntry(entry)}
+              >{busyFile === entry.id ? '添加中…' : '添加'}</button>
+            </li>
+          )
+        })}
+        {visible.length === 0 && <li className="hint">没有匹配的规则集</li>}
+        {hiddenCount > 0 && (
+          <li className="hint">还有 {hiddenCount} 条未显示，输入关键词或选择分类缩小范围。</li>
+        )}
+      </ul>
+      <div className="library-remote">
+        <div className="field">
+          <label>从在线地址添加</label>
+          <div className="row candidate-add">
+            <input className="input" type="url" placeholder="https://…/rules.list" value={remoteURL} onChange={(e) => setRemoteURL(e.target.value)} />
+            <input className="input" type="text" placeholder="名称（可选）" value={remoteName} onChange={(e) => setRemoteName(e.target.value)} />
+            <button className="btn" disabled={remoteBusy || !!busyFile} onClick={() => void addRemote()}>
+              {remoteBusy ? '读取中…' : '读取并添加'}
+            </button>
+          </div>
+          <div className="hint">通过本机 /api/fetch 读取；自动识别 Clash 列表 / provider YAML、QuanX filter、Egern YAML 和 sing-box source JSON。需要长期刷新可改用「+ 在线规则集」保存为订阅。</div>
+        </div>
+      </div>
+      {error && <div className="form-error" role="alert">{error}</div>}
+      <div className="actions">
+        <button className="btn ghost" onClick={onClose}>取消</button>
+      </div>
+    </dialog>
+  )
+}
+
+function RuleSetEditorDialog({
+  ruleSet,
+  onClose,
+  onSave,
+}: {
+  ruleSet?: LocalRuleSet
+  onClose: () => void
+  onSave: (set: LocalRuleSet) => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const fileRef = useRef<HTMLInputElement>(null)
+  const [name, setName] = useState(ruleSet?.name ?? '')
+  const [text, setText] = useState(ruleSet ? ruleSet.rules.map(ruleSetLine).join('\n') : '')
+  const [format, setFormat] = useState<RuleSetFormat | undefined>(ruleSet?.format)
+  const [error, setError] = useState('')
+
+  useEffect(() => { ref.current?.showModal() }, [])
+  const parsed = parseRuleList(text)
+
+  const readFile = async (file?: File) => {
+    if (!file) return
+    setError('')
+    try {
+      const textBody = await file.text()
+      const imported = parseRuleSetText(textBody)
+      setText(imported.rules.map(ruleSetLine).join('\n'))
+      setFormat(imported.format)
+      if (!name.trim()) setName(file.name.replace(/\.([^.]+)$/, ''))
+    } catch (e) {
+      setError((e as Error).message)
+    }
+  }
+
+  const save = () => {
+    if (!name.trim()) { setError('请填写规则集名称'); return }
+    if (parsed.length === 0) { setError('没有解析到有效规则，请每行填写一条规则'); return }
+    onSave({
+      id: ruleSet?.id ?? newID(),
+      name: name.trim(),
+      rules: parsed,
+      updatedAt: Date.now(),
+      format,
+    })
+    ref.current?.close()
+  }
+
+  return (
+    <dialog ref={ref} onClose={onClose} className="rule-set-dialog">
+      <h3>{ruleSet ? '编辑规则集' : '新建规则集'}</h3>
+      <form className="dialog-form" onSubmit={(e) => { e.preventDefault(); save() }}>
+        <div className="field">
+          <label>名称</label>
+          <input type="text" className="field" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
+        </div>
+        <div className="field">
+          <label>规则内容</label>
+          <textarea
+            className="field mono"
+            rows={8}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder={'DOMAIN-SUFFIX,example.com\nIP-CIDR,10.0.0.0/8\nDOMAIN-KEYWORD,keyword'}
+          />
+          <div className="row rs-import-row">
+            <button type="button" className="btn ghost" onClick={() => fileRef.current?.click()}>导入规则文件</button>
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".list,.txt,.conf,.yaml,.yml,.json"
+              style={{ display: 'none' }}
+              onChange={(e) => void readFile(e.target.files?.[0])}
+            />
+            {format && (
+              <span className="hint">已识别：{RULE_SET_FORMAT_TITLES[format]}，保存时转为通用规则行</span>
+            )}
+          </div>
+          <div className="hint">每行一条 Clash 经典规则；当前解析到 {parsed.length} 条。支持 Clash 列表 / provider YAML、QuanX filter、Egern YAML 和 sing-box source JSON。</div>
+        </div>
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <div className="actions">
+          <button type="submit" className="btn primary">保存</button>
+          <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
+        </div>
+      </form>
+    </dialog>
+  )
+}
+
+function RemoteRuleSetDialog({
+  scheme,
+  onClose,
+  onSave,
+}: {
+  scheme: RuleScheme
+  onClose: () => void
+  onSave: (set: LocalRuleSet, joinGroup?: string) => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const [url, setUrl] = useState('')
+  const [name, setName] = useState('')
+  const [group, setGroup] = useState(scheme.groups[0]?.name ?? '')
+  const [join, setJoin] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => { ref.current?.showModal() }, [])
+
+  const save = async () => {
+    const target = normalizeRemoteTextURL(url)
+    if (!/^https?:\/\//i.test(target)) { setError('请输入有效的 http(s) 规则集地址'); return }
+    setBusy(true); setError('')
+    try {
+      const parsed = await fetchRuleSet(target)
+      const fallback = (() => {
+        try {
+          const parsedURL = new URL(target)
+          return parsedURL.pathname.split('/').filter(Boolean).at(-1)?.replace(/\.[^.]+$/, '') || parsedURL.hostname
+        } catch {
+          return '在线规则集'
+        }
+      })()
+      onSave({
+        id: newID(),
+        name: name.trim() || fallback,
+        rules: parsed.rules,
+        updatedAt: Date.now(),
+        sourceURL: target,
+        format: parsed.format,
+      }, join && group ? group : undefined)
+      ref.current?.close()
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <dialog ref={ref} className="rule-set-dialog" onClose={onClose}>
+      <h3>添加在线规则集</h3>
+      <form className="dialog-form" onSubmit={(e) => { e.preventDefault(); void save() }}>
+        <div className="field">
+          <label>规则集地址</label>
+          <input
+            className="field mono"
+            type="url"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://…/rules.list 或 .yaml / .json"
+            autoFocus
+          />
+          <div className="hint">自动识别 Clash 经典列表 / provider YAML、QuanX filter、Egern YAML 和 sing-box source JSON；GitHub / Gitee 网页文件地址会转换为 raw 地址。</div>
+        </div>
+        <div className="field">
+          <label>名称（可选）</label>
+          <input className="field" type="text" value={name} onChange={(e) => setName(e.target.value)} />
+        </div>
+        {scheme.groups.length > 0 && (
+          <>
+            <div className="field">
+              <label>加入策略组</label>
+              <select className="input" value={group} onChange={(e) => setGroup(e.target.value)}>
+                {scheme.groups.map((g) => <option key={g.name} value={g.name}>{groupDisplayName(g.name)}</option>)}
+              </select>
+            </div>
+            <label className="setting-toggle">
+              <input type="checkbox" checked={join} onChange={(e) => setJoin(e.target.checked)} />
+              <span>保存后同时加入当前方案</span>
+            </label>
+          </>
+        )}
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <div className="actions">
+          <button type="submit" className="btn primary" disabled={busy}>
+            {busy ? '读取中…' : '添加'}
+          </button>
+          <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
+        </div>
+      </form>
+    </dialog>
+  )
+}
+
+function RenameRuleSetDialog({
+  set,
+  onClose,
+  onSave,
+}: {
+  set: LocalRuleSet
+  onClose: () => void
+  onSave: (name: string) => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const [name, setName] = useState(set.name)
+  const [error, setError] = useState('')
+
+  useEffect(() => { ref.current?.showModal() }, [])
+
+  const save = () => {
+    if (!name.trim()) { setError('请填写规则集名称'); return }
+    onSave(name.trim())
+    ref.current?.close()
+  }
+
+  return (
+    <dialog ref={ref} className="rule-set-dialog" onClose={onClose}>
+      <h3>重命名规则集</h3>
+      <div className="dialog-form">
+        <div className="field">
+          <label>名称</label>
+          <input
+            className="field"
+            type="text"
+            value={name}
+            autoFocus
+            onChange={(e) => setName(e.target.value)}
+          />
+          {set.sourceURL && <div className="hint">重命名不会改动已加入方案的快照名称。</div>}
+        </div>
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <div className="actions">
+          <button type="button" className="btn primary" onClick={save}>保存</button>
+          <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
+        </div>
+      </div>
+    </dialog>
+  )
+}
+
+function AddRuleSetToSchemeDialog({
+  ruleSet,
+  scheme,
+  onClose,
+  onAdd,
+}: {
+  ruleSet: LocalRuleSet
+  scheme: RuleScheme
+  onClose: () => void
+  onAdd: (group: string) => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const [group, setGroup] = useState(scheme.groups[0]?.name ?? '')
+  useEffect(() => { ref.current?.showModal() }, [])
+
+  return (
+    <dialog ref={ref} onClose={onClose}>
+      <h3>加入规则集</h3>
+      <div className="meta">「{ruleSet.name}」共 {ruleSet.rules.length} 条规则。</div>
+      <div className="field">
+        <label>加入策略组</label>
+        <select className="input" value={group} onChange={(e) => setGroup(e.target.value)}>
+          {scheme.groups.map((g) => <option key={g.name} value={g.name}>{groupDisplayName(g.name)}</option>)}
+        </select>
+      </div>
+      <div className="hint">加入的是当前规则内容的快照；之后编辑本地规则集不会自动改动已加入的方案。</div>
+      <div className="actions">
+        <button className="btn primary" disabled={!group} onClick={() => { onAdd(group); ref.current?.close() }}>加入</button>
+        <button className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
+      </div>
+    </dialog>
+  )
+}
+
+function RulesTab() {
+  const selectedSchemeID = useStore((s) => s.selectedSchemeID)
+  const setScheme = useStore((s) => s.setScheme)
+  const policySelections = useStore((s) => s.policySelections)
+  const setPolicy = useStore((s) => s.setPolicy)
+  const scheme = useScheme()
+  const nodes = useStore((s) => s.nodes)
+  const sources = useStore((s) => s.sources)
+  const customSchemes = useStore((s) => s.customSchemes)
+  const addCustomScheme = useStore((s) => s.addCustomScheme)
+  const removeCustomScheme = useStore((s) => s.removeCustomScheme)
+  const localRuleSets = useStore((s) => s.localRuleSets)
+  const addLocalRuleSet = useStore((s) => s.addLocalRuleSet)
+  const removeLocalRuleSet = useStore((s) => s.removeLocalRuleSet)
+  const [importingScheme, setImportingScheme] = useState(false)
+  const [schemeName, setSchemeName] = useState('')
+  const [schemeURL, setSchemeURL] = useState('')
+  const [schemeText, setSchemeText] = useState('')
+  const [schemeError, setSchemeError] = useState<string | null>(null)
+  const [schemeLoading, setSchemeLoading] = useState(false)
+  const [pendingSchemeDelete, setPendingSchemeDelete] = useState<RuleScheme | null>(null)
+  const [editingScheme, setEditingScheme] = useState<RuleScheme | null>(null)
+  const [customRuleTarget, setCustomRuleTarget] = useState<RuleScheme | null>(null)
+  const [customRuleGroup, setCustomRuleGroup] = useState<string | undefined>()
+  const [groupEditor, setGroupEditor] = useState<{
+    scheme: RuleScheme
+    group: PolicyGroup
+    tab?: 'settings' | 'rules'
+  } | null>(null)
+  const [networkEditor, setNetworkEditor] = useState<RuleScheme | null>(null)
+  const [dragFromIndex, setDragFromIndex] = useState<number | null>(null)
+  const [dragOverIndex, setDragOverIndex] = useState<number | null>(null)
+  const [reorderUndo, setReorderUndo] = useState<{
+    schemeID: string
+    groups: PolicyGroup[]
+    matchingOrder?: string[]
+  } | null>(null)
+  const [libraryOpen, setLibraryOpen] = useState(false)
+  const [localSetEditor, setLocalSetEditor] = useState<{ set?: LocalRuleSet } | null>(null)
+  const [localSetAddTarget, setLocalSetAddTarget] = useState<LocalRuleSet | null>(null)
+  const [pendingLocalSetDelete, setPendingLocalSetDelete] = useState<LocalRuleSet | null>(null)
+  const [remoteSetOpen, setRemoteSetOpen] = useState(false)
+  const [renamingLocalSet, setRenamingLocalSet] = useState<LocalRuleSet | null>(null)
+  const [localSetSearch, setLocalSetSearch] = useState('')
+  const localSetImportRef = useRef<HTMLInputElement>(null)
+  const [refreshingRuleSetID, setRefreshingRuleSetID] = useState<string | null>(null)
+  const [ruleSetError, setRuleSetError] = useState<string | null>(null)
+  const [flash, setFlash] = useState('')
+  const [refreshingScheme, setRefreshingScheme] = useState(false)
+  const [schemeFileName, setSchemeFileName] = useState('')
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const allMetas = allSchemeMetas(customSchemes)
+  const selectedMeta = allMetas.find((m) => m.id === selectedSchemeID)
+  const customScheme = customSchemes.find((c) => c.id === scheme?.id)
+  const schemeRules = useMemo(
+    () => scheme
+      ? [
+          ...(scheme.customRules ?? []),
+          ...(scheme.ruleSets ?? []).flatMap((set) => set.rules),
+          ...scheme.rules,
+        ]
+      : [],
+    [scheme],
+  )
+  const enabledForRules = useMemo(() => enabledNodes({ sources, nodes }), [sources, nodes])
+  // 方案卡已经显示总数；策略组卡片只补充不重复的信息。
+  const groupCardMeta = useMemo(() => {
+    if (!scheme) return ''
+    const parts: string[] = []
+    const customRules = scheme.customRules?.length ?? 0
+    if (customRules > 0) parts.push(`自定义规则 ${customRules} 条`)
+    const matchingGroups = scheme.groups.filter((group) => group.nodeFilter?.trim()).length
+    if (matchingGroups > 0) parts.push(`${matchingGroups} 个策略组按名称匹配节点`)
+    return parts.join(' · ') || '可调整顺序'
+  }, [scheme])
+
+  useEffect(() => {
+    if (!flash) return
+    const timer = window.setTimeout(() => setFlash(''), 4200)
+    return () => window.clearTimeout(timer)
+  }, [flash])
+
+  /** 空的策略组 / 规则会让导出的配置不可用，导入时直接拒绝。 */
+  const validateScheme = (parsed: RuleScheme) => {
+    if (!parsed.groups.length || !parsed.rules.length) {
+      throw new Error('没有解析到策略组或规则，请检查方案内容或规则列表地址')
+    }
+    return parsed
+  }
+
+  const importSchemeFromURL = async () => {
+    if (!schemeName.trim()) { setSchemeError('请先填写方案名称'); return }
+    if (!schemeURL.trim()) { setSchemeError('请填写方案地址'); return }
+    const sourceURL = normalizeRemoteTextURL(schemeURL)
+    setSchemeLoading(true); setSchemeError(null)
+    try {
+      const res = await fetch(`/api/fetch?url=${encodeURIComponent(sourceURL)}`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const text = await res.text()
+      const format = detectRuleSchemeFormat(text)
+      const parsed = validateScheme(await parseRuleSchemeText(
+        `custom-${Date.now()}`, schemeName.trim(), '从 URL 导入', text, format,
+      ))
+      addCustomScheme({
+        ...parsed,
+        sourceKind: 'url',
+        sourceFormat: format,
+        sourceURL,
+        updatedAt: Date.now(),
+        customRules: [],
+      })
+      setScheme(parsed.id)
+      setImportingScheme(false); setSchemeName(''); setSchemeURL(''); setSchemeText(''); setSchemeFileName('')
+    } catch (e: any) {
+      setSchemeError(e.message ?? '导入失败')
+    } finally { setSchemeLoading(false) }
+  }
+
+  const importSchemeFromText = async () => {
+    if (!schemeName.trim()) { setSchemeError('请先填写方案名称'); return }
+    if (!schemeText.trim()) { setSchemeError('请粘贴方案内容'); return }
+    setSchemeLoading(true); setSchemeError(null)
+    try {
+      const description = schemeFileName ? `从文件导入：${schemeFileName}` : '粘贴导入'
+      const format = detectRuleSchemeFormat(schemeText)
+      const parsed = validateScheme(await parseRuleSchemeText(
+        `custom-${Date.now()}`, schemeName.trim(), description, schemeText, format,
+      ))
+      addCustomScheme({
+        ...parsed,
+        sourceKind: schemeFileName ? 'file' : 'paste',
+        sourceFormat: format,
+        updatedAt: Date.now(),
+        customRules: [],
+      })
+      // 与 URL 导入保持一致：导入成功后立即启用新方案。
+      setScheme(parsed.id)
+      setImportingScheme(false); setSchemeName(''); setSchemeURL(''); setSchemeText(''); setSchemeFileName('')
+    } catch (e: any) {
+      setSchemeError(e.message ?? '解析失败')
+    } finally { setSchemeLoading(false) }
+  }
+
+  const readSchemeFile = async (file?: File) => {
+    if (!file) return
+    setSchemeError(null)
+    try {
+      const text = await file.text()
+      if (!text.trim()) throw new Error('文件内容为空')
+      setSchemeText(text)
+      setSchemeFileName(file.name)
+      if (!schemeName.trim()) setSchemeName(file.name.replace(/\.[^.]+$/, ''))
+    } catch (e: any) {
+      setSchemeError(e.message ?? '无法读取文件')
+    }
+  }
+
+  /** 修改内置方案前先复制，保留用户原来的策略组选择。 */
+  const makeEditableScheme = (source: RuleScheme): RuleScheme => {
+    const existing = customSchemes.find((c) => c.id === source.id)
+    if (existing) return existing
+    const copy: RuleScheme = {
+      ...source,
+      id: `custom-${Date.now()}`,
+      name: `${stripSchemeCustomSuffix(source.name)} · 自定义`,
+      description: source.description,
+      sourceKind: 'copy',
+      updatedAt: Date.now(),
+      customRules: [],
+    }
+    const previousSelections = useStore.getState().policySelections
+    addCustomScheme(copy)
+    setScheme(copy.id)
+    for (const [group, selection] of Object.entries(previousSelections)) {
+      useStore.getState().setPolicy(group, selection)
+    }
+    setFlash('已复制为自定义方案，后续修改不会影响内置方案。')
+    return copy
+  }
+
+  const beginEditScheme = () => {
+    if (!scheme) return
+    const editable = customScheme ?? makeEditableScheme(scheme)
+    setEditingScheme(editable)
+  }
+
+  const saveSchemeMeta = (next: RuleScheme) => {
+    addCustomScheme({ ...next, updatedAt: Date.now() })
+    setFlash(`已保存方案「${next.name}」。`)
+  }
+
+  const beginEditNetwork = () => {
+    if (!scheme) return
+    setNetworkEditor(customScheme ?? makeEditableScheme(scheme))
+  }
+
+  const saveNetworkSettings = (next: RuleScheme) => {
+    addCustomScheme({ ...next, updatedAt: Date.now() })
+    setNetworkEditor(null)
+    setFlash('DNS 与网络设置已保存。')
+  }
+
+  /** 拖动 / 上下移：同时调整策略组顺序和该组规则的匹配位置。 */
+  const reorderGroups = (source: RuleScheme, from: number, to: number) => {
+    const editable = makeEditableScheme(source)
+    if (from < 0 || from >= editable.groups.length || to < 0 || to >= editable.groups.length || from === to) {
+      return
+    }
+    const beforeNames = editable.groups.map((group) => group.name)
+    const groups = [...editable.groups]
+    const [moved] = groups.splice(from, 1)
+    groups.splice(to, 0, moved)
+    const names = groups.map((group) => group.name)
+    const knownGroups = new Set(names)
+    const matchingRules = [
+      ...(editable.ruleSets ?? []).flatMap((set) =>
+        set.rules.map((rule) => ({ ...rule, group: set.group })),
+      ),
+      ...editable.rules,
+    ]
+    const currentMatching = matchingGroupNames(matchingRules, knownGroups)
+    const nextMatching = matchingOrderAfterDragging(moved.name, beforeNames, names, currentMatching)
+    const changed = nextMatching.join('\n') !== currentMatching.join('\n')
+    setReorderUndo({
+      schemeID: editable.id,
+      groups: editable.groups,
+      matchingOrder: editable.matchingOrder,
+    })
+    addCustomScheme({
+      ...editable,
+      groups,
+      ...(changed ? { matchingOrder: nextMatching } : {}),
+      updatedAt: Date.now(),
+    })
+    setFlash(changed
+      ? `已调整「${moved.name}」的顺序，并把它的规则移到对应匹配位置。`
+      : `已调整「${moved.name}」的策略组顺序。`)
+  }
+
+  const moveGroup = (source: RuleScheme, index: number, delta: -1 | 1) => {
+    reorderGroups(source, index, index + delta)
+  }
+
+  const undoGroupReorder = () => {
+    if (!reorderUndo) return
+    const fresh = useStore.getState().customSchemes.find((scheme) => scheme.id === reorderUndo.schemeID)
+    if (fresh) {
+      addCustomScheme({
+        ...fresh,
+        groups: reorderUndo.groups,
+        matchingOrder: reorderUndo.matchingOrder,
+        updatedAt: Date.now(),
+      })
+      setFlash('已撤销策略组排序和匹配顺序。')
+    }
+    setReorderUndo(null)
+  }
+
+  /** 策略组名称匹配到的节点，供首选策略下拉使用。 */
+  const nodeChoicesFor = (group: PolicyGroup): string[] => {
+    if (!group.nodeFilter) return []
+    try {
+      const regex = new RegExp(group.nodeFilter)
+      return enabledForRules.filter((node) => regex.test(node.name)).map((node) => node.name)
+    } catch {
+      return []
+    }
+  }
+
+  const beginEditGroup = (
+    source: RuleScheme,
+    group: PolicyGroup,
+    tab: 'settings' | 'rules' = 'settings',
+  ) => {
+    const editable = makeEditableScheme(source)
+    const target = editable.groups.find((g) => g.name === group.name) ?? group
+    setGroupEditor({ scheme: editable, group: target, tab })
+  }
+
+  const saveGroupEdit = (target: { scheme: RuleScheme; group: PolicyGroup }, updated: PolicyGroup) => {
+    const fresh = useStore.getState().customSchemes.find((c) => c.id === target.scheme.id) ?? target.scheme
+    const oldName = target.group.name
+    const newName = updated.name
+    const groups = fresh.groups.map((group) => {
+      if (group.name === oldName) return updated
+      if (!group.options.includes(oldName)) return group
+      return {
+        ...group,
+        options: group.options.map((option) => option === oldName ? newName : option),
+      }
+    })
+    const rules = fresh.rules.map((rule) =>
+      rule.group === oldName ? { ...rule, group: newName } : rule,
+    )
+    const customRules = (fresh.customRules ?? []).map((rule) =>
+      rule.group === oldName ? { ...rule, group: newName } : rule,
+    )
+    const ruleSets = (fresh.ruleSets ?? []).map((set) => ({
+      ...set,
+      group: set.group === oldName ? newName : set.group,
+      rules: set.rules.map((rule) =>
+        rule.group === oldName ? { ...rule, group: newName } : rule,
+      ),
+    }))
+    addCustomScheme({ ...fresh, groups, rules, customRules, ruleSets, updatedAt: Date.now() })
+    if (oldName !== newName) {
+      useStore.getState().renamePolicySelection(oldName, newName)
+      setFlash(`策略组已改名为「${newName}」，规则和候选引用已同步更新。`)
+    } else {
+      setFlash(`已保存策略组「${newName}」。`)
+    }
+  }
+
+  const refreshImportedScheme = async () => {
+    const editable = customScheme
+    if (!editable?.sourceURL) return
+    const sourceURL = normalizeRemoteTextURL(editable.sourceURL)
+    setRefreshingScheme(true); setSchemeError(null)
+    try {
+      const res = await fetch(`/api/fetch?url=${encodeURIComponent(sourceURL)}`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const text = await res.text()
+      const format = detectRuleSchemeFormat(text)
+      const parsed = validateScheme(await parseRuleSchemeText(
+        editable.id, editable.name, editable.description, text, format,
+      ))
+      // 保留用户调整过的组顺序；新增组追加到末尾。
+      const previousOrder = editable.groups.map((g) => g.name)
+      const rank = (name: string) => {
+        const index = previousOrder.indexOf(name)
+        return index < 0 ? Number.MAX_SAFE_INTEGER : index
+      }
+      const groups = [...parsed.groups].sort((a, b) => rank(a.name) - rank(b.name))
+      const validGroups = new Set(groups.map((g) => g.name))
+      const customRules = (editable.customRules ?? []).filter((r) => validGroups.has(r.group))
+      const ruleSets = (editable.ruleSets ?? [])
+        .filter((set) => validGroups.has(set.group))
+        .map((set) => ({
+          ...set,
+          rules: set.rules.filter((rule) => validGroups.has(rule.group)),
+        }))
+        .filter((set) => set.rules.length > 0)
+      const removed = (editable.customRules ?? []).length - customRules.length
+      addCustomScheme({
+        ...parsed,
+        id: editable.id,
+        name: editable.name,
+        description: editable.description,
+        sourceKind: 'url',
+        sourceFormat: format,
+        sourceURL,
+        networkSettings: editable.networkSettings ?? parsed.networkSettings,
+        updatedAt: Date.now(),
+        groups,
+        customRules,
+        ruleSets,
+      })
+      setFlash(removed
+        ? `方案已刷新；移除了 ${removed} 条指向已删除策略组的自定义规则。`
+        : '方案已从来源刷新。')
+    } catch (e: any) {
+      setSchemeError(e.message ?? '刷新失败')
+    } finally { setRefreshingScheme(false) }
+  }
+
+  const beginAddCustomRule = (source: RuleScheme, group?: string) => {
+    const editable = makeEditableScheme(source)
+    setCustomRuleTarget(editable)
+    setCustomRuleGroup(group)
+  }
+
+  const saveCustomRule = (target: RuleScheme, rule: RoutingRule) => {
+    const fresh = useStore.getState().customSchemes.find((c) => c.id === target.id) ?? target
+    addCustomScheme({
+      ...fresh,
+      customRules: [...(fresh.customRules ?? []), rule],
+      updatedAt: Date.now(),
+    })
+    setFlash('已添加自定义规则，它会排在方案规则最前。')
+  }
+
+  const removeCustomRule = (target: RuleScheme, rule: RoutingRule) => {
+    const fresh = useStore.getState().customSchemes.find((c) => c.id === target.id) ?? target
+    addCustomScheme({
+      ...fresh,
+      customRules: (fresh.customRules ?? []).filter((r) => !(
+        r.group === rule.group && r.type === rule.type && (r.value ?? '') === (rule.value ?? '')
+      )),
+      updatedAt: Date.now(),
+    })
+    setFlash('已删除自定义规则。')
+  }
+
+  const applyRuleSet = (source: RuleScheme, payload: RuleSetPayload) => {
+    if (payload.rules.length === 0) return
+    const editable = makeEditableScheme(source)
+    const rules: RoutingRule[] = payload.rules.map((rule) => ({
+      ...rule,
+      group: payload.group,
+      sourceName: payload.name,
+    }))
+    const existing = editable.ruleSets ?? []
+    const existingIndex = payload.sourceRef
+      ? existing.findIndex((set) => set.sourceRef === payload.sourceRef && set.group === payload.group)
+      : -1
+    const snapshot: SchemeRuleSet = {
+      id: existingIndex >= 0 ? existing[existingIndex].id : newID(),
+      name: payload.name,
+      group: payload.group,
+      rules,
+      sourceKind: payload.sourceKind,
+      sourceRef: payload.sourceRef,
+      format: payload.format,
+      updatedAt: Date.now(),
+    }
+    const ruleSets = existingIndex >= 0
+      ? existing.map((set, index) => index === existingIndex ? snapshot : set)
+      : [...existing, snapshot]
+    addCustomScheme({ ...editable, ruleSets, updatedAt: Date.now() })
+    setFlash(existingIndex >= 0
+      ? `已更新「${payload.name}」：${rules.length} 条规则仍然加入「${payload.group}」。`
+      : `已把「${payload.name}」的 ${rules.length} 条规则加入「${payload.group}」。`)
+  }
+
+  const addLocalSetToScheme = (source: RuleScheme, set: LocalRuleSet, group: string) => {
+    applyRuleSet(source, {
+      name: set.name,
+      group,
+      rules: set.rules,
+      sourceKind: set.sourceURL ? 'url' : 'local',
+      sourceRef: set.sourceURL ?? set.id,
+      format: set.sourceURL ? set.format : undefined,
+    })
+  }
+
+  const saveRemoteRuleSet = (set: LocalRuleSet, joinGroup?: string) => {
+    // 同一地址只保留一条订阅，重复添加时更新快照。
+    const existing = localRuleSets.find((item) => item.sourceURL === set.sourceURL)
+    const saved = existing ? { ...set, id: existing.id, paused: existing.paused } : set
+    addLocalRuleSet(saved)
+    if (joinGroup && scheme) {
+      addLocalSetToScheme(scheme, saved, joinGroup)
+      setFlash(`已保存并加入「${saved.name}」：${saved.rules.length} 条规则。`)
+    } else {
+      setFlash(`已保存在线规则集「${saved.name}」：${saved.rules.length} 条规则。`)
+    }
+  }
+
+  const refreshLocalRuleSet = async (set: LocalRuleSet) => {
+    if (!set.sourceURL) return
+    setRefreshingRuleSetID(set.id)
+    setRuleSetError(null)
+    try {
+      const parsed = await fetchRuleSet(set.sourceURL)
+      addLocalRuleSet({
+        ...set,
+        rules: parsed.rules,
+        format: parsed.format,
+        updatedAt: Date.now(),
+        lastError: undefined,
+      })
+      setFlash(`已刷新「${set.name}」：${parsed.rules.length} 条规则。`)
+    } catch (e) {
+      const message = (e as Error).message
+      addLocalRuleSet({ ...set, lastError: message })
+      setRuleSetError(`「${set.name}」刷新失败：${message}`)
+    } finally {
+      setRefreshingRuleSetID(null)
+    }
+  }
+
+  const refreshAllLocalRuleSets = async () => {
+    const sets = localRuleSets.filter((set) => set.sourceURL && !set.paused)
+    if (!sets.length) return
+    setRefreshingRuleSetID('all')
+    setRuleSetError(null)
+    let ok = 0
+    const errors: string[] = []
+    for (const set of sets) {
+      try {
+        const parsed = await fetchRuleSet(set.sourceURL!)
+        addLocalRuleSet({
+          ...set,
+          rules: parsed.rules,
+          format: parsed.format,
+          updatedAt: Date.now(),
+          lastError: undefined,
+        })
+        ok += 1
+      } catch (error) {
+        const message = (error as Error).message
+        addLocalRuleSet({ ...set, lastError: message })
+        errors.push(`「${set.name}」${message}`)
+      }
+    }
+    setRefreshingRuleSetID(null)
+    setFlash(`已刷新 ${ok} 个在线规则集${errors.length ? `，${errors.length} 个失败` : ''}。`)
+    if (errors.length) setRuleSetError(errors.join('；'))
+  }
+
+  const toggleLocalRuleSetPaused = (set: LocalRuleSet) => {
+    addLocalRuleSet({ ...set, paused: !set.paused })
+    setFlash(set.paused ? `已恢复「${set.name}」的自动刷新。` : `已暂停「${set.name}」的自动刷新；仍可手动刷新。`)
+  }
+
+  const renameLocalRuleSet = (set: LocalRuleSet, name: string) => {
+    addLocalRuleSet({ ...set, name: name.trim() })
+    setFlash(`已重命名为「${name.trim()}」。已加入方案的条目保持原名称。`)
+  }
+
+  const importLocalRuleSetFiles = async (files: File[] | null) => {
+    if (!files?.length) return
+    if (files.length > 20) {
+      setRuleSetError('一次最多导入 20 个规则文件')
+      return
+    }
+    setRuleSetError(null)
+    const taken = new Set(localRuleSets.map((set) => set.name.trim()))
+    const created: LocalRuleSet[] = []
+    const errors: string[] = []
+    for (const file of files) {
+      try {
+        if (file.size > 8 * 1024 * 1024) throw new Error('文件大于 8 MB')
+        const textBody = await file.text()
+        const parsed = parseRuleSetText(textBody)
+        const base = file.name.replace(/\.[^.]+$/, '').trim() || '导入规则集'
+        let name = base
+        let suffix = 2
+        while (taken.has(name)) {
+          name = `${base} ${suffix}`
+          suffix += 1
+        }
+        taken.add(name)
+        created.push({
+          id: newID(),
+          name,
+          rules: parsed.rules,
+          updatedAt: Date.now(),
+          format: parsed.format,
+        })
+      } catch (error) {
+        errors.push(`${file.name}：${(error as Error).message}`)
+      }
+    }
+    for (const set of created) addLocalRuleSet(set)
+    if (created.length) setFlash(`已导入 ${created.length} 个规则集。`)
+    if (errors.length) setRuleSetError(errors.join('；'))
+  }
+
+  const localSetNeedle = localSetSearch.trim().toLowerCase()
+  const visibleLocalRuleSets = localSetNeedle
+    ? localRuleSets.filter((set) => {
+        const formatLabel = set.format ? RULE_SET_FORMAT_TITLES[set.format] : ''
+        return [set.name, set.sourceURL ?? '', formatLabel]
+          .some((text) => text.toLowerCase().includes(localSetNeedle))
+      })
+    : localRuleSets
+
+  const refreshSchemeRuleSet = async (set: SchemeRuleSet) => {
+    const fresh = customScheme
+    if (!fresh || set.sourceKind !== 'url' || !set.sourceRef) return
+    setRefreshingRuleSetID(set.id)
+    setRuleSetError(null)
+    try {
+      const parsed = await fetchRuleSet(set.sourceRef)
+      const rules = parsed.rules.map((rule) => ({
+        ...rule,
+        group: set.group,
+        sourceName: set.name,
+      }))
+      addCustomScheme({
+        ...fresh,
+        ruleSets: (fresh.ruleSets ?? []).map((item) => item.id === set.id
+          ? { ...item, rules, format: parsed.format, updatedAt: Date.now() }
+          : item),
+        updatedAt: Date.now(),
+      })
+      setFlash(`已刷新「${set.name}」：${parsed.rules.length} 条规则。`)
+    } catch (e) {
+      setRuleSetError(`「${set.name}」刷新失败：${(e as Error).message}`)
+    } finally {
+      setRefreshingRuleSetID(null)
+    }
+  }
+
+  const removeSchemeRuleSet = (id: string) => {
+    const fresh = customScheme
+    if (!fresh?.ruleSets) return
+    addCustomScheme({
+      ...fresh,
+      ruleSets: fresh.ruleSets.filter((set) => set.id !== id),
+      updatedAt: Date.now(),
+    })
+    setFlash('已从当前方案移除规则集。')
+  }
+
+
+  return (
+    <div>
+      <div className="page-head">
+        <div>
+          <div className="eyebrow">分流规则 · 03</div>
+          <h1>配置分流规则</h1>
+          <div className="sub">选择规则方案、调整策略组顺序，或添加自定义规则</div>
+        </div>
+      </div>
+
+      {flash && <div className="flash" role="status" aria-live="polite">{flash}</div>}
+
+      <div className="card scheme-card">
+        <div className="card-head scheme-card-head">
+          <div className="scheme-title-wrap">
+            <div className="scheme-kicker">当前方案</div>
+            <h3>{selectedMeta ? schemeDisplayName(selectedMeta.name, 'custom' in selectedMeta) : '规则方案'}</h3>
+          </div>
+          <div className="row wrap scheme-actions">
+            {scheme && (
+              <button className="btn ghost" onClick={beginEditScheme}>
+                {customScheme ? '编辑方案' : '复制并编辑'}
+              </button>
+            )}
+            {customScheme?.sourceURL && (
+              <button className="btn ghost" disabled={refreshingScheme} onClick={() => void refreshImportedScheme()}>
+                {refreshingScheme ? '刷新中…' : '刷新方案'}
+              </button>
+            )}
+            {scheme && (
+              <button className="btn ghost" onClick={beginEditNetwork}>DNS 与网络</button>
+            )}
+            <button className="btn ghost" onClick={() => setImportingScheme(true)}>+ 导入方案</button>
+          </div>
+        </div>
+        <div className="scheme-select-row">
+          <span className="scheme-select-label">切换方案</span>
+          <select className="input" value={selectedSchemeID} onChange={(e) => setScheme(e.target.value)}>
+            {allMetas.map((m) => <option key={m.id} value={m.id}>{schemeDisplayName(m.name, 'custom' in m)}</option>)}
+          </select>
+        </div>
+        <div className="scheme-facts">
+          <span><b>{scheme?.groups.length ?? 0}</b> 策略组</span>
+          <span><b>{schemeRules.length}</b> 规则</span>
+          <span><b>{enabledForRules.length}</b> 节点</span>
+        </div>
+        <p className="scheme-desc">{selectedMeta?.description}</p>
+        <details className="scheme-details">
+          <summary>来源与说明</summary>
+          <div className="scheme-source">
+            {selectedMeta?.sourceKind === 'url'
+              ? `${selectedMeta.sourceFormat ? `${RULE_SCHEME_FORMAT_TITLES[selectedMeta.sourceFormat]} · ` : ''}来源：URL 导入${selectedMeta.updatedAt ? ` · 更新于 ${formatDate(selectedMeta.updatedAt)}` : ''}`
+              : selectedMeta?.sourceKind === 'file'
+                ? `${selectedMeta.sourceFormat ? `${RULE_SCHEME_FORMAT_TITLES[selectedMeta.sourceFormat]} · ` : ''}来源：文件导入${selectedMeta.updatedAt ? ` · 更新于 ${formatDate(selectedMeta.updatedAt)}` : ''}`
+                : selectedMeta?.sourceKind === 'paste'
+                  ? `${selectedMeta.sourceFormat ? `${RULE_SCHEME_FORMAT_TITLES[selectedMeta.sourceFormat]} · ` : ''}来源：粘贴导入${selectedMeta.updatedAt ? ` · 更新于 ${formatDate(selectedMeta.updatedAt)}` : ''}`
+                  : selectedMeta?.sourceKind === 'copy'
+                    ? '来源：基于内置方案复制的自定义方案'
+                    : selectedMeta && 'custom' in selectedMeta
+                      ? '自定义方案 · 保存在本机'
+                      : '内置方案 · 离线可用'}
+          </div>
+          <div className="scheme-source scheme-network-summary">
+            DNS：{DNS_MODE_TITLES[scheme?.networkSettings?.dnsProtectionMode ?? 'standard']}
+            {scheme?.networkSettings?.proxyTestURLString
+              ? ` · 测试 ${scheme.networkSettings.proxyTestURLString}`
+              : ' · 使用默认测试地址'}
+          </div>
+          {selectedMeta && !customScheme && (
+            <div className="hint">编辑、排序或添加规则会先生成一份自定义副本。</div>
+          )}
+        </details>
+        {customSchemes.length > 0 && (
+          <div className="row wrap custom-scheme-chips">
+            {customSchemes.map((s) => (
+              <button
+                key={s.id}
+                type="button"
+                className="btn ghost"
+                onClick={() => setPendingSchemeDelete(s)}
+              >× {stripSchemeCustomSuffix(s.name)}</button>
+            ))}
+          </div>
+        )}
+        {schemeError && !importingScheme && <div className="error">{schemeError}</div>}
+      </div>
+
+      {importingScheme && (
+        <div className="card">
+          <h3 style={{ marginBottom: 14 }}>导入规则方案</h3>
+          <div className="field">
+            <label>方案名称</label>
+            <input className="input" value={schemeName} onChange={(e) => setSchemeName(e.target.value)} placeholder="例如：ACL4SSR 精简自定义" />
+          </div>
+          <div className="field">
+            <label>URL（方案地址）</label>
+            <input className="input" value={schemeURL} onChange={(e) => setSchemeURL(e.target.value)} placeholder="https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ACL4SSR_Online.ini" />
+            <div className="hint">自动识别 subconverter INI、Clash / mihomo YAML、Surge、Egern YAML 和 sing-box JSON；也可以直接粘贴内容到下方。</div>
+          </div>
+          <div className="field">
+            <label>粘贴方案内容（可选）</label>
+            <textarea className="field" value={schemeText} onChange={(e) => setSchemeText(e.target.value)} rows={6} placeholder="ruleset=广告,https://...&#10;custom_proxy_group=节点选择`select`[]DIRECT&#10;或粘贴 proxy-groups / policy_groups / route.rules / [Proxy Group]" />
+            <div className="row scheme-file-row">
+              <button type="button" className="btn ghost" onClick={() => fileInputRef.current?.click()}>选择方案文件</button>
+              {schemeFileName && <span className="hint">已读取：{schemeFileName}</span>}
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".ini,.txt,.conf,.yaml,.yml,.json"
+                style={{ display: 'none' }}
+                onChange={(e) => void readSchemeFile(e.target.files?.[0])}
+              />
+            </div>
+            <div className="hint">支持的格式：{Object.values(RULE_SCHEME_FORMAT_TITLES).join(' · ')}</div>
+          </div>
+          {schemeError && <div className="error">{schemeError}</div>}
+          <div className="row" style={{ gap: 8, marginTop: 8 }}>
+            <button className="btn primary" disabled={schemeLoading || !schemeURL.trim()} onClick={importSchemeFromURL}>
+              {schemeLoading ? '处理中…' : '从 URL 导入'}
+            </button>
+            <button className="btn" disabled={schemeLoading || !schemeText.trim()} onClick={importSchemeFromText}>
+              {schemeLoading ? '处理中…' : schemeFileName ? '导入文件内容' : '粘贴导入'}
+            </button>
+            <button className="btn ghost" onClick={() => { setImportingScheme(false); setSchemeError(null); }}>取消</button>
+          </div>
+        </div>
+      )}
+
+      {scheme && (
+        <div className="card">
+          <div className="card-head">
+            <h3>策略组</h3>
+            <span className="meta">{groupCardMeta}</span>
+          </div>
+          <div className="group-list" tabIndex={0} aria-label="策略组列表">
+          {scheme.groups.map((g, index) => {
+            const nodeChoices = g.type === 'select' ? nodeChoicesFor(g) : []
+            const choices = [...g.options, ...nodeChoices]
+            const selectedValue = policySelections[g.name]
+            const current = choices.includes(selectedValue ?? '') ? selectedValue : (choices[0] ?? '')
+            const ruleCount = schemeRules.filter((r) => r.group === g.name).length
+            const customCount = (scheme.customRules ?? []).filter((r) => r.group === g.name).length
+            return (
+              <div
+                className={`group-row${dragFromIndex === index ? ' dragging' : ''}${dragOverIndex === index ? ' drop-target' : ''}`}
+                key={g.name}
+                onDragOver={(e) => {
+                  if (dragFromIndex === null) return
+                  e.preventDefault()
+                  e.dataTransfer.dropEffect = 'move'
+                  if (dragOverIndex !== index) setDragOverIndex(index)
+                }}
+                onDragLeave={() => {
+                  if (dragOverIndex === index) setDragOverIndex(null)
+                }}
+                onDrop={(e) => {
+                  e.preventDefault()
+                  const from = dragFromIndex ?? Number(e.dataTransfer.getData('text/plain'))
+                  setDragFromIndex(null)
+                  setDragOverIndex(null)
+                  if (Number.isInteger(from) && from >= 0 && from !== index) {
+                    reorderGroups(scheme, from, index)
+                  }
+                }}
+              >
+                <div className="group-main">
+                  <div className="group-title">
+                    <span
+                      className="drag-handle"
+                      draggable
+                      aria-hidden="true"
+                      title="拖动调整策略组顺序和匹配优先级"
+                      onDragStart={(e) => {
+                        setDragFromIndex(index)
+                        e.dataTransfer.effectAllowed = 'move'
+                        e.dataTransfer.setData('text/plain', String(index))
+                      }}
+                      onDragEnd={() => {
+                        setDragFromIndex(null)
+                        setDragOverIndex(null)
+                      }}
+                    >⠿</span>
+                    <GroupIcon name={g.name} />
+                    <span className="gname">{groupDisplayName(g.name)}</span>
+                    <span className="gtype">{policyTypeLabel(g.type)}</span>
+                  </div>
+                  <div className="group-sub">
+                    {ruleCount} 条规则{customCount > 0 ? ` · ${customCount} 条自定义` : ''}
+                    {g.nodeFilter ? ` · 节点匹配 ${g.nodeFilter}` : ''}
+                  </div>
+                </div>
+                <div className="group-controls">
+                  {g.type === 'select' && choices.length > 0 && (
+                    <select
+                      className="input"
+                      aria-label={`${g.name} 的首选策略`}
+                      value={current}
+                      onChange={(e) => setPolicy(g.name, e.target.value)}
+                    >
+                      {g.options.length > 0 && (
+                        <optgroup label="策略组 / 内置">
+                          {g.options.map((c) => <option key={c} value={c}>{groupDisplayName(c)}</option>)}
+                        </optgroup>
+                      )}
+                      {nodeChoices.length > 0 && (
+                        <optgroup label="节点">
+                          {nodeChoices.map((c, i) => <option key={`${c}-${i}`} value={c}>{c}</option>)}
+                        </optgroup>
+                      )}
+                    </select>
+                  )}
+                  {g.type !== 'select' && <span className="pill">{policyTypeLabel(g.type)}</span>}
+                  {g.type === 'select' && choices.length === 0 && <span className="hint">没有候选策略</span>}
+                  <button className="btn ghost group-rule-btn" onClick={() => beginEditGroup(scheme, g, 'rules')}>
+                    规则 {ruleCount}
+                  </button>
+                  <button
+                    className="icon-btn"
+                    aria-label={`编辑策略组「${g.name}」`}
+                    title="编辑策略组"
+                    onClick={() => beginEditGroup(scheme, g)}
+                  >✎</button>
+                  <button
+                    className="icon-btn"
+                    disabled={index === 0}
+                    aria-label={`上移策略组「${g.name}」`}
+                    title="上移"
+                    onClick={() => moveGroup(scheme, index, -1)}
+                  >↑</button>
+                  <button
+                    className="icon-btn"
+                    disabled={index === scheme.groups.length - 1}
+                    aria-label={`下移策略组「${g.name}」`}
+                    title="下移"
+                    onClick={() => moveGroup(scheme, index, 1)}
+                  >↓</button>
+                </div>
+              </div>
+            )
+          })}
+          </div>
+          {reorderUndo && scheme && reorderUndo.schemeID === scheme.id && (
+            <div className="inline-notice group-order-undo" role="status">
+              已调整策略组顺序和匹配优先级。
+              <button type="button" className="btn ghost" onClick={undoGroupReorder}>撤销</button>
+            </div>
+          )}
+          <div className="hint group-order-hint">
+            拖动或上下移会写入客户端的策略组顺序，并把该组规则移到对应的匹配位置；排在前面的组先匹配。
+          </div>
+        </div>
+      )}
+
+      {scheme && (
+        <div className="card">
+          <div className="card-head">
+            <h3>自定义规则</h3>
+            <button className="btn ghost" onClick={() => beginAddCustomRule(scheme)}>+ 添加规则</button>
+          </div>
+          {(scheme.customRules?.length ?? 0) > 0 ? (
+            <ul className="custom-rule-list">
+              {scheme.customRules!.map((rule) => (
+                <li key={`${rule.group}-${rule.type}-${rule.value ?? ''}`}>
+                  <span className="pill">{groupDisplayName(rule.group)}</span>
+                  <span className="mono rule-type">{rule.type}</span>
+                  <span className="mono rule-value">{rule.value ?? '—'}</span>
+                  {rule.noResolve && <span className="hint">no-resolve</span>}
+                  <button
+                    className="icon-btn"
+                    aria-label={`删除规则 ${rule.type} ${rule.value ?? ''}`}
+                    title="删除这条自定义规则"
+                    onClick={() => removeCustomRule(scheme, rule)}
+                  >×</button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="hint">还没有自定义规则。添加的规则会排在方案规则最前；内置方案会先复制一份再修改。</div>
+          )}
+        </div>
+      )}
+
+      {scheme && (
+        <div className="card">
+          <div className="card-head">
+            <h3>规则库与规则集</h3>
+            <div className="row wrap" style={{ gap: 6 }}>
+              <button className="btn ghost" onClick={() => setLibraryOpen(true)}>浏览规则库</button>
+              <button className="btn ghost" onClick={() => setRemoteSetOpen(true)}>+ 在线规则集</button>
+              <button className="btn ghost" onClick={() => setLocalSetEditor({})}>+ 新建规则集</button>
+              <button className="btn ghost" onClick={() => localSetImportRef.current?.click()}>导入文件</button>
+              <input
+                ref={localSetImportRef}
+                type="file"
+                multiple
+                accept=".list,.txt,.conf,.yaml,.yml,.json"
+                style={{ display: 'none' }}
+                onChange={(e) => {
+                  const files = e.target.files ? Array.from(e.target.files) : []
+                  e.target.value = ''
+                  void importLocalRuleSetFiles(files)
+                }}
+              />
+            </div>
+          </div>
+          {ruleSetError && <div className="error" role="alert">{ruleSetError}</div>}
+
+          <div className="rs-section">
+            <div className="rs-section-title">
+              已加入当前方案
+              <span className="meta">{scheme.ruleSets?.length ?? 0} 组</span>
+            </div>
+            {(scheme.ruleSets?.length ?? 0) > 0 ? (
+              <ul className="rs-list">
+                {scheme.ruleSets!.map((set) => (
+                  <li key={set.id}>
+                    <div>
+                      <strong>{set.name}</strong>
+                      <span className="pill">{groupDisplayName(set.group)}</span>
+                      <span className="hint">
+                        {set.rules.length} 条 · {set.sourceKind === 'library' ? '内置规则库' : set.sourceKind === 'url' ? '在线订阅' : '我的规则集'}
+                        {set.format ? ` · ${RULE_SET_FORMAT_TITLES[set.format]}` : ''}
+                        {set.updatedAt ? ` · 更新于 ${formatDate(set.updatedAt)}` : ''}
+                      </span>
+                    </div>
+                    <div className="rs-actions">
+                      {set.sourceKind === 'url' && (
+                        <button
+                          className="btn ghost"
+                          disabled={refreshingRuleSetID !== null}
+                          onClick={() => void refreshSchemeRuleSet(set)}
+                        >
+                          {refreshingRuleSetID === set.id ? '刷新中…' : '刷新'}
+                        </button>
+                      )}
+                      <button
+                        className="icon-btn"
+                        aria-label={`从当前方案移除规则集「${set.name}」`}
+                        title="移除整组规则"
+                        onClick={() => removeSchemeRuleSet(set.id)}
+                      >×</button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <div className="hint">还没有加入规则集。规则集会排在自定义规则之后、方案规则之前。</div>
+            )}
+          </div>
+
+          <div className="rs-section">
+            <div className="rs-section-title">
+              <span>我的规则集 <span className="meta">{localRuleSets.length} 个</span></span>
+              {localRuleSets.some((set) => set.sourceURL && !set.paused) && (
+                <button
+                  className="btn ghost"
+                  disabled={refreshingRuleSetID !== null}
+                  onClick={() => void refreshAllLocalRuleSets()}
+                >
+                  {refreshingRuleSetID === 'all' ? '刷新中…' : '刷新全部'}
+                </button>
+              )}
+            </div>
+            {localRuleSets.length > 2 && (
+              <div className="search-wrap rs-search">
+                <input
+                  className="input"
+                  value={localSetSearch}
+                  onChange={(e) => setLocalSetSearch(e.target.value)}
+                  placeholder="搜索名称、地址或格式…"
+                  aria-label="搜索我的规则集"
+                />
+                {localSetSearch && (
+                  <button className="search-clear" aria-label="清空规则集搜索" onClick={() => setLocalSetSearch('')}>×</button>
+                )}
+              </div>
+            )}
+            {visibleLocalRuleSets.length > 0 ? (
+              <ul className="rs-list">
+                {visibleLocalRuleSets.map((set) => (
+                  <li key={set.id}>
+                    <div>
+                      <strong>{set.name}</strong>
+                      {set.sourceURL && <span className="pill">在线订阅</span>}
+                      <span className="hint">
+                        {set.rules.length} 条规则
+                        {` · ${set.sourceURL ? '在线订阅' : set.format ? `${RULE_SET_FORMAT_TITLES[set.format]} 导入` : '手动规则集'}`}
+                        {` · 更新于 ${formatDate(set.updatedAt)}`}
+                        {set.paused ? ' · 已暂停自动刷新' : ''}
+                      </span>
+                      {set.lastError && (
+                        <span className="hint rule-set-error">上次刷新失败：{set.lastError}</span>
+                      )}
+                    </div>
+                    <div className="rs-actions">
+                      {set.sourceURL && (
+                        <>
+                          <button
+                            className="btn ghost"
+                            disabled={refreshingRuleSetID !== null}
+                            onClick={() => void refreshLocalRuleSet(set)}
+                          >
+                            {refreshingRuleSetID === set.id ? '刷新中…' : '刷新'}
+                          </button>
+                          <button className="btn ghost" onClick={() => toggleLocalRuleSetPaused(set)}>
+                            {set.paused ? '恢复刷新' : '暂停刷新'}
+                          </button>
+                          <button className="btn ghost" onClick={() => setRenamingLocalSet(set)}>重命名</button>
+                        </>
+                      )}
+                      <button className="btn ghost" onClick={() => setLocalSetAddTarget(set)}>加入方案</button>
+                      {!set.sourceURL && (
+                        <button className="btn ghost" onClick={() => setLocalSetEditor({ set })}>编辑</button>
+                      )}
+                      <button className="btn ghost danger-text" onClick={() => setPendingLocalSetDelete(set)}>删除</button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            ) : localRuleSets.length === 0 ? (
+              <div className="hint">可以新建、导入多个规则文件，或添加在线规则集订阅；之后重复加入不同方案。</div>
+            ) : (
+              <div className="hint">没有匹配「{localSetSearch}」的规则集。</div>
+            )}
+            {localRuleSets.length > 0 && (
+              <div className="hint">加入方案使用当前快照；在线订阅加入后会保留远程地址，可在方案里单独刷新。</div>
+            )}
+          </div>
+        </div>
+      )}
+
+      <ConfirmDialog
+        open={!!pendingSchemeDelete}
+        title="删除自定义方案？"
+        body={<>将删除规则方案 <b>「{pendingSchemeDelete?.name}」</b>。如果它正被使用，会切回内置 ACL4SSR 方案。</>}
+        confirmLabel="删除"
+        danger
+        onCancel={() => setPendingSchemeDelete(null)}
+        onConfirm={() => {
+          const target = pendingSchemeDelete
+          setPendingSchemeDelete(null)
+          if (target) removeCustomScheme(target.id)
+        }}
+      />
+
+      {networkEditor && (
+        <NetworkSettingsDialog
+          scheme={networkEditor}
+          onClose={() => setNetworkEditor(null)}
+          onSave={saveNetworkSettings}
+        />
+      )}
+
+      {editingScheme && (
+        <SchemeEditDialog
+          key={editingScheme.id}
+          scheme={editingScheme}
+          onClose={() => setEditingScheme(null)}
+          onSave={saveSchemeMeta}
+        />
+      )}
+      {customRuleTarget && (
+        <AddCustomRuleDialog
+          key={`${customRuleTarget.id}-${customRuleGroup ?? ''}`}
+          scheme={customRuleTarget}
+          initialGroup={customRuleGroup}
+          onClose={() => setCustomRuleTarget(null)}
+          onSave={(rule) => saveCustomRule(customRuleTarget, rule)}
+        />
+      )}
+      {groupEditor && (
+        <GroupEditorDialog
+          key={`${groupEditor.scheme.id}-${groupEditor.group.name}-${groupEditor.tab ?? 'settings'}`}
+          scheme={groupEditor.scheme}
+          group={groupEditor.group}
+          nodes={enabledForRules}
+          rules={[
+            ...groupEditor.scheme.rules,
+            ...(groupEditor.scheme.ruleSets ?? []).flatMap((set) =>
+              set.rules.map((rule) => ({ ...rule, group: set.group })),
+            ),
+          ]}
+          customRules={groupEditor.scheme.customRules ?? []}
+          initialTab={groupEditor.tab}
+          onClose={() => setGroupEditor(null)}
+          onSave={(updated) => saveGroupEdit(groupEditor, updated)}
+          onAddRule={(rule) => saveCustomRule(groupEditor.scheme, rule)}
+        />
+      )}
+      {libraryOpen && scheme && (
+        <RuleLibraryDialog
+          scheme={scheme}
+          onClose={() => setLibraryOpen(false)}
+          onAdd={(payload) => applyRuleSet(scheme, payload)}
+        />
+      )}
+      {remoteSetOpen && scheme && (
+        <RemoteRuleSetDialog
+          key={scheme.id}
+          scheme={scheme}
+          onClose={() => setRemoteSetOpen(false)}
+          onSave={(set, group) => {
+            saveRemoteRuleSet(set, group)
+            setRemoteSetOpen(false)
+          }}
+        />
+      )}
+      {renamingLocalSet && (
+        <RenameRuleSetDialog
+          key={renamingLocalSet.id}
+          set={renamingLocalSet}
+          onClose={() => setRenamingLocalSet(null)}
+          onSave={(name) => {
+            renameLocalRuleSet(renamingLocalSet, name)
+            setRenamingLocalSet(null)
+          }}
+        />
+      )}
+      {localSetEditor && (
+        <RuleSetEditorDialog
+          key={localSetEditor.set?.id ?? 'new'}
+          ruleSet={localSetEditor.set}
+          onClose={() => setLocalSetEditor(null)}
+          onSave={(set) => {
+            addLocalRuleSet(set)
+            setFlash(`已保存规则集「${set.name}」，共 ${set.rules.length} 条规则。`)
+          }}
+        />
+      )}
+      {localSetAddTarget && scheme && (
+        <AddRuleSetToSchemeDialog
+          key={`${localSetAddTarget.id}-${scheme.id}`}
+          ruleSet={localSetAddTarget}
+          scheme={scheme}
+          onClose={() => setLocalSetAddTarget(null)}
+          onAdd={(group) => addLocalSetToScheme(scheme, localSetAddTarget, group)}
+        />
+      )}
+      <ConfirmDialog
+        open={!!pendingLocalSetDelete}
+        title="删除本地规则集？"
+        body={<>将删除 <b>「{pendingLocalSetDelete?.name}」</b>。已加入方案的规则集快照不会被移除。</>}
+        confirmLabel="删除"
+        danger
+        onCancel={() => setPendingLocalSetDelete(null)}
+        onConfirm={() => {
+          const target = pendingLocalSetDelete
+          setPendingLocalSetDelete(null)
+          if (target) {
+            removeLocalRuleSet(target.id)
+            setFlash(`已删除本地规则集「${target.name}」；已加入方案的快照保持不变。`)
+          }
+        }}
+      />
+    </div>
+  )
+}
+
+// ---------------- 导出 Tab ----------------
+
+/** 导出页客户端按订阅载体分组，新增客户端会自动落到对应分组。 */
+type ClientGroupKey = 'yaml' | 'egern' | 'surge' | 'loon-quanx' | 'json' | 'base64'
+const CLIENT_GROUPS: { key: ClientGroupKey; label: string }[] = [
+  { key: 'yaml', label: 'Clash / YAML 系' },
+  { key: 'egern', label: 'Egern' },
+  { key: 'surge', label: 'Surge' },
+  { key: 'loon-quanx', label: 'Loon / Quantumult X' },
+  { key: 'json', label: 'sing-box / JSON' },
+  { key: 'base64', label: '手机订阅 / Base64' },
+]
+
+function clientGroupKey(client: ClientInfo): ClientGroupKey {
+  switch (subFormatFor(client)) {
+    case 'yaml': return 'yaml'
+    case 'egern': return 'egern'
+    case 'surge': return 'surge'
+    case 'json': return 'json'
+    case 'base64': return 'base64'
+    default: return 'loon-quanx'
+  }
+}
+
+const FORMAT_LABELS = {
+  yaml: 'Clash YAML',
+  egern: 'Egern YAML',
+  surge: 'Surge',
+  loon: 'Loon',
+  quanx: 'Quantumult X',
+  json: 'sing-box JSON',
+  base64: '节点订阅',
+} satisfies Record<string, string>
+
+/** 发布订阅时，这些客户端的 Tailscale 写法需要独立变体。 */
+const TAILNET_TARGET_VARIANTS: ClientTarget[] = [
+  'clash',
+  'clash-apple',
+  'clash-verge',
+  'clashmac',
+  'flclash',
+  'mihomo-party',
+  'clash-mi',
+  'surge-mac',
+  'karing',
+  'egern',
+  'hiddify',
+]
+
+function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
+  const scheme = useScheme()
+  const policySelections = useStore((s) => s.policySelections)
+  const preferRuleSets = useStore((s) => s.preferRuleSets)
+  const setPreferRuleSets = useStore((s) => s.setPreferRuleSets)
+  const exportContentMode = useStore((s) => s.exportContentMode)
+  const exportContentModes = useStore((s) => s.exportContentModes)
+  const setExportContentModeFor = useStore((s) => s.setExportContentModeFor)
+  const embedRemoteSubscriptions = useStore((s) => s.embedRemoteSubscriptions)
+  const setEmbedRemoteSubscriptions = useStore((s) => s.setEmbedRemoteSubscriptions)
+  const nodeNameFilter = useStore((s) => s.nodeNameFilter)
+  const setNodeNameFilter = useStore((s) => s.setNodeNameFilter)
+  const exportProtocols = useStore((s) => s.exportProtocols)
+  const setExportProtocols = useStore((s) => s.setExportProtocols)
+  const exportConfigName = useStore((s) => s.exportConfigName)
+  const setExportConfigName = useStore((s) => s.setExportConfigName)
+  const appendSourceName = useStore((s) => s.appendSourceName)
+  const setAppendSourceName = useStore((s) => s.setAppendSourceName)
+  const clientOrder = useStore((s) => s.clientOrder)
+  const setClientOrder = useStore((s) => s.setClientOrder)
+  const hiddenClients = useStore((s) => s.hiddenClients)
+  const setClientHidden = useStore((s) => s.setClientHidden)
+  const sources = useStore((s) => s.sources)
+  const nodes = useStore((s) => s.nodes)
+  const tailnets = useStore((s) => s.tailnets)
+  const tailnetAuthKeys = useStore((s) => s.tailnetAuthKeys)
+  const [target, setTarget] = useState<ClientInfo>(CLIENTS[0])
+  const targetFormat = subFormatFor(target)
+  const contentMode = effectiveContentMode(target, exportContentModes, exportContentMode)
+  const orderedClients = useMemo(() => clientsInOrder(clientOrder), [clientOrder])
+  const visibleClients = useMemo(() => {
+    const shown = orderedClients.filter((client) => !hiddenClients.includes(client.target))
+    // 旧数据若把所有客户端都隐藏了，退回显示全部，避免导出页没有可选客户端。
+    return shown.length ? shown : orderedClients
+  }, [orderedClients, hiddenClients])
+  // 预览与下载按当前客户端载体准备方案；发布时由 generateSubscriptionFormats
+  // 再按各载体分别准备，避免这里提前合并导致规则重复。
+  const exportScheme = useMemo(
+    () => scheme ? prepareSchemeForExport(scheme, policySelections, {
+      preferRuleSets,
+      format: targetFormat,
+      target: target.target,
+    }) : undefined,
+    [scheme, policySelections, preferRuleSets, targetFormat, target.target],
+  )
+  const compatibility = useMemo(
+    () => scheme ? analyzeRuleCompatibility(target, scheme, { preferRuleSets, contentMode }) : undefined,
+    [target, scheme, preferRuleSets, contentMode],
+  )
+  const [clientQuery, setClientQuery] = useState('')
+  const [manageClients, setManageClients] = useState(false)
+  const pickerRef = useRef<HTMLDetailsElement>(null)
+  const [generated, setGenerated] = useState('')
+  const [skipped, setSkipped] = useState(0)
+  const [exportedNodeCount, setExportedNodeCount] = useState(0)
+  const [remoteSourceCount, setRemoteSourceCount] = useState(0)
+  const [tailnetNotes, setTailnetNotes] = useState<string[]>([])
+  const [previewQuery, setPreviewQuery] = useState('')
+  const [qrOpen, setQrOpen] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const [downloaded, setDownloaded] = useState(false)
+  const [pendingRevoke, setPendingRevoke] = useState(false)
+  const [importing, setImporting] = useState(false)
+  const [subToken, setSubToken] = useState<string>(() => localStorage.getItem('tower-sub-token') ?? '')
+  const [subURL, setSubURL] = useState(() => {
+    const raw = localStorage.getItem('tower-sub-url') ?? ''
+    if (!raw) return ''
+    // 旧版本 / 手工改坏的地址：不要让它带着整个导出页一起崩。
+    try {
+      return new URL(raw, window.location.origin).href
+    } catch {
+      return ''
+    }
+  })
+  const [subRefreshing, setSubRefreshing] = useState(false)
+  const [subUpdatedAt, setSubUpdatedAt] = useState<number | null>(() => {
+    const v = Number(localStorage.getItem('tower-sub-updated-at'))
+    return Number.isFinite(v) && v > 0 ? v : null
+  })
+  const [checking, setChecking] = useState(false)
+  const [checkResult, setCheckResult] = useState<{ ok: boolean; text: string } | null>(null)
+  const [copiedField, setCopiedField] = useState<'sub' | 'import' | 'lan' | null>(null)
+  const [importNotice, setImportNotice] = useState('')
+  const [net, setNet] = useState<{ host: string; lan: string[] } | null>(null)
+  const localHost = ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(window.location.hostname)
+
+  useEffect(() => {
+    fetch('/api/network')
+      .then((r) => r.json())
+      .then((d) => setNet({ host: String(d?.host ?? ''), lan: Array.isArray(d?.lan) ? d.lan : [] }))
+      .catch(() => {})
+  }, [])
+
+  // 换客户端后，上一份格式的检查结果 / 导入提示不再适用。
+  useEffect(() => {
+    setCheckResult(null)
+    setImportNotice('')
+    setCopiedField(null)
+  }, [target])
+
+  // 客户端选择面板：点面板外收起。
+  useEffect(() => {
+    const onDocClick = (e: MouseEvent) => {
+      const el = pickerRef.current
+      if (el?.open && !el.contains(e.target as Node)) el.open = false
+    }
+    document.addEventListener('click', onDocClick)
+    return () => document.removeEventListener('click', onDocClick)
+  }, [])
+
+  // 本机打开的页面，手机端要用局域网地址而不是 127.0.0.1。
+  const copyText = async (field: 'sub' | 'import' | 'lan', value: string) => {
+    const ok = await copyToClipboard(value)
+    if (!ok) {
+      setCheckResult({ ok: false, text: '这台机器不允许网页写剪贴板，请点输入框手动全选复制' })
+      return
+    }
+    setCopiedField(field)
+    window.setTimeout(() => setCopiedField((v) => (v === field ? null : v)), 1600)
+  }
+
+  const enabled = useMemo(() => enabledNodes({ sources, nodes }), [sources, nodes])
+  const nameFilterResult = useMemo(
+    () => filterNodesByName(enabled, nodeNameFilter),
+    [enabled, nodeNameFilter],
+  )
+  const protocolCounts = useMemo(() => {
+    const counts = new Map<ProxyKind, number>()
+    for (const node of nameFilterResult.nodes) counts.set(node.kind, (counts.get(node.kind) ?? 0) + 1)
+    return [...counts.entries()].sort(
+      (a, b) => b[1] - a[1] || PROXY_KIND_TITLES[a[0]].localeCompare(PROXY_KIND_TITLES[b[0]], 'zh-CN'),
+    )
+  }, [nameFilterResult.nodes])
+  const usable = useMemo(() => {
+    if (exportProtocols.length === 0) return nameFilterResult.nodes
+    return nameFilterResult.nodes.filter((node) => exportProtocols.includes(node.kind))
+  }, [nameFilterResult.nodes, exportProtocols])
+  const remoteSubscriptions = useMemo<RemoteSubscriptionEntry[]>(() => {
+    if (!embedRemoteSubscriptions) return []
+    return sources
+      .filter((source) => isSourceEnabled(source) && /^https?:\/\//i.test(source.url))
+      .map((source) => ({
+        id: source.id,
+        name: source.name,
+        url: source.url,
+        userAgent: source.userAgent,
+      }))
+  }, [embedRemoteSubscriptions, sources])
+  const activeTailnets = useMemo<TailnetExport[]>(
+    () => tailnets
+      .filter((connection) => connection.isEnabled)
+      .map((connection) => ({ connection, authKey: tailnetAuthKeys[connection.id] })),
+    [tailnets, tailnetAuthKeys],
+  )
+  // Shadowrocket consumes Clash YAML but has no proxy-provider support.
+  const supportsProxyCollections = target.target !== 'shadowrocket'
+    && formatSupportsProxyCollections(targetFormat)
+    && contentMode === 'full'
+  const previewRemoteSubscriptions = supportsProxyCollections ? remoteSubscriptions : []
+  const contentModeByFormat = useMemo(() => {
+    const modes: Partial<Record<SubFormat, ExportContentMode>> = {}
+    for (const format of ['yaml', 'egern', 'surge', 'loon', 'quanx', 'json'] as SubFormat[]) {
+      const representative = targetFormat === format
+        ? target
+        : orderedClients.find((client) => subFormatFor(client) === format)
+      modes[format] = representative
+        ? effectiveContentMode(representative, exportContentModes, exportContentMode)
+        : 'full'
+    }
+    modes.base64 = 'nodes'
+    return modes
+  }, [target, targetFormat, orderedClients, exportContentModes, exportContentMode])
+  const exportableCount = generated
+    ? exportedNodeCount
+    : Math.max(0, usable.length - skipped)
+  const hasRemoteExportable = remoteSourceCount > 0
+  const hasExportable = exportableCount > 0 || hasRemoteExportable
+  const noEnabledNodes = enabled.length === 0
+  const nameFilterEmpty = !noEnabledNodes && nameFilterResult.nodes.length === 0
+  const filterEmpty = !noEnabledNodes && !nameFilterEmpty && usable.length === 0
+  const emptyReason = noEnabledNodes
+    ? '当前没有启用的节点：请先在「订阅管理」添加订阅、自有节点或启用节点。'
+    : nameFilterResult.error
+      ? nameFilterResult.error
+      : nameFilterEmpty
+        ? '节点名称筛选没有匹配节点：调整关键词或清除筛选。'
+        : filterEmpty
+          ? '当前协议筛选没有匹配节点：清除筛选或选择其他协议。'
+          : `当前客户端不支持这 ${usable.length} 个节点的协议：请换一个客户端，或排除不兼容节点。`
+
+  const sourceNameByID = useMemo(() => new Map(sources.map((source) => [source.id, source.name])), [sources])
+  const nameForNode = useMemo(() => {
+    if (!appendSourceName) return undefined
+    return (node: ProxyNode) => {
+      const sourceName = node.sourceID ? sourceNameByID.get(node.sourceID) : undefined
+      return sourceName ? `${node.name} · ${sourceName}` : node.name
+    }
+  }, [appendSourceName, sourceNameByID])
+  const outputOptions = useMemo(
+    () => ({
+      contentMode,
+      nameForNode,
+      remoteSubscriptions: previewRemoteSubscriptions,
+      tailnets: contentMode === 'full' ? activeTailnets : [],
+    }),
+    [contentMode, nameForNode, previewRemoteSubscriptions, activeTailnets],
+  )
+  const configName = exportConfigName.trim() || 'tower'
+  const fileStem = configFileStem(configName)
+
+  const clientGroups = useMemo(() => {
+    const q = clientQuery.trim().toLowerCase()
+    return CLIENT_GROUPS.map((group) => ({
+      ...group,
+      clients: visibleClients.filter((client) => {
+        if (clientGroupKey(client) !== group.key) return false
+        if (!q) return true
+        return [client.name, client.subtitle, client.target].join(' ').toLowerCase().includes(q)
+      }),
+    })).filter((group) => group.clients.length > 0)
+  }, [clientQuery, visibleClients])
+
+  // 当前客户端被隐藏时，自动落到第一个可见客户端，避免选择面板里没有当前项。
+  useEffect(() => {
+    if (visibleClients.some((client) => client.target === target.target)) return
+    const next = visibleClients[0]
+    if (next) setTarget(next)
+  }, [visibleClients, target])
+
+  useEffect(() => {
+    if (!exportScheme) {
+      setGenerated('')
+      setSkipped(0)
+      setExportedNodeCount(0)
+      setRemoteSourceCount(0)
+      setTailnetNotes([])
+      return
+    }
+    const out = generateConfig(target, usable, exportScheme, outputOptions)
+    setGenerated(out.text)
+    setSkipped(out.skipped)
+    setExportedNodeCount(out.exportedNodeCount)
+    setRemoteSourceCount(out.remoteSourceCount)
+    setTailnetNotes(out.notes)
+  }, [target, usable, exportScheme, outputOptions])
+
+  // ------- 客户端专属订阅链接（跟随 target 实时变化）-------
+  // 同一 token 下按客户端 format 取对应载体：
+  //   yaml → Clash Verge / Mihomo / Stash …  ini → Surge / Loon / QuanX
+  //   json → sing-box MT / Hiddify           base64 → V2Box / Anywhere
+  //   yaml → Shadowrocket 也使用 Clash YAML；egern 使用独立 Egern 载体。
+  const clientSubURL = useMemo(() => {
+    if (!subURL) return ''
+    try {
+      // 用当前页面的 origin 重建：从 127.0.0.1 发布、之后用局域网地址打开时，
+      // 链接也会自动变成局域网地址，不会把 127.0.0.1 发给手机。
+      const u = new URL(new URL(subURL, window.location.origin).pathname, window.location.origin)
+      u.searchParams.set('format', subFormatFor(target))
+      // target 让服务端在存在客户端专属变体（如 Stash / Surge Mac）时选对写法。
+      u.searchParams.set('target', target.target)
+      return u.href
+    } catch {
+      // localStorage 里的旧地址被改坏时，别让整个导出页白屏。
+      return ''
+    }
+  }, [target, subURL])
+
+  // importScheme 可用时包装成客户端 deep link，否则直接给订阅地址。
+  const clientImportURL = useMemo(() => {
+    if (!clientSubURL) return ''
+    return target.importScheme ? target.importScheme(clientSubURL, configName, contentMode) : clientSubURL
+  }, [target, clientSubURL, configName, contentMode])
+
+  // 本机打开的页面，手机端要用局域网地址而不是 127.0.0.1。
+  const clientLanSubURL = useMemo(() => {
+    if (!localHost || !net?.lan[0] || !clientSubURL) return ''
+    return clientSubURL.replace(window.location.origin, net.lan[0])
+  }, [localHost, net, clientSubURL])
+
+  // 通用局域网地址不带 format，由服务端按客户端 User-Agent / target 自动识别。
+  const lanSubURL = useMemo(() => {
+    if (!localHost || !net?.lan[0] || !subURL) return ''
+    try {
+      const path = new URL(subURL, window.location.origin).pathname
+      return new URL(path, window.location.origin).href.replace(window.location.origin, net.lan[0])
+    } catch {
+      return ''
+    }
+  }, [localHost, net, subURL])
+
+  const previewText = useMemo(
+    () => maskTailnetAuthKeys(generated, activeTailnets.map((item) => item.authKey)),
+    [generated, activeTailnets],
+  )
+  const previewMatches = useMemo(() => {
+    const needle = previewQuery.trim()
+    if (!needle) return null
+    const lower = needle.toLowerCase()
+    const rows: { number: number; line: string }[] = []
+    let count = 0
+    for (const [index, line] of previewText.split('\n').entries()) {
+      if (!line.toLowerCase().includes(lower)) continue
+      count += 1
+      if (rows.length < 500) rows.push({ number: index + 1, line })
+    }
+    return { needle, count, rows, truncated: count > rows.length }
+  }, [previewText, previewQuery])
+
+  const download = () => {
+    if (!exportScheme) {
+      setCheckResult({ ok: false, text: '规则方案还没加载完成，稍后再试或到规则页重新选择方案' })
+      return
+    }
+    if (!hasExportable) {
+      setCheckResult({ ok: false, text: emptyReason })
+      return
+    }
+    const out = generateConfig(target, usable, exportScheme, outputOptions)
+    const blob = new Blob([out.text], { type: out.mime })
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = `${fileStem}.${out.extension}`
+    // 部分浏览器要求链接在 DOM 里才触发下载；URL 延后释放，避免抢在下载前回收。
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    window.setTimeout(() => URL.revokeObjectURL(a.href), 1000)
+    setDownloaded(true)
+    setTimeout(() => setDownloaded(false), 1600)
+  }
+
+  const copy = async () => {
+    if (!hasExportable) {
+      setCheckResult({ ok: false, text: emptyReason })
+      return
+    }
+    if (!generated) {
+      setCheckResult({ ok: false, text: '配置还在生成，稍后再试' })
+      return
+    }
+    const ok = await copyToClipboard(generated)
+    if (!ok) {
+      setCheckResult({ ok: false, text: '这台机器不允许网页写剪贴板，请在预览框里手动全选复制' })
+      return
+    }
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
+
+  const importIntoClient = async () => {
+    if (!target.importScheme) return
+    if (!exportScheme) {
+      setCheckResult({ ok: false, text: '规则方案还没加载完成，稍后再试' })
+      return
+    }
+    if (!hasExportable) {
+      setCheckResult({ ok: false, text: emptyReason })
+      return
+    }
+    setImporting(true)
+    try {
+      // 旧订阅快照可能还是修复前的产物（例如含 mihomo 不支持的 URL-REGEX）。
+      // 导入前先按当前设置重新发布，避免客户端拿到一份早已过期的配置。
+      const fresh = await publishNow()
+      let abs = ''
+      if (fresh) {
+        const u = new URL(fresh, window.location.origin)
+        u.searchParams.set('format', subFormatFor(target))
+        u.searchParams.set('target', target.target)
+        abs = u.href
+      } else {
+        const out = generateConfig(target, usable, exportScheme, outputOptions)
+        const res = await fetch(`/api/share?name=${encodeURIComponent(configName)}`, {
+          method: 'POST',
+          headers: { 'content-type': out.mime },
+          body: out.text,
+        })
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const { url } = await res.json()
+        if (!url) throw new Error('服务端没有返回导入链接')
+        abs = new URL(url, window.location.origin).href
+      }
+      window.location.href = target.importScheme(abs, configName, contentMode)
+      setImportNotice(`已同步最新配置并尝试唤起 ${target.name}；若没有反应，复制下面的订阅地址，在客户端里手动添加。`)
+    } catch {
+      setImportNotice(`唤起 ${target.name} 失败，请复制订阅地址手动添加。`)
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  /** 请求一个订阅地址，取回真实响应内容。 */
+  const probeSubscription = async (u: string) => {
+    const res = await fetch(u, { cache: 'no-store' })
+    const text = await res.text()
+    const firstLine = (text.split('\n').find((l) => l.trim()) ?? '').trim().slice(0, 80)
+    const ctype = res.headers.get('content-type') ?? '—'
+    if (!res.ok) {
+      return { ok: false, status: res.status, text: `HTTP ${res.status} · ${text.slice(0, 120)}` }
+    }
+    if (!text.trim()) {
+      return { ok: false, status: res.status, text: `HTTP ${res.status} 但内容为空（${ctype}）` }
+    }
+    return {
+      ok: true,
+      status: res.status,
+      text: `HTTP ${res.status} · ${ctype} · ${text.length} 字节 · 首行「${firstLine}」`,
+    }
+  }
+
+  /** 发布当前节点到订阅地址；返回可用的绝对地址（不含 format 参数）。 */
+  const publishNow = async (): Promise<string | null> => {
+    if (usable.length === 0) {
+      setCheckResult({ ok: false, text: '没有可导出的节点：请先在「订阅管理」添加订阅或自有节点，并启用节点' })
+      return null
+    }
+    if (!scheme) {
+      setCheckResult({ ok: false, text: '规则方案尚未加载完成，请稍后重试' })
+      return null
+    }
+    if (!hasExportable) {
+      setCheckResult({ ok: false, text: emptyReason })
+      return null
+    }
+    setSubRefreshing(true)
+    try {
+      // 一次生成全部载体，服务端按 format 参数分发，保证每个客户端拿到自己的格式。
+      // 传原始方案而不是 exportScheme：内部会按各载体再次准备规则，避免规则重复。
+      const formats = generateSubscriptionFormats(usable, scheme, {
+        policySelections,
+        preferRuleSets,
+        contentMode,
+        contentModeByFormat,
+        nameForNode,
+        remoteSubscriptions,
+        tailnets: activeTailnets,
+      })
+      if (!formats.base64) throw new Error('节点列表为空或无法转换')
+      // Stash / Surge Mac 的 Tailscale 写法与同格式其他客户端不同；Karing、
+      // Egern、Hiddify 不支持，需要不带 Tailscale 的变体。
+      const targets: Partial<Record<ClientTarget, string>> = {}
+      // Shadowrocket 与 Clash 共用 YAML 载体，但它不支持 proxy-providers。
+      // 始终提供目标变体，避免发布链接把代理集合写进 Shadowrocket 配置。
+      const shadowrocket = CLIENTS.find((client) => client.target === 'shadowrocket')
+      if (shadowrocket) {
+        const prepared = prepareSchemeForExport(scheme, policySelections, {
+          preferRuleSets,
+          format: 'yaml',
+          target: 'shadowrocket',
+        })
+        const mode = effectiveContentMode(shadowrocket, exportContentModes, exportContentMode)
+        targets.shadowrocket = generateConfig(shadowrocket, usable, prepared, {
+          contentMode: mode,
+          nameForNode,
+          remoteSubscriptions: [],
+          tailnets: [],
+        }).text
+      }
+      // Karing 与 Clash 共用 YAML，但核心不读 MRS；发布时单独去掉。
+      const karing = CLIENTS.find((client) => client.target === 'karing')
+      if (karing) {
+        const prepared = prepareSchemeForExport(scheme, policySelections, {
+          preferRuleSets,
+          format: 'yaml',
+          target: 'karing',
+        })
+        const mode = effectiveContentMode(karing, exportContentModes, exportContentMode)
+        targets.karing = generateConfig(karing, usable, prepared, {
+          contentMode: mode,
+          nameForNode,
+          remoteSubscriptions,
+          tailnets: [],
+        }).text
+      }
+      // sing-box 1.14 的远程规则集需要 http_clients，Hiddify 内嵌 1.13 不接受；
+      // 发布时给两个 JSON 客户端各自一份目标变体。
+      for (const targetKey of ['sing-box', 'hiddify'] as const) {
+        const client = CLIENTS.find((item) => item.target === targetKey)
+        if (!client) continue
+        const mode = effectiveContentMode(client, exportContentModes, exportContentMode)
+        const prepared = prepareSchemeForExport(scheme, policySelections, {
+          preferRuleSets,
+          format: 'json',
+          target: targetKey,
+        })
+        targets[targetKey] = generateConfig(client, usable, prepared, {
+          contentMode: mode,
+          nameForNode,
+          remoteSubscriptions,
+          tailnets: [],
+        }).text
+      }
+      if (activeTailnets.length > 0) {
+        for (const targetKey of TAILNET_TARGET_VARIANTS) {
+          const client = CLIENTS.find((item) => item.target === targetKey)
+          if (!client) continue
+          const format = subFormatFor(client)
+          if (format !== 'yaml' && format !== 'surge' && format !== 'json') continue
+          const mode = effectiveContentMode(client, exportContentModes, exportContentMode)
+          const prepared = prepareSchemeForExport(scheme, policySelections, {
+            preferRuleSets,
+            format,
+            target: targetKey,
+          })
+          targets[targetKey] = generateConfig(client, usable, prepared, {
+            contentMode: mode,
+            nameForNode,
+            remoteSubscriptions,
+            tailnets: mode === 'full' ? activeTailnets : [],
+          }).text
+        }
+      }
+      const query = new URLSearchParams({ title: configName })
+      if (subToken) query.set('token', subToken)
+      const res = await fetch(`/api/subscribe?${query.toString()}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({ title: configName, formats, targets }),
+      })
+      if (!res.ok) {
+        const detail = await res.text().catch(() => '')
+        throw new Error(`HTTP ${res.status} ${detail.slice(0, 80)}`)
+      }
+      const json = await res.json()
+      setSubToken(json.token)
+      localStorage.setItem('tower-sub-token', json.token)
+      const abs = new URL(json.url, window.location.origin).href
+      setSubURL(abs)
+      localStorage.setItem('tower-sub-url', abs)
+      const now = Date.now()
+      setSubUpdatedAt(now)
+      localStorage.setItem('tower-sub-updated-at', String(now))
+      return abs
+    } catch (e: unknown) {
+      setCheckResult({ ok: false, text: `发布失败：${e instanceof Error ? e.message : String(e)}` })
+      return null
+    } finally {
+      setSubRefreshing(false)
+    }
+  }
+
+  const publishSubscription = async () => {
+    const url = await publishNow()
+    if (url) {
+      const remoteLabel = remoteSubscriptions.length > 0 ? ` · ${remoteSubscriptions.length} 个代理集合` : ''
+      const tailnetLabel = activeTailnets.length > 0 ? ` · ${activeTailnets.length} 个 Tailscale 内网` : ''
+      setCheckResult({
+        ok: true,
+        text: `已发布 · ${exportableCount} 个本地节点${remoteLabel}${tailnetLabel} · 各载体按对应客户端设置生成`,
+      })
+    }
+  }
+
+  // 之前发布过的 token 里存的是旧内容（例如修好 DNS 之前的 YAML）。
+  // 进入导出页时静默同步一次，地址不变，用户 Clash 刷新订阅就能拿到修复后的配置。
+  const autoSyncedRef = useRef(false)
+  useEffect(() => {
+    if (autoSyncedRef.current) return
+    if (!subToken || !scheme || usable.length === 0) return
+    autoSyncedRef.current = true
+    void publishNow()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subToken, scheme, usable.length])
+
+  /**
+   * 检查链接：先探当前地址；若 404（多半是服务端重启前的旧 token），
+   * 自动重新发布再探一次，避免用户被一个死链困住。
+   */
+  const checkSubscription = async () => {
+    if (!clientSubURL) {
+      setCheckResult({ ok: false, text: '还没有订阅地址，请先点「生成订阅链接」' })
+      return
+    }
+    if (!hasExportable) {
+      setCheckResult({ ok: false, text: emptyReason })
+      return
+    }
+    setChecking(true)
+    setCheckResult(null)
+    try {
+      let result = await probeSubscription(clientSubURL)
+      if (!result.ok && result.status === 404) {
+        const fresh = await publishNow()
+        if (fresh) {
+          const u = new URL(fresh, window.location.origin)
+          u.searchParams.set('format', subFormatFor(target))
+          result = await probeSubscription(u.href)
+          result = { ...result, text: `已自动重新发布 · ${result.text}` }
+        } else {
+          result = { ...result, text: '旧链接已失效，且当前没有可发布的节点' }
+        }
+      }
+      setCheckResult({ ok: result.ok, text: result.text })
+    } catch (err) {
+      setCheckResult({ ok: false, text: `请求失败：${err instanceof Error ? err.message : String(err)}` })
+    } finally {
+      setChecking(false)
+    }
+  }
+
+  const chooseClient = (client: ClientInfo) => {
+    setTarget(client)
+    setClientQuery('')
+    if (pickerRef.current) pickerRef.current.open = false
+  }
+
+  const revokeSubscription = async () => {
+    if (!subToken) return
+    try { await fetch(`/api/sub/${encodeURIComponent(subToken)}`, { method: 'DELETE' }) } catch {}
+    setSubToken(''); setSubURL(''); setSubUpdatedAt(null)
+    localStorage.removeItem('tower-sub-token')
+    localStorage.removeItem('tower-sub-url')
+    localStorage.removeItem('tower-sub-updated-at')
+  }
+
+  const toggleProtocol = (kind: ProxyKind) => {
+    if (exportProtocols.includes(kind)) {
+      setExportProtocols(exportProtocols.filter((item) => item !== kind))
+    } else {
+      setExportProtocols([...exportProtocols, kind])
+    }
+  }
+
+  const moveClient = (client: ClientInfo, delta: number) => {
+    const order = orderedClients.map((item) => item.target)
+    const index = order.indexOf(client.target)
+    const next = index + delta
+    if (index < 0 || next < 0 || next >= order.length) return
+    const swapped = [...order]
+    ;[swapped[index], swapped[next]] = [swapped[next], swapped[index]]
+    setClientOrder(swapped)
+  }
+
+  const toggleClientVisible = (client: ClientInfo) => {
+    if (hiddenClients.includes(client.target)) {
+      setClientHidden(client.target, false)
+      return
+    }
+    // 至少保留一个可见客户端，避免一次隐藏后整个导出页无处落脚。
+    if (visibleClients.length <= 1) return
+    setClientHidden(client.target, true)
+    if (client.target === target.target) {
+      const next = visibleClients.find((item) => item.target !== client.target)
+      if (next) setTarget(next)
+    }
+  }
+
+  return (
+    <div>
+      <div className="page-head">
+        <div>
+          <div className="eyebrow">导出与发布 · 04</div>
+          <h1>导出与发布</h1>
+          <div className="sub">为 <span className="num">{visibleClients.length}</span> 种客户端生成配置，或发布订阅链接到手机</div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-head">
+          <h3>客户端</h3>
+          <div className="row client-head-actions">
+            <span className="meta">
+              <span className="num">{visibleClients.length}</span> 个 · 按格式分组
+              {hiddenClients.length > 0 ? ` · 已隐藏 ${hiddenClients.length}` : ''}
+            </span>
+            <button className="btn ghost" onClick={() => setManageClients((v) => !v)}>
+              {manageClients ? '完成' : '排序 / 隐藏'}
+            </button>
+          </div>
+        </div>
+
+        {manageClients ? (
+          <div className="client-manage">
+            <div className="client-manage-head">
+              <span className="hint">排序影响选择面板；隐藏不会删除客户端或已生成的配置。</span>
+              <button className="btn ghost" onClick={() => setClientOrder([])}>恢复默认顺序</button>
+            </div>
+            <ul className="client-manage-list">
+              {orderedClients.map((client, index) => {
+                const hidden = hiddenClients.includes(client.target)
+                const active = client.target === target.target
+                return (
+                  <li key={client.target} className={`${hidden ? 'is-hidden' : ''}${active ? ' is-active' : ''}`}>
+                    <span className="opt-icon">
+                      <img
+                        src={`/client-icons/${client.icon}`}
+                        alt=""
+                        loading="lazy"
+                        onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none' }}
+                      />
+                    </span>
+                    <span className="cm-info">
+                      <span className="cm-name">
+                        {client.name}
+                        {active && <span className="pill positive">当前</span>}
+                      </span>
+                      <span className="cm-sub">{FORMAT_LABELS[subFormatFor(client)]} · {client.subtitle}</span>
+                    </span>
+                    {hidden && <span className="pill">已隐藏</span>}
+                    <div className="cm-actions">
+                      <button
+                        className="icon-btn"
+                        aria-label={`上移 ${client.name}`}
+                        title="上移"
+                        disabled={index === 0}
+                        onClick={() => moveClient(client, -1)}
+                      >↑</button>
+                      <button
+                        className="icon-btn"
+                        aria-label={`下移 ${client.name}`}
+                        title="下移"
+                        disabled={index === orderedClients.length - 1}
+                        onClick={() => moveClient(client, 1)}
+                      >↓</button>
+                      <button
+                        className="btn ghost"
+                        disabled={!hidden && visibleClients.length <= 1}
+                        title={!hidden && visibleClients.length <= 1 ? '至少保留一个可见客户端' : undefined}
+                        onClick={() => toggleClientVisible(client)}
+                      >{hidden ? '显示' : '隐藏'}</button>
+                    </div>
+                  </li>
+                )
+              })}
+            </ul>
+          </div>
+        ) : (
+        /* 只展示当前客户端；其余收进可按格式分组、可搜索的选择面板，避免图标墙越堆越长。 */
+        <details className="client-picker" ref={pickerRef}>
+          <summary className="client-card active client-current" aria-label={`当前客户端：${target.name}，点击更换`}>
+            <span className="ctile">
+              <img
+                className="cicon"
+                src={`/client-icons/${target.icon}`}
+                alt={target.name}
+                onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none' }}
+              />
+            </span>
+            <span className="cinfo">
+              <span className="cname">{target.name}</span>
+              <span className="csub">{target.subtitle}</span>
+            </span>
+            <span className="client-change">更换客户端 <span aria-hidden="true">▾</span></span>
+          </summary>
+
+          <div className="client-picker-panel">
+            <input
+              className="input client-search"
+              value={clientQuery}
+              onChange={(e) => setClientQuery(e.target.value)}
+              placeholder="搜索客户端、平台或格式…"
+              aria-label="搜索客户端"
+            />
+            {clientGroups.map((group) => (
+              <div className="client-group" key={group.key}>
+                <div className="client-group-head">
+                  <span>{group.label}</span>
+                  <span className="num">{group.clients.length}</span>
+                </div>
+                <div className="client-options">
+                  {group.clients.map((client) => (
+                    <button
+                      key={client.target}
+                      className={`client-option${client.target === target.target ? ' active' : ''}`}
+                      aria-pressed={client.target === target.target}
+                      onClick={() => chooseClient(client)}
+                    >
+                      <span className="opt-icon">
+                        <img
+                          src={`/client-icons/${client.icon}`}
+                          alt=""
+                          loading="lazy"
+                          onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none' }}
+                        />
+                      </span>
+                      <span className="opt-text">
+                        <span className="opt-name">{client.name}</span>
+                        <span className="opt-sub">{client.subtitle}</span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+            {clientGroups.length === 0 && <div className="hint">没有匹配的客户端</div>}
+          </div>
+        </details>
+        )}
+      </div>
+
+      <div className="card">
+        <div className="card-head">
+          <h3>导出设置</h3>
+          <span className="meta">{configName}</span>
+        </div>
+        <div className="export-fields">
+          <div className="export-field">
+            <div className="export-field-head">
+              <span>内容模式</span>
+              <span className="hint">{contentMode === 'full' ? '节点 + 策略组 + 规则' : '仅节点内容'}</span>
+            </div>
+            {target.contentMode === 'nodes' ? (
+              <div className="segmented is-disabled" aria-label="导出内容模式">
+                <button type="button" disabled>完整配置</button>
+                <button type="button" className="active" aria-pressed="true" disabled>仅节点</button>
+              </div>
+            ) : (
+              <div className="segmented" role="group" aria-label="导出内容模式">
+                <button
+                  type="button"
+                  className={contentMode === 'full' ? 'active' : ''}
+                  aria-pressed={contentMode === 'full'}
+                  onClick={() => setExportContentModeFor(target.target, 'full')}
+                >完整配置</button>
+                <button
+                  type="button"
+                  className={contentMode === 'nodes' ? 'active' : ''}
+                  aria-pressed={contentMode === 'nodes'}
+                  onClick={() => setExportContentModeFor(target.target, 'nodes')}
+                >仅节点</button>
+              </div>
+            )}
+            <div className="hint">
+              {contentMode === 'full'
+                ? '写入策略组与规则，客户端导入后即可分流。'
+                : '只输出节点，省略策略组与规则，适合合并进已有配置。'}
+              {target.contentMode === 'nodes' ? ` ${target.name} 本身只接收节点订阅。` : ' 每个客户端会单独记住这个模式。'}
+            </div>
+          </div>
+
+          <div className="export-field">
+            <div className="export-field-head">
+              <label htmlFor="export-config-name">配置名称</label>
+              <span className="hint">用于文件名与订阅标题</span>
+            </div>
+            <input
+              id="export-config-name"
+              className="input"
+              value={exportConfigName}
+              maxLength={48}
+              placeholder="tower"
+              onChange={(e) => setExportConfigName(e.target.value)}
+            />
+            <div className="hint">
+              下载为 <span className="mono">{fileStem}.{targetFormat === 'json' ? 'json' : targetFormat === 'base64' ? 'txt' : targetFormat === 'yaml' ? 'yaml' : 'conf'}</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="export-field protocol-field">
+          <div className="export-field-head">
+            <span>协议筛选</span>
+            <span className="hint">
+              {exportProtocols.length === 0
+                ? `全部 ${nameFilterResult.nodes.length} 个命中节点`
+                : `已选 ${exportProtocols.length} 种协议 · ${usable.length} 个节点`}
+            </span>
+          </div>
+          {protocolCounts.length === 0 ? (
+            <div className="hint">还没有可导出的节点。</div>
+          ) : (
+            <div className="protocol-chips" role="group" aria-label="按协议筛选节点">
+              <button
+                type="button"
+                className={`protocol-chip${exportProtocols.length === 0 ? ' active' : ''}`}
+                aria-pressed={exportProtocols.length === 0}
+                onClick={() => setExportProtocols([])}
+              >
+                全部 <span className="num">{nameFilterResult.nodes.length}</span>
+              </button>
+              {protocolCounts.map(([kind, count]) => {
+                const active = exportProtocols.includes(kind)
+                return (
+                  <button
+                    key={kind}
+                    type="button"
+                    className={`protocol-chip${active ? ' active' : ''}`}
+                    aria-pressed={active}
+                    onClick={() => toggleProtocol(kind)}
+                  >
+                    {PROXY_KIND_TITLES[kind]} <span className="num">{count}</span>
+                  </button>
+                )
+              })}
+            </div>
+          )}
+        </div>
+
+        <details className="export-advanced">
+          <summary>
+            <span>节点名称筛选</span>
+            <span className="hint">
+              {nodeNameFilter.include || nodeNameFilter.exclude
+                ? `${nameFilterResult.nodes.length} / ${enabled.length} 个节点匹配`
+                : '包含 / 排除关键词，可选正则'}
+            </span>
+          </summary>
+          <div className="name-filter-fields">
+            <div className="export-field">
+              <label htmlFor="node-filter-include">只保留包含这些关键词的节点</label>
+              <textarea
+                id="node-filter-include"
+                className="field"
+                rows={2}
+                value={nodeNameFilter.include}
+                placeholder="每行一个，例如：香港&#10;JP"
+                onChange={(e) => setNodeNameFilter({ include: e.target.value })}
+              />
+            </div>
+            <div className="export-field">
+              <label htmlFor="node-filter-exclude">排除包含这些关键词的节点</label>
+              <textarea
+                id="node-filter-exclude"
+                className="field"
+                rows={2}
+                value={nodeNameFilter.exclude}
+                placeholder="每行一个，例如：到期&#10;官网"
+                onChange={(e) => setNodeNameFilter({ exclude: e.target.value })}
+              />
+            </div>
+          </div>
+          <div className="name-filter-options">
+            <label className="filter-check">
+              <input
+                type="checkbox"
+                checked={nodeNameFilter.useRegex}
+                onChange={(e) => setNodeNameFilter({ useRegex: e.target.checked })}
+              />
+              使用正则
+            </label>
+            <label className="filter-check">
+              <input
+                type="checkbox"
+                checked={nodeNameFilter.caseSensitive}
+                onChange={(e) => setNodeNameFilter({ caseSensitive: e.target.checked })}
+              />
+              区分大小写
+            </label>
+            {(nodeNameFilter.include || nodeNameFilter.exclude) && (
+              <button
+                className="btn ghost"
+                onClick={() => setNodeNameFilter({ include: '', exclude: '' })}
+              >清除名称筛选</button>
+            )}
+          </div>
+          {nameFilterResult.error ? (
+            <div className="error">{nameFilterResult.error}</div>
+          ) : (
+            <div className="hint">条件会用于所有客户端导出；订阅刷新后新增的节点也会自动匹配。</div>
+          )}
+        </details>
+
+        <label className={`setting-toggle${contentMode === 'nodes' ? ' is-disabled' : ''}`}>
+          <input
+            type="checkbox"
+            checked={embedRemoteSubscriptions}
+            disabled={contentMode === 'nodes'}
+            onChange={(e) => setEmbedRemoteSubscriptions(e.target.checked)}
+          />
+          <span>
+            <strong>代理集合（嵌入原始订阅链接）</strong>
+            <small>
+              {contentMode === 'nodes'
+                ? '仅节点模式不会写入代理集合。'
+                : `把已启用订阅的原始地址写入配置，节点由客户端更新。当前载体${supportsProxyCollections ? '支持' : '暂不支持，会回退为内联节点'}；Clash / mihomo、Stash、Karing、Surge、Loon、Quantumult X 和 Egern 可写入代理集合，Shadowrocket 与 sing-box 系回退为内联节点。${embedRemoteSubscriptions ? ` 已启用 ${remoteSubscriptions.length} 个代理集合，其节点不受名称/协议筛选和追加订阅名影响。` : ''}`}
+            </small>
+          </span>
+        </label>
+
+        <label className="setting-toggle">
+          <input
+            type="checkbox"
+            checked={appendSourceName}
+            onChange={(e) => setAppendSourceName(e.target.checked)}
+          />
+          <span>
+            <strong>节点名追加订阅名</strong>
+            <small>例如「香港 01 · 机场 A」，多订阅合并时更容易区分；本地节点不追加。</small>
+          </span>
+        </label>
+        <div className="hint export-settings-note">
+          这些设置同时影响预览、下载和订阅链接；修改后请点「同步节点到链接」更新已发布订阅。
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-head">
+          <h3>规则导出</h3>
+          <span className="meta">{target.name} · {FORMAT_LABELS[targetFormat]}</span>
+        </div>
+        <label className="setting-toggle rule-export-toggle">
+          <input
+            type="checkbox"
+            checked={preferRuleSets}
+            onChange={(e) => setPreferRuleSets(e.target.checked)}
+          />
+          <span>
+            <strong>优先引用远程规则集</strong>
+            <small>
+              客户端能读取规则集原始格式时直接写远程引用：Clash / mihomo、Stash、Shadowrocket、
+              Surge 和 Loon 可读经典列表；经典列表还会由塔台服务无损转换并托管为
+              QuanX / Egern / sing-box 方言。托管地址跟随当前访问的塔台地址，手机导入请使用局域网地址或局域网订阅链接；
+              无法转换的格式和「我的规则集」会展开写入；节点订阅客户端不包含规则。
+            </small>
+          </span>
+        </label>
+        {compatibility ? (
+          <>
+            <div className="rule-export-facts">
+              <div className="rule-export-fact">
+                <span>自定义规则</span>
+                <strong className="num">{scheme?.customRules?.length ?? 0}</strong>
+              </div>
+              <div className="rule-export-fact">
+                <span>规则集</span>
+                <strong className="num">{compatibility.ruleSetCount}</strong>
+              </div>
+              <div className="rule-export-fact">
+                <span>远程引用</span>
+                <strong className="num">{compatibility.remoteRuleSets}</strong>
+              </div>
+              <div className="rule-export-fact">
+                <span>跳过规则</span>
+                <strong className="num">{compatibility.skipped}</strong>
+              </div>
+            </div>
+            {compatibility.nodeOnly ? (
+              <div className="inline-notice">
+                <span>{compatibility.note}</span>
+              </div>
+            ) : (
+              <div className="hint rule-export-note">
+                {compatibility.supportsRemoteRuleSets
+                  ? preferRuleSets
+                    ? compatibility.ruleSetCount === 0
+                      ? '当前方案没有加入规则集，自定义规则与方案规则会直接写入配置。'
+                      : compatibility.remoteRuleSets > 0
+                        ? `当前会把 ${compatibility.remoteRuleSets} 组规则集写成远程引用${compatibility.inlineRuleSets > 0 ? `，${compatibility.inlineRuleSets} 组规则集继续展开` : ''}。客户端需要能访问规则集的远程地址。`
+                        : compatibility.ruleSetNote ?? '这些规则集当前会展开写入。'
+                    : compatibility.ruleSetCount > 0
+                      ? `已加入 ${compatibility.ruleSetCount} 组规则集；开启后会优先写成 ${target.name} 能直接读取的远程格式，其余继续展开。`
+                      : '当前方案没有加入规则集，自定义规则与方案规则会直接写入配置。'
+                  : compatibility.ruleSetCount > 0
+                    ? `${target.name} 不能直接引用远程规则集，${compatibility.ruleSetCount} 组规则集会展开为单条规则写入。`
+                    : `${target.name} 不能直接引用远程规则集，规则会逐条写入。`}
+              </div>
+            )}
+            {compatibility.skipped > 0 && (
+              <div className="inline-notice">
+                <span>{compatibility.note}</span>
+              </div>
+            )}
+          </>
+        ) : (
+          <div className="hint rule-export-note">规则方案加载中，稍后显示兼容性。</div>
+        )}
+      </div>
+
+      <div className="card">
+        <div className="card-head">
+          <h3>配置预览</h3>
+          <span className="meta">
+            <span className="num">{exportableCount}</span> 本地可用
+            {hasRemoteExportable ? ` · ${remoteSourceCount} 个代理集合` : ''}
+            {noEnabledNodes
+              ? ' · 没有启用的节点'
+              : nameFilterEmpty
+                ? ' · 名称筛选没有匹配节点'
+                : filterEmpty
+                  ? ' · 协议筛选没有匹配节点'
+                  : exportableCount === 0 && !hasRemoteExportable
+                    ? ` · ${target.name} 不支持当前节点的协议`
+                    : skipped
+                      ? ` · ${skipped} 个协议不被 ${target.name} 支持`
+                      : ` · 共 ${usable.length} 节点`}
+            {exportProtocols.length > 0 && !filterEmpty ? ` · 已筛选 ${enabled.length - usable.length} 个` : ''}
+          </span>
+        </div>
+        {!hasExportable && (
+          <div className="inline-notice error">
+            <span>{emptyReason}</span>
+            <div className="row" style={{ gap: 6 }}>
+              {(nameFilterEmpty || nameFilterResult.error) && (
+                <button className="btn ghost" onClick={() => setNodeNameFilter({ include: '', exclude: '' })}>清除名称筛选</button>
+              )}
+              {(filterEmpty || exportProtocols.length > 0) && (
+                <button className="btn ghost" onClick={() => setExportProtocols([])}>清除协议筛选</button>
+              )}
+              {usable.length > 0 && (
+                <button
+                  className="btn ghost"
+                  onClick={() => {
+                    const picker = pickerRef.current
+                    if (picker) {
+                      picker.open = true
+                      picker.scrollIntoView({ block: 'center', behavior: 'smooth' })
+                    }
+                  }}
+                >
+                  换客户端
+                </button>
+              )}
+              <button className="btn ghost" onClick={() => onGo?.('sub')}>去订阅管理</button>
+            </div>
+          </div>
+        )}
+        <div className="row" style={{ gap: 8, marginBottom: 14 }}>
+          <button className="btn" disabled={!scheme || !hasExportable} onClick={download}>{downloaded ? '已下载' : '下载文件'}</button>
+          <button className="btn ghost" disabled={!hasExportable || !generated} onClick={copy}>{copied ? '已复制' : '复制'}</button>
+          {target.importScheme && (
+            <button className="btn ghost" disabled={importing || !hasExportable} onClick={importIntoClient}>
+              {importing ? '生成链接…' : `导入到 ${target.name}`}
+            </button>
+          )}
+        </div>
+        {importNotice && <div className="hint" style={{ marginBottom: 10 }}>{importNotice}</div>}
+        {skipped > 0 && hasExportable && (
+          <div className="inline-notice">
+            <span>
+              {skipped} 个节点因 {target.name} 不支持其协议，不会写入这份配置。
+            </span>
+            <button className="btn ghost" onClick={() => onGo?.('sub')}>去订阅管理排除</button>
+          </div>
+        )}
+        {tailnetNotes.map((note) => (
+          <div className="inline-notice tailnet-note" key={note}>
+            <span>{note}</span>
+            <button className="btn ghost" onClick={() => onGo?.('tailnet')}>内网设置</button>
+          </div>
+        ))}
+        {contentMode === 'full' && activeTailnets.length > 0 && tailnetSupports(target.target) && (
+          <div className="hint tailnet-applied">
+            已写入 {activeTailnets.length} 个 Tailscale 内网：
+            {activeTailnets.map((item) => tailnetPolicyName(item.connection)).join('、')}
+            {targetFormat === 'surge' ? '。Surge 的 [Tailscale …] 段位于配置末尾（预览只显示前 40000 字符，下载后可完整查看）' : ''}。
+          </div>
+        )}
+        {hasExportable && generated && (
+          <div className="preview-tools">
+            <div className="search-wrap preview-search">
+              <input
+                className="input"
+                value={previewQuery}
+                onChange={(e) => setPreviewQuery(e.target.value)}
+                placeholder="搜索配置内容：域名、规则类型、节点名…"
+                aria-label="搜索配置预览"
+              />
+              {previewQuery && (
+                <button className="search-clear" aria-label="清空预览搜索" onClick={() => setPreviewQuery('')}>×</button>
+              )}
+            </div>
+            {previewMatches && (
+              <span className={`preview-hit${previewMatches.count === 0 ? ' is-empty' : ''}`}>
+                {previewMatches.count === 0 ? '没有匹配行' : `${previewMatches.count} 行命中`}
+              </span>
+            )}
+          </div>
+        )}
+        {hasExportable ? (
+          previewMatches ? (
+            previewMatches.rows.length > 0 ? (
+              <pre className="preview preview-filtered">
+                {previewMatches.rows.map((row) => (
+                  <span className="preview-line" key={row.number}>
+                    <span className="preview-line-no">{String(row.number).padStart(4, ' ')}</span>
+                    {'  '}
+                    <Highlight text={row.line} needle={previewMatches.needle} />
+                  </span>
+                ))}
+                {previewMatches.truncated && <span className="preview-line-more">…仅显示前 500 行匹配，缩小关键词可继续定位</span>}
+              </pre>
+            ) : (
+              <div className="preview-empty preview-no-match">
+                <strong>没有匹配的配置行</strong>
+                <span>换一个域名、规则类型或节点名再试。</span>
+              </div>
+            )
+          ) : (
+            <pre className="preview">{previewText.slice(0, 40000)}{previewText.length > 40000 ? '\n…（预览截断）' : ''}</pre>
+          )
+        ) : (
+          <div className="preview-empty">
+            <strong>当前配置不含可用节点</strong>
+            <span>{noEnabledNodes ? '添加订阅或启用节点后，这里会显示生成的配置。' : nameFilterEmpty ? '清除名称筛选，或换一组关键词后再导出。' : filterEmpty ? '清除协议筛选，或选择其他协议后再导出。' : '换一个支持这些协议的客户端，或排除不兼容节点后再导出。'}</span>
+          </div>
+        )}
+      </div>
+
+      <div className="card">
+        <div className="card-head">
+          <h3 style={{ margin: 0 }}>服务端订阅链接</h3>
+          <div className="meta" style={{ margin: 0 }}>按客户端自动分发格式</div>
+        </div>
+        <div className="field" style={{ marginTop: 14 }}>
+          {subURL ? (
+            <>
+              {/* 客户端专属 URL（跟随 target 实时变化） */}
+              <div className="sub-url-wrap">
+                <div className="sub-url-label">{target.name} 订阅地址（{subFormatFor(target)}）</div>
+                <input readOnly className="input" value={clientSubURL} style={{ fontFamily: '"IBM Plex Mono", ui-monospace, monospace', fontSize: 12 }} />
+              </div>
+              {target.importScheme && (
+                <div className="sub-url-wrap" style={{ marginTop: 10 }}>
+                  <div className="sub-url-label">一键导入链接（deep link）</div>
+                  <input readOnly className="input" value={clientImportURL} style={{ fontFamily: '"IBM Plex Mono", ui-monospace, monospace', fontSize: 12, color: 'var(--muted)' }} />
+                </div>
+              )}
+              {lanSubURL && (
+                <div className="sub-url-wrap" style={{ marginTop: 10 }}>
+                  <div className="sub-url-label">手机 / 局域网订阅地址（同一 Wi-Fi 可导入）</div>
+                  <input readOnly className="input" value={lanSubURL} style={{ fontFamily: '"IBM Plex Mono", ui-monospace, monospace', fontSize: 12 }} />
+                  <div className="hint" style={{ marginTop: 6 }}>
+                    通用地址会按客户端 User-Agent 自动选择格式；上方客户端专属地址始终返回当前格式。
+                  </div>
+                </div>
+              )}
+              {net && net.host !== '0.0.0.0' && (
+                <div className="hint" style={{ marginTop: 8 }}>
+                  服务端当前只监听本机，手机无法访问；用 <span className="mono">HOST=0.0.0.0</span> 重启后才可用。
+                </div>
+              )}
+              {subUpdatedAt && (
+                <div className="hint">
+                  上次同步 {new Date(subUpdatedAt).toLocaleString('zh-CN')} · 本地节点 <span className="num">{exportableCount}</span> 个
+                  {remoteSourceCount > 0 ? ` · ${remoteSourceCount} 个代理集合` : ''}
+                  {exportProtocols.length > 0 ? ` · ${exportProtocols.length} 种协议` : ''}
+                </div>
+              )}
+              <div className="row sub-actions" style={{ gap: 8, marginTop: 10 }}>
+                <button className="btn primary" disabled={subRefreshing || !hasExportable} onClick={publishSubscription}>
+                  {subRefreshing ? '同步中…' : '同步节点到链接'}
+                </button>
+                <button className="btn ghost" disabled={checking || !hasExportable} onClick={checkSubscription}>
+                  {checking ? '检查中…' : '检查链接'}
+                </button>
+                <button className="btn ghost" onClick={() => copyText('sub', clientSubURL)}>
+                  {copiedField === 'sub' ? '已复制订阅地址' : '复制订阅地址'}
+                </button>
+                <button className="btn ghost" onClick={() => copyText('import', clientImportURL)}>
+                  {copiedField === 'import' ? '已复制导入链接' : '复制导入链接'}
+                </button>
+                {lanSubURL && (
+                  <button className="btn ghost" onClick={() => copyText('lan', lanSubURL)}>
+                    {copiedField === 'lan' ? '已复制局域网地址' : '复制局域网地址'}
+                  </button>
+                )}
+                <button className="btn ghost" onClick={() => setQrOpen(true)}>二维码</button>
+                <button className="btn ghost" onClick={() => setPendingRevoke(true)}>撤销</button>
+              </div>
+              {checkResult && (
+                <div className={checkResult.ok ? 'hint' : 'error'} style={{ marginTop: 8 }}>
+                  {checkResult.ok ? '可用 · ' : '异常 · '}
+                  {checkResult.text}
+                  {!checkResult.ok && hasExportable && (
+                    <button className="btn ghost" style={{ marginLeft: 8 }} onClick={publishSubscription}>
+                      重新生成链接
+                    </button>
+                  )}
+                </div>
+              )}
+              <div className="next-steps">
+                <div className="next-steps-title">下一步</div>
+                <ol>
+                  {target.importScheme && (
+                    <li>点「导入到 {target.name}」直接唤起客户端；没反应就复制下面的订阅地址手动添加。</li>
+                  )}
+                  <li>
+                    复制{lanSubURL ? '「手机 / 局域网」' : ''}订阅地址，在 {target.name} 的「订阅 / 配置」里粘贴。
+                  </li>
+                  <li>在客户端里更新一次订阅，确认节点数量与测速正常。</li>
+                </ol>
+                {skipped > 0 && (
+                  <div className="next-steps-note">
+                    {target.name} 不支持 {skipped} 个节点的协议，这些节点不会出现在订阅里。
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <>
+              <button className="btn primary sub-publish-start" disabled={subRefreshing || !hasExportable} onClick={publishSubscription}>
+                {subRefreshing ? '生成中…' : '生成订阅链接'}
+              </button>
+              {!hasExportable && <div className="error" style={{ marginTop: 8 }}>{emptyReason}</div>}
+              <div className="next-steps">
+                <div className="next-steps-title">生成后会得到什么</div>
+                <ol>
+                  <li>一条订阅地址：同一 token 下按客户端自动分发 6 种格式。</li>
+                  <li>复制地址或点「导入到 {target.name}」把它交给客户端。</li>
+                  <li>在客户端更新一次订阅，节点与规则随即生效。</li>
+                </ol>
+              </div>
+            </>
+          )}
+        </div>
+        <details className="link-note">
+          <summary>链接存储与有效期</summary>
+          <div className="link-note-body">
+            链接保存在本机 <span className="mono">server/subscriptions.json</span>，塔台重启后仍然有效；
+            server 关闭期间客户端更新会失败，重新启动即可恢复。撤销或删除订阅会让对应链接立即失效。
+          </div>
+        </details>
+      </div>
+
+      <ConfirmDialog
+        open={pendingRevoke}
+        title="撤销订阅链接？"
+        body={<>撤销后 <b>已经导入该链接的客户端</b> 将无法再更新订阅，需要重新生成。节点本身不会删除。</>}
+        confirmLabel="撤销链接"
+        danger
+        onCancel={() => setPendingRevoke(false)}
+        onConfirm={() => { setPendingRevoke(false); void revokeSubscription() }}
+      />
+      <QRCodeDialog
+        open={qrOpen}
+        url={clientLanSubURL || clientSubURL}
+        title={configName}
+        hint={lanSubURL
+          ? '手机与电脑需在同一 Wi-Fi；扫码后把订阅地址添加到客户端。'
+          : localHost
+            ? '当前二维码指向本机地址，手机扫描可能无法访问；请改用局域网地址打开塔台后再生成。'
+            : '扫码后把订阅地址添加到客户端。'}
+        onClose={() => setQrOpen(false)}
+      />
+    </div>
+  )
+}
+
+// ---------------- App ----------------
+
+const TABS: { key: TabKey; label: string; short: string; Icon: () => ReactNode }[] = [
+  { key: 'sub', label: '订阅管理', short: '订阅', Icon: Icon.Subscriptions },
+  { key: 'tailnet', label: 'Tailscale', short: '内网', Icon: Icon.Network },
+  { key: 'rules', label: '规则配置', short: '规则', Icon: Icon.Rules },
+  { key: 'export', label: '导出', short: '导出', Icon: Icon.Export },
+]
+
+export function App() {
+  const [tab, setTab] = useState<TabKey>('sub')
+  const [sidebarOpen, setSidebarOpen] = useState(false)
+  const autoRefreshStarted = useRef(false)
+  const ruleSetAutoRefreshStarted = useRef(false)
+  const keysPruned = useRef(false)
+
+  // 快照恢复后删除已删除连接留下的 Auth Key。
+  useEffect(() => {
+    const run = () => {
+      if (keysPruned.current) return
+      keysPruned.current = true
+      useStore.getState().pruneTailnetKeys()
+    }
+    if (useStore.persist.hasHydrated()) {
+      run()
+      return
+    }
+    return useStore.persist.onFinishHydration(run)
+  }, [])
+
+  // 只在页面打开时尝试一次；未启用/没有地址的订阅不联网。
+  useEffect(() => {
+    if (autoRefreshStarted.current) return
+    autoRefreshStarted.current = true
+    const run = () => {
+      const state = useStore.getState()
+      if (!state.autoRefreshOnOpen) return
+      const ids = state.sources
+        .filter((s) => s.url && isSourceEnabled(s) && !state.loadingSourceIDs.includes(s.id))
+        .map((s) => s.id)
+      if (!ids.length) return
+      void Promise.all(ids.map((id) => state.refreshSource(id)))
+    }
+    if (useStore.persist.hasHydrated()) {
+      run()
+      return
+    }
+    return useStore.persist.onFinishHydration(run)
+  }, [])
+
+  // 在线规则集订阅的打开时刷新；只更新「我的规则集」快照，不改方案快照。
+  useEffect(() => {
+    if (ruleSetAutoRefreshStarted.current) return
+    ruleSetAutoRefreshStarted.current = true
+    const run = () => {
+      const state = useStore.getState()
+      if (!state.autoRefreshRuleSetsOnOpen) return
+      const sets = state.localRuleSets.filter((set) => set.sourceURL && !set.paused)
+      if (!sets.length) return
+      void Promise.all(sets.map(async (set) => {
+        try {
+          const parsed = await fetchRuleSet(set.sourceURL!)
+          const current = useStore.getState().localRuleSets.find((item) => item.id === set.id)
+          if (!current) return
+          useStore.getState().addLocalRuleSet({
+            ...current,
+            rules: parsed.rules,
+            format: parsed.format,
+            updatedAt: Date.now(),
+            lastError: undefined,
+          })
+        } catch (error) {
+          const current = useStore.getState().localRuleSets.find((item) => item.id === set.id)
+          if (!current) return
+          useStore.getState().addLocalRuleSet({
+            ...current,
+            lastError: (error as Error).message,
+          })
+        }
+      }))
+    }
+    if (useStore.persist.hasHydrated()) {
+      run()
+      return
+    }
+    return useStore.persist.onFinishHydration(run)
+  }, [])
+
+  // Close drawer on desktop resize
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 861px)')
+    const handler = (e: MediaQueryListEvent | MediaQueryList) => {
+      if ((e as any).matches !== undefined ? (e as MediaQueryListEvent).matches : (e as MediaQueryList).matches) {
+        setSidebarOpen(false)
+      }
+    }
+    mq.addEventListener('change', handler)
+    return () => mq.removeEventListener('change', handler)
+  }, [])
+
+  // Lock body scroll while drawer open
+  useEffect(() => {
+    if (sidebarOpen) document.body.classList.add('no-scroll')
+    else document.body.classList.remove('no-scroll')
+    return () => document.body.classList.remove('no-scroll')
+  }, [sidebarOpen])
+
+  // Esc 关闭抽屉
+  useEffect(() => {
+    if (!sidebarOpen) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setSidebarOpen(false) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [sidebarOpen])
+
+  // 抽屉关闭后不要把键盘焦点留在已隐藏的侧栏里；落到当前移动端页签。
+  useEffect(() => {
+    if (sidebarOpen || !window.matchMedia('(max-width: 860px)').matches) return
+    const active = document.activeElement as HTMLElement | null
+    if (!active?.closest('.sidebar')) return
+    const currentTab = TABS.find((t) => t.key === tab)
+    let mobileTarget: HTMLElement | null = currentTab
+      ? (document.querySelector(`.mobile-tab[aria-label="${currentTab.label}"]`) as HTMLElement | null)
+      : null
+    if (!mobileTarget) mobileTarget = document.querySelector('.menu-toggle') as HTMLElement | null
+    mobileTarget?.focus()
+  }, [sidebarOpen, tab])
+
+  const switchTab = (key: TabKey) => {
+    setTab(key)
+    setSidebarOpen(false)
+  }
+
+  return (
+    <div className="app-shell">
+      <aside
+        className={`sidebar${sidebarOpen ? ' open' : ''}`}
+      >
+        <div className="brand">
+          <div className="logo">
+            <img src="/logo.png" alt="塔台 Tower" />
+          </div>
+          <div className="brand-text">
+            <div className="name">塔台</div>
+            <div className="sub">Tower Web · 本地代理管理</div>
+          </div>
+          <button className="sidebar-close" onClick={() => setSidebarOpen(false)} aria-label="关闭菜单">
+            <Icon.Close />
+          </button>
+        </div>
+        <nav className="nav">
+          {TABS.map((t) => (
+            <button
+              key={t.key}
+              className={`nav-item${tab === t.key ? ' active' : ''}`}
+              onClick={() => switchTab(t.key)}
+              aria-current={tab === t.key ? 'page' : undefined}
+            >
+              <t.Icon />
+              <span>{t.label}</span>
+            </button>
+          ))}
+        </nav>
+        <div className="bottom">
+          {GITHUB_REPO_URL ? (
+            <a
+              className="gh-link"
+              href={GITHUB_REPO_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label="在 GitHub 打开 thintsing 的主页"
+              title="GitHub · thintsing"
+            >
+              <Icon.Github />
+              <span className="gh-text">GitHub</span>
+            </a>
+          ) : (
+            <span
+              className="gh-link is-placeholder"
+              role="img"
+              aria-label="GitHub 仓库地址待配置"
+              title="GitHub 仓库地址待配置"
+            >
+              <Icon.Github />
+              <span className="gh-text">GitHub</span>
+            </span>
+          )}
+          <div className="meta">
+            所有订阅解析、节点生成、配置导出<br />均在本机完成，不上传任何第三方服务
+          </div>
+        </div>
+      </aside>
+
+      {/* mobile overlay behind drawer */}
+      <div
+        className={`drawer-overlay${sidebarOpen ? ' visible' : ''}`}
+        onClick={() => setSidebarOpen(false)}
+        aria-hidden="true"
+      />
+
+      <main className="right-col">
+        {/* 窄屏导航条：桌面端由侧栏导航，这里不重复页名。 */}
+        <div className="topbar">
+          <button
+            className="menu-toggle"
+            onClick={() => setSidebarOpen((v) => !v)}
+            aria-label={sidebarOpen ? '关闭菜单' : '打开菜单'}
+            aria-expanded={sidebarOpen}
+          >
+            {sidebarOpen ? <Icon.Close /> : <Icon.Menu />}
+          </button>
+          <nav className="mobile-tabs" aria-label="工作区切换">
+            {TABS.map((t) => (
+              <button
+                key={t.key}
+                type="button"
+                className={`mobile-tab${tab === t.key ? ' active' : ''}`}
+                onClick={() => switchTab(t.key)}
+                aria-label={t.label}
+                aria-current={tab === t.key ? 'page' : undefined}
+                title={t.label}
+              >
+                <t.Icon />
+                <span>{t.short}</span>
+              </button>
+            ))}
+          </nav>
+        </div>
+        <div className="sheet">
+          {tab === 'sub' && <SubscriptionTab onGo={switchTab} />}
+          {tab === 'tailnet' && <TailnetTab />}
+          {tab === 'rules' && <RulesTab />}
+          {tab === 'export' && <ExportTab onGo={switchTab} />}
+        </div>
+      </main>
+    </div>
+  )
+}

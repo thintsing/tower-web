@@ -1,0 +1,26 @@
+Offline IP country data
+=======================
+
+Source: sapics/ip-location-db, server-country
+Snapshot: 2026-09-06T22:31Z
+Project: https://github.com/sapics/ip-location-db
+License: Open Data Commons Public Domain Dedication and License (PDDL) v1.0
+License URL: https://opendatacommons.org/licenses/pddl/1-0/
+
+The upstream project publishes these original datasets under PDDL. They are
+compiled from public RIR/NRO, BGP, WHOIS and geofeed data. server-country aims
+at server location, so IP-based country data is an estimate and not proof of
+proxy exit location. Tower only queries these bundled databases locally.
+
+This Web repository bundles the country lookup tables (IPCountryIPv4.bin and
+IPCountryIPv6.bin) in this directory, and the ASN/organization tables
+(IPASNIPv4.bin, IPASNIPv6.bin and IPASNNames.bin) in ../ip-asn/. The upstream
+manifest and update scripts from the iOS project are not included.
+
+Binary format (all integers big-endian, sorted non-overlapping ranges):
+- IPCountryIPv4.bin: 4-byte start, 4-byte end, 2 ASCII country bytes (10 bytes).
+- IPCountryIPv6.bin: 16-byte start, 16-byte end, 2 country bytes (34 bytes).
+- IPCountryVersion.txt: snapshot version used to invalidate local lookup caches.
+
+No city, coordinates, timezone, or private node data is included. Adjacent
+ranges with identical values are merged without changing lookup semantics.

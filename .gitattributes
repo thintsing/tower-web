@@ -1,0 +1,14 @@
+* text=auto eol=lf
+
+*.bin binary
+*.mmdb binary
+*.dat binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+
+package-lock.json text eol=lf

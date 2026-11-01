@@ -1,0 +1,26 @@
+Offline IP network organization data
+====================================
+
+Source: sapics/ip-location-db, origin-asn
+Snapshot: 2026-09-06T22:31Z
+Project: https://github.com/sapics/ip-location-db
+License: Open Data Commons Public Domain Dedication and License (PDDL) v1.0
+License URL: https://opendatacommons.org/licenses/pddl/1-0/
+
+The upstream project publishes these original datasets under PDDL. They are
+compiled from public RIR/NRO, BGP, WHOIS and geofeed data. origin-asn describes
+the originating autonomous system. Organization names identify network
+organizations, not necessarily a user's retail ISP. IP-based organization data
+is an estimate, not proof of proxy exit location. Tower Web only queries these
+bundled databases locally.
+
+Binary format (all integers big-endian, sorted non-overlapping ranges):
+- IPASNIPv4.bin: 4-byte start, 4-byte end, uint32 ASN, uint32 organization byte
+  offset, uint16 organization byte length (18 bytes).
+- IPASNIPv6.bin: 16-byte start, 16-byte end, uint32 ASN, uint32 organization byte
+  offset, uint16 organization byte length (42 bytes).
+- IPASNNames.bin: shared, deduplicated UTF-8 byte pool, without terminators.
+
+No city, coordinates, timezone, subscription URL, node credential or private
+node data is included. Adjacent ranges with identical values are merged without
+changing lookup semantics.

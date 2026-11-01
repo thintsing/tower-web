@@ -1,0 +1,73 @@
+{
+  "name": "tower-web",
+  "private": true,
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "本地优先的代理订阅管理、测速与多客户端配置导出工具",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thintsing/tower-web.git"
+  },
+  "homepage": "https://github.com/thintsing/tower-web#readme",
+  "bugs": {
+    "url": "https://github.com/thintsing/tower-web/issues"
+  },
+  "keywords": [
+    "clash",
+    "mihomo",
+    "surge",
+    "sing-box",
+    "subscription",
+    "proxy",
+    "react",
+    "vite"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,green \"npm:server\" \"npm:web\"",
+    "web": "vite",
+    "server": "node server/index.mjs",
+    "start": "node server/index.mjs",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "selfcheck:asn": "tsx scripts/selfcheck-asn.ts",
+    "selfcheck:backup": "tsx scripts/selfcheck-backup.ts",
+    "selfcheck:batch": "tsx scripts/selfcheck-batch.ts",
+    "selfcheck:catalog": "tsx scripts/selfcheck-catalog.ts",
+    "selfcheck:clients": "tsx scripts/selfcheck-clients.ts",
+    "selfcheck:dns": "tsx scripts/selfcheck-dns.ts",
+    "selfcheck:importers": "tsx scripts/selfcheck-importers.ts",
+    "selfcheck:icons": "tsx scripts/selfcheck-icons.ts",
+    "selfcheck:manual": "tsx scripts/selfcheck-manual.ts",
+    "selfcheck:manual-form": "tsx scripts/selfcheck-manual-form.ts",
+    "selfcheck:matching": "tsx scripts/selfcheck-matching.ts",
+    "selfcheck:protocols": "tsx scripts/selfcheck-protocols.ts",
+    "selfcheck:qr": "tsx scripts/selfcheck-qr.ts",
+    "selfcheck:remote": "tsx scripts/selfcheck-remote.ts",
+    "selfcheck:rulesets": "tsx scripts/selfcheck-rulesets.ts",
+    "selfcheck:yaml": "tsx scripts/selfcheck-yaml.ts"
+  },
+  "dependencies": {
+    "jsqr": "^1.4.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-simple-maps": "^5.0.5",
+    "topojson-client": "^3.1.0",
+    "uqr": "^0.1.3",
+    "world-atlas": "^2.0.2",
+    "yaml": "^2.8.0",
+    "zustand": "^5.0.6"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "concurrently": "^9.2.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.0",
+    "vite": "^7.1.0"
+  }
+}
