@@ -1,7 +1,7 @@
 // Shared group→node resolution for all generators.
 // A scheme group's nodeFilter regex is matched against node display names;
 // declared options ([]引用 / DIRECT / REJECT) always come first.
-import type { ClientTarget, ExportContentMode, PolicyGroup, ProxyNode, RemoteSubscriptionEntry, RuleScheme, RuleSetFormat, SchemeRuleSet, SubFormat, TailnetExport } from '../models/types'
+import type { ClientTarget, ExportContentMode, PolicyGroup, ProxyNode, RemoteSubscriptionEntry, RoutingRule, RuleScheme, RuleSetFormat, SchemeRuleSet, SubFormat, TailnetExport } from '../models/types'
 import {
   classicalRulesFitTarget,
   hostedDialectForFormat,
@@ -12,6 +12,7 @@ import {
   subFormatSupportsRuleSetFormat,
   targetSupportsRuleSetFormat,
 } from '../rules/remoteFormats'
+import { mihomoBinaryPlan, singBoxBinaryPlan } from '../rules/binaryRuleSets'
 import { inlineRuleSetMetadata } from '../rules/inlineSets'
 import { reorderRulesByMatchingOrder } from '../rules/matchingOrder'
 
@@ -243,12 +244,38 @@ export interface PrepareSchemeOptions {
   target?: ClientTarget
 }
 
+export interface RemoteRuleSetReference {
+  url: string
+  format: RuleSetFormat
+  /** MRS 必须声明 domain / ipcidr。 */
+  behavior?: 'domain' | 'ipcidr'
+  /** 写在 RULE-SET 行上的参数，例如 ipcidr 的 no-resolve。 */
+  options?: string[]
+}
+
 export interface RemoteRuleSetCandidate {
   set: SchemeRuleSet
   url?: string
   format?: RuleSetFormat
+  /** 一个规则集拆成多个二进制引用（MRS domain + ipcidr）。 */
+  references?: RemoteRuleSetReference[]
+  /** 远程引用无法覆盖、需要逐条内联的规则。 */
+  residual?: RoutingRule[]
   /** 格式兼容且匹配顺序安全，可以直接写成远程引用。 */
   remote: boolean
+}
+
+function hostedReference(
+  set: SchemeRuleSet,
+  dialect: 'mrs-domain' | 'mrs-ipcidr' | 'srs',
+): RemoteRuleSetReference | undefined {
+  const url = hostedRuleSetURL(set, dialect)
+  if (!url) return undefined
+  return {
+    url,
+    format: ruleSetFormatForDialect(dialect),
+    behavior: dialect === 'srs' ? undefined : dialect === 'mrs-domain' ? 'domain' : 'ipcidr',
+  }
 }
 
 /** 规则集快照能否在各载体直接引用；排序敏感的 Loon / QuanX 另行判断。 */
@@ -262,6 +289,58 @@ export function remoteRuleSetCandidates(
     if (!options.preferRuleSets || !options.format) return { set, url: undefined, format: undefined }
     const originalURL = remoteRuleSetURL(set)
     const originalFormat = ruleSetFormatOfSet(set, originalURL)
+
+    // 经典列表优先压成二进制：mihomo / Stash 用 MRS，sing-box / Hiddify 用 SRS。
+    // 表达不了的类型留在 residual 里逐条内联，顺序与原规则集一致。
+    if (originalFormat === 'classical' && set.rules.length > 0) {
+      if (options.format === 'yaml'
+        && options.target
+        && targetSupportsRuleSetFormat(options.target, 'mrs')) {
+        const plan = mihomoBinaryPlan(set.rules)
+        if (plan) {
+          const references: RemoteRuleSetReference[] = []
+          if (plan.domain.length) {
+            const reference = hostedReference(set, 'mrs-domain')
+            if (reference) references.push(reference)
+          }
+          if (plan.ipcidr.length) {
+            const reference = hostedReference(set, 'mrs-ipcidr')
+            if (reference) {
+              references.push({
+                ...reference,
+                options: plan.ipNoResolve ? ['no-resolve'] : [],
+              })
+            }
+          }
+          if (references.length) {
+            return {
+              set,
+              references,
+              residual: plan.residual,
+              url: undefined,
+              format: undefined,
+            }
+          }
+        }
+      }
+      if (options.format === 'json'
+        && (!options.target || targetSupportsRuleSetFormat(options.target, 'singbox-binary'))) {
+        const plan = singBoxBinaryPlan(set.rules)
+        if (plan) {
+          const reference = hostedReference(set, 'srs')
+          if (reference) {
+            return {
+              set,
+              references: [reference],
+              residual: plan.residual,
+              url: undefined,
+              format: undefined,
+            }
+          }
+        }
+      }
+    }
+
     const originalSupported = !!originalURL && !!originalFormat
       && (originalFormat !== 'mrs' || ['domain', 'ipcidr'].includes(set.ruleSetBehavior ?? ''))
       && (originalFormat !== 'classical' || classicalRulesFitTarget(set.rules, options.target, options.format))
@@ -286,8 +365,12 @@ export function remoteRuleSetCandidates(
   // 直接引用会改变匹配顺序，这时宁可继续展开。
   const orderSensitive = options.format === 'loon' || options.format === 'quanx'
   const canKeepOrder = !orderSensitive
-    || (scheme.rules.every((rule) => rule.type === 'FINAL') && candidates.every((item) => item.url))
-  return candidates.map((item) => ({ ...item, remote: !!item.url && canKeepOrder }))
+    || (scheme.rules.every((rule) => rule.type === 'FINAL')
+      && candidates.every((item) => item.url || item.references?.length))
+  return candidates.map((item) => ({
+    ...item,
+    remote: (!!item.url || !!item.references?.length) && canKeepOrder,
+  }))
 }
 
 /**
@@ -309,7 +392,23 @@ export function prepareSchemeForExport(
   })
   const customRules = scheme.customRules ?? []
   const remoteCandidates = remoteRuleSetCandidates(scheme, options)
-  const ruleSetRules = remoteCandidates.flatMap(({ set, url, format, remote }) => {
+  const ruleSetRules = remoteCandidates.flatMap(({ set, url, format, remote, references, residual }) => {
+    if (remote && references?.length) {
+      const remoteRules: RoutingRule[] = references.map((reference) => ({
+        type: 'RULE-SET',
+        value: reference.url,
+        group: set.group,
+        sourceName: set.name,
+        ruleSetFormat: reference.format,
+        ruleSetBehavior: reference.behavior,
+        options: reference.options,
+      }))
+      const residualRules: RoutingRule[] = (residual ?? []).map((rule) => ({
+        ...rule,
+        group: set.group,
+      }))
+      return [...remoteRules, ...residualRules]
+    }
     if (remote && url) {
       return [{
         type: 'RULE-SET',

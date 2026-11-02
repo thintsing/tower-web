@@ -154,7 +154,13 @@ const SINGBOX_CONVERTIBLE_TYPES = new Set([
 const CONVERTIBLE_IP_TYPES = new Set(['IP-CIDR', 'IP-CIDR6', 'IP6-CIDR'])
 const EGERN_IP_TYPES = new Set([...CONVERTIBLE_IP_TYPES, 'GEOIP', 'IP-ASN'])
 
-export type HostedRuleSetDialect = 'quanx' | 'egern' | 'singbox'
+export type HostedRuleSetDialect =
+  | 'quanx'
+  | 'egern'
+  | 'singbox'
+  | 'srs'
+  | 'mrs-domain'
+  | 'mrs-ipcidr'
 
 export function hostedDialectForFormat(format: SubFormat | undefined): HostedRuleSetDialect | undefined {
   if (format === 'quanx') return 'quanx'
@@ -164,7 +170,12 @@ export function hostedDialectForFormat(format: SubFormat | undefined): HostedRul
 }
 
 export function ruleSetFormatForDialect(dialect: HostedRuleSetDialect): RuleSetFormat {
-  return dialect
+  switch (dialect) {
+    case 'srs': return 'singbox-binary'
+    case 'mrs-domain':
+    case 'mrs-ipcidr': return 'mrs'
+    default: return dialect
+  }
 }
 
 function optionsOnlyNoResolve(rule: RoutingRule): boolean {
@@ -210,7 +221,15 @@ export function hostedRuleSetURL(
   dialect: HostedRuleSetDialect,
 ): string | undefined {
   if (!set.sourceRef) return undefined
-  const params = new URLSearchParams({ format: dialect })
+  const params = new URLSearchParams()
+  if (dialect === 'mrs-domain' || dialect === 'mrs-ipcidr') {
+    params.set('format', 'mrs')
+    params.set('behavior', dialect === 'mrs-domain' ? 'domain' : 'ipcidr')
+  } else if (dialect === 'srs') {
+    params.set('format', 'srs')
+  } else {
+    params.set('format', dialect)
+  }
   if (set.sourceKind === 'library') {
     if (!/^[A-Za-z0-9_.-]+\.list$/.test(set.sourceRef) || set.sourceRef.includes('..')) {
       return undefined

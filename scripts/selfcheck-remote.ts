@@ -5,6 +5,7 @@ import { CLIENTS, type ProxyNode, type RemoteSubscriptionEntry, type RuleScheme 
 import { generateConfig } from '../src/generator'
 import { generateClashYAML } from '../src/generator/clashYaml'
 import { generateLoon } from '../src/generator/loon'
+import { generateSingBox } from '../src/generator/singbox'
 import { generateSurge } from '../src/generator/surge'
 import { formatSupportsProxyCollections, prepareSchemeForExport, remoteRuleSetCandidates } from '../src/generator/groups'
 
@@ -197,12 +198,15 @@ async function main(): Promise<void> {
       { type: 'FINAL', group: '节点选择' },
     ],
   }
-  check('规则集快照：YAML / Surge 直接引用', () => {
+  check('规则集快照：YAML 用 MRS / Surge 直接引用', () => {
     const yaml = prepareSchemeForExport(snapshotScheme, {}, {
       preferRuleSets: true, format: 'yaml', target: 'clash-verge',
     })
     assert.equal(yaml.rules[0]?.type, 'RULE-SET')
-    assert.equal(yaml.rules[0]?.ruleSetFormat, 'classical')
+    assert.equal(yaml.rules[0]?.ruleSetFormat, 'mrs')
+    assert.equal(yaml.rules[0]?.ruleSetBehavior, 'domain')
+    assert.match(yaml.rules[0]?.value ?? '', /format=mrs/)
+    assert.match(yaml.rules[0]?.value ?? '', /behavior=domain/)
     const surge = prepareSchemeForExport(snapshotScheme, {}, {
       preferRuleSets: true, format: 'surge', target: 'surge',
     })
@@ -240,12 +244,12 @@ async function main(): Promise<void> {
     assert.equal(loon.rules.some((rule) => rule.type === 'RULE-SET'), false)
     assert.ok(loon.rules.some((rule) => rule.type === 'PROCESS-NAME'))
   })
-  check('规则集快照：经典列表转换为 QuanX / Egern / sing-box 托管产物', () => {
+  check('规则集快照：经典列表转换为 QuanX / Egern / SRS 托管产物', () => {
     const finalOnly = { ...snapshotScheme, rules: [{ type: 'FINAL', group: '节点选择' }] }
-    for (const [format, target, expected] of [
-      ['quanx', 'quanx', 'quanx'],
-      ['egern', 'egern', 'egern'],
-      ['json', 'sing-box', 'singbox'],
+    for (const [format, target, expected, hosted] of [
+      ['quanx', 'quanx', 'quanx', 'quanx'],
+      ['egern', 'egern', 'egern', 'egern'],
+      ['json', 'sing-box', 'singbox-binary', 'srs'],
     ] as const) {
       const prepared = prepareSchemeForExport(finalOnly, {}, {
         preferRuleSets: true, format, target,
@@ -253,9 +257,105 @@ async function main(): Promise<void> {
       assert.equal(prepared.rules[0]?.type, 'RULE-SET', format)
       assert.equal(prepared.rules[0]?.ruleSetFormat, expected, format)
       assert.ok(prepared.rules[0]?.value?.startsWith('/api/ruleset?'), prepared.rules[0]?.value)
-      assert.ok(prepared.rules[0]?.value?.includes(`format=${format === 'json' ? 'singbox' : format}`))
+      assert.ok(prepared.rules[0]?.value?.includes(`format=${hosted}`))
       assert.ok(prepared.rules[0]?.value?.includes('file=ACL4SSR_BanAD.list'))
     }
+  })
+  check('二进制 MRS：拆分 domain / ipcidr 并把剩余规则内联', () => {
+    const binaryScheme: RuleScheme = {
+      ...snapshotScheme,
+      ruleSets: [{
+        ...snapshotScheme.ruleSets![0],
+        rules: [
+          { type: 'DOMAIN-SUFFIX', value: 'ads.example', group: '节点选择' },
+          { type: 'DOMAIN-KEYWORD', value: 'adkw', group: '节点选择' },
+          { type: 'IP-CIDR', value: '1.2.3.0/24', group: '节点选择', options: ['no-resolve'], noResolve: true },
+        ],
+      }],
+      rules: [{ type: 'FINAL', group: '节点选择' }],
+    }
+    // 浏览器里 hostedRuleSetURL 使用站点 origin；测试时补一个假 origin，
+    // 让 Clash 生成器像真实导出一样写出 http 规则集地址。
+    const locationDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'location')
+    Object.defineProperty(globalThis, 'location', {
+      value: { origin: 'https://tower.example' },
+      configurable: true,
+    })
+    try {
+      const prepared = prepareSchemeForExport(binaryScheme, {}, {
+        preferRuleSets: true, format: 'yaml', target: 'clash-verge',
+      })
+      assert.equal(prepared.rules[0]?.type, 'RULE-SET')
+      assert.equal(prepared.rules[0]?.ruleSetBehavior, 'domain')
+      assert.match(prepared.rules[0]?.value ?? '', /behavior=domain/)
+      assert.equal(prepared.rules[1]?.ruleSetBehavior, 'ipcidr')
+      assert.match(prepared.rules[1]?.value ?? '', /behavior=ipcidr/)
+      assert.deepEqual(prepared.rules[1]?.options, ['no-resolve'])
+      assert.equal(prepared.rules[2]?.type, 'DOMAIN-KEYWORD')
+      assert.equal(prepared.rules[3]?.type, 'FINAL')
+
+      const text = generateClashYAML([], prepared, { contentMode: 'full', target: 'clash-verge' })
+      assert.equal((text.match(/format: mrs/g) ?? []).length, 2)
+      assert.match(text, /behavior: domain/)
+      assert.match(text, /behavior: ipcidr/)
+      assert.match(text, /RULE-SET,tower-rule-set-1,节点选择/)
+      assert.match(text, /RULE-SET,tower-rule-set-2,节点选择,no-resolve/)
+      assert.match(text, /DOMAIN-KEYWORD,adkw,节点选择/)
+      assert.match(text, /tower-rule-set-1\.mrs/)
+      assert.match(text, /tower-rule-set-2\.mrs/)
+    } finally {
+      if (locationDescriptor) Object.defineProperty(globalThis, 'location', locationDescriptor)
+      else Reflect.deleteProperty(globalThis, 'location')
+    }
+  })
+  check('二进制 MRS：目标不支持或 IP 参数混用时回退经典列表', () => {
+    const binaryScheme: RuleScheme = {
+      ...snapshotScheme,
+      ruleSets: [{
+        ...snapshotScheme.ruleSets![0],
+        rules: [
+          { type: 'DOMAIN-SUFFIX', value: 'ads.example', group: '节点选择' },
+          { type: 'IP-CIDR', value: '1.2.3.0/24', group: '节点选择' },
+          { type: 'IP-CIDR', value: '2.2.2.0/24', group: '节点选择', options: ['no-resolve'], noResolve: true },
+        ],
+      }],
+      rules: [{ type: 'FINAL', group: '节点选择' }],
+    }
+    const karing = prepareSchemeForExport(binaryScheme, {}, {
+      preferRuleSets: true, format: 'yaml', target: 'karing',
+    })
+    assert.doesNotMatch(karing.rules[0]?.value ?? '', /format=mrs/)
+    assert.equal(karing.rules[0]?.ruleSetFormat, 'classical')
+    const mixed = prepareSchemeForExport(binaryScheme, {}, {
+      preferRuleSets: true, format: 'yaml', target: 'clash-verge',
+    })
+    assert.equal(mixed.rules.some((rule) => rule.ruleSetFormat === 'mrs'), false)
+    assert.equal(mixed.rules[0]?.ruleSetFormat, 'classical')
+  })
+  check('二进制 SRS：sing-box 引用并把无法编码的规则内联', () => {
+    const binaryScheme: RuleScheme = {
+      ...snapshotScheme,
+      ruleSets: [{
+        ...snapshotScheme.ruleSets![0],
+        rules: [
+          { type: 'DOMAIN-SUFFIX', value: 'ads.example', group: '节点选择' },
+          { type: 'DOMAIN-KEYWORD', value: 'adkw', group: '节点选择' },
+          { type: 'IP-CIDR', value: '1.2.3.0/24', group: '节点选择', options: ['no-resolve'], noResolve: true },
+          { type: 'GEOIP', value: 'CN', group: '节点选择' },
+        ],
+      }],
+      rules: [{ type: 'FINAL', group: '节点选择' }],
+    }
+    const prepared = prepareSchemeForExport(binaryScheme, {}, {
+      preferRuleSets: true, format: 'json', target: 'sing-box',
+    })
+    assert.equal(prepared.rules[0]?.type, 'RULE-SET')
+    assert.equal(prepared.rules[0]?.ruleSetFormat, 'singbox-binary')
+    assert.match(prepared.rules[0]?.value ?? '', /format=srs/)
+    assert.ok(prepared.rules.some((rule) => rule.type === 'GEOIP'))
+    const singboxText = generateSingBox([], prepared, { contentMode: 'full', target: 'sing-box' }).text
+    assert.match(singboxText, /"format": "binary"/)
+    assert.match(singboxText, /format=srs/)
   })
   check('规则集快照：无法无损转换时保持内联', () => {
     const finalOnly = { ...snapshotScheme, rules: [{ type: 'FINAL', group: '节点选择' }] }

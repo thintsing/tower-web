@@ -1,9 +1,11 @@
 // 自检：规则集方言转换与塔台托管产物 URL。
 // 用法：npm run selfcheck:rulesets
 import assert from 'node:assert/strict'
+import { inflateSync, zstdDecompressSync } from 'node:zlib'
 // @ts-expect-error server converter is plain ESM and not part of the src tsconfig
 import { convertRuleSet, RuleSetConversionError } from '../server/ruleset-convert.mjs'
 import type { RoutingRule, SchemeRuleSet } from '../src/models/types'
+import { mihomoBinaryPlan, singBoxBinaryPlan } from '../src/rules/binaryRuleSets'
 import {
   hostedRuleSetURL,
   ruleSetRulesFitDialect,
@@ -60,6 +62,82 @@ const rule = (type: string, value?: string, extra: Partial<RoutingRule> = {}): R
   ...extra,
 })
 
+/** 读取 MRS / SRS 的 succinct set，还原其中的域名模式，便于验证编码结果。 */
+function decodeSuccinct(
+  buffer: Buffer,
+  start: number,
+  lengths: 'int64' | 'uvarint',
+): { version: number; keys: string[]; next: number } {
+  let position = start
+  const version = buffer[position++]
+  const readLength = (): number => {
+    if (lengths === 'int64') {
+      const value = buffer.readBigInt64BE(position)
+      position += 8
+      return Number(value)
+    }
+    let value = 0
+    let shift = 0
+    for (;;) {
+      const byte = buffer[position++]
+      value |= (byte & 0x7f) << shift
+      if (!(byte & 0x80)) return value
+      shift += 7
+    }
+  }
+  const readWords = () => {
+    const count = readLength()
+    const words: bigint[] = []
+    for (let index = 0; index < count; index += 1) {
+      words.push(buffer.readBigUInt64BE(position))
+      position += 8
+    }
+    return words
+  }
+  const leaves = readWords()
+  const labelBitmap = readWords()
+  const labelCount = readLength()
+  const labels = buffer.subarray(position, position + labelCount)
+  position += labelCount
+
+  const bit = (words: bigint[], index: number) =>
+    Number((words[index >> 6] ?? 0n) >> BigInt(index & 63)) & 1
+  const onesBefore = (words: bigint[], end: number) => {
+    let total = 0
+    for (let index = 0; index < end; index += 1) total += bit(words, index)
+    return total
+  }
+  const countZeros = (words: bigint[], end: number) => end - onesBefore(words, end)
+  const selectIthOne = (words: bigint[], target: number) => {
+    let seen = 0
+    for (let index = 0; index < words.length * 64; index += 1) {
+      if (!bit(words, index)) continue
+      if (seen === target) return index
+      seen += 1
+    }
+    return words.length * 64
+  }
+
+  const keys: string[] = []
+  const traverse = (nodeId: number, bitmapIndex: number, bytes: number[]) => {
+    if (bit(leaves, nodeId)) {
+      const key = Buffer.from(bytes).toString('utf8')
+      keys.push([...key].reverse().join(''))
+    }
+    let cursor = bitmapIndex
+    for (;;) {
+      if (bit(labelBitmap, cursor)) return
+      const label = labels[cursor - nodeId]
+      const nextNodeId = countZeros(labelBitmap, cursor + 1)
+      const nextBitmapIndex = selectIthOne(labelBitmap, nextNodeId - 1) + 1
+      traverse(nextNodeId, nextBitmapIndex, [...bytes, label])
+      cursor += 1
+    }
+  }
+  traverse(0, 0, [])
+  return { version, keys, next: position }
+}
+
 const makeSet = (overrides: Partial<SchemeRuleSet> = {}): SchemeRuleSet => ({
   id: 'set-1',
   name: '测试规则集',
@@ -100,6 +178,110 @@ function main(): void {
     assert.match(output, /"domain_suffix"/)
     assert.match(output, /"domain_keyword"/)
     assert.match(output, /"ip_cidr"/)
+  })
+
+  check('MRS domain：编码可解码回域名模式', () => {
+    const output = convertRuleSet(DOMAIN_AND_IP, 'mrs', { behavior: 'domain' })
+    assert.ok(Buffer.isBuffer(output.text))
+    const raw = zstdDecompressSync(output.text)
+    assert.equal(raw.subarray(0, 5).toString('hex'), '4d52530100')
+    assert.equal(Number(raw.readBigInt64BE(5)), 2)
+    assert.equal(Number(raw.readBigInt64BE(13)), 0)
+    const set = decodeSuccinct(raw, 21, 'int64')
+    assert.equal(set.version, 1)
+    assert.deepEqual(
+      set.keys.sort(),
+      ['+.foo.com', 'example.com', 'foo.com'].sort(),
+    )
+  })
+
+  check('MRS ipcidr：编码 IPv4 网段', () => {
+    const output = convertRuleSet(DOMAIN_AND_IP, 'mrs', { behavior: 'ipcidr' })
+    const raw = zstdDecompressSync(output.text)
+    assert.equal(raw.subarray(0, 5).toString('hex'), '4d52530101')
+    assert.equal(Number(raw.readBigInt64BE(5)), 1)
+    const from = raw.subarray(30, 46)
+    const to = raw.subarray(46, 62)
+    assert.equal(from.subarray(0, 10).toString('hex'), '00000000000000000000')
+    assert.equal(from.subarray(10, 16).toString('hex'), 'ffff01020300')
+    assert.equal(to.subarray(10, 16).toString('hex'), 'ffff010203ff')
+  })
+
+  check('SRS：生成 sing-box binary v2', () => {
+    const output = convertRuleSet(WITHOUT_GEOIP, 'srs')
+    assert.ok(Buffer.isBuffer(output.text))
+    assert.equal(output.text.subarray(0, 4).toString('hex'), '53525302')
+    const plain = inflateSync(output.text.subarray(4))
+    let position = 0
+    const readUvarint = (): number => {
+      let value = 0
+      let shift = 0
+      for (;;) {
+        const byte = plain[position++]
+        value |= (byte & 0x7f) << shift
+        if (!(byte & 0x80)) return value
+        shift += 7
+      }
+    }
+    assert.equal(readUvarint(), 1)
+    assert.equal(plain[position++], 0)
+    assert.equal(plain[position++], 2)
+    const matcher = decodeSuccinct(plain, position, 'uvarint')
+    position = matcher.next
+    assert.deepEqual(matcher.keys.sort(), ['\nfoo.com', 'example.com'].sort())
+    assert.equal(plain[position++], 3)
+    assert.equal(readUvarint(), 1)
+    const keywordLength = readUvarint()
+    assert.equal(plain.subarray(position, position + keywordLength).toString(), 'keyword')
+    position += keywordLength
+    assert.equal(plain[position++], 6)
+    assert.equal(plain[position++], 1)
+    assert.equal(Number(plain.readBigUInt64BE(position)), 1)
+    position += 8
+    assert.equal(readUvarint(), 4)
+    assert.equal(plain.readUInt32BE(position), 0x01020300)
+    position += 4
+    assert.equal(readUvarint(), 4)
+    assert.equal(plain.readUInt32BE(position), 0x010203ff)
+    position += 4
+    assert.equal(plain[position++], 0xff)
+    assert.equal(plain[position++], 0)
+    assert.equal(position, plain.length)
+  })
+
+  check('二进制编码：缺少 behavior 或可编码规则时报错', () => {
+    assert.throws(() => convertRuleSet(DOMAIN_AND_IP, 'mrs'), /behavior/)
+    assert.throws(
+      () => convertRuleSet('IP-CIDR,1.2.3.0/24', 'mrs', { behavior: 'domain' }),
+      /没有可编码/,
+    )
+    assert.throws(
+      () => convertRuleSet('PROCESS-NAME,curl', 'srs'),
+      /没有可编码/,
+    )
+  })
+
+  check('前端：MRS / SRS 二进制规划保留无法编码的规则', () => {
+    const rules: RoutingRule[] = [
+      rule('DOMAIN-SUFFIX', 'ads.example'),
+      rule('DOMAIN-KEYWORD', 'adkw'),
+      rule('IP-CIDR', '1.2.3.0/24', { options: ['no-resolve'], noResolve: true }),
+      rule('GEOIP', 'CN'),
+    ]
+    const mrs = mihomoBinaryPlan(rules)
+    assert.ok(mrs)
+    assert.equal(mrs.domain.length, 1)
+    assert.equal(mrs.ipcidr.length, 1)
+    assert.equal(mrs.residual.length, 2)
+    assert.equal(mrs.ipNoResolve, true)
+    assert.equal(mihomoBinaryPlan([
+      rule('IP-CIDR', '1.2.3.0/24'),
+      rule('IP-CIDR', '2.2.2.0/24', { options: ['no-resolve'], noResolve: true }),
+    ]), undefined)
+    const srs = singBoxBinaryPlan(rules)
+    assert.ok(srs)
+    assert.equal(srs.covered.length, 3)
+    assert.equal(srs.residual.length, 1)
   })
 
   check('无法无损转换时拒绝整份规则集', () => {
@@ -207,6 +389,11 @@ function main(): void {
       sourceRef: 'https://rules.example/ads.list?token=abc',
     }), 'egern')
     assert.match(remote ?? '', /\/api\/ruleset\?format=egern&url=https%3A%2F%2Frules\.example%2Fads\.list%3Ftoken%3Dabc/)
+    const mrs = hostedRuleSetURL(makeSet({ sourceKind: 'url', sourceRef: 'https://rules.example/ads.list' }), 'mrs-domain')
+    assert.match(mrs ?? '', /format=mrs/)
+    assert.match(mrs ?? '', /behavior=domain/)
+    const srs = hostedRuleSetURL(makeSet({ sourceKind: 'url', sourceRef: 'https://rules.example/ads.list' }), 'srs')
+    assert.match(srs ?? '', /format=srs/)
     const local = makeSet({ sourceKind: 'local', sourceRef: 'local-1' })
     assert.equal(hostedRuleSetURL(local, 'singbox'), undefined)
   })

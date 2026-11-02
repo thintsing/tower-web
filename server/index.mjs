@@ -80,17 +80,22 @@ function cacheRuleSet(key, artifact) {
 
 function ruleSetCacheKey(query) {
   const format = String(query.get('format') ?? '').toLowerCase()
+  const behavior = String(query.get('behavior') ?? '').toLowerCase()
   const file = query.get('file')
   const remote = query.get('url')
   if (!format || (!file && !remote)) return ''
-  return `${format}|${file ? `file:${file}` : `url:${remote}`}`
+  return `${format}|${behavior}|${file ? `file:${file}` : `url:${remote}`}`
 }
 
 /** 读取内置规则文件或抓取远程列表，再转换成目标客户端方言。 */
 async function buildRuleSetArtifact(query) {
   const format = String(query.get('format') ?? '').toLowerCase()
-  if (!['quanx', 'egern', 'singbox', 'sing-box'].includes(format)) {
-    throw new RuleSetConversionError('format 必须是 quanx / egern / singbox')
+  if (!['quanx', 'egern', 'singbox', 'sing-box', 'mrs', 'srs'].includes(format)) {
+    throw new RuleSetConversionError('format 必须是 quanx / egern / singbox / mrs / srs')
+  }
+  const behavior = String(query.get('behavior') ?? '').toLowerCase()
+  if (format === 'mrs' && behavior !== 'domain' && behavior !== 'ipcidr') {
+    throw new RuleSetConversionError('MRS 需要 behavior=domain 或 behavior=ipcidr', 400)
   }
   const file = query.get('file')
   const remote = query.get('url')
@@ -135,9 +140,9 @@ async function buildRuleSetArtifact(query) {
     }
     sourceText = response.body.toString('utf8')
   }
-  const artifact = convertRuleSet(sourceText, format)
+  const artifact = convertRuleSet(sourceText, format, { behavior })
   return {
-    key: `${format}|${file ? `file:${file}` : `url:${remote}`}`,
+    key: `${format}|${behavior}|${file ? `file:${file}` : `url:${remote}`}`,
     body: artifact.text,
     contentType: artifact.contentType,
     ruleCount: artifact.ruleCount,

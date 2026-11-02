@@ -1,6 +1,9 @@
 // Convert a classical Clash rule list into the remote rule-set dialect a
 // client can actually download. Every line must be representable; a partial
 // conversion is rejected so a remote reference never silently loses rules.
+// Binary MRS / SRS output only contains the subset each format can express;
+// the caller keeps every other line inline in the generated profile.
+import { encodeMihomoRuleSet, encodeSingBoxRuleSet } from './ruleset-binary.mjs'
 
 const QUANX_TYPES = {
   DOMAIN: 'host',
@@ -47,6 +50,8 @@ const CONTENT_TYPES = {
   quanx: 'text/plain; charset=utf-8',
   egern: 'text/yaml; charset=utf-8',
   singbox: 'application/json; charset=utf-8',
+  mrs: 'application/octet-stream',
+  srs: 'application/octet-stream',
 }
 
 export class RuleSetConversionError extends Error {
@@ -266,9 +271,17 @@ function convertSingBox(rules) {
   }, null, 2) + '\n'
 }
 
-export const RULESET_CONVERT_FORMATS = ['quanx', 'egern', 'singbox']
+export const RULESET_CONVERT_FORMATS = ['quanx', 'egern', 'singbox', 'mrs', 'srs']
 
-export function convertRuleSet(text, format) {
+function normalizedRule(rule) {
+  return {
+    type: rule.type,
+    value: unquote(rule.fields[1] ?? ''),
+    options: rule.fields.slice(2).map(unquote),
+  }
+}
+
+export function convertRuleSet(text, format, options = {}) {
   if (typeof text !== 'string' || !text.trim()) {
     throw new RuleSetConversionError('规则集内容为空')
   }
@@ -279,13 +292,36 @@ export function convertRuleSet(text, format) {
   if (!rules.length) throw new RuleSetConversionError('没有解析到规则')
   const normalized = format === 'sing-box' ? 'singbox' : format
   let body
+  let ruleCount = rules.length
   if (normalized === 'quanx') body = convertQuanX(rules)
   else if (normalized === 'egern') body = convertEgern(rules)
   else if (normalized === 'singbox') body = convertSingBox(rules)
-  else throw new RuleSetConversionError(`不支持的规则集格式：${format}`)
+  else if (normalized === 'mrs') {
+    const behavior = String(options.behavior ?? '').toLowerCase()
+    if (behavior !== 'domain' && behavior !== 'ipcidr') {
+      throw new RuleSetConversionError('MRS 需要 behavior=domain 或 behavior=ipcidr')
+    }
+    try {
+      const binary = encodeMihomoRuleSet(rules.map(normalizedRule), behavior)
+      body = binary.body
+      ruleCount = binary.ruleCount
+    } catch (error) {
+      throw new RuleSetConversionError(error?.message ?? 'MRS 编码失败')
+    }
+  } else if (normalized === 'srs') {
+    try {
+      const binary = encodeSingBoxRuleSet(rules.map(normalizedRule))
+      body = binary.body
+      ruleCount = binary.ruleCount
+    } catch (error) {
+      throw new RuleSetConversionError(error?.message ?? 'SRS 编码失败')
+    }
+  } else {
+    throw new RuleSetConversionError(`不支持的规则集格式：${format}`)
+  }
   return {
     text: body,
     contentType: CONTENT_TYPES[normalized],
-    ruleCount: rules.length,
+    ruleCount,
   }
 }
