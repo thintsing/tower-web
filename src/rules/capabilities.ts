@@ -126,7 +126,110 @@ export const ALL_RULE_TYPES = new Set([
   ...quanx, ...singbox, ...egern, 'FINAL', 'MATCH',
 ])
 
-export type EffectiveGroupType = 'select' | 'url-test' | 'smart' | 'fallback' | 'load-balance' | 'relay'
+export type EffectiveGroupType = 'select' | 'url-test' | 'smart' | 'fallback' | 'load-balance' | 'relay' | 'conditional'
+
+type GroupParameters = Record<string, string> | undefined
+
+function stringArray(value: string | undefined): string[] | undefined {
+  if (!value) return undefined
+  try {
+    const parsed = JSON.parse(value)
+    return Array.isArray(parsed) && parsed.every((item) => typeof item === 'string')
+      ? parsed
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Surge conditional group (`subnet`) 的设备字段；必须含 default=。 */
+export function surgeConditionalFields(parameters: GroupParameters): string[] | undefined {
+  const fields = stringArray(parameters?.['subnet-fields'])
+  if (!fields?.length) return undefined
+  if (!fields.some((field) => field.trim().startsWith('default='))) return undefined
+  return fields.every((field) => field.includes('=') && !/[\r\n]/.test(field))
+    ? fields
+    : undefined
+}
+
+export interface EgernConditional {
+  rules: string
+  fallback: string
+}
+
+/** Egern conditional rules 的受限结构：ssid / bssid / cellular → match + policy。 */
+export function egernConditional(parameters: GroupParameters): EgernConditional | undefined {
+  const fallback = parameters?.default_policy?.trim()
+  if (!fallback) return undefined
+  if (!parameters?.rules) return undefined
+  try {
+    const rules = JSON.parse(parameters.rules)
+    if (!Array.isArray(rules) || !rules.length) return undefined
+    const valid = rules.every((rule) => {
+      if (!rule || typeof rule !== 'object' || Array.isArray(rule)) return false
+      const entries = Object.entries(rule)
+      if (entries.length !== 1) return false
+      const [kind, value] = entries[0]
+      if (!['ssid', 'bssid', 'cellular'].includes(kind)) return false
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+      const pairs = Object.entries(value as Record<string, unknown>)
+      return pairs.length === 2
+        && pairs.every(([key, item]) => ['match', 'policy'].includes(key) && typeof item === 'string')
+    })
+    return valid
+      ? { rules: JSON.stringify(rules), fallback }
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export interface NativeGroupOption {
+  key: string
+  value: string
+}
+
+/** 条件组降级为普通选择组时使用的默认策略。 */
+export function conditionalDefaultPolicy(parameters: GroupParameters): string | undefined {
+  const fallback = parameters?.default_policy?.trim()
+  if (fallback) return fallback
+  const subnet = stringArray(parameters?.['subnet-fields'])
+  for (const field of subnet ?? []) {
+    const equal = field.indexOf('=')
+    if (equal >= 0 && field.slice(0, equal).trim() === 'default') {
+      const value = field.slice(equal + 1).trim()
+      if (value) return value
+    }
+  }
+  return stringArray(parameters?.['ssid-members'])?.[0]?.trim() || undefined
+}
+
+/** 只透传同一种方言的标量参数，单位与语义不跨客户端猜测。 */
+export function nativeGroupOptions(
+  parameters: GroupParameters,
+  target: ClientTarget | undefined,
+): NativeGroupOption[] {
+  if (!parameters) return []
+  const allowed = target === 'surge' || target === 'surge-mac'
+    ? new Set(['timeout', 'evaluate-before-use', 'no-alert'])
+    : target === 'egern'
+      ? new Set(['timeout', 'flatten', 'block_quic'])
+      : target === 'loon'
+        ? new Set(['max-timeout'])
+        : target === 'quanx'
+          ? new Set(['alive-checking'])
+          : new Set<string>()
+  const booleanKeys = new Set(['evaluate-before-use', 'no-alert', 'flatten', 'block_quic', 'alive-checking'])
+  return Object.entries(parameters)
+    .filter(([key, value]) => {
+      if (!allowed.has(key)) return false
+      if (booleanKeys.has(key)) return ['true', 'false'].includes(value)
+      if (key === 'timeout' || key === 'max-timeout') return /^\d+$/.test(value)
+      return false
+    })
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => ({ key, value }))
+}
 
 const FALLBACK_TARGETS: ClientTarget[] = [
   'surge', 'surge-mac', 'quanx', 'clash', 'clash-mi', 'clash-apple',
@@ -150,6 +253,7 @@ const RELAY_TARGETS: ClientTarget[] = [
 export function effectiveGroupType(
   type: PolicyGroupType,
   target?: ClientTarget,
+  parameters?: Record<string, string>,
 ): EffectiveGroupType {
   switch (type) {
     case 'select':
@@ -167,6 +271,11 @@ export function effectiveGroupType(
       // 只有少数 mihomo 客户端原生支持 relay；共享 YAML 载体保持保守。
       return target && RELAY_TARGETS.includes(target) ? 'relay' : 'select'
     case 'conditional':
+      if ((target === 'surge' || target === 'surge-mac') && surgeConditionalFields(parameters)) {
+        return 'conditional'
+      }
+      if (target === 'egern' && egernConditional(parameters)) return 'conditional'
+      return 'select'
     case 'unsupported':
       return 'select'
   }

@@ -196,7 +196,7 @@ export function generateQuanX(
         if (selection.filter) list.push(`server-tag-regex=${selection.filter}`)
       }
       if (!list.length) list.push('direct')
-      const kind = effectiveGroupType(group.type, options.target)
+      const kind = effectiveGroupType(group.type, options.target, group.parameters)
       const type = kind === 'url-test' || kind === 'fallback' || kind === 'smart'
         ? 'url-latency-benchmark'
         : kind === 'load-balance' ? 'round-robin' : 'static'

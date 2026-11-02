@@ -630,6 +630,8 @@ function surgeGroup(line: string): PolicyGroup | undefined {
   const group: PolicyGroup = { name, type, options }
   let includeAll = false
   let regexFilter: string | undefined
+  let parameters: Record<string, string> | undefined
+  const conditionalFields: string[] = []
   for (const field of fields.slice(1)) {
     const eq = field.indexOf('=')
     if (eq < 0) {
@@ -664,10 +666,23 @@ function surgeGroup(line: string): PolicyGroup | undefined {
       case 'policy-regex-filter':
         regexFilter = value
         break
+      case 'timeout':
+      case 'evaluate-before-use':
+      case 'no-alert':
+        // 同方言标量参数；导出到 Surge 时原样写回。
+        parameters = { ...(parameters ?? {}), [key]: value }
+        break
       default:
+        if (group.type === 'conditional' && field.trim()) {
+          conditionalFields.push(field.trim())
+        }
         break
     }
   }
+  if (conditionalFields.length) {
+    parameters = { ...(parameters ?? {}), 'subnet-fields': JSON.stringify(conditionalFields) }
+  }
+  if (parameters) group.parameters = parameters
   if (includeAll) group.nodeFilter = regexFilter || '.*'
   else if (regexFilter) group.nodeFilter = regexFilter
   return group
@@ -801,6 +816,21 @@ function egernGroup(raw: unknown): PolicyGroup | undefined {
   const filter = text(value.filter)
   const includeAll = stringList(value.urls).length > 0 || truthy(value.include_all)
   group.nodeFilter = filter || (includeAll ? '.*' : undefined)
+  // conditional 组的数据必须整组保留，导出 Egern 时才能原样写回。
+  if (group.type === 'conditional') {
+    const rules = array(value.rules).filter((rule) => dict(rule))
+    if (rules.length) group.parameters = { rules: JSON.stringify(rules) }
+    const fallback = text(value.default_policy)
+    if (fallback) group.parameters = { ...(group.parameters ?? {}), default_policy: fallback }
+  }
+  const native: Record<string, string> = {}
+  const timeout = scalar(value.timeout)
+  if (timeout) native.timeout = timeout
+  const flatten = scalar(value.flatten)
+  if (flatten) native.flatten = flatten
+  const blockQuic = scalar(value.block_quic)
+  if (blockQuic) native.block_quic = blockQuic
+  if (Object.keys(native).length) group.parameters = { ...(group.parameters ?? {}), ...native }
   return group
 }
 

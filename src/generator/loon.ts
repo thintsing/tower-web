@@ -232,7 +232,7 @@ export function generateLoon(
       const list = [...localMembers]
       if (remoteMember) list.push(remoteMember)
       const finalList = list.length ? list : ['DIRECT']
-      const kind = effectiveGroupType(group.type, options.target)
+      const kind = effectiveGroupType(group.type, options.target, group.parameters)
       const type = kind === 'load-balance' ? 'load-balance' : kind === 'fallback' ? 'fallback' : kind === 'url-test' ? 'url-test' : 'select'
       const tail =
         kind === 'select'
@@ -260,7 +260,7 @@ export function generateLoon(
         remoteRules.push(`${rule.value},policy=${group},tag=tower-rule-set-${remoteRules.length + 1},enabled=true`)
         continue
       }
-      out.push(compileRuleLine(rule, group))
+      out.push(compileRuleLine(rule, group, 'loon'))
     }
     if (remoteRules.length) out.push('', '[Remote Rule]', ...remoteRules)
   }

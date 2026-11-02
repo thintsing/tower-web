@@ -90,8 +90,8 @@ function ruleSetCacheKey(query) {
 /** 读取内置规则文件或抓取远程列表，再转换成目标客户端方言。 */
 async function buildRuleSetArtifact(query) {
   const format = String(query.get('format') ?? '').toLowerCase()
-  if (!['quanx', 'egern', 'singbox', 'sing-box', 'mrs', 'srs'].includes(format)) {
-    throw new RuleSetConversionError('format 必须是 quanx / egern / singbox / mrs / srs')
+  if (!['quanx', 'egern', 'singbox', 'sing-box', 'mrs', 'srs', 'srs-domain'].includes(format)) {
+    throw new RuleSetConversionError('format 必须是 quanx / egern / singbox / mrs / srs / srs-domain')
   }
   const behavior = String(query.get('behavior') ?? '').toLowerCase()
   if (format === 'mrs' && behavior !== 'domain' && behavior !== 'ipcidr') {

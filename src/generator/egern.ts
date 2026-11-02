@@ -10,7 +10,12 @@ import {
   uniqueDisplayNames,
   type OutputOptions,
 } from './groups'
-import { effectiveGroupType, filterRulesForTarget } from '../rules/capabilities'
+import {
+  effectiveGroupType,
+  egernConditional,
+  filterRulesForTarget,
+  nativeGroupOptions,
+} from '../rules/capabilities'
 import { supportsRuleSetReference } from '../rules/remoteFormats'
 import { latencyTestURL } from '../models/networkSettings'
 import { withPolicyGroupIcons } from './groupIcons'
@@ -287,7 +292,7 @@ function groupLines(
     const selection = remoteGroupSelection(group, allNodes, remoteSources, displayName)
     const urls = [...new Set(selection.sources.map((source) => source.url))]
     const name = yaml(group.name)
-    const kind = effectiveGroupType(group.type, target)
+    const kind = effectiveGroupType(group.type, target, group.parameters)
     switch (kind) {
       case 'url-test':
       case 'smart':
@@ -299,7 +304,7 @@ function groupLines(
         lines.push(`      interval: ${group.interval ?? 300}`)
         lines.push(`      latency_test_url: ${yaml(group.url ?? testURL)}`)
         if (kind !== 'fallback') lines.push(`      tolerance: ${group.tolerance ?? 50}`)
-        lines.push('      timeout: 5')
+        lines.push(`      timeout: ${group.parameters?.timeout ?? '5'}`)
         break
       }
       case 'load-balance':
@@ -308,10 +313,31 @@ function groupLines(
         lines.push(...membersBlock(policies, urls, selection.filter))
         lines.push(`      algorithm: ${yaml(group.algorithm?.trim() || 'hash')}`)
         break
+      case 'conditional': {
+        const conditional = egernConditional(group.parameters)
+        if (conditional) {
+          lines.push('  - conditional:')
+          lines.push(`      name: ${name}`)
+          lines.push(`      rules: ${conditional.rules}`)
+          lines.push(`      default_policy: ${yaml(conditional.fallback)}`)
+          break
+        }
+        lines.push('  - select:')
+        lines.push(`      name: ${name}`)
+        lines.push(...membersBlock(policies, urls, selection.filter))
+        break
+      }
       default:
         lines.push('  - select:')
         lines.push(`      name: ${name}`)
         lines.push(...membersBlock(policies, urls, selection.filter))
+    }
+    if (group.parameters?.flatten === 'true' && group.parameters.filter) {
+      lines.push(`      filter: ${yaml(group.parameters.filter)}`)
+    }
+    for (const { key, value } of nativeGroupOptions(group.parameters, target)) {
+      if (key === 'timeout' && ['url-test', 'smart', 'fallback'].includes(kind)) continue
+      lines.push(`      ${key}: ${value}`)
     }
     if (group.icon) lines.push(`      icon: ${yaml(group.icon)}`)
   }

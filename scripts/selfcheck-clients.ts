@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { parse } from 'yaml'
 import { generateBase64Subscription } from '../src/generator/base64Sub'
 import { generateConfig, generateSubscriptionFormats } from '../src/generator'
+import { compileRuleLine, prepareSchemeForExport } from '../src/generator/groups'
 import { CLIENTS, clientSupportsImport, type ClientTarget, type ProxyNode, type RuleScheme } from '../src/models/types'
 
 const base = { tls: false, skipCertificateVerification: false } as const
@@ -75,6 +76,59 @@ const generic = generateSubscriptionFormats(SAMPLE, {
     { type: 'PROCESS-NAME', value: 'unsupported-process', group: '🚀 节点选择' },
   ],
 }, { contentMode: 'full' })
+
+// 条件组只在 Surge subnet / Egern conditional 中原样保留；其他客户端退回默认策略。
+const CONDITIONAL: RuleScheme = {
+  id: 'conditional',
+  name: 'conditional',
+  description: '',
+  groups: [
+    {
+      name: '节点选择',
+      type: 'select',
+      options: ['DIRECT'],
+      nodeFilter: '.*',
+      parameters: { timeout: '10', 'no-alert': 'true' },
+    },
+    {
+      name: '网络',
+      type: 'conditional',
+      options: [],
+      parameters: {
+        'subnet-fields': JSON.stringify(['default=节点选择', 'Wi-Fi=节点选择']),
+      },
+    },
+    {
+      name: 'SSID 网络',
+      type: 'conditional',
+      options: [],
+      parameters: {
+        rules: JSON.stringify([{ ssid: { match: 'Home', policy: '节点选择' } }]),
+        default_policy: '节点选择',
+      },
+    },
+  ],
+  rules: [{ type: 'FINAL', group: '节点选择' }],
+  networkSettings: scheme.networkSettings,
+}
+const conditionalSurge = generateConfig(
+  client('surge'),
+  SAMPLE,
+  prepareSchemeForExport(CONDITIONAL, {}, { format: 'surge', target: 'surge' }),
+  { contentMode: 'full' },
+)
+const conditionalEgern = generateConfig(
+  client('egern'),
+  SAMPLE,
+  prepareSchemeForExport(CONDITIONAL, {}, { format: 'egern', target: 'egern' }),
+  { contentMode: 'full' },
+)
+const conditionalClash = generateConfig(
+  client('clash-verge'),
+  SAMPLE,
+  prepareSchemeForExport(CONDITIONAL, {}, { format: 'yaml', target: 'clash-verge' }),
+  { contentMode: 'full' },
+)
 
 writeFileSync(join(outDir, 'sample.json'), singbox.text, 'utf8')
 writeFileSync(join(outDir, 'sample.surge.conf'), surge.text, 'utf8')
@@ -164,7 +218,11 @@ validateINI('loon', loon.text, {
   groupNames: (l) => l.split(' = ')[0]?.trim(),
   groupMembers: (l) => membersOf(l).slice(1), // 第一个是类型（select/url-test）
   ruleSection: 'Rule',
-  ruleGroup: (l) => l.split(',').at(-1)?.trim(),
+  ruleGroup: (l) => {
+    const parts = l.split(',').map((part) => part.trim())
+    const tail = parts.at(-1)
+    return tail && /^no-resolve$/i.test(tail) ? parts.at(-2) : tail
+  },
 })
 
 validateINI('quanx', quanx.text, {
@@ -234,6 +292,54 @@ if (clashVergeDoc?.tun?.enable !== true || clashVergeDoc?.tun?.['strict-route'] 
 if (!(clashVergeDoc?.dns?.nameserver as string[] | undefined)
   ?.some((value) => value.includes('https://8.8.4.4/dns-query'))) {
   problems.push('clash-verge: 严格模式未使用远程 DNS')
+}
+
+// GEOIP 默认补 no-resolve；只有 mihomo 系目标在 DNS 已走代理/方案 DNS 时，
+// 才释放最后一条 GEOIP 的 no-resolve。Surge 的 IP 规则同样补 no-resolve。
+if (compileRuleLine({ type: 'GEOIP', value: 'CN' }, 'DIRECT', 'clash') !== 'GEOIP,CN,DIRECT,no-resolve') {
+  problems.push('clash: GEOIP 未补 no-resolve')
+}
+if (compileRuleLine({ type: 'IP-CIDR', value: '10.0.0.0/8' }, 'DIRECT', 'surge') !== 'IP-CIDR,10.0.0.0/8,DIRECT,no-resolve') {
+  problems.push('surge: IP-CIDR 未补 no-resolve')
+}
+if (compileRuleLine({ type: 'IP-CIDR', value: '10.0.0.0/8' }, 'DIRECT', 'loon') !== 'IP-CIDR,10.0.0.0/8,DIRECT') {
+  problems.push('loon: IP-CIDR 不应补 Surge 专属 no-resolve')
+}
+const clashGeoIP = (clashVergeDoc?.rules as string[] | undefined)
+  ?.find((line) => /^GEOIP,CN,DIRECT/.test(line))
+if (!clashGeoIP) problems.push('clash-verge: 缺少 GEOIP,CN,DIRECT 规则')
+if (clashGeoIP?.includes('no-resolve')) {
+  problems.push('clash-verge: DNS 已走代理时末尾 GEOIP 应释放 no-resolve')
+}
+if (![surge.text, loon.text].every((text) => /GEOIP,CN,DIRECT,no-resolve/.test(text))) {
+  problems.push('surge/loon: GEOIP 未补 no-resolve')
+}
+
+// 条件组：Surge 写 subnet，Egern 写 conditional；其他目标退回默认策略。
+if (!/网络 = subnet, "default"=节点选择/.test(conditionalSurge.text)) {
+  problems.push('surge: conditional 组未写成 subnet 或默认策略丢失')
+}
+if (!conditionalSurge.text.includes('no-alert=true') || !conditionalSurge.text.includes('timeout=10')) {
+  problems.push('surge: 同方言标量参数未写回')
+}
+const conditionalEgernDoc = parse(conditionalEgern.text) as any
+const egernConditionalGroup = (conditionalEgernDoc?.policy_groups as any[] | undefined)
+  ?.find((item) => item.conditional)
+if (!egernConditionalGroup) problems.push('egern: conditional 组未写回')
+if (egernConditionalGroup?.conditional?.default_policy !== '节点选择') {
+  problems.push('egern: conditional 默认策略丢失')
+}
+if (!JSON.stringify(egernConditionalGroup?.conditional?.rules ?? []).includes('ssid')) {
+  problems.push('egern: conditional 规则丢失')
+}
+const conditionalClashDoc = parse(conditionalClash.text) as any
+const clashConditionalGroup = (conditionalClashDoc?.['proxy-groups'] as any[] | undefined)
+  ?.find((item) => item.name === '网络')
+if (clashConditionalGroup?.type !== 'select') {
+  problems.push('clash: conditional 组未降级为 select')
+}
+if (!(clashConditionalGroup?.proxies as string[] | undefined)?.includes('节点选择')) {
+  problems.push('clash: conditional 降级后未使用默认策略')
 }
 
 console.log(`egern: 节点 ${egernProxies} · 分组 ${egernGroups} · 规则 ${egernRules}`)

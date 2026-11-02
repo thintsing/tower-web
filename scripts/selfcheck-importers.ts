@@ -2,6 +2,8 @@
 // 用法：npm run selfcheck:importers
 import assert from 'node:assert/strict'
 import { detectRuleSchemeFormat, parseRuleSchemeText } from '../src/rules/importers'
+import { parsePlainRulesetText, subconverterRulesetReference } from '../src/rules/scheme'
+import { validateSchemePolicy } from '../src/rules/policyValidation'
 import type { PolicyGroup, RuleScheme } from '../src/models/types'
 
 let failures = 0
@@ -446,6 +448,71 @@ rules:
     console.error('✗ 未声明的规则组会补 select 组，内置策略不补')
     console.error(`  ${error instanceof Error ? error.message : String(error)}`)
   }
+
+  check('subconverter 规则集前缀、interval 与 domain/ipcidr 负载', () => {
+    assert.deepEqual(subconverterRulesetReference('clash-classic:https://example.com/a.list,86400'), {
+      target: 'https://example.com/a.list',
+      format: 'classical',
+    })
+    assert.deepEqual(subconverterRulesetReference('quanx:https://example.com/q.list'), {
+      target: 'https://example.com/q.list',
+      format: 'quanx',
+    })
+    assert.deepEqual(subconverterRulesetReference('clash-domain:https://example.com/d.txt'), {
+      target: 'https://example.com/d.txt',
+      plainList: 'domain',
+    })
+    assert.deepEqual(subconverterRulesetReference('clash-ipcidr:https://example.com/ip.txt'), {
+      target: 'https://example.com/ip.txt',
+      plainList: 'ipcidr',
+    })
+
+    const domain = parsePlainRulesetText('example.com\n+.suffix.example\n*.wild.example\n# comment\n', 'domain')
+    assert.deepEqual(domain.map((item) => [item.type, item.value]), [
+      ['DOMAIN', 'example.com'],
+      ['DOMAIN-SUFFIX', 'suffix.example'],
+      ['DOMAIN-SUFFIX', 'wild.example'],
+    ])
+    const ip = parsePlainRulesetText('1.2.3.0/24\n2001:db8::/32\nnot-a-cidr\n', 'ipcidr')
+    assert.deepEqual(ip.map((item) => [item.type, item.value]), [
+      ['IP-CIDR', '1.2.3.0/24'],
+      ['IP-CIDR6', '2001:db8::/32'],
+    ])
+    assert.ok(ip.every((item) => item.noResolve === true))
+  })
+
+  check('策略组图预校验：重复、缺失、循环、空组与非法正则', () => {
+    const scheme: RuleScheme = {
+      id: 'policy-check',
+      name: 'policy-check',
+      description: '',
+      groups: [
+        { name: 'A', type: 'select', options: ['B', 'DIRECT'] },
+        { name: 'B', type: 'select', options: ['A'] },
+        { name: 'empty', type: 'select', options: [] },
+        { name: 'bad-regex', type: 'select', options: [], nodeFilter: '(' },
+        { name: 'A', type: 'select', options: ['NO-SUCH'] },
+      ],
+      rules: [{ type: 'FINAL', value: '', group: 'NO-RULE-GROUP' }],
+    }
+    const issues = validateSchemePolicy(scheme, ['node-a'])
+    assert.ok(issues.some((issue) => issue.code === 'duplicateGroupName'))
+    assert.ok(issues.some((issue) => issue.code === 'unknownGroupMember'))
+    assert.ok(issues.some((issue) => issue.code === 'unknownRuleTarget'))
+    assert.ok(issues.some((issue) => issue.code === 'cycle'))
+    assert.ok(issues.some((issue) => issue.code === 'emptyGroup'))
+    assert.ok(issues.some((issue) => issue.code === 'invalidNodePattern'))
+
+    const valid: RuleScheme = {
+      ...scheme,
+      groups: [
+        { name: 'A', type: 'select', options: ['B', 'DIRECT'] },
+        { name: 'B', type: 'select', options: ['node-a'] },
+      ],
+      rules: [{ type: 'FINAL', value: '', group: 'A' }],
+    }
+    assert.deepEqual(validateSchemePolicy(valid, ['node-a']), [])
+  })
 
   if (failures) {
     console.error(`\n${failures} 项检查失败`)

@@ -159,6 +159,7 @@ export type HostedRuleSetDialect =
   | 'egern'
   | 'singbox'
   | 'srs'
+  | 'srs-domain'
   | 'mrs-domain'
   | 'mrs-ipcidr'
 
@@ -171,7 +172,8 @@ export function hostedDialectForFormat(format: SubFormat | undefined): HostedRul
 
 export function ruleSetFormatForDialect(dialect: HostedRuleSetDialect): RuleSetFormat {
   switch (dialect) {
-    case 'srs': return 'singbox-binary'
+    case 'srs':
+    case 'srs-domain': return 'singbox-binary'
     case 'mrs-domain':
     case 'mrs-ipcidr': return 'mrs'
     default: return dialect
@@ -225,8 +227,8 @@ export function hostedRuleSetURL(
   if (dialect === 'mrs-domain' || dialect === 'mrs-ipcidr') {
     params.set('format', 'mrs')
     params.set('behavior', dialect === 'mrs-domain' ? 'domain' : 'ipcidr')
-  } else if (dialect === 'srs') {
-    params.set('format', 'srs')
+  } else if (dialect === 'srs' || dialect === 'srs-domain') {
+    params.set('format', dialect)
   } else {
     params.set('format', dialect)
   }

@@ -210,6 +210,8 @@ export interface RoutingRule {
   ruleSetFormat?: RuleSetFormat
   /** Clash MRS provider 的 behavior（domain / ipcidr）。 */
   ruleSetBehavior?: string
+  /** sing-box 远程 SRS 配套的 domain-only SRS，只用于 DNS 投影。 */
+  ruleSetDNSURL?: string
   /** 本地规则集写成客户端内联规则集时的元数据；只存在于导出准备结果。 */
   inlineSet?: InlineRuleSetMeta
 }
@@ -338,6 +340,8 @@ export interface RuleScheme {
   rawConfigurationText?: string
   /** DNS / IPv6 / 延迟测试等网络设置。 */
   networkSettings?: RuleSchemeNetworkSettings
+  /** 导入 / 刷新时发现的策略组图问题，展示给用户修正。 */
+  policyWarnings?: string[]
   updatedAt?: number
 }
 

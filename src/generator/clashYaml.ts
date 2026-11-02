@@ -26,6 +26,26 @@ const CLASH_PROXIED_DNS_TARGETS: ClientTarget[] = [
 ]
 
 /**
+ * 这些客户端的 DNS 已经走代理，或 follow-scheme 模式已由方案自己的 DNS 解析，
+ * 末尾 GEOIP 的 no-resolve 可以去掉；源规则自己写的 no-resolve 永远保留。
+ */
+function clashResolvesTerminalGeoIP(
+  network: RuleSchemeNetworkSettings,
+  target: ClientTarget | undefined,
+  dnsGroup: string | undefined,
+): boolean {
+  if (!target || !CLASH_PROXIED_DNS_TARGETS.includes(target)) return false
+  return network.dnsProtectionMode === 'follow-scheme' || !!dnsGroup
+}
+
+/** 去掉 Tower 补在最后一条 GEOIP 上的 no-resolve。 */
+function releaseTerminalGeoIP(lines: string[]): string[] {
+  const last = lines[lines.length - 1]
+  if (!last || !/^GEOIP,/i.test(last) || !/,no-resolve$/i.test(last)) return lines
+  return [...lines.slice(0, -1), last.slice(0, -',no-resolve'.length)]
+}
+
+/**
  * 远程 DNS 只挑会尊重 ECS 的解析器，并带上中国子网。只把 DNS 查询交给
  * “客户端附近的解析器”不够，CDN 仍会按节点出口返回海外地址。
  */
@@ -554,7 +574,7 @@ export function generateClashYAML(
   if (!nodesOnly) {
     out.push('proxy-groups:')
     for (const { group, members } of resolved) {
-      const kind = effectiveGroupType(group.type, options.target)
+      const kind = effectiveGroupType(group.type, options.target, group.parameters)
       out.push(`  - name: ${yaml(group.name)}`)
       out.push(`    type: ${kind}`)
       if (group.icon) out.push(`    icon: ${yaml(group.icon)}`)
@@ -673,25 +693,42 @@ export function generateClashYAML(
 
     out.push('rules:')
     const emittedInlineSets = new Set<string>()
+    const ruleLines: string[] = []
+    const finalLines: string[] = []
+    let lastSourceWroteNoResolve = false
     for (const rule of filteredRules) {
       if (rule.inlineSet) {
         if (emittedInlineSets.has(rule.inlineSet.id)) continue
         const provider = inlineRuleSets.get(rule.inlineSet.id)
         if (provider) {
           emittedInlineSets.add(rule.inlineSet.id)
-          out.push(`  - ${inlineSetReference(provider.key, provider.meta, rule.group)}`)
+          ruleLines.push(inlineSetReference(provider.key, provider.meta, rule.group))
+          lastSourceWroteNoResolve = true
           continue
         }
       }
       if (rule.type === 'RULE-SET' && rule.value) {
         const provider = remoteRuleSets.get(rule.value)
         if (provider) {
-          out.push(`  - ${compileRuleLine({ ...rule, value: provider.key }, rule.group)}`)
+          ruleLines.push(compileRuleLine({ ...rule, value: provider.key }, rule.group, options.target))
+          lastSourceWroteNoResolve = true
         }
         continue
       }
-      out.push(`  - ${compileRuleLine(rule, rule.group)}`)
+      if (rule.type === 'FINAL') {
+        finalLines.push(compileRuleLine(rule, rule.group, options.target))
+        continue
+      }
+      ruleLines.push(compileRuleLine(rule, rule.group, options.target))
+      lastSourceWroteNoResolve = (rule.options ?? [])
+        .some((option) => option.toLowerCase() === 'no-resolve')
     }
+    const emittedRules = clashResolvesTerminalGeoIP(network, options.target, dnsGroup)
+      && !lastSourceWroteNoResolve
+      ? releaseTerminalGeoIP(ruleLines)
+      : ruleLines
+    for (const line of emittedRules) out.push(`  - ${line}`)
+    for (const line of finalLines) out.push(`  - ${line}`)
   }
 
   return out.join('\n') + '\n'

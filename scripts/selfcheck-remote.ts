@@ -352,7 +352,12 @@ async function main(): Promise<void> {
     assert.equal(prepared.rules[0]?.type, 'RULE-SET')
     assert.equal(prepared.rules[0]?.ruleSetFormat, 'singbox-binary')
     assert.match(prepared.rules[0]?.value ?? '', /format=srs/)
+    assert.match(prepared.rules[0]?.ruleSetDNSURL ?? '', /format=srs-domain/)
     assert.ok(prepared.rules.some((rule) => rule.type === 'GEOIP'))
+    const hiddify = prepareSchemeForExport(binaryScheme, {}, {
+      preferRuleSets: true, format: 'json', target: 'hiddify',
+    })
+    assert.equal(hiddify.rules[0]?.ruleSetDNSURL, undefined)
     const singboxText = generateSingBox([], prepared, { contentMode: 'full', target: 'sing-box' }).text
     assert.match(singboxText, /"format": "binary"/)
     assert.match(singboxText, /format=srs/)

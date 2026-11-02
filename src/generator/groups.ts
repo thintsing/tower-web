@@ -12,9 +12,11 @@ import {
   subFormatSupportsRuleSetFormat,
   targetSupportsRuleSetFormat,
 } from '../rules/remoteFormats'
-import { mihomoBinaryPlan, singBoxBinaryPlan } from '../rules/binaryRuleSets'
+import { mihomoBinaryPlan, singBoxBinaryPlan, SRS_DOMAIN_TYPES } from '../rules/binaryRuleSets'
 import { inlineRuleSetMetadata } from '../rules/inlineSets'
 import { reorderRulesByMatchingOrder } from '../rules/matchingOrder'
+import { insertRuleSetBlocks, sortSupplementRules, type RuleSetBlock } from '../rules/ruleOrder'
+import { conditionalDefaultPolicy, effectiveGroupType } from '../rules/capabilities'
 
 /** 所有客户端生成器共用的导出选项。 */
 export interface OutputOptions {
@@ -206,17 +208,22 @@ export function remoteSourceAliases(
 export function compileRuleLine(
   rule: { type: string; value?: string; noResolve?: boolean; options?: string[]; raw?: string },
   group: string,
+  target?: ClientTarget,
 ): string {
   if (rule.type === 'FINAL') return `MATCH,${group}`
   if (rule.raw) return `${rule.raw},${group}`
+  const type = rule.type.toUpperCase()
   const options = [...(rule.options ?? [])]
-  // no-resolve 只对 IP 类规则有效；GEOIP 带上它会被 mihomo 判为非法参数。
   const sourceNoResolve = options.some((option) => option.toLowerCase() === 'no-resolve')
-  if (rule.noResolve && !sourceNoResolve) options.push('no-resolve')
-  const filtered = rule.type === 'GEOIP'
-    ? options.filter((option) => option.toLowerCase() !== 'no-resolve')
-    : options
-  return [rule.type, rule.value ?? '', group, ...filtered].join(',')
+  // Tower iOS 会给 GEOIP 补 no-resolve，避免上方的 IP/GEOIP 规则为了判断匹配
+  // 而提前解析域名；Surge 系的 IP/ASN 规则也需要同样的保护。源规则自己写了
+  // no-resolve 时原样保留，不重复追加。
+  const surgeIPRule = (target === 'surge' || target === 'surge-mac')
+    && ['IP-CIDR', 'IP-CIDR6', 'IP6-CIDR', 'IP-ASN'].includes(type)
+  if ((rule.noResolve || type === 'GEOIP' || surgeIPRule) && !sourceNoResolve) {
+    options.push('no-resolve')
+  }
+  return [rule.type, rule.value ?? '', group, ...options].join(',')
 }
 
 /**
@@ -251,6 +258,8 @@ export interface RemoteRuleSetReference {
   behavior?: 'domain' | 'ipcidr'
   /** 写在 RULE-SET 行上的参数，例如 ipcidr 的 no-resolve。 */
   options?: string[]
+  /** sing-box DNS 投影专用的 domain-only SRS，不写进路由规则。 */
+  dnsDomainURL?: string
 }
 
 export interface RemoteRuleSetCandidate {
@@ -267,14 +276,16 @@ export interface RemoteRuleSetCandidate {
 
 function hostedReference(
   set: SchemeRuleSet,
-  dialect: 'mrs-domain' | 'mrs-ipcidr' | 'srs',
+  dialect: 'mrs-domain' | 'mrs-ipcidr' | 'srs' | 'srs-domain',
 ): RemoteRuleSetReference | undefined {
   const url = hostedRuleSetURL(set, dialect)
   if (!url) return undefined
   return {
     url,
     format: ruleSetFormatForDialect(dialect),
-    behavior: dialect === 'srs' ? undefined : dialect === 'mrs-domain' ? 'domain' : 'ipcidr',
+    behavior: dialect === 'srs' || dialect === 'srs-domain'
+      ? undefined
+      : dialect === 'mrs-domain' ? 'domain' : 'ipcidr',
   }
 }
 
@@ -329,9 +340,15 @@ export function remoteRuleSetCandidates(
         if (plan) {
           const reference = hostedReference(set, 'srs')
           if (reference) {
+            // 官方 sing-box 的 DNS 规则不能引用包含 IP 条件的 SRS；同一份列表
+            // 另托管一个 domain-only SRS，只给 DNS 投影使用（Hiddify 1.13 不投影）。
+            const dnsDomainURL = options.target === 'sing-box'
+              && plan.covered.some((rule) => SRS_DOMAIN_TYPES.has(rule.type.toUpperCase()))
+              ? hostedReference(set, 'srs-domain')?.url
+              : undefined
             return {
               set,
-              references: [reference],
+              references: [{ ...reference, ...(dnsDomainURL ? { dnsDomainURL } : {}) }],
               residual: plan.residual,
               url: undefined,
               format: undefined,
@@ -386,13 +403,21 @@ export function prepareSchemeForExport(
   options: PrepareSchemeOptions = {},
 ): RuleScheme {
   const groups = scheme.groups.map((group) => {
-    if (group.type !== 'select') return group
-    const selected = policySelections[group.name]
-    return selected ? { ...group, selected } : group
+    let updated = group
+    if (group.type === 'conditional'
+      && (!options.target || effectiveGroupType(group.type, options.target, group.parameters) !== 'conditional')) {
+      // 条件组在目标客户端没有对应类型时，退回默认策略而不是 DIRECT。
+      const fallback = conditionalDefaultPolicy(group.parameters)
+      if (fallback) updated = { ...updated, options: [fallback] }
+    }
+    if (updated.type !== 'select') return updated
+    const selected = policySelections[updated.name]
+    return selected ? { ...updated, selected } : updated
   })
   const customRules = scheme.customRules ?? []
   const remoteCandidates = remoteRuleSetCandidates(scheme, options)
-  const ruleSetRules = remoteCandidates.flatMap(({ set, url, format, remote, references, residual }) => {
+  const ruleSetBlocks: RuleSetBlock[] = remoteCandidates.map(({ set, url, format, remote, references, residual }) => {
+    let rules: RoutingRule[]
     if (remote && references?.length) {
       const remoteRules: RoutingRule[] = references.map((reference) => ({
         type: 'RULE-SET',
@@ -402,15 +427,15 @@ export function prepareSchemeForExport(
         ruleSetFormat: reference.format,
         ruleSetBehavior: reference.behavior,
         options: reference.options,
+        ruleSetDNSURL: reference.dnsDomainURL,
       }))
       const residualRules: RoutingRule[] = (residual ?? []).map((rule) => ({
         ...rule,
         group: set.group,
       }))
-      return [...remoteRules, ...residualRules]
-    }
-    if (remote && url) {
-      return [{
+      rules = [...remoteRules, ...residualRules]
+    } else if (remote && url) {
+      rules = [{
         type: 'RULE-SET',
         value: url,
         group: set.group,
@@ -418,25 +443,29 @@ export function prepareSchemeForExport(
         ruleSetFormat: format,
         ruleSetBehavior: set.ruleSetBehavior,
       }]
+    } else {
+      const inline = options.format
+        ? inlineRuleSetMetadata(set, options.format, options.target)
+        : undefined
+      rules = inline
+        ? set.rules.map((rule) => ({ ...rule, inlineSet: inline }))
+        : set.rules.map((rule) => ({ ...rule, group: set.group }))
     }
-    const inline = options.format
-      ? inlineRuleSetMetadata(set, options.format, options.target)
-      : undefined
-    if (inline) {
-      return set.rules.map((rule) => ({ ...rule, inlineSet: inline }))
+    return {
+      group: set.group,
+      matchRules: set.rules,
+      sourceURL: remoteRuleSetURL(set),
+      rules,
     }
-    return set.rules
   })
+  // 规则集插到第一条冲突规则之前；自定义规则仍全部前置，并最具体优先。
+  const mergedRules = insertRuleSetBlocks(scheme.rules, ruleSetBlocks)
   return {
     ...scheme,
     groups,
-    // 自定义规则始终排在最前；拖动策略组只调整其余规则的匹配顺序。
     rules: [
-      ...customRules,
-      ...reorderRulesByMatchingOrder(
-        [...ruleSetRules, ...scheme.rules],
-        scheme.matchingOrder,
-      ),
+      ...sortSupplementRules(customRules),
+      ...reorderRulesByMatchingOrder(mergedRules, scheme.matchingOrder),
     ],
   }
 }

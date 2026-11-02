@@ -3517,6 +3517,28 @@ body.no-scroll { overflow: hidden; }
   margin-top: 8px;
 }
 
+.scheme-warnings {
+  margin-top: 10px;
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, var(--warning) 35%, var(--border));
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--warning) 7%, var(--surface));
+  color: var(--text);
+  font-size: 12px;
+}
+
+.scheme-warnings summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.scheme-warnings ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
 /* ---------- LAN access key / gate ---------- */
 .api-key-row {
   display: flex;

@@ -93,6 +93,91 @@ function main(): void {
     )
   })
 
+  check('自定义规则按最具体优先排序', () => {
+    const scheme: RuleScheme = {
+      id: 'supplement-order',
+      name: '测试',
+      description: '',
+      groups: [group('A')],
+      rules: [{ type: 'FINAL', group: 'A' }],
+      customRules: [
+        rule('A', 'example.com', 'DOMAIN-SUFFIX'),
+        rule('A', 'ads.example.com', 'DOMAIN-SUFFIX'),
+        rule('A', 'example.com', 'DOMAIN'),
+        rule('A', 'tracking', 'DOMAIN-KEYWORD'),
+        rule('A', '10.0.0.0/8', 'IP-CIDR'),
+      ],
+    }
+    const prepared = prepareSchemeForExport(scheme, {}, {})
+    assert.deepEqual(
+      prepared.rules.slice(0, 5).map((item) => `${item.type},${item.value ?? ''}`),
+      [
+        'DOMAIN,example.com',
+        'DOMAIN-SUFFIX,ads.example.com',
+        'DOMAIN-SUFFIX,example.com',
+        'DOMAIN-KEYWORD,tracking',
+        'IP-CIDR,10.0.0.0/8',
+      ],
+    )
+    assert.equal(prepared.rules.at(-1)?.type, 'FINAL')
+  })
+
+  check('规则集插到第一条冲突规则之前，而不是全部压到最前', () => {
+    const scheme: RuleScheme = {
+      id: 'ruleset-placement',
+      name: '测试',
+      description: '',
+      groups: [group('A'), group('B'), group('C')],
+      rules: [
+        rule('A', 'a.example.com'),
+        rule('B', 'b.example.com'),
+        rule('C', 'c.example.com'),
+        { type: 'FINAL', group: 'A' },
+      ],
+      ruleSets: [
+        {
+          id: 'set-b',
+          name: 'B 列表',
+          group: 'B',
+          sourceKind: 'local',
+          updatedAt: 1,
+          rules: [
+            rule('B', 'b.example.com'),
+            rule('B', 'b2.example.com'),
+          ],
+        },
+        {
+          id: 'set-d',
+          name: 'D 列表',
+          group: 'C',
+          sourceKind: 'local',
+          updatedAt: 1,
+          rules: [rule('C', 'not-in-template.example.com')],
+        },
+      ],
+    }
+    const prepared = prepareSchemeForExport(scheme, {}, {})
+    assert.deepEqual(
+      prepared.rules.map((item) => `${item.type},${item.value ?? ''},${item.group}`),
+      [
+        'DOMAIN,a.example.com,A',
+        'DOMAIN,b.example.com,B',
+        'DOMAIN,b2.example.com,B',
+        'DOMAIN,b.example.com,B',
+        'DOMAIN,not-in-template.example.com,C',
+        'DOMAIN,c.example.com,C',
+        'FINAL,,A',
+      ],
+    )
+  })
+
+  check('FINAL 不进入匹配顺序，也不会被拖动前移', () => {
+    assert.equal(matchingGroupNames([...RULES, { type: 'FINAL', group: 'D' }]).includes('D'), false)
+    const withFinal = [...A, ...B, { type: 'FINAL', group: 'C' }]
+    const result = reorderRulesByMatchingOrder(withFinal, ['C', 'A', 'B'])
+    assert.equal(result.at(-1)?.type, 'FINAL')
+  })
+
   check('新建节点组使用唯一名称并校验正则', () => {
     const scheme: RuleScheme = {
       id: 'new-group',

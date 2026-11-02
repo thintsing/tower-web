@@ -121,7 +121,7 @@ export function hysteria2ObfsSupported(node: ProxyNode, target?: ClientTarget): 
 /** Official sing-box/Hiddify SOCKS has no TLS field; dropping TLS changes the protocol. */
 export function socksTLSSupported(node: ProxyNode, target?: ClientTarget): boolean {
   if (node.kind !== 'socks5') return true
-  if (!node.tls && !node.usesReality) return true
+  if (!node.tls && !node.realityPublicKey) return true
   return target !== 'sing-box' && target !== 'hiddify'
 }
 

@@ -2,7 +2,12 @@
 import type { ProxyNode, RoutingRule, RuleScheme } from '../models/types'
 import { confName } from './naming'
 import { compileRuleLine, resolveGroups, uniqueDisplayNames, type OutputOptions } from './groups'
-import { effectiveGroupType, filterRulesForTarget } from '../rules/capabilities'
+import {
+  effectiveGroupType,
+  filterRulesForTarget,
+  nativeGroupOptions,
+  surgeConditionalFields,
+} from '../rules/capabilities'
 import { inlineSetReference, surgeInlinePayload } from '../rules/inlineSets'
 import { supportsRuleSetReference } from '../rules/remoteFormats'
 import { effectiveNetworkSettings, latencyTestURL } from '../models/networkSettings'
@@ -296,20 +301,35 @@ export function generateSurge(
           )].map((sourceID) => sourceGroupNames.get(sourceID)).filter(Boolean) as string[]
         : []
       const list = inlineMembers.length ? inlineMembers : includedSources.length ? [] : ['DIRECT']
-      const kind = effectiveGroupType(group.type, options.target)
-      const parts: string[] = [...list]
-      if (kind !== 'select') {
-        parts.push(`url=${group.url ?? testURL}`)
-        parts.push(`interval=${group.interval ?? 300}`)
-        if (group.tolerance) parts.push(`tolerance=${group.tolerance}`)
-      }
-      if (includedSources.length) {
-        parts.push(`include-other-group=${quote(includedSources.join(','))}`)
-        if (group.nodeFilter) parts.push(`policy-regex-filter=${quote(group.nodeFilter)}`)
+      const kind = effectiveGroupType(group.type, options.target, group.parameters)
+      const parts: string[] = []
+      if (kind === 'conditional') {
+        // Surge subnet 组：设备名/网段=策略，default= 必须存在。
+        const fields = surgeConditionalFields(group.parameters) ?? []
+        for (const field of fields) {
+          const equal = field.indexOf('=')
+          if (equal < 0) continue
+          parts.push(`${quote(field.slice(0, equal).trim())}=${confName(field.slice(equal + 1).trim())}`)
+        }
+      } else {
+        parts.push(...list)
+        if (kind !== 'select') {
+          parts.push(`url=${group.url ?? testURL}`)
+          parts.push(`interval=${group.interval ?? 300}`)
+          if (group.tolerance) parts.push(`tolerance=${group.tolerance}`)
+        }
+        if (includedSources.length) {
+          parts.push(`include-other-group=${quote(includedSources.join(','))}`)
+          if (group.nodeFilter) parts.push(`policy-regex-filter=${quote(group.nodeFilter)}`)
+        }
       }
       if (parts.length === 0) parts.push('DIRECT')
-      const line = `${confName(group.name)} = ${kind}, ${parts.join(', ')}`
-      out.push(group.icon ? `${line}, icon-url=${group.icon}` : line)
+      const keyword = kind === 'conditional' ? 'subnet' : kind
+      let line = `${confName(group.name)} = ${keyword}, ${parts.join(', ')}`
+      const native = nativeGroupOptions(group.parameters, options.target)
+      if (native.length) line += native.map(({ key, value }) => `, ${key}=${value}`).join('')
+      if (group.icon) line += `, icon-url=${group.icon}`
+      out.push(line)
     }
     const filteredRules = filterRulesForTarget(scheme.rules, options.target)
     const inlineRuleSets = new Map<string, {
@@ -348,7 +368,7 @@ export function generateSurge(
       }
       if (rule.type === 'FINAL') out.push(`FINAL,${group}`)
       else if (rule.type === 'RULE-SET' && !supportsRuleSetReference(rule, 'surge', options.target)) continue
-      else out.push(compileRuleLine(rule, group))
+      else out.push(compileRuleLine(rule, group, options.target === 'surge-mac' ? 'surge-mac' : 'surge'))
     }
     for (const set of inlineRuleSets.values()) {
       out.push('', `[Ruleset ${set.key}]`, ...set.lines)

@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict'
 import { parse } from 'yaml'
 import { generateConfig, generateSubscriptionFormats } from '../src/generator'
+import { prepareSchemeForExport } from '../src/generator/groups'
 import { CLIENTS, type ClientTarget, type ProxyNode, type RuleScheme } from '../src/models/types'
 
 let failures = 0
@@ -182,6 +183,49 @@ function main(): void {
     assert.equal(respond?.action, 'respond')
     const ruleSet = config.route.rule_set.find((set: Record<string, any>) => set.tag === 'tower-geoip-cn')
     assert.ok(ruleSet.rules[0].ip_cidr.length > 1000)
+  })
+
+  check('sing-box 远程 SRS 用 domain-only 版本投影 DNS', () => {
+    const source = scheme(true, 'standard')
+    source.ruleSets = [{
+      id: 'srs-set',
+      name: '广告列表',
+      group: '节点选择',
+      sourceKind: 'library',
+      sourceRef: 'ACL4SSR_BanAD.list',
+      updatedAt: 1,
+      rules: [
+        { type: 'DOMAIN-SUFFIX', value: 'ads.example', group: '节点选择' },
+        { type: 'DOMAIN-KEYWORD', value: 'adkw', group: '节点选择' },
+        { type: 'IP-CIDR', value: '1.2.3.0/24', group: '节点选择', options: ['no-resolve'], noResolve: true },
+      ],
+    }]
+    source.rules = [{ type: 'FINAL', group: '节点选择' }]
+    const prepared = prepareSchemeForExport(source, {}, {
+      preferRuleSets: true,
+      format: 'json',
+      target: 'sing-box',
+    })
+    const config = singbox(prepared)
+    const routeSets = config.route.rule_set as Record<string, any>[]
+    const primary = routeSets.find((set) => /format=srs&/.test(set.url))
+    const dns = routeSets.find((set) => /format=srs-domain/.test(set.url))
+    assert.ok(primary)
+    assert.ok(dns)
+    const dnsRule = dnsRules(config).find((rule) => rule.rule_set?.includes(dns.tag))
+    assert.ok(dnsRule)
+    assert.equal(dnsRule.action, 'route')
+    assert.equal(dnsRule.server, 'remote')
+    assert.equal(dnsRules(config).some((rule) => rule.ip_cidr), false)
+
+    const hiddifyPrepared = prepareSchemeForExport(source, {}, {
+      preferRuleSets: true,
+      format: 'json',
+      target: 'hiddify',
+    })
+    const hiddifyConfig = singbox(hiddifyPrepared, 'hiddify')
+    const hiddifySets = hiddifyConfig.route.rule_set as Record<string, any>[]
+    assert.equal(hiddifySets.some((set) => /format=srs-domain/.test(set.url)), false)
   })
 
   check('Hiddify 的 1.13 不写 ECS 提示', () => {

@@ -5,6 +5,8 @@ import type { RoutingRule } from '../models/types'
 
 export const MRS_DOMAIN_TYPES = new Set(['DOMAIN', 'DOMAIN-SUFFIX'])
 export const MRS_IP_TYPES = new Set(['IP-CIDR', 'IP-CIDR6', 'IP6-CIDR'])
+/** DNS 规则只能判断查询名；domain-only SRS 只收这三类。 */
+export const SRS_DOMAIN_TYPES = new Set(['DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD'])
 export const SRS_TYPES = new Set([
   'DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD', 'DOMAIN-REGEX',
   'IP-CIDR', 'IP-CIDR6', 'IP6-CIDR',

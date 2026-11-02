@@ -2,7 +2,7 @@
 //   ruleset=组名,https://…/Clash/Ruleset/X.list   (or []GEOIP,CN / []FINAL)
 //   custom_proxy_group=组名`类型`[]引用`正则`url`interval`,tolerance
 // Bundled rule lists are inlined into per-group rules at load time.
-import type { PolicyGroup, PolicyGroupType, RoutingRule, RuleScheme, RuleSchemeFormat, RuleSchemeSource } from '../models/types'
+import type { PolicyGroup, PolicyGroupType, RoutingRule, RuleScheme, RuleSchemeFormat, RuleSchemeSource, RuleSetFormat } from '../models/types'
 import { apiFetch } from '../util/apiAuth'
 import { ALL_RULE_TYPES } from './capabilities'
 
@@ -151,6 +151,59 @@ export async function loadScheme(meta: SchemeMeta): Promise<RuleScheme> {
   return { id: meta.id, name: meta.name, description: meta.description, groups, rules }
 }
 
+export interface SubconverterRulesetReference {
+  target: string
+  format?: RuleSetFormat
+  plainList?: 'domain' | 'ipcidr'
+}
+
+/** subconverter: ruleset=<group>,[<type>:]<url>[,<interval>]. */
+export function subconverterRulesetReference(raw: string): SubconverterRulesetReference {
+  let target = raw.trim()
+  const lastComma = target.lastIndexOf(',')
+  if (lastComma > 0 && /^\s*\d+\s*$/.test(target.slice(lastComma + 1))) {
+    target = target.slice(0, lastComma).trim()
+  }
+  const prefix = target.match(/^(clash-domain|clash-ipcidr|clash-classic|quanx|surge):/i)
+  if (!prefix) return { target }
+  target = target.slice(prefix[0].length).trim()
+  switch (prefix[1].toLowerCase()) {
+    case 'clash-domain': return { target, plainList: 'domain' }
+    case 'clash-ipcidr': return { target, plainList: 'ipcidr' }
+    case 'clash-classic': return { target, format: 'classical' }
+    case 'quanx': return { target, format: 'quanx' }
+    case 'surge': return { target, format: 'classical' }
+    default: return { target }
+  }
+}
+
+/** Clash `behavior: domain` / `behavior: ipcidr` provider payloads. */
+export function parsePlainRulesetText(
+  text: string,
+  kind: 'domain' | 'ipcidr',
+): Omit<RoutingRule, 'group'>[] {
+  const rules: Omit<RoutingRule, 'group'>[] = []
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#') || line.startsWith(';') || line === 'payload:') continue
+    const value = (line.startsWith('- ') ? line.slice(2).trim() : line)
+    if (!value) continue
+    if (kind === 'domain') {
+      const type = value.startsWith('+.') || value.startsWith('*.')
+        ? 'DOMAIN-SUFFIX'
+        : 'DOMAIN'
+      const domain = value.replace(/^(\+\.|\*\.)/, '').replace(/^\./, '')
+      const rule = parseInlineRule(`${type},${domain}`)
+      if (rule) rules.push(rule)
+    } else {
+      if (!value.includes('/')) continue
+      const rule = parseInlineRule(`${value.includes(':') ? 'IP-CIDR6' : 'IP-CIDR'},${value},no-resolve`)
+      if (rule) rules.push(rule)
+    }
+  }
+  return rules
+}
+
 /** Parse raw ACL4SSR INI text (same format as bundled files) into groups + rules.
  *  Used for both bundled schemes (through loadScheme) and user-imported custom schemes.
  *  Remote ruleset URLs are fetched through /api/fetch proxy so the browser's CORS does not block. */
@@ -205,16 +258,27 @@ export async function parseSchemeINI(
 
   const rulesByGroup = new Map<string, Omit<RoutingRule, 'group'>[]>()
   for (const rs of rulesets) {
+    const reference = subconverterRulesetReference(rs.target)
     let text = ''
-    const local = localFileForURL(rs.target, localIndex)
+    const local = localFileForURL(reference.target, localIndex)
     if (local) text = await fileFetch(local)
-    else if (/^https?:\/\//i.test(rs.target)) text = await urlFetch(rs.target)
-    else if (rs.target.startsWith('[]')) {
-      const parsed = parseInlineRule(rs.target.slice(2))
-      if (parsed) rulesByGroup.set(rs.group, [...(rulesByGroup.get(rs.group) ?? []), parsed])
-      continue
+    else if (/^https?:\/\//i.test(reference.target)) text = await urlFetch(reference.target)
+    if (!text.trim()) continue
+
+    let parsed: Omit<RoutingRule, 'group'>[] = []
+    const looksStructured = text.trim().startsWith('{') || /^\s*(payload:|proxies:|rules:)/m.test(text)
+    if (reference.plainList && !looksStructured) {
+      parsed = parsePlainRulesetText(text, reference.plainList)
+    } else {
+      try {
+        // Dynamic import avoids a static cycle: ruleSets.ts imports helpers from
+        // this module for its classical parser.
+        const { parseRuleSetText } = await import('./ruleSets')
+        parsed = parseRuleSetText(text, reference.format).rules
+      } catch {
+        parsed = parseRuleList(text)
+      }
     }
-    const parsed = parseRuleList(text)
     if (parsed.length) rulesByGroup.set(rs.group, [...(rulesByGroup.get(rs.group) ?? []), ...parsed])
   }
 

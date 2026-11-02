@@ -207,6 +207,45 @@ function main(): void {
     assert.equal(to.subarray(10, 16).toString('hex'), 'ffff010203ff')
   })
 
+  check('SRS domain：DNS 专用列表只编码域名与关键词', () => {
+    const output = convertRuleSet(DOMAIN_AND_IP, 'srs-domain')
+    assert.ok(Buffer.isBuffer(output.text))
+    assert.equal(output.text.subarray(0, 4).toString('hex'), '53525302')
+    assert.equal(output.ruleCount, 3)
+    const plain = inflateSync(output.text.subarray(4))
+    let position = 0
+    const readUvarint = (): number => {
+      let value = 0
+      let shift = 0
+      for (;;) {
+        const byte = plain[position++]
+        value |= (byte & 0x7f) << shift
+        if (!(byte & 0x80)) return value
+        shift += 7
+      }
+    }
+    assert.equal(readUvarint(), 1)
+    assert.equal(plain[position++], 0)
+    assert.equal(plain[position++], 2)
+    const matcher = decodeSuccinct(plain, position, 'uvarint')
+    position = matcher.next
+    assert.deepEqual(matcher.keys.sort(), ['\nfoo.com', 'example.com'].sort())
+    assert.equal(plain[position++], 3)
+    assert.equal(readUvarint(), 1)
+    const keywordLength = readUvarint()
+    assert.equal(plain.subarray(position, position + keywordLength).toString(), 'keyword')
+    position += keywordLength
+    assert.equal(plain[position++], 0xff)
+    assert.equal(plain[position++], 0)
+    assert.equal(position, plain.length)
+  })
+
+  check('SRS domain：没有域名规则时报错', () => {
+    assert.throws(
+      () => convertRuleSet('IP-CIDR,1.2.3.0/24\nPROCESS-NAME,curl', 'srs-domain'),
+      /没有可编码/,
+    )
+  })
   check('SRS：生成 sing-box binary v2', () => {
     const output = convertRuleSet(WITHOUT_GEOIP, 'srs')
     assert.ok(Buffer.isBuffer(output.text))
@@ -394,6 +433,8 @@ function main(): void {
     assert.match(mrs ?? '', /behavior=domain/)
     const srs = hostedRuleSetURL(makeSet({ sourceKind: 'url', sourceRef: 'https://rules.example/ads.list' }), 'srs')
     assert.match(srs ?? '', /format=srs/)
+    const srsDomain = hostedRuleSetURL(makeSet({ sourceKind: 'url', sourceRef: 'https://rules.example/ads.list' }), 'srs-domain')
+    assert.match(srsDomain ?? '', /format=srs-domain/)
     const local = makeSet({ sourceKind: 'local', sourceRef: 'local-1' })
     assert.equal(hostedRuleSetURL(local, 'singbox'), undefined)
   })

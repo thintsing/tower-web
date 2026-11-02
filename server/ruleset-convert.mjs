@@ -52,6 +52,7 @@ const CONTENT_TYPES = {
   singbox: 'application/json; charset=utf-8',
   mrs: 'application/octet-stream',
   srs: 'application/octet-stream',
+  'srs-domain': 'application/octet-stream',
 }
 
 export class RuleSetConversionError extends Error {
@@ -271,7 +272,7 @@ function convertSingBox(rules) {
   }, null, 2) + '\n'
 }
 
-export const RULESET_CONVERT_FORMATS = ['quanx', 'egern', 'singbox', 'mrs', 'srs']
+export const RULESET_CONVERT_FORMATS = ['quanx', 'egern', 'singbox', 'mrs', 'srs', 'srs-domain']
 
 function normalizedRule(rule) {
   return {
@@ -308,9 +309,12 @@ export function convertRuleSet(text, format, options = {}) {
     } catch (error) {
       throw new RuleSetConversionError(error?.message ?? 'MRS 编码失败')
     }
-  } else if (normalized === 'srs') {
+  } else if (normalized === 'srs' || normalized === 'srs-domain') {
     try {
-      const binary = encodeSingBoxRuleSet(rules.map(normalizedRule))
+      const binary = encodeSingBoxRuleSet(
+        rules.map(normalizedRule),
+        { domainOnly: normalized === 'srs-domain' },
+      )
       body = binary.body
       ruleCount = binary.ruleCount
     } catch (error) {

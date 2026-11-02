@@ -1,8 +1,9 @@
 // 拖动策略组后调整规则匹配顺序。移植自 Tower iOS：
 // 只移动被拖动的组，尽量保留原来的相对顺序；规则里的 GEOIP 兜底不移动。
 import type { RoutingRule } from '../models/types'
+import { isTerminalRule } from './ruleKeys'
 
-/** 规则实际触达的策略组，按匹配顺序去重。 */
+/** 规则实际触达的策略组，按匹配顺序去重；FINAL / MATCH 不属于匹配顺序。 */
 export function matchingGroupNames(
   rules: RoutingRule[],
   knownGroups?: Set<string>,
@@ -11,7 +12,7 @@ export function matchingGroupNames(
   const names: string[] = []
   for (const rule of rules) {
     const name = rule.group
-    if (!name || seen.has(name)) continue
+    if (!name || isTerminalRule(rule) || seen.has(name)) continue
     if (knownGroups && !knownGroups.has(name)) continue
     seen.add(name)
     names.push(name)
@@ -92,7 +93,7 @@ function longestIncreasingSubsequence(values: number[]): number[] {
 }
 
 function isAnchoredFallback(rule: RoutingRule): boolean {
-  return rule.type === 'GEOIP' || /^GEOIP,/i.test((rule.raw ?? '').trim())
+  return isTerminalRule(rule) || rule.type === 'GEOIP' || /^GEOIP,/i.test((rule.raw ?? '').trim())
 }
 
 /**

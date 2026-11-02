@@ -27,6 +27,8 @@ import { detectRuleSchemeFormat, parseRuleSchemeText, RULE_SCHEME_FORMAT_TITLES 
 import { fetchRuleSet, parseRuleSetText, RULE_SET_FORMAT_TITLES, type RuleSetRule } from './rules/ruleSets'
 import { matchingGroupNames, matchingOrderAfterDragging } from './rules/matchingOrder'
 import { findRuleOrderConflicts, type RuleOrderConflict } from './rules/orderConflicts'
+import { policyIssueText, validateSchemePolicy } from './rules/policyValidation'
+import { orderedSchemeBaseRules, orderedSchemeRules } from './rules/ruleOrder'
 import { buildNodeFilterGroup, nextGroupName, previewNodeMatches, removePolicyGroup, validateNodeGroupDraft, type NodeGroupDraft } from './rules/groupEditing'
 import { ONLINE_RULE_CATALOG } from './rules/ruleCatalog'
 import type { ManualNodeImportResult } from './manualNodes'
@@ -5040,13 +5042,7 @@ function RulesTab() {
   const selectedMeta = allMetas.find((m) => m.id === selectedSchemeID)
   const customScheme = customSchemes.find((c) => c.id === scheme?.id)
   const schemeRules = useMemo(
-    () => scheme
-      ? [
-          ...(scheme.customRules ?? []),
-          ...(scheme.ruleSets ?? []).flatMap((set) => set.rules),
-          ...scheme.rules,
-        ]
-      : [],
+    () => scheme ? orderedSchemeRules(scheme) : [],
     [scheme],
   )
   const enabledForRules = useMemo(() => enabledNodes({ sources, nodes }), [sources, nodes])
@@ -5067,11 +5063,18 @@ function RulesTab() {
     return () => window.clearTimeout(timer)
   }, [flash])
 
-  /** 空的策略组 / 规则会让导出的配置不可用，导入时直接拒绝。 */
+  /** 空的策略组 / 规则会让导出的配置不可用；策略组图问题作为可修正提示展示。 */
   const validateScheme = (parsed: RuleScheme) => {
     if (!parsed.groups.length || !parsed.rules.length) {
       throw new Error('没有解析到策略组或规则，请检查方案内容或规则列表地址')
     }
+    const available = enabledNodes(useStore.getState())
+    const issues = validateSchemePolicy(
+      parsed,
+      available.map((node) => node.name),
+      available.length === 0,
+    )
+    parsed.policyWarnings = issues.length ? issues.map(policyIssueText) : undefined
     return parsed
   }
 
@@ -5278,12 +5281,7 @@ function RulesTab() {
     groups.splice(to, 0, moved)
     const names = groups.map((group) => group.name)
     const knownGroups = new Set(names)
-    const matchingRules = [
-      ...(editable.ruleSets ?? []).flatMap((set) =>
-        set.rules.map((rule) => ({ ...rule, group: set.group })),
-      ),
-      ...editable.rules,
-    ]
+    const matchingRules = orderedSchemeBaseRules(editable)
     const currentMatching = matchingGroupNames(matchingRules, knownGroups)
     const nextMatching = matchingOrderAfterDragging(moved.name, beforeNames, names, currentMatching)
     const changed = nextMatching.join('\n') !== currentMatching.join('\n')
@@ -5798,6 +5796,16 @@ function RulesTab() {
           </div>
         )}
         {schemeError && !importingScheme && <div className="error">{schemeError}</div>}
+        {(scheme?.policyWarnings?.length ?? 0) > 0 && !importingScheme && (
+          <details className="scheme-warnings">
+            <summary>方案校验提示 · {scheme!.policyWarnings!.length}</summary>
+            <ul>
+              {scheme!.policyWarnings!.map((warning, index) => (
+                <li key={`${warning}-${index}`}>{warning}</li>
+              ))}
+            </ul>
+          </details>
+        )}
       </div>
 
       {importingScheme && (
@@ -6224,12 +6232,7 @@ function RulesTab() {
           scheme={groupEditor.scheme}
           group={groupEditor.group}
           nodes={enabledForRules}
-          rules={[
-            ...groupEditor.scheme.rules,
-            ...(groupEditor.scheme.ruleSets ?? []).flatMap((set) =>
-              set.rules.map((rule) => ({ ...rule, group: set.group })),
-            ),
-          ]}
+          rules={orderedSchemeBaseRules(groupEditor.scheme)}
           customRules={groupEditor.scheme.customRules ?? []}
           initialTab={groupEditor.tab}
           onClose={() => setGroupEditor(null)}

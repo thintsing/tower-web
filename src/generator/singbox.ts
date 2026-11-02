@@ -168,6 +168,7 @@ function projectedDNSRules(
   remoteTag: string,
   chinaTag: string | undefined,
   ruleSetTags: Map<string, string>,
+  dnsRuleSetTags?: Map<string, string>,
 ): Record<string, unknown>[] {
   if (protection === 'follow-scheme') return []
   // 保持路由规则顺序；只有连续命中同一个解析器时才合并，避免重复域名
@@ -205,14 +206,16 @@ function projectedDNSRules(
   }
   for (const rule of rules) {
     if (rule.type === 'RULE-SET') {
-      const tag = ruleSetTags.get(rule.value ?? '')
-      if (!tag || rule.ruleSetBehavior !== 'domain') continue
+      const value = rule.value ?? ''
+      const dnsTag = dnsRuleSetTags?.get(value)
+      const tag = ruleSetTags.get(value)
+      if (!dnsTag && (!tag || rule.ruleSetBehavior !== 'domain')) continue
       const group = rule.group
       if (group.toUpperCase() === 'REJECT') {
-        append('reject', 'reject', undefined, 'rule_set', tag)
+        append('reject', 'reject', undefined, 'rule_set', dnsTag ?? tag!)
       } else {
         const target = routeTarget(group)
-        append(target.key, 'route', target.server, 'rule_set', tag, target.clientSubnet)
+        append(target.key, 'route', target.server, 'rule_set', dnsTag ?? tag!, target.clientSubnet)
       }
       continue
     }
@@ -651,7 +654,7 @@ export function generateSingBox(
     // sing-box 1.11 起 `block` 出站已移除，组里不能再引用 REJECT。
     const list = members.length ? members.filter((m) => m !== 'REJECT') : []
     if (!list.length) list.push('DIRECT')
-    const kind = effectiveGroupType(group.type, options.target)
+    const kind = effectiveGroupType(group.type, options.target, group.parameters)
     if (kind === 'select') {
       groupTags.push({ type: 'selector', tag: group.name, outbounds: list })
     } else {
@@ -745,6 +748,8 @@ export function generateSingBox(
 
   // 远程规则集：只引用 sing-box 自己的 source JSON / SRS。
   const remoteRuleSetDefs: Record<string, unknown>[] = []
+  const dnsRuleSetDefs: Record<string, unknown>[] = []
+  const dnsRuleSetTags = new Map<string, string>()
   const remoteRuleRules: Record<string, unknown>[] = []
   const ruleSetTags = new Map<string, string>()
   for (const rule of filteredRules) {
@@ -761,6 +766,21 @@ export function generateSingBox(
       update_interval: '1d',
     })
     ruleSetTags.set(rule.value, tag)
+    // DNS 规则不能引用含 IP 条件的 SRS；用同一列表的 domain-only 版本。
+    if (rule.ruleSetDNSURL
+      && options.target === 'sing-box'
+      && dnsProxyGroup
+      && protection !== 'follow-scheme') {
+      const dnsTag = `tower-rule-set-dns-${dnsRuleSetDefs.length + 1}`
+      dnsRuleSetDefs.push({
+        type: 'remote',
+        tag: dnsTag,
+        format: 'binary',
+        url: rule.ruleSetDNSURL,
+        update_interval: '1d',
+      })
+      dnsRuleSetTags.set(rule.value, dnsTag)
+    }
     remoteRuleRules.push(
       rule.group.toUpperCase() === 'REJECT'
         ? { rule_set: [tag], action: 'reject' }
@@ -844,6 +864,7 @@ export function generateSingBox(
       dnsPlan.remoteTag,
       ecs?.tag,
       ruleSetTags,
+      dnsRuleSetTags,
     ))
   }
   if (ecs) {
@@ -899,8 +920,8 @@ export function generateSingBox(
     default_domain_resolver: dnsPlan.localTag,
     auto_detect_interface: true,
   }
-  if (remoteRuleSetDefs.length || localRuleSetDefs.length) {
-    route.rule_set = [...remoteRuleSetDefs, ...localRuleSetDefs]
+  if (remoteRuleSetDefs.length || dnsRuleSetDefs.length || localRuleSetDefs.length) {
+    route.rule_set = [...remoteRuleSetDefs, ...dnsRuleSetDefs, ...localRuleSetDefs]
   }
   const config: Record<string, unknown> = {
     log: { level: 'info' },

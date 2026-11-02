@@ -359,8 +359,11 @@ export function encodeMihomoRuleSet(rules, behavior) {
   throw new BinaryRuleSetError('MRS behavior 必须是 domain 或 ipcidr')
 }
 
-/** 生成 SRS v2；域名 / 关键字 / 正则 / IP 放进同一条 headless 规则（OR 语义）。 */
-export function encodeSingBoxRuleSet(rules) {
+/**
+ * 生成 SRS v2；默认把域名 / 关键字 / 正则 / IP 放进同一条 headless 规则（OR 语义）。
+ * `domainOnly` 只写 DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD，供 DNS 投影引用。
+ */
+export function encodeSingBoxRuleSet(rules, { domainOnly = false } = {}) {
   const domains = []
   const suffixes = []
   const keywords = []
@@ -380,17 +383,24 @@ export function encodeSingBoxRuleSet(rules) {
       count += 1
     } else if (SRS_STRING_TYPES.has(type)) {
       if (options.length) continue
-      if (type === 'DOMAIN-KEYWORD') keywords.push(value.toLowerCase())
-      else regexes.push(value)
+      if (type === 'DOMAIN-KEYWORD') {
+        keywords.push(value.toLowerCase())
+      } else if (!domainOnly) {
+        regexes.push(value)
+      } else {
+        continue
+      }
       count += 1
-    } else if (IP_TYPES.has(type)) {
+    } else if (!domainOnly && IP_TYPES.has(type)) {
       const prefix = parsePrefix(value)
       if (!prefix || !noResolveOptions(options)) continue
       prefixes.push(prefix)
       count += 1
     }
   }
-  if (!count) throw new BinaryRuleSetError('没有可编码为 SRS 的规则')
+  if (!count) throw new BinaryRuleSetError(domainOnly
+    ? '没有可编码为 SRS domain 的规则'
+    : '没有可编码为 SRS 的规则')
 
   const items = [Buffer.from([0])] // default rule
   if (domains.length || suffixes.length) {
