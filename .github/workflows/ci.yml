@@ -23,7 +23,7 @@ jobs:
       - name: Run selfchecks
         shell: bash
         run: |
-          for check in asn backup batch catalog clients dns importers icons manual manual-form matching protocols qr remote rulesets yaml; do
+          for check in asn auth backup batch catalog clients dns importers icons manual manual-form matching protocols qr remote rulesets yaml; do
             echo "::group::selfcheck:$check"
             npm run "selfcheck:$check"
             echo "::endgroup::"

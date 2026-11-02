@@ -38,6 +38,7 @@ import { formatSupportsProxyCollections, prepareSchemeForExport } from './genera
 import { autoFillGroupEmojis } from './generator/groupIcons'
 import { maskTailnetAuthKeys, tailnetSupports } from './generator/tailnet'
 import { copyToClipboard, newID } from './util/browser'
+import { apiFetch, clearAPIKey, getAPIKey, setAPIKey } from './util/apiAuth'
 import { normalizeRemoteTextURL } from './util/remoteURL'
 import { GITHUB_REPO_URL } from './config'
 import { RouteIllustration } from './components/RouteIllustration'
@@ -221,6 +222,77 @@ function QRCodeDialog({
         <button className="btn ghost" onClick={onClose}>关闭</button>
       </div>
     </dialog>
+  )
+}
+
+/**
+ * 局域网访问门：服务端关闭共享或要求密钥时，先挡住页面。
+ * 本机访问、无鉴权或已带有效密钥时完全不渲染。
+ */
+function LANAccessGate() {
+  const [status, setStatus] = useState<{
+    lanSharing: boolean
+    requiresAuth: boolean
+    local: boolean
+    valid: boolean
+  } | null>(null)
+  const [key, setKey] = useState(() => getAPIKey())
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    apiFetch('/api/auth-status', { cache: 'no-store' })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const data = await res.json()
+        if (!cancelled) setStatus(data)
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : '无法读取访问状态')
+      })
+    return () => { cancelled = true }
+  }, [])
+
+  if (!status || status.local) return null
+  if (status.lanSharing && (!status.requiresAuth || status.valid)) return null
+  const needsKey = status.lanSharing && status.requiresAuth && !status.valid
+
+  return (
+    <div className="lan-gate" role="dialog" aria-modal="true" aria-labelledby="lan-gate-title">
+      <div className="lan-gate-card">
+        <strong id="lan-gate-title">{needsKey ? '需要访问密钥' : '局域网共享已关闭'}</strong>
+        <p>
+          {needsKey
+            ? '这台设备正在通过局域网访问塔台。请输入服务端本机「订阅设置 → 局域网与访问密钥」里显示的访问密钥。'
+            : '服务端已关闭局域网共享。请在运行塔台服务的电脑上打开「订阅设置 → 局域网与访问密钥」重新开启。'}
+        </p>
+        {needsKey && (
+          <form
+            onSubmit={(event) => {
+              event.preventDefault()
+              const trimmed = key.trim()
+              if (!trimmed) { setError('请输入访问密钥'); return }
+              setAPIKey(trimmed)
+              window.location.reload()
+            }}
+          >
+            <input
+              className="input mono"
+              value={key}
+              onChange={(event) => { setKey(event.target.value); setError('') }}
+              placeholder="访问密钥"
+              aria-label="访问密钥"
+              autoFocus
+            />
+            <div className="actions">
+              <button className="btn primary" type="submit">保存并重新加载</button>
+            </div>
+          </form>
+        )}
+        {error && <div className="form-error" role="alert"><span>{error}</span></div>}
+        <div className="hint">本机打开塔台无需密钥；关闭共享或轮换密钥请在服务端本机操作。</div>
+      </div>
+    </div>
   )
 }
 
@@ -1207,8 +1279,103 @@ function SubscriptionSettingsDialog({
   const [backupNotice, setBackupNotice] = useState('')
   const [history, setHistory] = useState<BackupHistoryItem[]>([])
   const [resetConfirm, setResetConfirm] = useState(false)
+  const [serverAccess, setServerAccess] = useState<{
+    lanSharing: boolean
+    requiresAuth: boolean
+    apiToken: string
+    mobileURL?: string
+  } | null>(null)
+  const [serverAccessError, setServerAccessError] = useState('')
+  const [serverAccessNotice, setServerAccessNotice] = useState('')
+  const [serverAccessBusy, setServerAccessBusy] = useState(false)
 
   const refreshHistory = () => setHistory(backupHistoryItems(readBackupHistory()))
+
+  const loadServerAccess = async () => {
+    setServerAccessError('')
+    try {
+      const res = await apiFetch('/api/settings', { cache: 'no-store' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}) as { error?: string })
+        throw new Error(body.error ?? `HTTP ${res.status}`)
+      }
+      setServerAccess(await res.json())
+    } catch (error) {
+      setServerAccess(null)
+      setServerAccessError(error instanceof Error ? error.message : '无法读取服务端设置')
+    }
+  }
+
+  const saveLanSharing = async (enabled: boolean) => {
+    setServerAccessBusy(true)
+    setServerAccessError('')
+    try {
+      const res = await apiFetch('/api/settings', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({ lanSharing: enabled }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}) as { error?: string })
+        throw new Error(body.error ?? `HTTP ${res.status}`)
+      }
+      setServerAccess(await res.json())
+      setServerAccessNotice(enabled ? '已开启局域网共享。' : '已关闭局域网共享；手机和其他设备将无法访问塔台。')
+    } catch (error) {
+      setServerAccessError(error instanceof Error ? error.message : '保存失败')
+    } finally {
+      setServerAccessBusy(false)
+    }
+  }
+
+  const rotateAPIToken = async () => {
+    setServerAccessBusy(true)
+    setServerAccessError('')
+    try {
+      const res = await apiFetch('/api/settings/token', { method: 'POST' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}) as { error?: string })
+        throw new Error(body.error ?? `HTTP ${res.status}`)
+      }
+      const data = await res.json()
+      setServerAccess(data)
+      setAPIKey(String(data.apiToken ?? ''))
+      setServerAccessNotice('已生成新的访问密钥。局域网页面需要用新密钥重新打开。')
+    } catch (error) {
+      setServerAccessError(error instanceof Error ? error.message : '生成失败')
+    } finally {
+      setServerAccessBusy(false)
+    }
+  }
+
+  const disableAPIToken = async () => {
+    setServerAccessBusy(true)
+    setServerAccessError('')
+    try {
+      const res = await apiFetch('/api/settings/token', { method: 'DELETE' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}) as { error?: string })
+        throw new Error(body.error ?? `HTTP ${res.status}`)
+      }
+      const data = await res.json()
+      setServerAccess(data)
+      clearAPIKey()
+      setServerAccessNotice('已关闭 API 鉴权；局域网 API 恢复为无密钥访问。')
+    } catch (error) {
+      setServerAccessError(error instanceof Error ? error.message : '关闭失败')
+    } finally {
+      setServerAccessBusy(false)
+    }
+  }
+
+  const copyMobileAccess = async () => {
+    if (!serverAccess?.mobileURL) return
+    if (await copyToClipboard(serverAccess.mobileURL)) {
+      setServerAccessNotice('已复制带访问密钥的手机地址。')
+    } else {
+      setServerAccessError('无法写入剪贴板，请手动复制。')
+    }
+  }
 
   useEffect(() => {
     if (open) {
@@ -1218,6 +1385,9 @@ function SubscriptionSettingsDialog({
       setBackupError('')
       setBackupNotice('')
       setResetConfirm(false)
+      setServerAccessError('')
+      setServerAccessNotice('')
+      void loadServerAccess()
       refreshHistory()
     } else {
       ref.current?.close()
@@ -1387,6 +1557,87 @@ function SubscriptionSettingsDialog({
           <i aria-hidden="true" />
           自动刷新同样由本机服务发起，不会经过第三方转换服务。
         </div>
+
+        <div className="settings-divider" />
+        <div className="settings-data-head">
+          <div>
+            <strong>局域网与访问密钥</strong>
+            <small>控制手机 / 其他设备能否访问塔台，以及管理 API 是否需要密钥。</small>
+          </div>
+          {serverAccessBusy && <span className="hint">保存中…</span>}
+        </div>
+        {serverAccessError && (
+          <div className="form-error" role="alert">
+            <span>{serverAccessError}</span>
+          </div>
+        )}
+        {serverAccess ? (
+          <>
+            <label className="setting-toggle">
+              <input
+                type="checkbox"
+                checked={serverAccess.lanSharing}
+                disabled={serverAccessBusy}
+                onChange={(e) => void saveLanSharing(e.target.checked)}
+              />
+              <span>
+                <strong>允许局域网共享</strong>
+                <small>关闭后，非本机设备无法打开塔台页面，也无法更新订阅或下载规则集；本机访问不受影响。</small>
+              </span>
+            </label>
+            <div className="field">
+              <label>管理 API 访问密钥</label>
+              {serverAccess.requiresAuth ? (
+                <div className="api-key-row">
+                  <input
+                    readOnly
+                    className="input mono"
+                    value={serverAccess.apiToken}
+                    aria-label="API 访问密钥"
+                    onFocus={(e) => e.currentTarget.select()}
+                  />
+                  <button type="button" className="btn ghost" onClick={() => void copyToClipboard(serverAccess.apiToken)}>
+                    复制
+                  </button>
+                  <button type="button" className="btn ghost" disabled={serverAccessBusy} onClick={() => void rotateAPIToken()}>
+                    重新生成
+                  </button>
+                  <button type="button" className="btn ghost" disabled={serverAccessBusy} onClick={() => void disableAPIToken()}>
+                    关闭鉴权
+                  </button>
+                </div>
+              ) : (
+                <div className="api-key-row">
+                  <button type="button" className="btn ghost" disabled={serverAccessBusy} onClick={() => void rotateAPIToken()}>
+                    生成访问密钥
+                  </button>
+                  <span className="hint">生成后，局域网设备调用管理 API 时需要带密钥；订阅链接、一次性分享链接和托管规则集本身就是独立凭证，不受影响。</span>
+                </div>
+              )}
+              {serverAccess.mobileURL && serverAccess.requiresAuth && (
+                <div className="api-key-row" style={{ marginTop: 8 }}>
+                  <input
+                    readOnly
+                    className="input mono"
+                    value={serverAccess.mobileURL}
+                    aria-label="带访问密钥的手机地址"
+                    onFocus={(e) => e.currentTarget.select()}
+                  />
+                  <button type="button" className="btn ghost" onClick={() => void copyMobileAccess()}>
+                    复制手机地址
+                  </button>
+                </div>
+              )}
+              <div className="hint">
+                密钥保存在服务端 <span className="mono">settings.json</span>，不会进入浏览器备份。
+                轮换密钥后，局域网里的塔台页面需要用新密钥重新打开；已发布订阅和托管规则集链接不受影响。
+              </div>
+            </div>
+          </>
+        ) : (
+          !serverAccessError && <div className="hint">正在读取服务端设置…</div>
+        )}
+        {serverAccessNotice && <div className="inline-notice" role="status">{serverAccessNotice}</div>}
 
         <div className="settings-divider" />
         <div className="settings-data-head">
@@ -1884,7 +2135,7 @@ function networkOrganizationForHost(host: string): Promise<NetworkOrganization |
   if (cached) return cached
   const controller = new AbortController()
   const timer = window.setTimeout(() => controller.abort(), 5000)
-  const request = fetch(`/api/ip-country?host=${encodeURIComponent(host)}`, { signal: controller.signal })
+  const request = apiFetch(`/api/ip-country?host=${encodeURIComponent(host)}`, { signal: controller.signal })
     .then(async (res) => {
       if (!res.ok) return null
       const data = await res.json() as { asn?: number; organization?: string }
@@ -2787,7 +3038,7 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     for (const host of hosts) pendingCountryHosts.current.add(host)
     void Promise.all([...hosts].map(async (host) => {
       try {
-        const res = await fetch(`/api/ip-country?host=${encodeURIComponent(host)}`)
+        const res = await apiFetch(`/api/ip-country?host=${encodeURIComponent(host)}`)
         if (!res.ok) return [host, ''] as const
         const data = await res.json() as { country?: string }
         return [host, data.country ?? ''] as const
@@ -4838,7 +5089,7 @@ function RulesTab() {
     const sourceURL = normalizeRemoteTextURL(rawURL)
     setSchemeLoading(true); setSchemeError(null)
     try {
-      const res = await fetch(`/api/fetch?url=${encodeURIComponent(sourceURL)}`)
+      const res = await apiFetch(`/api/fetch?url=${encodeURIComponent(sourceURL)}`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const text = await res.text()
       const format = detectRuleSchemeFormat(text)
@@ -5182,7 +5433,7 @@ function RulesTab() {
     const sourceURL = normalizeRemoteTextURL(editable.sourceURL)
     setRefreshingScheme(true); setSchemeError(null)
     try {
-      const res = await fetch(`/api/fetch?url=${encodeURIComponent(sourceURL)}`)
+      const res = await apiFetch(`/api/fetch?url=${encodeURIComponent(sourceURL)}`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const text = await res.text()
       const format = detectRuleSchemeFormat(text)
@@ -6241,7 +6492,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const localHost = ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(window.location.hostname)
 
   useEffect(() => {
-    fetch('/api/network')
+    apiFetch('/api/network')
       .then((r) => r.json())
       .then((d) => setNet({ host: String(d?.host ?? ''), lan: Array.isArray(d?.lan) ? d.lan : [] }))
       .catch(() => {})
@@ -6527,7 +6778,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         abs = u.href
       } else {
         const out = generateConfig(target, usable, exportScheme, outputOptions)
-        const res = await fetch(`/api/share?name=${encodeURIComponent(configName)}`, {
+        const res = await apiFetch(`/api/share?name=${encodeURIComponent(configName)}`, {
           method: 'POST',
           headers: { 'content-type': out.mime },
           body: out.text,
@@ -6550,7 +6801,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
 
   /** 请求一个订阅地址，取回真实响应内容。 */
   const probeSubscription = async (u: string) => {
-    const res = await fetch(u, { cache: 'no-store' })
+    const res = await apiFetch(u, { cache: 'no-store' })
     const text = await res.text()
     const firstLine = (text.split('\n').find((l) => l.trim()) ?? '').trim().slice(0, 80)
     const ctype = res.headers.get('content-type') ?? '—'
@@ -6671,7 +6922,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       }
       const query = new URLSearchParams({ title: configName })
       if (subToken) query.set('token', subToken)
-      const res = await fetch(`/api/subscribe?${query.toString()}`, {
+      const res = await apiFetch(`/api/subscribe?${query.toString()}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json; charset=utf-8' },
         body: JSON.stringify({ title: configName, formats, targets }),
@@ -6765,7 +7016,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
 
   const revokeSubscription = async () => {
     if (!subToken) return
-    try { await fetch(`/api/sub/${encodeURIComponent(subToken)}`, { method: 'DELETE' }) } catch {}
+    try { await apiFetch(`/api/sub/${encodeURIComponent(subToken)}`, { method: 'DELETE' }) } catch {}
     setSubToken(''); setSubURL(''); setSubUpdatedAt(null)
     localStorage.removeItem('tower-sub-token')
     localStorage.removeItem('tower-sub-url')
@@ -7631,6 +7882,7 @@ export function App() {
 
   return (
     <div className="app-shell">
+      <LANAccessGate />
       <aside
         className={`sidebar${sidebarOpen ? ' open' : ''}`}
       >

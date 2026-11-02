@@ -8,6 +8,7 @@ import { loadTailnetAuthKeys, persistTailnetAuthKeys, pruneTailnetAuthKeys } fro
 import type { PersistedData } from './backup'
 import { prepareManualNodes, type ManualNodeImportResult } from './manualNodes'
 import { parse, parseUserinfoHeader } from './parser'
+import { apiFetch } from './util/apiAuth'
 import { newID } from './util/browser'
 
 export interface Store extends AppState {
@@ -159,7 +160,7 @@ async function fetchSubscription(
   const params = new URLSearchParams({ url })
   if (userAgent) params.set('ua', userAgent)
   if (dnsOverHTTPSURL) params.set('doh', dnsOverHTTPSURL)
-  const res = await fetch(`/api/fetch?${params.toString()}`)
+  const res = await apiFetch(`/api/fetch?${params.toString()}`)
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
     throw new Error(body.error ?? `HTTP ${res.status}`)
@@ -657,7 +658,7 @@ export const useStore = create<Store>()(
           const requestMode = udpOnly && testMode === 'automatic' ? 'icmp' : testMode
           // 浏览器侧网络抖动也可能导致 fetch 失败，这里再补一次。
           for (let attempt = 0; attempt < 2; attempt++) {
-            const res = await fetch(
+            const res = await apiFetch(
               `/api/probe?host=${encodeURIComponent(node.server)}&port=${node.port}&timeout=${PROBE_TIMEOUT}&mode=${requestMode}`,
             ).catch(() => null)
             if (!res) continue

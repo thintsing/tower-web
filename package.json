@@ -34,6 +34,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "selfcheck:asn": "tsx scripts/selfcheck-asn.ts",
+    "selfcheck:auth": "tsx scripts/selfcheck-auth.ts",
     "selfcheck:backup": "tsx scripts/selfcheck-backup.ts",
     "selfcheck:batch": "tsx scripts/selfcheck-batch.ts",
     "selfcheck:catalog": "tsx scripts/selfcheck-catalog.ts",

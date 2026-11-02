@@ -15,7 +15,7 @@ import { readFile } from 'node:fs/promises'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join, dirname, extname, normalize, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib'
 import { convertRuleSet, RuleSetConversionError } from './ruleset-convert.mjs'
 import { loadIPASNData, organizationForAddress } from './ip-asn.mjs'
@@ -153,6 +153,171 @@ async function buildRuleSetArtifact(query) {
 // 容器内的网卡地址不是宿主机地址，TOWER_PUBLIC_URL 用于覆盖 /api/network 的局域网地址。
 const DATA_DIR = process.env.TOWER_DATA_DIR || dirname(fileURLToPath(import.meta.url))
 const SUBS_FILE = join(DATA_DIR, 'subscriptions.json')
+const SETTINGS_FILE = join(DATA_DIR, 'settings.json')
+
+const DEFAULT_SERVER_SETTINGS = Object.freeze({
+  /** 关闭后，非本机请求不能使用塔台 API / 订阅 / 规则集。 */
+  lanSharing: true,
+  /** 非空时，局域网设备必须带此密钥才能调用管理 API。 */
+  apiToken: '',
+})
+
+let serverSettings = { ...DEFAULT_SERVER_SETTINGS }
+
+function normalizeAPIToken(value) {
+  const token = String(value ?? '').trim()
+  return /^[A-Za-z0-9_-]{16,128}$/.test(token) ? token : ''
+}
+
+function loadServerSettings() {
+  try {
+    const data = JSON.parse(readFileSync(SETTINGS_FILE, 'utf8'))
+    serverSettings = {
+      lanSharing: data?.lanSharing !== false,
+      apiToken: normalizeAPIToken(data?.apiToken),
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      console.error('[tower] 服务端设置读取失败，使用默认值:', error?.message ?? error)
+    }
+  }
+}
+
+function persistServerSettings() {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true })
+    const temp = `${SETTINGS_FILE}.tmp`
+    writeFileSync(temp, JSON.stringify(serverSettings), 'utf8')
+    renameSync(temp, SETTINGS_FILE)
+  } catch (error) {
+    console.error('[tower] 服务端设置保存失败:', error?.message ?? error)
+  }
+}
+
+function normalizedRemoteAddress(req) {
+  return String(req.socket?.remoteAddress ?? '').toLowerCase().replace(/^::ffff:/, '')
+}
+
+function isLoopbackAddress(address) {
+  // 只把标准回环地址视为本机；127.0.0.2 等其他回环别名可以用来自验证局域网逻辑。
+  return address === '::1' || address === '127.0.0.1'
+}
+
+function requestHostname(req) {
+  const raw = String(req.headers.host ?? '').trim()
+  if (!raw) return ''
+  try {
+    return new URL(`http://${raw}`).hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  } catch {
+    return ''
+  }
+}
+
+function isPrivateAddress(address) {
+  if (!address) return false
+  if (address.startsWith('10.') || address.startsWith('192.168.') || address.startsWith('169.254.')) return true
+  if (address.startsWith('172.')) {
+    const second = Number(address.split('.')[1])
+    return second >= 16 && second <= 31
+  }
+  return address.startsWith('fc') || address.startsWith('fd') || address.startsWith('fe80:')
+}
+
+/**
+ * 本机请求直接放行。Docker 默认桥接会把宿主机访问显示成 172.x / 192.168.65.x，
+ * 因此容器内再结合 Host 头判断：Host 仍是 localhost / 127.0.0.1 时视为本机。
+ */
+function isTrustedLocalRequest(req) {
+  const remote = normalizedRemoteAddress(req)
+  if (isLoopbackAddress(remote)) return true
+  if (process.env.TOWER_CONTAINER === '1'
+    && isPrivateAddress(remote)
+    && ['localhost', '::1', '127.0.0.1'].includes(requestHostname(req))) {
+    return true
+  }
+  return false
+}
+
+function cookieValue(req, name) {
+  for (const part of String(req.headers.cookie ?? '').split(';')) {
+    const separator = part.indexOf('=')
+    if (separator < 0) continue
+    if (part.slice(0, separator).trim() !== name) continue
+    try {
+      return decodeURIComponent(part.slice(separator + 1).trim())
+    } catch {
+      return part.slice(separator + 1).trim()
+    }
+  }
+  return ''
+}
+
+function presentedAPIToken(req, url) {
+  const header = String(req.headers['x-tower-key'] ?? '').trim()
+  if (header) return header
+  const authorization = String(req.headers.authorization ?? '').trim()
+  if (/^bearer\s/i.test(authorization)) return authorization.slice(7).trim()
+  const query = url.searchParams.get('key')
+  if (query) return query.trim()
+  return cookieValue(req, 'tower_key')
+}
+
+function apiTokenMatches(presented) {
+  const expected = serverSettings.apiToken
+  if (!expected) return true
+  if (!presented || presented.length !== expected.length) return false
+  try {
+    return timingSafeEqual(Buffer.from(presented), Buffer.from(expected))
+  } catch {
+    return false
+  }
+}
+
+function rememberAPIToken(res) {
+  if (!serverSettings.apiToken) return
+  res.setHeader(
+    'set-cookie',
+    `tower_key=${encodeURIComponent(serverSettings.apiToken)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800`,
+  )
+}
+
+/**
+ * 订阅 / 一次性分享链接本身是不可猜测的凭证，托管规则集只输出公开规则；
+ * 这些 GET 请求不要求再带管理 API 密钥，否则订阅持有者会从配置里拿到密钥。
+ */
+function apiAuthExempt(url, method) {
+  if (url.pathname === '/api/auth-status' || url.pathname === '/api/health') return true
+  if (method === 'GET' && url.pathname === '/api/ruleset') return true
+  if (method === 'GET' && /^\/api\/sub\/[A-Za-z0-9_-]+$/.test(url.pathname)) return true
+  if (method === 'GET' && /^\/api\/s\/[A-Za-z0-9_-]+$/.test(url.pathname)) return true
+  return false
+}
+
+function authStatus(req, url) {
+  const local = isTrustedLocalRequest(req)
+  return {
+    lanSharing: serverSettings.lanSharing,
+    requiresAuth: !!serverSettings.apiToken,
+    local,
+    valid: local || apiTokenMatches(presentedAPIToken(req, url)),
+  }
+}
+
+function settingsPayload() {
+  const lan = PUBLIC_URL ? [PUBLIC_URL] : (HOST === '0.0.0.0' ? lanUrls(PORT) : [])
+  const mobileBase = lan[0]
+  const mobileURL = mobileBase
+    ? `${mobileBase}/${serverSettings.apiToken ? `?key=${encodeURIComponent(serverSettings.apiToken)}` : ''}`
+    : undefined
+  return {
+    lanSharing: serverSettings.lanSharing,
+    requiresAuth: !!serverSettings.apiToken,
+    apiToken: serverSettings.apiToken,
+    mobileURL,
+  }
+}
+
+loadServerSettings()
 
 function loadSubscriptions() {
   try {
@@ -487,7 +652,10 @@ function rewriteRuleSetOrigins(payload, origin) {
 }
 
 function json(res, status, value) {
-  send(res, status, JSON.stringify(value), { 'content-type': 'application/json; charset=utf-8' })
+  send(res, status, JSON.stringify(value), {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+  })
 }
 
 function sanitizeUserAgent(value) {
@@ -799,6 +967,62 @@ async function readBody(req) {
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
   try {
+    const localRequest = isTrustedLocalRequest(req)
+    // 带正确密钥的请求顺手种下 cookie，让局域网里打开的页面后续 fetch 自动带上密钥。
+    if (!localRequest && serverSettings.apiToken && apiTokenMatches(presentedAPIToken(req, url))) {
+      rememberAPIToken(res)
+    }
+    if (url.pathname.startsWith('/api/') && !localRequest) {
+      if (!serverSettings.lanSharing
+        && url.pathname !== '/api/auth-status'
+        && url.pathname !== '/api/health') {
+        return json(res, 403, { error: '局域网共享已关闭', code: 'lan_disabled' })
+      }
+      if (serverSettings.apiToken
+        && !apiAuthExempt(url, req.method)
+        && !apiTokenMatches(presentedAPIToken(req, url))) {
+        return json(res, 401, { error: '需要访问密钥', code: 'auth_required' })
+      }
+    }
+
+    if (url.pathname === '/api/auth-status') {
+      return json(res, 200, authStatus(req, url))
+    }
+
+    if (url.pathname.startsWith('/api/settings')) {
+      if (!localRequest) {
+        return json(res, 403, { error: '访问密钥设置只能在服务端本机修改', code: 'local_only' })
+      }
+      if (url.pathname === '/api/settings' && req.method === 'GET') {
+        return json(res, 200, { ...settingsPayload(), local: true })
+      }
+      if (url.pathname === '/api/settings' && req.method === 'PUT') {
+        const raw = await readBody(req)
+        let payload
+        try {
+          payload = JSON.parse(raw.toString('utf8') || '{}')
+        } catch {
+          return json(res, 400, { error: '请求内容不是 JSON' })
+        }
+        if (typeof payload?.lanSharing !== 'boolean') {
+          return json(res, 400, { error: 'lanSharing 必须是布尔值' })
+        }
+        serverSettings.lanSharing = payload.lanSharing
+        persistServerSettings()
+        return json(res, 200, { ...settingsPayload(), local: true })
+      }
+      if (url.pathname === '/api/settings/token' && req.method === 'POST') {
+        serverSettings.apiToken = randomBytes(24).toString('base64url')
+        persistServerSettings()
+        return json(res, 200, { ...settingsPayload(), local: true })
+      }
+      if (url.pathname === '/api/settings/token' && req.method === 'DELETE') {
+        serverSettings.apiToken = ''
+        persistServerSettings()
+        return json(res, 200, { ...settingsPayload(), local: true })
+      }
+    }
+
     if (url.pathname === '/api/fetch' && req.method === 'GET') {
       const target = url.searchParams.get('url')
       if (!target) return json(res, 400, { error: '缺少 url 参数' })
@@ -893,6 +1117,8 @@ const server = createServer(async (req, res) => {
         port: PORT,
         lan,
         local: `http://127.0.0.1:${PORT}`,
+        lanSharing: serverSettings.lanSharing,
+        requiresAuth: !!serverSettings.apiToken,
       })
     }
 
@@ -1054,7 +1280,10 @@ server.listen(PORT, HOST, () => {
   console.log(`[tower-web] companion server on http://127.0.0.1:${PORT}`)
   if (HOST === '0.0.0.0') {
     for (const u of lanUrls(PORT)) console.log(`[tower-web] 局域网可访问: ${u}`)
-    console.log('[tower-web] 局域网访问无身份验证，请只在可信网络开启；关闭用 HOST=127.0.0.1')
+    console.log(`[tower-web] 局域网共享：${serverSettings.lanSharing ? '开启' : '关闭'} · API 密钥：${serverSettings.apiToken ? '已启用' : '未启用'}`)
+    if (!serverSettings.apiToken) {
+      console.log('[tower-web] 可在「订阅设置 → 局域网与访问密钥」生成密钥；不需要局域网时也可用 HOST=127.0.0.1 启动')
+    }
   } else {
     console.log('[tower-web] 仅本机可访问（HOST=0.0.0.0 可开放局域网）')
   }

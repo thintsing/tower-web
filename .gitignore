@@ -9,6 +9,8 @@ dist/
 server/subscriptions.json
 server/subscriptions.json.tmp
 server/subscriptions.json.corrupt-*
+server/settings.json
+server/settings.json.tmp
 .env
 .env.*
 !.env.example

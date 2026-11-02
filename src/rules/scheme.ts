@@ -3,6 +3,7 @@
 //   custom_proxy_group=组名`类型`[]引用`正则`url`interval`,tolerance
 // Bundled rule lists are inlined into per-group rules at load time.
 import type { PolicyGroup, PolicyGroupType, RoutingRule, RuleScheme, RuleSchemeFormat, RuleSchemeSource } from '../models/types'
+import { apiFetch } from '../util/apiAuth'
 import { ALL_RULE_TYPES } from './capabilities'
 
 export interface SchemeMeta {
@@ -190,7 +191,7 @@ export async function parseSchemeINI(
   const localIndex = await rulesetIndex().catch(() => ({} as Record<string, string>))
   const urlFetch = async (url: string): Promise<string> => {
     try {
-      const res = await fetch(`/api/fetch?url=${encodeURIComponent(url)}`)
+      const res = await apiFetch(`/api/fetch?url=${encodeURIComponent(url)}`)
       if (!res.ok) return ''
       return await res.text()
     } catch { return '' }

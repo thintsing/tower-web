@@ -15,7 +15,8 @@ FROM node:22-alpine AS runtime
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=8787 \
-    TOWER_DATA_DIR=/app/data
+    TOWER_DATA_DIR=/app/data \
+    TOWER_CONTAINER=1
 WORKDIR /app
 # 测速的 ICMP 模式调用系统 ping；不可用时服务端会自动回退 TCP。
 RUN apk add --no-cache iputils \

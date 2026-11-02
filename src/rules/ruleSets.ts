@@ -2,6 +2,7 @@
 // lists / provider YAML, Quantumult X filters, Egern YAML and sing-box source.
 import { parse as parseYAML } from 'yaml'
 import type { RuleSetFormat, RoutingRule } from '../models/types'
+import { apiFetch } from '../util/apiAuth'
 import { inlineRuleFromFields, splitRuleFields } from './scheme'
 
 export type RuleSetRule = Omit<RoutingRule, 'group'>
@@ -301,7 +302,7 @@ export function parseRuleSetText(textBody: string, format?: RuleSetFormat): Pars
 export async function fetchRuleSet(url: string): Promise<ParsedRuleSet> {
   const target = url.trim()
   if (!/^https?:\/\//i.test(target)) throw new Error('请输入有效的 http(s) 规则集地址')
-  const response = await fetch(`/api/fetch?url=${encodeURIComponent(target)}`)
+  const response = await apiFetch(`/api/fetch?url=${encodeURIComponent(target)}`)
   if (!response.ok) {
     const body = await response.json().catch(() => ({}) as { error?: string })
     throw new Error(body.error ?? `规则集地址返回 HTTP ${response.status}`)
