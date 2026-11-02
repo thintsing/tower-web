@@ -7,9 +7,11 @@ import { encodeBase64String, decodeBase64String } from '../src/parser/util'
 import { clashSkippedCount, generateClashYAML } from '../src/generator/clashYaml'
 import { generateEgern } from '../src/generator/egern'
 import { generateLoon } from '../src/generator/loon'
+import { generateQuanX } from '../src/generator/quanx'
 import { generateSingBox } from '../src/generator/singbox'
 import { generateSurge } from '../src/generator/surge'
 import { generateBase64Subscription } from '../src/generator/base64Sub'
+import { nodeShareText } from '../src/generator/shareLink'
 
 let failures = 0
 
@@ -154,6 +156,53 @@ const SNELL: ProxyNode = {
   obfsParam: 'obfs.example.com',
   tls: false,
   skipCertificateVerification: false,
+  rawURI: '',
+}
+
+const SHADOW_TLS: ProxyNode = {
+  id: 'shadowtls-node',
+  kind: 'ss',
+  name: 'ShadowTLS 节点',
+  server: 'stls.example.com',
+  port: 443,
+  cipher: 'aes-128-gcm',
+  password: 'inner-password',
+  plugin: 'shadow-tls',
+  shadowTLS: { version: 3, host: 'front.example.com', password: 'outer-password' },
+  tls: false,
+  skipCertificateVerification: false,
+  rawURI: '',
+}
+
+const V2RAY_PLUGIN: ProxyNode = {
+  id: 'v2ray-node',
+  kind: 'ss',
+  name: 'v2ray-plugin 节点',
+  server: 'v2ray.example.com',
+  port: 443,
+  cipher: 'aes-128-gcm',
+  password: 'v2-pass',
+  plugin: 'v2ray-plugin',
+  pluginMux: false,
+  transport: 'ws',
+  tls: true,
+  hostHeader: 'cdn.example.com',
+  path: '/ws',
+  skipCertificateVerification: false,
+  rawURI: '',
+}
+
+const SS_TLS: ProxyNode = {
+  id: 'ss-tls-node',
+  kind: 'ss',
+  name: 'SS TLS 节点',
+  server: 'ss-tls.example.com',
+  port: 443,
+  cipher: 'aes-256-gcm',
+  password: 'tls-pass',
+  tls: true,
+  sni: 'ss-tls.example.com',
+  skipCertificateVerification: true,
   rawURI: '',
 }
 
@@ -527,6 +576,144 @@ function main(): void {
     const parsed = parse(bad)
     assert.equal(parsed.nodes.length, 0)
     assert.equal(parsed.rejectedLineCount, 3)
+  })
+
+  check('ShadowTLS：Surge / Loon / sing-box / Hiddify 写出，QuanX 跳过', () => {
+    const surge = generateSurge([SHADOW_TLS], scheme)
+    assert.equal(surge.skipped, 0)
+    assert.ok(surge.text.includes('shadow-tls-password=outer-password'))
+    assert.ok(surge.text.includes('shadow-tls-sni=front.example.com'))
+    assert.ok(surge.text.includes('shadow-tls-version=3'))
+
+    const loon = generateLoon([SHADOW_TLS], scheme, { target: 'loon' })
+    assert.equal(loon.skipped, 0)
+    assert.ok(loon.text.includes('shadow-tls-password=outer-password'))
+
+    const singbox = generateSingBox([SHADOW_TLS], scheme, { target: 'sing-box' })
+    assert.equal(singbox.skipped, 0)
+    const config = JSON.parse(singbox.text)
+    const helper = config.outbounds.find((item: { type?: string }) => item.type === 'shadowtls')
+    assert.ok(helper)
+    assert.equal(helper.version, 3)
+    assert.equal(helper.tls.server_name, 'front.example.com')
+    const inner = config.outbounds.find((item: { tag?: string }) => item.tag === 'ShadowTLS 节点')
+    assert.equal(inner.detour, helper.tag)
+    assert.equal(inner.network, 'tcp')
+
+    const hiddify = generateSingBox([SHADOW_TLS], scheme, { target: 'hiddify' })
+    assert.equal(hiddify.skipped, 0)
+    assert.ok(JSON.parse(hiddify.text).outbounds.some((item: { tag?: string }) =>
+      String(item.tag).startsWith('§hide§tower-shadowtls-')))
+
+    const quanx = generateQuanX([SHADOW_TLS], scheme)
+    assert.equal(quanx.skipped, 1)
+  })
+
+  check('v2ray-plugin：不支持的目标跳过，支持的写出插件', () => {
+    for (const result of [
+      generateSurge([V2RAY_PLUGIN], scheme),
+      generateLoon([V2RAY_PLUGIN], scheme, { target: 'loon' }),
+      generateEgern([V2RAY_PLUGIN], scheme),
+    ]) {
+      assert.equal(result.skipped, 1)
+      assert.ok(!result.text.includes('v2ray-plugin 节点'))
+    }
+
+    const quanx = generateQuanX([V2RAY_PLUGIN], scheme)
+    assert.equal(quanx.skipped, 0)
+    assert.ok(quanx.text.includes('obfs=wss'))
+    assert.ok(quanx.text.includes('obfs-host=cdn.example.com'))
+    assert.ok(quanx.text.includes('obfs-uri=/ws'))
+
+    const singbox = generateSingBox([V2RAY_PLUGIN], scheme, { target: 'sing-box' })
+    assert.equal(singbox.skipped, 0)
+    const ss = JSON.parse(singbox.text).outbounds.find((item: { type?: string }) =>
+      item.type === 'shadowsocks')
+    assert.equal(ss.plugin, 'v2ray-plugin')
+    assert.match(ss.plugin_opts, /mode=websocket/)
+    assert.match(ss.plugin_opts, /mux=0/)
+    assert.match(ss.plugin_opts, /host=cdn\.example\.com/)
+    assert.match(ss.plugin_opts, /path=\/ws/)
+
+    const clash = generateClashYAML([V2RAY_PLUGIN], scheme, { target: 'clash-verge' })
+    assert.ok(clash.includes('plugin: v2ray-plugin'))
+    assert.ok(clash.includes('mode: websocket'))
+    assert.equal(generateBase64Subscription([V2RAY_PLUGIN]).skipped, 1)
+  })
+
+  check('SS cipher / Snell 版本 / VLESS encryption 按目标限制', () => {
+    const chacha2022: ProxyNode = { ...SS_TLS, id: 'chacha', tls: false, sni: undefined, cipher: '2022-blake3-chacha20-poly1305' }
+    assert.equal(generateSurge([chacha2022], scheme).skipped, 1)
+    assert.equal(generateLoon([chacha2022], scheme, { target: 'loon' }).skipped, 1)
+    assert.equal(generateQuanX([chacha2022], scheme).skipped, 1)
+    assert.equal(clashSkippedCount([chacha2022], 'clash'), 1)
+    assert.equal(clashSkippedCount([chacha2022], 'clash-verge'), 0)
+
+    const snellV5: ProxyNode = { ...SNELL, id: 'snell-v5', version: 5 }
+    assert.equal(clashSkippedCount([snellV5], 'clash'), 1)
+    assert.equal(clashSkippedCount([snellV5], 'clash-verge'), 0)
+    const snellBox = generateSingBox([snellV5], scheme, { target: 'sing-box' })
+    assert.equal(snellBox.skipped, 0)
+    assert.ok(JSON.parse(snellBox.text).outbounds.some((item: { version?: number }) => item.version === 4))
+
+    const vlessEncrypted: ProxyNode = {
+      ...SS_TLS,
+      id: 'vless-encrypted',
+      kind: 'vless',
+      uuid: '11111111-1111-1111-1111-111111111111',
+      cipher: undefined,
+      password: undefined,
+      vlessEncryption: 'mlkem768x25519plus',
+    }
+    assert.equal(clashSkippedCount([vlessEncrypted], 'clash'), 1)
+    const mihomo = generateClashYAML([vlessEncrypted], scheme, { target: 'clash-verge' })
+    assert.ok(mihomo.includes('encryption: "mlkem768x25519plus"'))
+    assert.equal(generateSingBox([vlessEncrypted], scheme, { target: 'sing-box' }).skipped, 1)
+  })
+
+  check('Stash 证书 pin 字段与原生 SS TLS', () => {
+    const pinned: ProxyNode = {
+      ...SS_TLS,
+      kind: 'trojan',
+      cipher: undefined,
+      password: 'trojan-pass',
+      certificateFingerprint: 'aa'.repeat(32),
+    }
+    const stash = generateClashYAML([pinned], scheme, { target: 'clash' })
+    assert.ok(stash.includes(`server-cert-fingerprint: "${'aa'.repeat(32)}"`))
+    assert.ok(!/\n    fingerprint:/.test(stash))
+    const mihomo = generateClashYAML([pinned], scheme, { target: 'clash-verge' })
+    assert.ok(mihomo.includes(`fingerprint: "${'aa'.repeat(32)}"`))
+
+    const karing = generateClashYAML([SS_TLS], scheme, { target: 'karing' })
+    assert.ok(karing.includes('tls: true'))
+    assert.ok(karing.includes('servername: "ss-tls.example.com"'))
+    const shadowrocket = generateClashYAML([SS_TLS], scheme, { target: 'shadowrocket' })
+    assert.ok(shadowrocket.includes('tls: true'))
+    assert.equal(generateSurge([SS_TLS], scheme).skipped, 1)
+    assert.equal(generateLoon([SS_TLS], scheme, { target: 'loon' }).skipped, 1)
+    assert.equal(clashSkippedCount([SS_TLS], 'clash-verge'), 1)
+    const quanx = generateQuanX([SS_TLS], scheme)
+    assert.equal(quanx.skipped, 0)
+    assert.ok(quanx.text.includes('obfs=over-tls'))
+  })
+
+  check('节点分享：标准 URI 与特殊协议的可移植片段', () => {
+    const tt = nodes.find((node) => node.name === 'TT-H2')!
+    const ssh = nodes.find((node) => node.name === 'SSH-Password')!
+    const masque = nodes.find((node) => node.name === 'MASQUE Key')!
+    assert.ok(nodeShareText(tt)?.includes('type: trusttunnel'))
+    assert.ok(nodeShareText(ssh)?.includes('type: ssh'))
+    assert.ok(nodeShareText(masque)?.includes('type: masque'))
+    assert.ok(nodeShareText(SNELL)?.includes('= snell,'))
+    assert.ok(nodeShareText(SHADOW_TLS)?.includes('plugin=shadow-tls'))
+    assert.ok(nodeShareText(V2RAY_PLUGIN)?.includes('plugin=v2ray-plugin'))
+    assert.match(nodeShareText(SS_TLS) ?? '', /^ss:\/\/[A-Za-z0-9_-]+@ss-tls\.example\.com:443/)
+
+    const basic = parse(SINGBOX_ENDPOINTS).nodes[0]
+    const shared = nodeShareText(basic)
+    assert.ok(shared)
+    assert.equal(JSON.parse(shared).endpoints[0].type, 'masque-client')
   })
 
   if (failures) {

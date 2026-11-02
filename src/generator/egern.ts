@@ -2,6 +2,7 @@
 // and one mapping per rule (`- domain: { match, policy }`).
 import type { ProxyNode, RemoteSubscriptionEntry, RuleScheme, RoutingRule } from '../models/types'
 import { yaml, yamlMultiline } from './naming'
+import { nodeSupportedForTarget } from './nodeCapabilities'
 import {
   remoteGroupSelection,
   remoteNodePlan,
@@ -96,6 +97,7 @@ function transport(node: ProxyNode): string[] | undefined {
 }
 
 function egernNode(node: ProxyNode, name: string): string | undefined {
+  if (!nodeSupportedForTarget(node, 'egern')) return undefined
   // Egern documents ShadowTLS v3 only and has no native SS-over-TLS transport.
   if (node.kind === 'ss') {
     if (node.tls) return undefined

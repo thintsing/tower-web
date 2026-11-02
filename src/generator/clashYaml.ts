@@ -4,6 +4,7 @@ import type { ClientTarget, ProxyNode, RoutingRule, RuleScheme, RuleSchemeNetwor
 import { yaml, yamlMultiline } from './naming'
 import { compileRuleLine, resolveGroups, uniqueDisplayNames, type OutputOptions, type ResolvedGroup } from './groups'
 import { effectiveGroupType, filterRulesForTarget } from '../rules/capabilities'
+import { nodeSupportedForTarget } from './nodeCapabilities'
 import { clashInlinePayload, inlineSetReference } from '../rules/inlineSets'
 import { ruleSetFormatOfRule, supportsRuleSetReference } from '../rules/remoteFormats'
 import {
@@ -129,8 +130,9 @@ function clashNode(node: ProxyNode, name: string, target?: ClientTarget): string
     if (entries.length) lines.push(`    alpn: [${entries.map(yaml).join(', ')}]`)
   }
   const certFP = () => {
-    if (node.certificateFingerprint)
-      lines.push(`    fingerprint: ${yaml(node.certificateFingerprint)}`)
+    if (!node.certificateFingerprint) return
+    const key = target === 'clash' ? 'server-cert-fingerprint' : 'fingerprint'
+    lines.push(`    ${key}: ${yaml(node.certificateFingerprint)}`)
   }
   const clientFP = () => {
     if (node.fingerprint) lines.push(`    client-fingerprint: ${yaml(node.fingerprint)}`)
@@ -231,6 +233,15 @@ function clashNode(node: ProxyNode, name: string, target?: ClientTarget): string
         lines.push('    plugin-opts:')
         lines.push(`      mode: ${yaml(node.obfs)}`)
         if (node.obfsParam) lines.push(`      host: ${yaml(node.obfsParam)}`)
+      } else if (node.tls && (target === 'shadowrocket' || target === 'karing')) {
+        // Shadowrocket / Karing understand ordinary SS-over-TLS. Other Clash
+        // targets must skip instead of dropping TLS and emitting plain SS.
+        lines.push('    tls: true')
+        lines.push(`    skip-cert-verify: ${node.skipCertificateVerification}`)
+        if (node.sni) lines.push(`    servername: ${yaml(node.sni)}`)
+        alpn()
+        certFP()
+        clientFP()
       }
       break
     }
@@ -425,6 +436,7 @@ function masqueSupported(node: ProxyNode): boolean {
 
 function clashSupported(node: ProxyNode, target?: ClientTarget): boolean {
   if (!CLASH_KINDS.has(node.kind)) return false
+  if (!nodeSupportedForTarget(node, target)) return false
   if (node.kind === 'masque') {
     // 密钥模式只给 mihomo 系和 Shadowrocket；Stash / Karing / 通用 YAML 不写。
     return masqueSupported(node) && target !== undefined

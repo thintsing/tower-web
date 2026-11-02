@@ -3,6 +3,7 @@
 //                 Name = VMess,host,port,username=uuid,tls=true,ws=true,ws-path=/...
 import type { ProxyNode, RuleScheme } from '../models/types'
 import { confName } from './naming'
+import { nodeSupportedForTarget } from './nodeCapabilities'
 import {
   compileRuleLine,
   remoteGroupSelection,
@@ -22,6 +23,7 @@ function loonQuoted(value: string): string {
 }
 
 function loonNode(node: ProxyNode, name: string): string | undefined {
+  if (!nodeSupportedForTarget(node, 'loon')) return undefined
   const n = confName(name)
   const host = node.server.includes(':') ? `[${node.server}]` : node.server
   const tlsTail = (): string[] => {
@@ -36,11 +38,16 @@ function loonNode(node: ProxyNode, name: string): string | undefined {
 
   switch (node.kind) {
     case 'ss': {
-      if (node.shadowTLS) return undefined
       const parts = [`${n} = Shadowsocks, ${host}, ${node.port}`, node.cipher ?? 'aes-256-gcm', node.password ?? '']
-      // Loon 里 `obfs` 是 SSR 专用字段；simple-obfs 要用 obfs-name / obfs-host。
-      if (node.obfs) parts.push(`obfs-name=${node.obfs}`)
-      if (node.obfsParam) parts.push(`obfs-host=${node.obfsParam}`)
+      if (node.shadowTLS) {
+        parts.push(`shadow-tls-password=${node.shadowTLS.password}`)
+        parts.push(`shadow-tls-sni=${node.shadowTLS.host}`)
+        parts.push(`shadow-tls-version=${node.shadowTLS.version}`)
+      } else if (node.obfs) {
+        // Loon 里 `obfs` 是 SSR 专用字段；simple-obfs 要用 obfs-name / obfs-host。
+        parts.push(`obfs-name=${node.obfs}`)
+        if (node.obfsParam) parts.push(`obfs-host=${node.obfsParam}`)
+      }
       if (node.udpRelayEnabled !== undefined) parts.push(`udp=${node.udpRelayEnabled}`)
       return parts.join(', ')
     }

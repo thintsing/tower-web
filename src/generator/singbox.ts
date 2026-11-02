@@ -8,6 +8,7 @@ import type {
 } from '../models/types'
 import { resolveGroups, uniqueDisplayNames, type OutputOptions } from './groups'
 import { effectiveGroupType, filterRulesForTarget } from '../rules/capabilities'
+import { nodeSupportedForTarget, v2rayPluginSupported } from './nodeCapabilities'
 import { ruleSetFormatOfRule, supportsRuleSetReference } from '../rules/remoteFormats'
 import {
   CHINA_CLIENT_SUBNET,
@@ -360,6 +361,52 @@ function singboxWireGuardOutbound(node: ProxyNode, name: string): Outbound | und
   return outbound
 }
 
+/**
+ * ShadowTLS 在 sing-box 里是“SS outbound + ShadowTLS detour”的两个出站。
+ * 辅助出站不进策略组；Hiddify 用 §hide§ 前缀避免它出现在可选节点里。
+ */
+function singboxShadowTLSOutbounds(
+  node: ProxyNode,
+  name: string,
+  target: ClientTarget | undefined,
+  occupied: Set<string>,
+): Outbound[] | undefined {
+  const options = node.shadowTLS
+  if (!options || node.plugin !== 'shadow-tls') return undefined
+  if (!nodeSupportedForTarget(node, target)) return undefined
+  const prefix = target === 'hiddify' ? '§hide§' : ''
+  let tag = `${prefix}tower-shadowtls-${occupied.size}`
+  while (occupied.has(tag)) tag += '-'
+  occupied.add(tag)
+  const tls: Record<string, unknown> = {
+    enabled: true,
+    server_name: options.host,
+    insecure: options.skipCertificateVerification === true,
+  }
+  if (node.fingerprint) tls.utls = { enabled: true, fingerprint: node.fingerprint }
+  return [
+    {
+      type: 'shadowtls',
+      tag,
+      server: node.server,
+      server_port: node.port,
+      version: options.version,
+      password: options.password,
+      tls,
+    },
+    {
+      type: 'shadowsocks',
+      tag: name,
+      server: node.server,
+      server_port: node.port,
+      method: node.cipher ?? 'aes-256-gcm',
+      password: node.password ?? '',
+      detour: tag,
+      network: 'tcp',
+    },
+  ]
+}
+
 function singboxOutbound(node: ProxyNode, name: string, target?: ClientTarget): Outbound | undefined {
   const tls = (enabled: boolean) => {
     if (!enabled) return undefined
@@ -394,9 +441,25 @@ function singboxOutbound(node: ProxyNode, name: string, target?: ClientTarget): 
     }
   }
   const base = { type: '', tag: name, server: node.server, server_port: node.port }
+  if (!nodeSupportedForTarget(node, target)) return undefined
   switch (node.kind) {
     case 'ss': {
-      if (node.plugin === 'shadow-tls' || node.plugin === 'v2ray-plugin') return undefined
+      if (node.shadowTLS || node.plugin === 'shadow-tls') return undefined
+      if (node.plugin === 'v2ray-plugin' && v2rayPluginSupported(node, target)) {
+        const options = ['mode=websocket']
+        if (node.pluginMux !== undefined) options.push(`mux=${node.pluginMux ? 1 : 0}`)
+        if (node.tls) options.push('tls')
+        if (node.hostHeader) options.push(`host=${node.hostHeader}`)
+        if (node.path) options.push(`path=${node.path}`)
+        return {
+          ...base,
+          type: 'shadowsocks',
+          method: node.cipher ?? 'aes-256-gcm',
+          password: node.password ?? '',
+          plugin: 'v2ray-plugin',
+          plugin_opts: options.join(';'),
+        }
+      }
       return {
         ...base,
         type: 'shadowsocks',
@@ -529,6 +592,9 @@ export function generateSingBox(
 
   const outbounds: Outbound[] = []
   const endpoints: Outbound[] = []
+  const occupiedTags = new Set(usable.map((node) => displayName(node)))
+  occupiedTags.add('direct')
+  occupiedTags.add('REJECT')
   let skipped = 0
   const emitted = new Set<string>()
   for (const node of usable) {
@@ -539,6 +605,17 @@ export function generateSingBox(
       : undefined
     if (endpoint) {
       endpoints.push(endpoint)
+      emitted.add(node.id)
+      continue
+    }
+    const shadowTLS = singboxShadowTLSOutbounds(
+      node,
+      name,
+      options.target,
+      occupiedTags,
+    )
+    if (shadowTLS) {
+      outbounds.push(...shadowTLS)
       emitted.add(node.id)
       continue
     }

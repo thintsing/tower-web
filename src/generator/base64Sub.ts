@@ -3,6 +3,7 @@
 import type { ClientTarget, ProxyNode } from '../models/types'
 import { encodeBase64String } from '../parser/util'
 import type { OutputOptions } from './groups'
+import { nodeSupportedForTarget } from './nodeCapabilities'
 
 const enc = encodeURIComponent
 
@@ -104,19 +105,29 @@ function b64urlSafe(value: string): string {
   return encodeBase64String(value).replace(/=+$/, '')
 }
 
-function nodeURI(node: ProxyNode, displayName: string, target?: ClientTarget): string | undefined {
+function nodeURI(
+  node: ProxyNode,
+  displayName: string,
+  target?: ClientTarget,
+  forShare = false,
+): string | undefined {
   if (target === 'v2box' && !V2BOX_KINDS.has(node.kind)) return undefined
   if (target === 'anywhere' && anywhereUnsupported(node)) return undefined
+  // Subscription URI lists cannot carry two ShadowTLS layers, SIP003 plugin TLS
+  // or native SS-over-TLS. A one-node share link can still carry SIP003, so the
+  // share path bypasses this gate and uses the plugin fields below.
+  if (!forShare && !nodeSupportedForTarget(node, target)) return undefined
   const name = enc(displayName)
   const server = node.server.includes(':') ? `[${node.server}]` : node.server
   switch (node.kind) {
     case 'ss': {
       const auth = b64urlSafe(`${node.cipher ?? 'aes-256-gcm'}:${node.password ?? ''}`)
       let plugin = ''
-      if (node.shadowTLS) {
+      if (forShare && node.shadowTLS) {
         plugin = `?plugin=${enc(`shadow-tls;host=${node.shadowTLS.host};password=${node.shadowTLS.password};version=${node.shadowTLS.version}`)}`
-      } else if (node.plugin === 'v2ray-plugin') {
+      } else if (forShare && node.plugin === 'v2ray-plugin') {
         const parts = ['v2ray-plugin;mode=websocket']
+        if (node.pluginMux !== undefined) parts.push(`mux=${node.pluginMux ? 1 : 0}`)
         if (node.tls) parts.push('tls')
         if (node.hostHeader) parts.push(`host=${node.hostHeader}`)
         if (node.path) parts.push(`path=${node.path}`)
@@ -248,6 +259,11 @@ function nodeURI(node: ProxyNode, displayName: string, target?: ClientTarget): s
       // snell / hysteria1 / ssh … have no portable URI form here.
       return undefined
   }
+}
+
+/** 单个节点的标准分享 URI；不同于订阅列表，允许 SIP003 / ShadowTLS 插件。 */
+export function canonicalNodeURI(node: ProxyNode, displayName = node.name): string | undefined {
+  return nodeURI(node, displayName, undefined, true)
 }
 
 export function generateBase64Subscription(

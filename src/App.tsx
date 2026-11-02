@@ -33,6 +33,7 @@ import type { ManualNodeImportResult } from './manualNodes'
 import { MAX_BATCH_SUBSCRIPTIONS, splitSubscriptionURLs, subscriptionLabel } from './batchSubscriptions'
 import { WorldMapSVG } from './worldmap/WorldMapSVG'
 import { generateConfig, generateSubscriptionFormats } from './generator'
+import { nodeShareText } from './generator/shareLink'
 import { analyzeRuleCompatibility } from './generator/compatibility'
 import { formatSupportsProxyCollections, prepareSchemeForExport } from './generator/groups'
 import { autoFillGroupEmojis } from './generator/groupIcons'
@@ -2147,15 +2148,6 @@ function networkOrganizationForHost(host: string): Promise<NetworkOrganization |
   return request
 }
 
-/** 只有真正可分享的协议链接才允许复制 / 生成二维码。 */
-function shareableNodeURI(node: ProxyNode): string | undefined {
-  const uri = node.rawURI?.trim()
-  if (!uri || uri.startsWith('clash://local/')) return undefined
-  return /^(ss|ssr|vmess|vless|trojan|anytls|hysteria2?|hy2?|tuic|wireguard|wg|snell|ssh|socks5|http|https):\/\/\S+/i.test(uri)
-    ? uri
-    : undefined
-}
-
 /** 订阅页与自有节点的统一搜索条件；公告 / 配额伪节点永远不命中。 */
 function nodeMatchesKeyword(node: ProxyNode, needle: string): boolean {
   if (node.isSubscriptionMetadata) return false
@@ -2235,7 +2227,7 @@ function NodeRow({
     : regionForName(node.name)
       ? '节点名称'
       : node.detectedCountry ? '离线 IP' : '未知'
-  const shareURI = shareableNodeURI(node)
+  const shareURI = nodeShareText(node)
   const method = latencyMethodMap[node.id]
   const latencyText = latency === undefined
     ? (testing ? '测速中' : '未测')

@@ -4,6 +4,7 @@
 // [filter_local] 行形如：host-suffix, google.com, 分组名 / final, 分组名
 import type { ProxyNode, RuleScheme } from '../models/types'
 import { confName } from './naming'
+import { nodeSupportedForTarget } from './nodeCapabilities'
 import {
   exactNamePattern,
   remoteGroupSelection,
@@ -27,6 +28,7 @@ function qxPolicy(name: string): string {
 }
 
 function qxNode(node: ProxyNode, tag: string): string | undefined {
+  if (!nodeSupportedForTarget(node, 'quanx')) return undefined
   const host = node.server.includes(':') ? `[${node.server}]` : node.server
   const addr = `${host}:${node.port}`
   const tls = (): string[] => {
@@ -37,13 +39,19 @@ function qxNode(node: ProxyNode, tag: string): string | undefined {
   }
   switch (node.kind) {
     case 'ss': {
-      if (node.shadowTLS) return undefined
       const parts = [`shadowsocks=${addr}`, `method=${node.cipher ?? 'aes-256-gcm'}`, `password=${node.password ?? ''}`]
-      if (node.obfs) {
+      if (node.plugin === 'v2ray-plugin') {
+        parts.push(`obfs=${node.tls ? 'wss' : 'ws'}`)
+        if (node.hostHeader) parts.push(`obfs-host=${node.hostHeader}`)
+        if (node.path) parts.push(`obfs-uri=${node.path}`)
+      } else if (node.tls) {
+        parts.push('obfs=over-tls')
+        if (node.sni) parts.push(`obfs-host=${node.sni}`)
+      } else if (node.obfs) {
         // QuanX 的 ss obfs 只有 simple-obfs 的 http / tls 两种
         if (node.obfs === 'http' || node.obfs === 'tls') parts.push(`obfs=${node.obfs}`)
+        if (node.obfsParam) parts.push(`obfs-host=${node.obfsParam}`)
       }
-      if (node.obfsParam) parts.push(`obfs-host=${node.obfsParam}`)
       parts.push('fast-open=false', 'udp-relay=false', `tag=${tag}`)
       return parts.join(', ')
     }

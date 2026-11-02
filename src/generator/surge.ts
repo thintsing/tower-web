@@ -6,6 +6,7 @@ import { effectiveGroupType, filterRulesForTarget } from '../rules/capabilities'
 import { inlineSetReference, surgeInlinePayload } from '../rules/inlineSets'
 import { supportsRuleSetReference } from '../rules/remoteFormats'
 import { effectiveNetworkSettings, latencyTestURL } from '../models/networkSettings'
+import { nodeSupportedForTarget } from './nodeCapabilities'
 import { withPolicyGroupIcons } from './groupIcons'
 
 function wireGuardSectionName(node: ProxyNode): string {
@@ -54,6 +55,7 @@ function surgeWireGuardSections(nodes: ProxyNode[]): string[] {
 }
 
 function surgeNode(node: ProxyNode, name: string): string | undefined {
+  if (!nodeSupportedForTarget(node, 'surge')) return undefined
   const n = confName(name)
   const server = node.server.includes(':') ? `[${node.server}]` : node.server
   const tlsFlags = () => {
@@ -64,12 +66,17 @@ function surgeNode(node: ProxyNode, name: string): string | undefined {
   }
   switch (node.kind) {
     case 'ss': {
-      if (node.shadowTLS) return undefined // Surge: interactive only; skip.
       const parts = [`${n} = ss, ${server}, ${node.port}`,
         `encrypt-method=${node.cipher ?? 'aes-256-gcm'}`,
         `password=${node.password ?? ''}`]
-      if (node.obfs) parts.push(`obfs=${node.obfs}`)
-      if (node.obfsParam) parts.push(`obfs-host=${node.obfsParam}`)
+      if (node.shadowTLS) {
+        parts.push(`shadow-tls-password=${node.shadowTLS.password.replace(/%/g, '%25')}`)
+        parts.push(`shadow-tls-sni=${node.shadowTLS.host}`)
+        parts.push(`shadow-tls-version=${node.shadowTLS.version}`)
+      } else if (node.obfs) {
+        parts.push(`obfs=${node.obfs}`)
+        if (node.obfsParam) parts.push(`obfs-host=${node.obfsParam}`)
+      }
       if (node.udpRelayEnabled !== undefined) parts.push(`udp-relay=${node.udpRelayEnabled}`)
       return parts.join(', ')
     }
