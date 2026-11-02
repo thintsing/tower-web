@@ -2,7 +2,7 @@
 // 用法：npm run selfcheck:icons
 import assert from 'node:assert/strict'
 import type { PolicyGroup, ProxyNode, RuleScheme } from '../src/models/types'
-import { withPolicyGroupIcons } from '../src/generator/groupIcons'
+import { autoFillGroupEmojis, withPolicyGroupIcons } from '../src/generator/groupIcons'
 import { clashSkippedCount, generateClashYAML } from '../src/generator/clashYaml'
 import { generateSurge } from '../src/generator/surge'
 import { generateLoon } from '../src/generator/loon'
@@ -44,6 +44,27 @@ const SCHEME: RuleScheme = {
     { type: 'FINAL', value: '', group: '🚀 节点选择' },
   ],
 }
+
+check('补全 Emoji 会同步更新候选、规则和匹配顺序', () => {
+  const scheme: RuleScheme = {
+    id: 'emoji-autofill',
+    name: 'emoji-autofill',
+    description: '',
+    groups: [
+      { name: '节点选择', type: 'select', options: ['自动选择', 'DIRECT'] },
+      { name: '自动选择', type: 'url-test', options: [] },
+      { name: '🚀 已有 Emoji', type: 'select', options: ['DIRECT'] },
+    ],
+    rules: [{ type: 'FINAL', value: '', group: '节点选择' }],
+    matchingOrder: ['自动选择', '节点选择'],
+  }
+  const result = autoFillGroupEmojis(scheme)
+  assert.deepEqual(result.renamed, [['节点选择', '🚀 节点选择'], ['自动选择', '♻️ 自动选择']])
+  assert.deepEqual(result.scheme.groups[0].options, ['♻️ 自动选择', 'DIRECT'])
+  assert.equal(result.scheme.rules[0].group, '🚀 节点选择')
+  assert.deepEqual(result.scheme.matchingOrder, ['♻️ 自动选择', '🚀 节点选择'])
+  assert.equal(result.scheme.groups[2].name, '🚀 已有 Emoji')
+})
 
 const node = (id: string, kind: ProxyNode['kind']): ProxyNode => ({
   id,

@@ -14,6 +14,7 @@ import {
   removePolicyGroup,
   validateNodeGroupDraft,
 } from '../src/rules/groupEditing'
+import { findRuleOrderConflicts } from '../src/rules/orderConflicts'
 import { prepareSchemeForExport } from '../src/generator/groups'
 
 let failures = 0
@@ -131,6 +132,23 @@ function main(): void {
     assert.equal(built.url, 'http://www.gstatic.com/generate_204')
     assert.equal(built.interval, 300)
     assert.equal(built.tolerance, 50)
+  })
+
+  check('拖动后检测到域名从一组改走另一组', () => {
+    const scheme: RuleScheme = {
+      id: 'conflicts',
+      name: 'conflicts',
+      description: '',
+      groups: [group('A'), group('B')],
+      rules: [
+        { type: 'DOMAIN', value: 'youtube.com', group: 'A' },
+        { type: 'DOMAIN-SUFFIX', value: 'youtube.com', group: 'B' },
+        { type: 'DOMAIN-KEYWORD', value: 'spotify', group: 'B' },
+      ],
+    }
+    const conflicts = findRuleOrderConflicts(scheme, ['A', 'B'], ['B', 'A'])
+    assert.deepEqual(conflicts, [{ from: 'A', to: 'B', domains: ['youtube.com'] }])
+    assert.deepEqual(findRuleOrderConflicts(scheme, ['A', 'B'], ['A', 'B']), [])
   })
 
   check('删除策略组会清理规则、引用和规则集快照', () => {

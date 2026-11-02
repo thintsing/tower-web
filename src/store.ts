@@ -54,6 +54,8 @@ export interface Store extends AppState {
   filterSubscriptionInfoNodes: boolean
   /** 到期 / 流量提醒；Web 只在塔台打开时提示。 */
   renewalRemindersEnabled: boolean
+  /** 在策略组列表和规则标签里显示组名开头的 Emoji。 */
+  showGroupEmoji: boolean
   /** Tailscale 内网连接；Auth Key 单独存在 tailnetAuthKeys。 */
   tailnets: TailnetConnection[]
   /** 本机保存的 Auth Key；不进入持久化快照，刷新前从独立 localStorage 读取。 */
@@ -76,6 +78,7 @@ export interface Store extends AppState {
   setNodeNameFilter: (patch: Partial<NodeNameFilterSettings>) => void
   setFilterSubscriptionInfoNodes: (enabled: boolean) => void
   setRenewalRemindersEnabled: (enabled: boolean) => void
+  setShowGroupEmoji: (enabled: boolean) => void
   addTailnet: (connection: TailnetConnection) => void
   updateTailnet: (connection: TailnetConnection) => void
   deleteTailnet: (id: string) => void
@@ -268,6 +271,7 @@ export function persistedSnapshot(s: Store): PersistedData {
     nodeNameFilter: s.nodeNameFilter,
     filterSubscriptionInfoNodes: s.filterSubscriptionInfoNodes,
     renewalRemindersEnabled: s.renewalRemindersEnabled,
+    showGroupEmoji: s.showGroupEmoji,
     latencyTestMode: s.latencyTestMode,
     tailnets: s.tailnets,
   }
@@ -304,6 +308,7 @@ export const useStore = create<Store>()(
       nodeNameFilter: { include: '', exclude: '', useRegex: false, caseSensitive: false },
       filterSubscriptionInfoNodes: false,
       renewalRemindersEnabled: false,
+      showGroupEmoji: false,
       tailnets: [],
       tailnetAuthKeys: loadTailnetAuthKeys(),
 
@@ -387,6 +392,7 @@ export const useStore = create<Store>()(
         set((s) => ({ nodeNameFilter: { ...s.nodeNameFilter, ...patch } })),
       setFilterSubscriptionInfoNodes: (enabled) => set({ filterSubscriptionInfoNodes: enabled }),
       setRenewalRemindersEnabled: (enabled) => set({ renewalRemindersEnabled: enabled }),
+      setShowGroupEmoji: (enabled) => set({ showGroupEmoji: enabled }),
       addTailnet: (connection) =>
         set((s) => ({
           tailnets: [...s.tailnets.filter((item) => item.id !== connection.id), connection],

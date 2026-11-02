@@ -953,6 +953,9 @@ dialog.confirm { width: min(420px, 92vw); }
 }
 .group-controls select.input { width: 100%; min-width: 0; max-width: none; }
 .group-controls .pill { justify-self: end; max-width: 100%; }
+.group-order-conflict-list { display: grid; gap: 4px; min-width: 0; }
+.group-order-conflict-list strong { color: var(--text); }
+.group-order-conflict-list .hint { margin-top: 2px; }
 .group-rule-btn { width: 100%; height: 30px; padding: 0 8px; font-size: 11.5px; }
 .group-rule-btn:hover { background: var(--raised); }
 .group-order-hint { margin-top: 10px; }

@@ -335,6 +335,51 @@ function resolvedEmoji(group: PolicyGroup, scheme: RuleScheme): string {
     ?? fallbackEmoji(group.type)
 }
 
+export interface EmojiAutofillResult {
+  scheme: RuleScheme
+  renamed: Array<[string, string]>
+}
+
+/**
+ * Prefix groups that do not start with an emoji. References in options,
+ * rules, rule-set snapshots and matchingOrder follow the rename.
+ */
+export function autoFillGroupEmojis(source: RuleScheme): EmojiAutofillResult {
+  const used = new Set(source.groups.map((group) => group.name))
+  const renames = new Map<string, string>()
+  for (const group of source.groups) {
+    if (leadingEmoji(group.name)) continue
+    const candidate = `${resolvedEmoji(group, source)} ${group.name}`.trim()
+    if (used.has(candidate)) continue
+    used.add(candidate)
+    renames.set(group.name, candidate)
+  }
+  if (!renames.size) return { scheme: source, renamed: [] }
+
+  const mapName = (name: string) => renames.get(name) ?? name
+  return {
+    scheme: {
+      ...source,
+      groups: source.groups.map((group) => ({
+        ...group,
+        name: mapName(group.name),
+        options: group.options.map(mapName),
+      })),
+      rules: source.rules.map((rule) => ({ ...rule, group: mapName(rule.group) })),
+      customRules: (source.customRules ?? []).map((rule) => ({ ...rule, group: mapName(rule.group) })),
+      ruleSets: (source.ruleSets ?? []).map((set) => ({
+        ...set,
+        group: mapName(set.group),
+        rules: set.rules.map((rule) => ({ ...rule, group: mapName(rule.group) })),
+      })),
+      matchingOrder: source.matchingOrder?.map(mapName),
+      rawConfigurationText: undefined,
+      updatedAt: Date.now(),
+    },
+    renamed: [...renames.entries()],
+  }
+}
+
 function encodePath(path: string): string {
   return path.split('/').map(encodeURIComponent).join('/')
 }

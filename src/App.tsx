@@ -26,6 +26,7 @@ import { BUILTIN_SCHEMES, allSchemeMetas, loadScheme, parseRuleList } from './ru
 import { detectRuleSchemeFormat, parseRuleSchemeText, RULE_SCHEME_FORMAT_TITLES } from './rules/importers'
 import { fetchRuleSet, parseRuleSetText, RULE_SET_FORMAT_TITLES, type RuleSetRule } from './rules/ruleSets'
 import { matchingGroupNames, matchingOrderAfterDragging } from './rules/matchingOrder'
+import { findRuleOrderConflicts, type RuleOrderConflict } from './rules/orderConflicts'
 import { buildNodeFilterGroup, nextGroupName, previewNodeMatches, removePolicyGroup, validateNodeGroupDraft, type NodeGroupDraft } from './rules/groupEditing'
 import { ONLINE_RULE_CATALOG } from './rules/ruleCatalog'
 import type { ManualNodeImportResult } from './manualNodes'
@@ -34,6 +35,7 @@ import { WorldMapSVG } from './worldmap/WorldMapSVG'
 import { generateConfig, generateSubscriptionFormats } from './generator'
 import { analyzeRuleCompatibility } from './generator/compatibility'
 import { formatSupportsProxyCollections, prepareSchemeForExport } from './generator/groups'
+import { autoFillGroupEmojis } from './generator/groupIcons'
 import { maskTailnetAuthKeys, tailnetSupports } from './generator/tailnet'
 import { copyToClipboard, newID } from './util/browser'
 import { normalizeRemoteTextURL } from './util/remoteURL'
@@ -1194,6 +1196,8 @@ function SubscriptionSettingsDialog({
   const setFilterSubscriptionInfoNodes = useStore((s) => s.setFilterSubscriptionInfoNodes)
   const renewalRemindersEnabled = useStore((s) => s.renewalRemindersEnabled)
   const setRenewalRemindersEnabled = useStore((s) => s.setRenewalRemindersEnabled)
+  const showGroupEmoji = useStore((s) => s.showGroupEmoji)
+  const setShowGroupEmoji = useStore((s) => s.setShowGroupEmoji)
   const latencyTestMode = useStore((s) => s.latencyTestMode)
   const setLatencyTestMode = useStore((s) => s.setLatencyTestMode)
   const restoreBackup = useStore((s) => s.restoreBackup)
@@ -1352,6 +1356,17 @@ function SubscriptionSettingsDialog({
           <span>
             <strong>到期与流量提醒</strong>
             <small>订阅即将到期或流量接近上限时，在订阅页提示；允许通知后，塔台打开期间还会发系统通知。</small>
+          </span>
+        </label>
+        <label className="setting-toggle">
+          <input
+            type="checkbox"
+            checked={showGroupEmoji}
+            onChange={(e) => setShowGroupEmoji(e.target.checked)}
+          />
+          <span>
+            <strong>显示策略组 Emoji</strong>
+            <small>在策略组列表和规则标签里显示组名开头的 Emoji；关闭时只显示文字。</small>
           </span>
         </label>
         <div className="field">
@@ -4724,6 +4739,8 @@ function RulesTab() {
   const policySelections = useStore((s) => s.policySelections)
   const setPolicy = useStore((s) => s.setPolicy)
   const removePolicy = useStore((s) => s.removePolicy)
+  const showGroupEmoji = useStore((s) => s.showGroupEmoji)
+  const setShowGroupEmoji = useStore((s) => s.setShowGroupEmoji)
   const scheme = useScheme()
   const nodes = useStore((s) => s.nodes)
   const sources = useStore((s) => s.sources)
@@ -4742,6 +4759,7 @@ function RulesTab() {
   const [pendingSchemeDelete, setPendingSchemeDelete] = useState<RuleScheme | null>(null)
   const [editingScheme, setEditingScheme] = useState<RuleScheme | null>(null)
   const [textEditorScheme, setTextEditorScheme] = useState<RuleScheme | null>(null)
+  const [restoreInitialConfirm, setRestoreInitialConfirm] = useState(false)
   const [creatingGroup, setCreatingGroup] = useState<RuleScheme | null>(null)
   const [pendingGroupDelete, setPendingGroupDelete] = useState<PolicyGroup | null>(null)
   const [customRuleTarget, setCustomRuleTarget] = useState<RuleScheme | null>(null)
@@ -4758,6 +4776,7 @@ function RulesTab() {
     schemeID: string
     groups: PolicyGroup[]
     matchingOrder?: string[]
+    conflicts: RuleOrderConflict[]
   } | null>(null)
   const [libraryOpen, setLibraryOpen] = useState(false)
   const [localSetEditor, setLocalSetEditor] = useState<{ set?: LocalRuleSet } | null>(null)
@@ -4920,6 +4939,50 @@ function RulesTab() {
     setFlash(`已保存方案「${next.name}」。`)
   }
 
+  const builtinForCustom = customScheme?.sourceKind === 'copy'
+    ? BUILTIN_SCHEMES.find((meta) => meta.name === stripSchemeCustomSuffix(customScheme.name))
+    : undefined
+
+  const restoreInitialRules = async () => {
+    if (!customScheme || !builtinForCustom) return
+    setRestoreInitialConfirm(false)
+    try {
+      const original = await loadScheme(builtinForCustom)
+      addCustomScheme({
+        ...original,
+        id: customScheme.id,
+        name: customScheme.name,
+        description: customScheme.description,
+        sourceKind: 'copy',
+        rawConfigurationText: undefined,
+        customRules: [],
+        ruleSets: [],
+        matchingOrder: undefined,
+        updatedAt: Date.now(),
+      })
+      setScheme(customScheme.id)
+      setFlash(`已恢复「${builtinForCustom.name}」的初始策略组和规则。`)
+    } catch (error) {
+      setFlash(`恢复初始规则失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  const autoFillGroupEmoji = () => {
+    if (!scheme) return
+    const editable = customScheme ?? makeEditableScheme(scheme)
+    const result = autoFillGroupEmojis(editable)
+    if (!result.renamed.length) {
+      setFlash('所有策略组都已经带 Emoji。')
+      return
+    }
+    addCustomScheme(result.scheme)
+    for (const [oldName, newName] of result.renamed) {
+      useStore.getState().renamePolicySelection(oldName, newName)
+    }
+    setShowGroupEmoji(true)
+    setFlash(`已为 ${result.renamed.length} 个策略组补全 Emoji，并同步更新规则引用。`)
+  }
+
   const createNodeGroup = (source: RuleScheme, group: PolicyGroup) => {
     const editable = makeEditableScheme(source)
     addCustomScheme({
@@ -4981,10 +5044,12 @@ function RulesTab() {
     const currentMatching = matchingGroupNames(matchingRules, knownGroups)
     const nextMatching = matchingOrderAfterDragging(moved.name, beforeNames, names, currentMatching)
     const changed = nextMatching.join('\n') !== currentMatching.join('\n')
+    const conflicts = findRuleOrderConflicts(editable, currentMatching, nextMatching)
     setReorderUndo({
       schemeID: editable.id,
       groups: editable.groups,
       matchingOrder: editable.matchingOrder,
+      conflicts,
     })
     addCustomScheme({
       ...editable,
@@ -5420,6 +5485,12 @@ function RulesTab() {
                 {customScheme ? '编辑方案' : '复制并编辑'}
               </button>
             )}
+            {builtinForCustom && (
+              <button className="btn ghost" onClick={() => setRestoreInitialConfirm(true)}>恢复初始规则</button>
+            )}
+            {scheme && (
+              <button className="btn ghost" onClick={autoFillGroupEmoji}>补全 Emoji</button>
+            )}
             {customScheme?.rawConfigurationText && (
               <button className="btn ghost" onClick={() => setTextEditorScheme(customScheme)}>编辑全文</button>
             )}
@@ -5588,7 +5659,7 @@ function RulesTab() {
                       }}
                     >⠿</span>
                     <GroupIcon name={g.name} />
-                    <span className="gname">{groupDisplayName(g.name)}</span>
+                    <span className="gname">{groupDisplayName(g.name, showGroupEmoji)}</span>
                     <span className="gtype">{policyTypeLabel(g.type)}</span>
                   </div>
                   <div className="group-sub">
@@ -5606,7 +5677,7 @@ function RulesTab() {
                     >
                       {g.options.length > 0 && (
                         <optgroup label="策略组 / 内置">
-                          {g.options.map((c) => <option key={c} value={c}>{groupDisplayName(c)}</option>)}
+                          {g.options.map((c) => <option key={c} value={c}>{groupDisplayName(c, showGroupEmoji)}</option>)}
                         </optgroup>
                       )}
                       {nodeChoices.length > 0 && (
@@ -5655,7 +5726,21 @@ function RulesTab() {
           </div>
           {reorderUndo && scheme && reorderUndo.schemeID === scheme.id && (
             <div className="inline-notice group-order-undo" role="status">
-              已调整策略组顺序和匹配优先级。
+              <div className="group-order-conflict-list">
+                {reorderUndo.conflicts.length > 0 ? (
+                  <>
+                    <strong>有网站的归属改变了：</strong>
+                    {reorderUndo.conflicts.slice(0, 3).map((conflict) => (
+                      <div key={`${conflict.from}-${conflict.to}`}>
+                        「{groupDisplayName(conflict.from, showGroupEmoji)}」中 {conflict.domains.length} 个域名改走
+                        「{groupDisplayName(conflict.to, showGroupEmoji)}」，如 {conflict.domains.slice(0, 2).join('、')}
+                      </div>
+                    ))}
+                    {reorderUndo.conflicts.length > 3 && <div>…</div>}
+                    <div className="hint">规则从上到下匹配，同一个域名只会命中排在前面的组。</div>
+                  </>
+                ) : '已调整策略组顺序和匹配优先级。'}
+              </div>
               <button type="button" className="btn ghost" onClick={undoGroupReorder}>撤销</button>
             </div>
           )}
@@ -5675,7 +5760,7 @@ function RulesTab() {
             <ul className="custom-rule-list">
               {scheme.customRules!.map((rule) => (
                 <li key={`${rule.group}-${rule.type}-${rule.value ?? ''}`}>
-                  <span className="pill">{groupDisplayName(rule.group)}</span>
+                  <span className="pill">{groupDisplayName(rule.group, showGroupEmoji)}</span>
                   <span className="mono rule-type">{rule.type}</span>
                   <span className="mono rule-value">{rule.value ?? '—'}</span>
                   {rule.noResolve && <span className="hint">no-resolve</span>}
@@ -5730,7 +5815,7 @@ function RulesTab() {
                   <li key={set.id}>
                     <div>
                       <strong>{set.name}</strong>
-                      <span className="pill">{groupDisplayName(set.group)}</span>
+                      <span className="pill">{groupDisplayName(set.group, showGroupEmoji)}</span>
                       <span className="hint">
                         {set.rules.length} 条 · {set.sourceKind === 'library' ? '内置规则库' : set.sourceKind === 'url' ? '在线订阅' : '我的规则集'}
                         {set.format ? ` · ${RULE_SET_FORMAT_TITLES[set.format]}` : ''}
@@ -5965,6 +6050,22 @@ function RulesTab() {
           scheme={scheme}
           onClose={() => setLocalSetAddTarget(null)}
           onAdd={(group) => addLocalSetToScheme(scheme, localSetAddTarget, group)}
+        />
+      )}
+      {restoreInitialConfirm && customScheme && builtinForCustom && (
+        <ConfirmDialog
+          open
+          title="恢复初始规则？"
+          body={(
+            <>
+              将把「{customScheme.name}」恢复为「{builtinForCustom.name}」的初始策略组和规则。
+              当前自定义规则、规则集快照、Emoji 补全和匹配顺序都会被清空，此操作不可撤销。
+            </>
+          )}
+          confirmLabel="恢复初始规则"
+          danger
+          onCancel={() => setRestoreInitialConfirm(false)}
+          onConfirm={() => void restoreInitialRules()}
         />
       )}
       {pendingGroupDelete && scheme && (

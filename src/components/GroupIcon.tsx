@@ -4,7 +4,8 @@ import type { ReactNode } from 'react'
  * ACL4SSR 的策略组名以彩色 emoji 开头（🚀、🍎、🌍…）。
  * 这些字符只用于展示，配置里仍保留原名，避免规则引用失配。
  */
-export function groupDisplayName(name: string): string {
+export function groupDisplayName(name: string, showEmoji = false): string {
+  if (showEmoji) return name.trim() || name
   const stripped = name
     .replace(/^[\p{Extended_Pictographic}\uFE0F\u200D\u20E3]+\s*/u, '')
     .trim()
