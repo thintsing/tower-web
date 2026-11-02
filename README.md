@@ -42,6 +42,7 @@
 - **协议**：Shadowsocks / SSR / VMess / VLESS / Trojan / Hysteria / Hysteria 2 / TUIC / WireGuard / AnyTLS / Snell / SOCKS5 / HTTP / SSH / TrustTunnel / MASQUE；按客户端能力自动跳过无法表达的节点。
 - **自有节点**：可从链接、配置文本、文件导入，也可逐协议手动新建 / 编辑；不随订阅刷新，可单独启用、停用、改名、删除和标记地区。
 - **测速与健康**：本机 TCP / ICMP 测速；订阅页汇总正常、异常、未测节点，可重测失败节点，并在节点详情显示来源、地区、ASN 网络组织和 TLS 信息。
+- **分布地图**：按延迟给国家着色；支持按钮 / Ctrl+滚轮缩放、放大后拖动、低倍率地区聚合圆点、地区清单和选中地区的节点列表。
 - **规则方案**：内置 ACL4SSR；支持粘贴、文件或 URL 导入 INI、Clash / mihomo、Surge、Egern 和 sing-box 方案，也可一键导入 Self-Configuration 预设。策略组可新建、删除、改名、按节点名正则建组、改类型、编辑候选、调整匹配顺序；导入来源方案支持全文编辑，复制自内置方案后还可恢复初始规则。
 - **策略组展示**：可按组名识别并自动补全 Emoji，规则页可切换显示或隐藏；拖动组改变匹配顺序时，会提示哪些域名从原组改走新组，避免分流被悄悄改变。
 - **规则集**：内置 ACL4SSR 快照与 871 个在线列表；支持本地 / 在线规则集、刷新、暂停、跨客户端引用或无损展开。开启「优先引用规则集」后，经典列表会自动压成 mihomo / Stash 的 MRS 与 sing-box / Hiddify 的 SRS 二进制规则集，表达不了的类型保持逐条内联。
@@ -165,7 +166,7 @@ $env:HOST='127.0.0.1'; npm start
 | `npm run selfcheck:protocols` | 校验协议解析与降级 |
 
 <details>
-<summary>全部 17 项自检</summary>
+<summary>全部 18 项自检</summary>
 
 ```text
 selfcheck:asn         离线 IP / ASN 查询
@@ -179,6 +180,7 @@ selfcheck:importers   Clash / Surge / Egern / sing-box / INI 导入
 selfcheck:icons       策略组图标与能力矩阵
 selfcheck:manual      自有节点导入与去重
 selfcheck:manual-form 手动节点表单
+selfcheck:map         地图地区聚合
 selfcheck:matching    策略组拖动后的规则顺序
 selfcheck:protocols   协议解析与客户端降级
 selfcheck:qr          二维码生成与解码
@@ -187,7 +189,7 @@ selfcheck:rulesets    规则集方言转换
 selfcheck:yaml        Clash YAML 结构
 ```
 
-自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 17 项自检。
+自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 18 项自检。
 
 </details>
 

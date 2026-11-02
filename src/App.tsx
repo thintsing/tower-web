@@ -3564,7 +3564,7 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           <div className="card-head">
             <h3>全球节点分布</h3>
             <div className="meta">
-              {selectedCode ? `选中：${selectedCode} · 点击空白取消` : '点击国家查看'}
+              {selectedCode ? `选中：${selectedCode} · 点击空白取消` : '缩放 / 拖动 / 点击地区查看节点'}
             </div>
           </div>
           <WorldMapSVG

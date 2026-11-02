@@ -44,6 +44,7 @@
     "selfcheck:icons": "tsx scripts/selfcheck-icons.ts",
     "selfcheck:manual": "tsx scripts/selfcheck-manual.ts",
     "selfcheck:manual-form": "tsx scripts/selfcheck-manual-form.ts",
+    "selfcheck:map": "tsx scripts/selfcheck-map.ts",
     "selfcheck:matching": "tsx scripts/selfcheck-matching.ts",
     "selfcheck:protocols": "tsx scripts/selfcheck-protocols.ts",
     "selfcheck:qr": "tsx scripts/selfcheck-qr.ts",
