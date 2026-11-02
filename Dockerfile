@@ -2,7 +2,9 @@
 
 # 构建阶段：安装依赖并产出 dist/。运行阶段不需要 node_modules，
 # 服务端只使用 Node 内置模块和 server/ 下的本地 .mjs 文件。
-FROM node:22-alpine AS build
+# 构建产物是平台无关的 JS/CSS；让构建阶段跑在原生 BUILDPLATFORM，
+# 避免 arm64 目标在 QEMU 里执行 npm ci 时崩溃。运行阶段仍使用目标架构。
+FROM --platform=$BUILDPLATFORM node:22-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
