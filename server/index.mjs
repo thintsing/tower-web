@@ -181,6 +181,14 @@ function loadServerSettings() {
       console.error('[tower] 服务端设置读取失败，使用默认值:', error?.message ?? error)
     }
   }
+  // 容器部署可由启动参数提供初始密钥，避免只能依赖可伪造的 Host 头
+  // 来识别宿主机页面。显式环境变量优先于 settings.json。
+  const envTokenRaw = String(process.env.TOWER_API_TOKEN ?? '').trim()
+  if (envTokenRaw) {
+    const envToken = normalizeAPIToken(envTokenRaw)
+    if (envToken) serverSettings.apiToken = envToken
+    else console.warn('[tower] TOWER_API_TOKEN 格式无效（需 16–128 位 A-Z/a-z/0-9/_/-），已忽略')
+  }
 }
 
 function persistServerSettings() {
@@ -235,24 +243,19 @@ function isPrivateAddress(address) {
 }
 
 /**
- * 本机请求直接放行。Docker 默认桥接会把宿主机访问显示成 172.x / 192.168.65.x，
- * 因此容器内再结合 Host 头判断：Host 仍是 localhost / 127.0.0.1 时视为本机。
- */
-function isTrustedLocalRequest(req) {
-  const remote = normalizedRemoteAddress(req)
-  if (isLoopbackAddress(remote)) return true
-  return isContainerHostLocalRequest(req)
-}
-
-/**
  * 设置接口允许本机直连；Docker 宿主机通过 Host 头识别，但一旦启用管理密钥，
  * 仍必须带上正确密钥。否则局域网里的任意客户端都能伪造 `Host: localhost`
  * 读取 settings.json 里的密钥。
  */
-function canManageSettings(req, url) {
+function canManageSettings(req, url, action = 'write') {
   if (isLoopbackRequest(req)) return true
-  return isContainerHostLocalRequest(req)
-    && apiTokenMatches(presentedAPIToken(req, url))
+  if (!isContainerHostLocalRequest(req)) return false
+  // 容器内只能看到「私有地址 + Host: localhost」，局域网客户端可以伪造
+  // Host。没有管理密钥时，不能仅凭 Host 头创建/轮换密钥，否则任何局域网
+  // 用户都能先设置密钥并接管实例。首次密钥请用 TOWER_API_TOKEN 或容器内
+  // 回环请求创建。
+  if (action === 'token' && !serverSettings.apiToken) return false
+  return apiTokenMatches(presentedAPIToken(req, url))
 }
 
 function cookieValue(req, name) {
@@ -523,6 +526,12 @@ const SUB_MIME = {
   base64: 'text/plain; charset=utf-8',
 }
 const SUB_EXT = { yaml: 'yaml', egern: 'yaml', surge: 'conf', loon: 'conf', quanx: 'conf', json: 'json', base64: 'txt' }
+
+/** 标题会进入响应头与客户端 profile 名，限制长度并去掉换行。 */
+function normalizeSubscriptionTitle(value, fallback = 'tower') {
+  const text = String(value ?? '').replace(/[\r\n]/g, ' ').trim().slice(0, 96)
+  return text || fallback
+}
 
 // ---------- offline IP country database (sapics/ip-location-db, PDDL-1.0) ----------
 const IP_COUNTRY_DIR = join(dirname(fileURLToPath(import.meta.url)), 'ip-country')
@@ -973,12 +982,19 @@ async function handleProbe(url, res) {
   }
 }
 
-async function readBody(req) {
+class RequestError extends Error {
+  constructor(message, status = 400) {
+    super(message)
+    this.status = status
+  }
+}
+
+async function readBody(req, maxBytes = 8 * 1024 * 1024) {
   const chunks = []
   let size = 0
   for await (const chunk of req) {
     size += chunk.length
-    if (size > 8 * 1024 * 1024) throw new Error('内容过大')
+    if (size > maxBytes) throw new RequestError('内容过大', 413)
     chunks.push(chunk)
   }
   return Buffer.concat(chunks)
@@ -997,17 +1013,24 @@ const server = createServer(async (req, res) => {
         'content-type': 'text/plain; charset=utf-8',
       })
     }
-    const localRequest = isTrustedLocalRequest(req)
     const loopbackRequest = isLoopbackRequest(req)
+    const containerHostRequest = isContainerHostLocalRequest(req)
     // 带正确密钥的请求顺手种下 cookie，让局域网里打开的页面后续 fetch 自动带上密钥。
     if (!loopbackRequest && serverSettings.apiToken && apiTokenMatches(presentedAPIToken(req, url))) {
       rememberAPIToken(res)
     }
     if (url.pathname.startsWith('/api/')) {
-      if (!localRequest
+      // 容器宿主机与局域网客户端都可能表现为「私有地址 + Host: localhost」。
+      // 关闭共享时只给它保留恢复设置所需的端点；订阅、规则集、代理等数据/代理
+      // 端点不能因为伪造 Host 继续可用。
+      const containerHostRecoveryPath = url.pathname === '/api/settings'
+        || url.pathname === '/api/auth-status'
+        || url.pathname === '/api/health'
+      if (!loopbackRequest
         && !serverSettings.lanSharing
         && url.pathname !== '/api/auth-status'
-        && url.pathname !== '/api/health') {
+        && url.pathname !== '/api/health'
+        && !(containerHostRequest && containerHostRecoveryPath)) {
         return json(res, 403, { error: '局域网共享已关闭', code: 'lan_disabled' })
       }
       // 容器内 Host: localhost 只能用来识别宿主机页面，不能代替管理密钥；
@@ -1025,7 +1048,8 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname.startsWith('/api/settings')) {
-      if (!canManageSettings(req, url)) {
+      const settingsAction = url.pathname === '/api/settings/token' ? 'token' : req.method === 'GET' ? 'read' : 'write'
+      if (!canManageSettings(req, url, settingsAction)) {
         return json(res, 403, { error: '访问密钥设置只能在服务端本机修改', code: 'local_only' })
       }
       if (url.pathname === '/api/settings' && req.method === 'GET') {
@@ -1110,7 +1134,7 @@ const server = createServer(async (req, res) => {
         expiresAt: Date.now() + SHARE_TTL_MS,
         used: false,
       })
-      const name = url.searchParams.get('name') ?? ''
+      const name = normalizeSubscriptionTitle(url.searchParams.get('name'), '')
       return json(res, 200, {
         token,
         url: `/api/s/${token}${name ? `?name=${encodeURIComponent(name)}` : ''}`,
@@ -1162,11 +1186,10 @@ const server = createServer(async (req, res) => {
     // subscriptions are persisted to server/subscriptions.json so a restart
     // does not invalidate links clients already saved.
     if (url.pathname === '/api/subscribe' && req.method === 'POST') {
-      const raw = await readBody(req)
+      const raw = await readBody(req, 16 * 1024 * 1024)
       if (raw.length === 0) return json(res, 400, { error: '内容为空' })
-      if (raw.length > 16 * 1024 * 1024) return json(res, 400, { error: '订阅过大（>16MB）' })
       const contentType = String(req.headers['content-type'] ?? '')
-      let title = url.searchParams.get('title') ?? 'tower'
+      let title = normalizeSubscriptionTitle(url.searchParams.get('title'))
       let formats
       let targets = {}
       if (contentType.includes('application/json')) {
@@ -1176,7 +1199,9 @@ const server = createServer(async (req, res) => {
         } catch {
           return json(res, 400, { error: 'JSON 解析失败' })
         }
-        if (typeof parsed?.title === 'string' && parsed.title) title = parsed.title
+        if (typeof parsed?.title === 'string' && parsed.title) {
+          title = normalizeSubscriptionTitle(parsed.title)
+        }
         const src = parsed?.formats ?? {}
         formats = {}
         for (const key of SUB_FORMATS) {
@@ -1195,7 +1220,10 @@ const server = createServer(async (req, res) => {
         // 兼容旧客户端：纯文本 body 视为 base64 节点列表
         formats = { base64: raw.toString('utf8') }
       }
-      let token = url.searchParams.get('token')
+      let token = String(url.searchParams.get('token') ?? '').trim()
+      if (token && !normalizeAPIToken(token)) {
+        return json(res, 400, { error: '订阅 token 无效' })
+      }
       const isRefresh = !!token
       if (!token) token = randomBytes(16).toString('base64url')
       subscriptions.set(token, {
@@ -1251,7 +1279,7 @@ const server = createServer(async (req, res) => {
           'content-type': 'text/plain; charset=utf-8',
         })
       }
-      const name = url.searchParams.get('name') ?? sub.title ?? 'tower'
+      const name = normalizeSubscriptionTitle(url.searchParams.get('name') ?? sub.title)
       // HTTP 头只接受 latin1；中文标题会触发 ERR_INVALID_CHAR，这里做 ASCII 兜底。
       const asciiName = String(name).replace(/[^\x20-\x7E]/g, '').trim() || 'tower'
       return send(res, 200, rewriteRuleSetOrigins(payload, url.origin), {
@@ -1314,7 +1342,8 @@ const server = createServer(async (req, res) => {
       return
     }
     try {
-      json(res, 500, { error: String(error?.message ?? error) })
+      const status = error instanceof RequestError ? error.status : 500
+      json(res, status, { error: String(error?.message ?? error) })
     } catch {
       res.destroy()
     }

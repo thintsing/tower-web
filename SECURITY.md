@@ -11,7 +11,7 @@ Tower Web 是一个本地优先的工具，默认设计用于本机或可信局�
   - `/api/subscribe` 可写入订阅 token；
   - `/api/sub/:token` 可读取已发布配置。
 - 可以在「订阅设置 → 局域网与访问密钥」关闭局域网共享，或生成管理 API 访问密钥。启用后，非本机请求调用管理 API 必须带 `key` / `X-Tower-Key` / Bearer；页面用 `?key=` 打开会种下 HttpOnly cookie。本机 `127.0.0.1` / `::1` 不需要密钥。
-- Docker 下宿主机页面通常以私有地址 + `Host: localhost` 出现，服务端据此识别宿主机。启用密钥后，这类请求同样必须带正确密钥，伪造 Host 不能读取 `settings.json` 或管理密钥；但关闭共享时该识别仍用于让宿主机恢复设置，不能替代网络隔离。
+- Docker 下宿主机页面通常以私有地址 + `Host: localhost` 出现，服务端据此识别宿主机。启用密钥后，这类请求同样必须带正确密钥，伪造 Host 不能读取 `settings.json` 或管理密钥；没有密钥时也不能仅凭伪造 Host 创建首个密钥，首次密钥请用 `TOWER_API_TOKEN` 或在容器内对回环地址调用 `/api/settings/token`。关闭共享时该识别只保留 `/api/settings`、`/api/auth-status`、`/api/health` 以便宿主机恢复设置，订阅、规则集和代理端点仍拒绝；但它不能替代网络隔离。
 - 免管理密钥但仍受局域网共享开关约束的端点：`/api/health`、`/api/auth-status`、`/api/ruleset`，以及 GET `/api/sub/:token`、GET `/api/s/:token`。订阅 / 分享 token 和托管规则集地址本身是独立凭证，拿到即可读取对应内容。
 - 密钥只保护管理 API，不是公网级身份认证；公开部署前至少需要：反向代理 + 身份验证、网络访问控制、限流、审计日志，以及为订阅管理增加用户隔离。
 - 不需要局域网访问时，用 `HOST=127.0.0.1` 启动，或在设置页关闭局域网共享。

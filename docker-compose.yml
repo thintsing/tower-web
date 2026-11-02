@@ -8,6 +8,9 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: "8787"
+      # 可选的初始化管理密钥。容器内无法可靠区分「宿主机浏览器」和伪造
+      # Host 的局域网客户端；未设置密钥时，设置页不能从宿主机创建首个密钥。
+      # TOWER_API_TOKEN: change-me-at-least-16-chars
       # 从宿主机本机打开页面、又要复制给手机时，填宿主机的局域网地址；
       # 容器内网卡地址默认对手机不可达。
       # TOWER_PUBLIC_URL: http://192.168.1.10:8787

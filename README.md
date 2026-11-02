@@ -110,6 +110,18 @@ docker compose up -d
 
 容器默认 `HOST=0.0.0.0`、`PORT=8787`，打开 <http://127.0.0.1:8787>。已发布订阅保存在数据卷 `/app/data`，重建容器前请保留该卷；也可以用 `TOWER_DATA_DIR` 改路径。ICMP 测速依赖镜像内的 `ping`，不可用时自动回退 TCP。
 
+容器内无法可靠区分「宿主机浏览器」和伪造 `Host: localhost` 的局域网客户端。需要管理密钥时，建议启动时设置 `TOWER_API_TOKEN`（16–128 位 `A-Z/a-z/0-9/_/-`）：
+
+```bash
+docker run -d --name tower-web \
+  -p 8787:8787 \
+  -v tower-data:/app/data \
+  -e TOWER_API_TOKEN=replace-with-a-long-random-token \
+  ghcr.io/thintsing/tower-web:latest
+```
+
+未设置时，宿主机设置页不能创建首个密钥；可以在容器内对回环地址调用 `POST /api/settings/token`，或重启时设置 `TOWER_API_TOKEN`。
+
 Docker 内看到的网卡地址不是宿主机地址；如果从本机打开页面又要复制订阅地址给手机，请把 `TOWER_PUBLIC_URL` 设为宿主机的局域网地址：
 
 ```bash
@@ -123,11 +135,11 @@ docker run -d --name tower-web \
 推送 `v*.*.*` tag 后，GitHub Actions 会自动构建双架构镜像、推送 GHCR 并创建 Release：
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
-> 镜像默认允许局域网访问，可以在「订阅设置 → 局域网与访问密钥」关闭共享或生成 API 密钥。`-p 8787:8787` 仍会暴露到局域网，只建议在可信网络使用。
+> 镜像默认允许局域网访问，可以在「订阅设置 → 局域网与访问密钥」关闭共享或生成 API 密钥；Docker 下生成首个密钥建议用 `TOWER_API_TOKEN`。`-p 8787:8787` 仍会暴露到局域网，只建议在可信网络使用。
 
 ### 局域网 / 手机访问
 

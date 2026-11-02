@@ -23,8 +23,64 @@ jobs:
       - name: Run selfchecks
         shell: bash
         run: |
+          set -euo pipefail
+          data_dir="$(mktemp -d)"
+          export TOWER_DATA_DIR="$data_dir"
+          export HOST=127.0.0.1
+          export PORT=8787
+          node server/index.mjs > /tmp/tower-ci-server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          ready=0
+          for attempt in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:8787/api/health" >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            cat /tmp/tower-ci-server.log
+            exit 1
+          fi
+          # 让 selfcheck:yaml 的发布/分发 E2E 也指向隔离的临时服务端，
+          # 不依赖开发者本机 8787，也不写仓库里的 subscriptions.json。
+          export TOWER_BASE="http://127.0.0.1:8787"
           for check in asn auth backup batch catalog clients dns importers icons manual manual-form map matching protocols qr regressions remote rulesets yaml; do
             echo "::group::selfcheck:$check"
             npm run "selfcheck:$check"
             echo "::endgroup::"
           done
+
+      # 本机不一定有 Docker；在 CI 里真实构建并启动一次镜像，验证 Dockerfile、
+      # .dockerignore 和运行时的 /api/health。镜像不推送。
+      - name: Docker image smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 用假文件验证运行数据/密钥不会被打进镜像；CI 工作区是临时的。
+          printf '{"apiToken":"ci-secret"}' > server/settings.json
+          printf '{"ci":"secret"}' > server/subscriptions.json
+          cleanup() {
+            docker rm -f tower-web-ci >/dev/null 2>&1 || true
+            rm -f server/settings.json server/subscriptions.json
+          }
+          trap cleanup EXIT
+          docker build -t tower-web:ci .
+          docker run --rm tower-web:ci sh -c \
+            'test ! -e /app/server/settings.json && test ! -e /app/server/subscriptions.json'
+          docker run -d --name tower-web-ci -p 18787:8787 tower-web:ci
+          ready=0
+          for attempt in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:18787/api/health" >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            docker logs tower-web-ci
+            exit 1
+          fi
+          curl -fsS "http://127.0.0.1:18787/api/health"
+          docker rm -f tower-web-ci >/dev/null

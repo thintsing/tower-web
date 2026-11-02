@@ -1,14 +1,18 @@
 // 本机数据备份：只包含持久化快照，不包含测速结果、瞬时错误和密钥。
 // 恢复前由界面再次确认；备份文件本身含订阅地址与节点凭据，不能公开分享。
+import { PROXY_KIND_TITLES } from './models/types'
 import type {
   ClientTarget,
   ExportContentMode,
   LatencyTestMode,
   LocalRuleSet,
   NodeNameFilterSettings,
+  PolicyGroup,
   ProxyKind,
   ProxyNode,
+  RoutingRule,
   RuleScheme,
+  SchemeRuleSet,
   SubscriptionSource,
   TailnetConnection,
 } from './models/types'
@@ -89,6 +93,36 @@ function stringArray(value: unknown): string[] | undefined {
   return values.length === value.length ? values : undefined
 }
 
+const NODE_KINDS = new Set(Object.keys(PROXY_KIND_TITLES))
+
+function validGroup(value: unknown): value is PolicyGroup {
+  return isRecord(value)
+    && isString(value.name)
+    && isString(value.type)
+    && Array.isArray(value.options)
+    && value.options.every(isString)
+    && (value.nodeFilter === undefined || isString(value.nodeFilter))
+}
+
+function validRule(value: unknown): value is RoutingRule {
+  return isRecord(value)
+    && isString(value.type)
+    && isString(value.group)
+    && (value.value === undefined || isString(value.value))
+    && (value.raw === undefined || isString(value.raw))
+    && (value.options === undefined || stringArray(value.options) !== undefined)
+    && (value.noResolve === undefined || typeof value.noResolve === 'boolean')
+}
+
+function validRuleSet(value: unknown): value is SchemeRuleSet {
+  return isRecord(value)
+    && isString(value.id)
+    && isString(value.name)
+    && isString(value.group)
+    && Array.isArray(value.rules)
+    && value.rules.every(validRule)
+}
+
 function validSource(value: unknown): value is SubscriptionSource {
   return isRecord(value)
     && isString(value.id)
@@ -102,6 +136,7 @@ function validNode(value: unknown): value is ProxyNode {
   return isRecord(value)
     && isString(value.id)
     && isString(value.kind)
+    && NODE_KINDS.has(value.kind)
     && isString(value.name)
     && isString(value.server)
     && typeof value.port === 'number'
@@ -111,6 +146,8 @@ function validNode(value: unknown): value is ProxyNode {
     && (value.sourceID === undefined || isString(value.sourceID))
     && (value.isManual === undefined || typeof value.isManual === 'boolean')
     && (value.isEnabled === undefined || typeof value.isEnabled === 'boolean')
+    && (value.tls === undefined || typeof value.tls === 'boolean')
+    && (value.skipCertificateVerification === undefined || typeof value.skipCertificateVerification === 'boolean')
 }
 
 function validScheme(value: unknown): value is RuleScheme {
@@ -118,7 +155,13 @@ function validScheme(value: unknown): value is RuleScheme {
     && isString(value.id)
     && isString(value.name)
     && Array.isArray(value.groups)
+    && value.groups.every(validGroup)
     && Array.isArray(value.rules)
+    && value.rules.every(validRule)
+    && (value.customRules === undefined
+      || (Array.isArray(value.customRules) && value.customRules.every(validRule)))
+    && (value.ruleSets === undefined
+      || (Array.isArray(value.ruleSets) && value.ruleSets.every(validRuleSet)))
 }
 
 function validLocalRuleSet(value: unknown): value is LocalRuleSet {
@@ -126,6 +169,7 @@ function validLocalRuleSet(value: unknown): value is LocalRuleSet {
     && isString(value.id)
     && isString(value.name)
     && Array.isArray(value.rules)
+    && value.rules.every(validRule)
 }
 
 function validTailnet(value: unknown): value is TailnetConnection {
@@ -133,6 +177,7 @@ function validTailnet(value: unknown): value is TailnetConnection {
     && isString(value.id)
     && isString(value.name)
     && Array.isArray(value.subnets)
+    && value.subnets.every(isString)
     && typeof value.isEnabled === 'boolean'
 }
 

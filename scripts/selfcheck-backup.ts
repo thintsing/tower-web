@@ -166,6 +166,32 @@ function main(): void {
     assert.throws(() => parseBackup(wrap(badEnabled)), /订阅数据/)
   })
 
+  check('备份会拒绝损坏的方案组、规则、规则集与节点类型', () => {
+    const badGroup = {
+      ...DATA,
+      customSchemes: [{ id: 'scheme-1', name: '坏方案', groups: [null], rules: [] }],
+    }
+    assert.throws(() => parseBackup(wrap(badGroup)), /规则方案/)
+
+    const badRule = {
+      ...DATA,
+      customSchemes: [{
+        id: 'scheme-2', name: '坏规则', groups: [],
+        rules: [{ type: 'DOMAIN', value: 'example.com' }],
+      }],
+    }
+    assert.throws(() => parseBackup(wrap(badRule)), /规则方案/)
+
+    const badRuleSet = {
+      ...DATA,
+      localRuleSets: [{ id: 'set-1', name: '坏规则集', rules: [null] }],
+    }
+    assert.throws(() => parseBackup(wrap(badRuleSet)), /规则集/)
+
+    const badKind = { ...DATA, nodes: [{ ...DATA.nodes[0], kind: 'not-a-real-kind' }] }
+    assert.throws(() => parseBackup(wrap(badKind)), /节点数据/)
+  })
+
   check('备份不保留未知密钥字段', () => {
     const parsed = parseBackup(wrap({ ...DATA, tailnetAuthKeys: { secret: 'key' } }))
     assert.equal('tailnetAuthKeys' in parsed.data, false)

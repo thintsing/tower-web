@@ -607,10 +607,15 @@ await checkAsync('畸形 Host 不崩溃；容器内伪造 Host 不能绕过管�
     }
     return output
   }
-  const raw = (path: string, host: string, address = '127.0.0.1'): Promise<{ status: number; body: string }> =>
+  const raw = (
+    path: string,
+    host: string,
+    address = '127.0.0.1',
+    method = 'GET',
+  ): Promise<{ status: number; body: string }> =>
     new Promise((resolve, reject) => {
       const socket = connect(port, address, () => {
-        socket.write(`GET ${path} HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`)
+        socket.write(`${method} ${path} HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`)
       })
       let output = ''
       socket.on('data', (chunk) => { output += chunk })
@@ -657,10 +662,30 @@ await checkAsync('畸形 Host 不崩溃；容器内伪造 Host 不能绕过管�
     assert.equal(health.status, 200)
     assert.equal(child.exitCode, null)
 
+    // 输入校验：非法订阅 token 直接拒绝；请求体超过上限返回 413，
+    // 而不是走到外层 catch 变成 500。
+    const badToken = await originalFetch(`http://127.0.0.1:${port}/api/subscribe?token=bad`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: 'bad-token', formats: { base64: 'eA==' } }),
+    })
+    assert.equal(badToken.status, 400)
+    const oversizedShare = await originalFetch(`http://127.0.0.1:${port}/api/share`, {
+      method: 'POST',
+      headers: { 'content-type': 'text/plain' },
+      body: Buffer.alloc(8 * 1024 * 1024 + 1),
+    })
+    assert.equal(oversizedShare.status, 413)
+
     if (lan) {
       // 宿主机通过 Docker 端口映射访问时是私有地址 + Host: localhost。
       const bootstrap = await raw('/api/settings', `localhost:${port}`, lan)
       assert.equal(bootstrap.status, 200)
+      // 没有密钥时，不能仅凭伪造成 localhost 的 Host 头创建首个密钥，
+      // 否则局域网客户端可以抢先设置密钥并接管实例。
+      const preToken = await raw('/api/settings/token', `localhost:${port}`, lan, 'POST')
+      assert.equal(preToken.status, 403)
+      assert.match(preToken.body, /local_only/)
       const token = await originalFetch(`http://127.0.0.1:${port}/api/settings/token`, { method: 'POST' })
         .then((response) => response.json() as Promise<{ apiToken?: string }>)
         .then((body) => body.apiToken ?? '')
@@ -686,6 +711,23 @@ await checkAsync('畸形 Host 不崩溃；容器内伪造 Host 不能绕过管�
       assert.equal(network.status, 401)
       const networkAuthorized = await raw(`/api/network?key=${encodeURIComponent(token)}`, `localhost:${port}`, lan)
       assert.equal(networkAuthorized.status, 200)
+      // 关闭共享后，即使 Host 头伪造成 localhost，也只保留恢复设置所需的端点。
+      const disable = await originalFetch(`http://127.0.0.1:${port}/api/settings`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ lanSharing: false }),
+      })
+      assert.equal(disable.status, 200)
+      const blockedNetwork = await raw(`/api/network?key=${encodeURIComponent(token)}`, `localhost:${port}`, lan)
+      assert.equal(blockedNetwork.status, 403)
+      const blockedRuleset = await raw(
+        '/api/ruleset?format=mrs&behavior=domain&file=ACL4SSR_Apple.list',
+        `localhost:${port}`,
+        lan,
+      )
+      assert.equal(blockedRuleset.status, 403)
+      const recovery = await raw(`/api/settings?key=${encodeURIComponent(token)}`, `localhost:${port}`, lan)
+      assert.equal(recovery.status, 200)
     } else {
       console.log('… 没有私有局域网地址，跳过容器 Host 鉴权检查')
     }
