@@ -162,6 +162,8 @@ function main(): void {
     assert.throws(() => parseBackup(wrap(badNode)), /节点数据/)
     const badSource = { ...DATA, sources: [{ id: 1, name: '坏订阅', url: '' }] }
     assert.throws(() => parseBackup(wrap(badSource)), /订阅数据/)
+    const badEnabled = { ...DATA, sources: [{ ...DATA.sources[0], isEnabled: 0 }] }
+    assert.throws(() => parseBackup(wrap(badEnabled)), /订阅数据/)
   })
 
   check('备份不保留未知密钥字段', () => {

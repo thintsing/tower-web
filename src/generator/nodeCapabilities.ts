@@ -111,9 +111,13 @@ export function hysteria2ObfsSupported(node: ProxyNode, target?: ClientTarget): 
   if (node.kind !== 'hysteria2') return true
   const obfs = hysteria2ObfsType(node)
   if (!obfs) return true
-  if (target && ['surge', 'surge-mac', 'shadowrocket', 'loon'].includes(target)) {
+  // Surge 的 Salamander 参数目前只在 Mac 版文档中出现；iOS 版写入未知参数
+  // 会得到无法加载的策略，因此 iOS 目标宁可跳过该节点。
+  if (target === 'surge') return false
+  if (target && ['surge-mac', 'shadowrocket', 'loon'].includes(target)) {
     if (obfs.type !== 'salamander') return false
     if (target === 'loon' && LOON_DELIMITERS.test(obfs.password)) return false
+    if (target === 'surge-mac' && (obfs.password.includes(',') || /[\r\n]/.test(obfs.password))) return false
   }
   return true
 }

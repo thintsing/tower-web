@@ -138,6 +138,36 @@ function clashProxy(entry: unknown, sourceID?: string): ProxyNode | undefined {
   const hasRealityOptions = !!realityOptions(d) || str(d['security'])?.toLowerCase() === 'reality'
 
   const transport = kind === 'masque' ? undefined : pluginTransport ?? normalizedTransport(str(d['network']))
+
+  // Clash / mihomo 把 WebSocket、gRPC、HTTP/2、XHTTP 的路径和 Host 放在
+  // 嵌套的 *-opts 里。只读顶层 host/path 会让订阅里的 ws 节点丢掉
+  // path 和 Host，导出后连不上。
+  const wsOpts = subRecord(d, 'ws-opts')
+  const httpOpts = subRecord(d, 'http-opts')
+  const h2Opts = subRecord(d, 'h2-opts')
+  const grpcOpts = subRecord(d, 'grpc-opts')
+  const xhttpOpts = subRecord(d, 'xhttp-opts')
+  const nestedHost = transport === 'ws' || transport === 'httpupgrade'
+    ? headerField(subRecord(wsOpts ?? {}, 'headers'), 'Host')
+    : transport === 'http'
+      ? headerField(subRecord(httpOpts ?? {}, 'headers'), 'Host') ?? firstString(httpOpts?.['host'])
+      : transport === 'h2'
+        ? firstString(h2Opts?.['host'])
+        : transport === 'xhttp'
+          ? firstString(xhttpOpts?.['host'])
+          : undefined
+  const nestedPath = transport === 'ws' || transport === 'httpupgrade'
+    ? firstString(wsOpts?.['path'])
+    : transport === 'http'
+      ? firstString(httpOpts?.['path'])
+      : transport === 'h2'
+        ? firstString(h2Opts?.['path'])
+        : transport === 'xhttp'
+          ? firstString(xhttpOpts?.['path'])
+          : transport === 'grpc'
+            ? firstString(grpcOpts?.['grpc-service-name']) ?? firstString(grpcOpts?.['service-name'])
+            : undefined
+
   const node: ProxyNode = {
     id: nextNodeID(),
     sourceID,
@@ -160,12 +190,15 @@ function clashProxy(entry: unknown, sourceID?: string): ProxyNode | undefined {
       || pluginTLS || boolString(str(d['tls'])),
     sni: str(d['servername']) ?? str(d['sni']),
     hostHeader:
-      sip003Plugin === 'v2ray-plugin' ? obfsHost : str(d['authority']) ?? str(d['host']),
+      sip003Plugin === 'v2ray-plugin'
+        ? obfsHost
+        : nestedHost ?? str(d['authority']) ?? str(d['host']),
     path:
-      pluginPath ??
-      (transport === 'grpc'
-        ? str(d['grpc-service-name']) ?? str(d['service-name']) ?? str(d['path'])
-        : str(d['path'])),
+      pluginPath
+        ?? nestedPath
+        ?? (transport === 'grpc'
+          ? str(d['grpc-service-name']) ?? str(d['service-name']) ?? str(d['path'])
+          : str(d['path'])),
     alpn: alpnValue(d['alpn']),
     realityPublicKey: hasRealityOptions
       ? str(realityOpts?.['public-key']) ?? str(realityOpts?.['pbk'])
@@ -230,6 +263,31 @@ function subRecord(d: Record<string, unknown>, key: string): Record<string, unkn
   const value = d[key]
   if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
     return value as Record<string, unknown>
+  }
+  return undefined
+}
+
+/** mihomo 的 path / host 可能写成标量，也可能是单元素数组。 */
+function firstString(value: unknown): string | undefined {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const parsed = str(item)
+      if (parsed) return parsed
+    }
+    return undefined
+  }
+  return str(value)
+}
+
+/** HTTP header 名大小写不敏感；Clash 常见 `headers: { Host: … }`。 */
+function headerField(
+  headers: Record<string, unknown> | undefined,
+  name: string,
+): string | undefined {
+  if (!headers) return undefined
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() !== name.toLowerCase()) continue
+    return firstString(value)
   }
   return undefined
 }

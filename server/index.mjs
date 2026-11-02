@@ -203,6 +203,17 @@ function isLoopbackAddress(address) {
   return address === '::1' || address === '127.0.0.1'
 }
 
+function isLoopbackRequest(req) {
+  return isLoopbackAddress(normalizedRemoteAddress(req))
+}
+
+/** 容器内看到的宿主机访问常是 172.x；用 Host 头区分宿主机浏览器。 */
+function isContainerHostLocalRequest(req) {
+  return process.env.TOWER_CONTAINER === '1'
+    && isPrivateAddress(normalizedRemoteAddress(req))
+    && ['localhost', '::1', '127.0.0.1'].includes(requestHostname(req))
+}
+
 function requestHostname(req) {
   const raw = String(req.headers.host ?? '').trim()
   if (!raw) return ''
@@ -230,12 +241,18 @@ function isPrivateAddress(address) {
 function isTrustedLocalRequest(req) {
   const remote = normalizedRemoteAddress(req)
   if (isLoopbackAddress(remote)) return true
-  if (process.env.TOWER_CONTAINER === '1'
-    && isPrivateAddress(remote)
-    && ['localhost', '::1', '127.0.0.1'].includes(requestHostname(req))) {
-    return true
-  }
-  return false
+  return isContainerHostLocalRequest(req)
+}
+
+/**
+ * 设置接口允许本机直连；Docker 宿主机通过 Host 头识别，但一旦启用管理密钥，
+ * 仍必须带上正确密钥。否则局域网里的任意客户端都能伪造 `Host: localhost`
+ * 读取 settings.json 里的密钥。
+ */
+function canManageSettings(req, url) {
+  if (isLoopbackRequest(req)) return true
+  return isContainerHostLocalRequest(req)
+    && apiTokenMatches(presentedAPIToken(req, url))
 }
 
 function cookieValue(req, name) {
@@ -294,7 +311,10 @@ function apiAuthExempt(url, method) {
 }
 
 function authStatus(req, url) {
-  const local = isTrustedLocalRequest(req)
+  // 容器宿主机通过 Host: localhost 识别；但只有没有管理密钥（或已经带对
+  // 密钥）时才把 local 报给页面，避免局域网伪造 Host 后绕过访问门。
+  const local = isLoopbackRequest(req)
+    || (isContainerHostLocalRequest(req) && apiTokenMatches(presentedAPIToken(req, url)))
   return {
     lanSharing: serverSettings.lanSharing,
     requiresAuth: !!serverSettings.apiToken,
@@ -965,21 +985,36 @@ async function readBody(req) {
 }
 
 const server = createServer(async (req, res) => {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
   try {
+    // Host / 请求目标都来自外部输入；畸形 Host（例如单个 `%`）会让 new URL
+    // 抛出，而 async 监听器里的异常不会经过下面的响应逻辑，会直接终止进程。
+    // 这里先兜底成 400，避免一条坏请求把整个本地服务打掉。
+    let url
+    try {
+      url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+    } catch {
+      return send(res, 400, 'bad request', {
+        'content-type': 'text/plain; charset=utf-8',
+      })
+    }
     const localRequest = isTrustedLocalRequest(req)
+    const loopbackRequest = isLoopbackRequest(req)
     // 带正确密钥的请求顺手种下 cookie，让局域网里打开的页面后续 fetch 自动带上密钥。
-    if (!localRequest && serverSettings.apiToken && apiTokenMatches(presentedAPIToken(req, url))) {
+    if (!loopbackRequest && serverSettings.apiToken && apiTokenMatches(presentedAPIToken(req, url))) {
       rememberAPIToken(res)
     }
-    if (url.pathname.startsWith('/api/') && !localRequest) {
-      if (!serverSettings.lanSharing
+    if (url.pathname.startsWith('/api/')) {
+      if (!localRequest
+        && !serverSettings.lanSharing
         && url.pathname !== '/api/auth-status'
         && url.pathname !== '/api/health') {
         return json(res, 403, { error: '局域网共享已关闭', code: 'lan_disabled' })
       }
+      // 容器内 Host: localhost 只能用来识别宿主机页面，不能代替管理密钥；
+      // 否则局域网客户端伪造 Host 就能读取 settings.json 里的密钥。
       if (serverSettings.apiToken
         && !apiAuthExempt(url, req.method)
+        && !loopbackRequest
         && !apiTokenMatches(presentedAPIToken(req, url))) {
         return json(res, 401, { error: '需要访问密钥', code: 'auth_required' })
       }
@@ -990,7 +1025,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname.startsWith('/api/settings')) {
-      if (!localRequest) {
+      if (!canManageSettings(req, url)) {
         return json(res, 403, { error: '访问密钥设置只能在服务端本机修改', code: 'local_only' })
       }
       if (url.pathname === '/api/settings' && req.method === 'GET') {
@@ -1272,7 +1307,17 @@ const server = createServer(async (req, res) => {
 
     json(res, 404, { error: 'not found' })
   } catch (error) {
-    json(res, 500, { error: String(error?.message ?? error) })
+    // 已经写出响应头后不能再写 JSON；直接断开连接，避免二次 writeHead
+    // 在 catch 里再次抛出、变成未处理的 Promise 拒绝。
+    if (res.headersSent || res.writableEnded) {
+      res.destroy()
+      return
+    }
+    try {
+      json(res, 500, { error: String(error?.message ?? error) })
+    } catch {
+      res.destroy()
+    }
   }
 })
 

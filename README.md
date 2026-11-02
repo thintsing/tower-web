@@ -167,7 +167,7 @@ $env:HOST='127.0.0.1'; npm start
 | `npm run selfcheck:protocols` | 校验协议解析与降级 |
 
 <details>
-<summary>全部 18 项自检</summary>
+<summary>全部 19 项自检</summary>
 
 ```text
 selfcheck:asn         离线 IP / ASN 查询
@@ -185,12 +185,13 @@ selfcheck:map         地图地区聚合
 selfcheck:matching    策略组拖动后的规则顺序
 selfcheck:protocols   协议解析与客户端降级
 selfcheck:qr          二维码生成与解码
+selfcheck:regressions 审计回归：凭据编码 / Clash 嵌套字段 / sing-box 顺序 / 地图国家码
 selfcheck:remote      代理集合与远程规则集
 selfcheck:rulesets    规则集方言转换
 selfcheck:yaml        Clash YAML 结构
 ```
 
-自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 18 项自检。
+自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 19 项自检。
 
 </details>
 
@@ -198,6 +199,8 @@ selfcheck:yaml        Clash YAML 结构
 
 - 服务端面向本机或可信局域网；可选管理 API 密钥和局域网共享开关，但没有用户隔离、限流或公网级防护，`/api/health`、订阅 / 分享 / 托管规则集等 GET 端点仍按独立凭证或公开规则处理。
 - 不能部署到 GitHub Pages，需要 Node 运行环境；公网部署必须额外加安全层。
+- 订阅解析对 Surge `[Proxy]` 目前只识别 Shadowsocks、MASQUE 和单节点 URI；Loon `[Proxy]`、Quantumult X `[server_local]` 的节点行尚未完整导入，会按无法识别行处理。需要这些格式时请优先使用 Clash YAML / URI 列表。
+- 手动编辑 SSH 节点时表单只保留密码登录；导入时携带的私钥和口令不会回填到表单，保存后会丢失，请重新导入。
 - SSR、部分协议和部分规则类型只在支持它的客户端保留，导出页会列出跳过项。
 - 规则兼容性、协议能力、Tailscale 和 DNS / ECS 的具体限制随客户端不同，导出前请查看页面提示。
 - 数据备份是覆盖恢复，不提供合并；备份不含 Tailscale Auth Key、测速结果和已发布 token。

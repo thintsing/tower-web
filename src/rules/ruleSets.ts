@@ -185,10 +185,6 @@ function parseEgern(textBody: string): ParsedRuleSet {
   return { format: 'egern', rules: requireRules(rules, 'Egern YAML') }
 }
 
-function singboxCondition(type: string, value: string): string {
-  return `(${type},${value})`
-}
-
 function parseSingBox(textBody: string): ParsedRuleSet {
   let root: unknown
   try {
@@ -202,45 +198,24 @@ function parseSingBox(textBody: string): ParsedRuleSet {
   const rules: RuleSetRule[] = []
   for (const rawRule of root.rules) {
     if (!isDict(rawRule)) throw new Error('sing-box rules 中存在非对象条目')
-    const families = Object.entries(rawRule).map(([field, value]) => {
+    // sing-box 的 domain* / geoip / ip_cidr 在同一个 OR 条件组里；拆成多条
+    // 规则后语义等价，且所有客户端都能表达，不需要客户端支持逻辑规则。
+    for (const [field, value] of Object.entries(rawRule)) {
       const mapped = SINGBOX_FIELDS[field]
       if (!mapped) throw new Error(`不支持的 sing-box 规则字段：${field}`)
       const values = stringList(value)
       if (!values.length) throw new Error(`sing-box ${field} 缺少值`)
-      return {
-        field,
-        conditions: values.map((item) => ({
-          type: field === 'ip_cidr'
-            ? (item.includes(':') ? 'IP-CIDR6' : 'IP-CIDR')
-            : mapped,
-          value: item,
-        })),
-      }
-    })
-    if (!families.length) continue
-    if (families.length === 1) {
-      const [family] = families
-      for (const condition of family.conditions) {
+      for (const item of values) {
+        const type = field === 'ip_cidr'
+          ? (item.includes(':') ? 'IP-CIDR6' : 'IP-CIDR')
+          : mapped
         rules.push({
-          type: condition.type,
-          value: condition.value,
-          noResolve: IP_TYPES.has(condition.type),
+          type,
+          value: item,
+          noResolve: IP_TYPES.has(type),
         })
       }
-      continue
     }
-    const branches = families.map((family) => {
-      if (family.conditions.length === 1) {
-        const [condition] = family.conditions
-        return singboxCondition(condition.type, condition.value)
-      }
-      return `(OR,(${family.conditions.map((condition) => singboxCondition(condition.type, condition.value)).join(',')}))`
-    })
-    rules.push({
-      type: 'AND',
-      raw: `AND,(${branches.join(',')})`,
-      noResolve: false,
-    })
   }
   return { format: 'singbox', rules: requireRules(rules, 'sing-box source JSON') }
 }

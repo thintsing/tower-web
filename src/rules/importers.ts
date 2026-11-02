@@ -936,6 +936,11 @@ const SINGBOX_RULE_TYPES: Record<string, string> = {
   user_agent: 'USER-AGENT',
 }
 
+/** sing-box 默认规则里 domain* / geoip / ip_cidr 属于同一个 OR 条件组。 */
+const SINGBOX_OR_FIELDS = new Set([
+  'domain', 'domain_suffix', 'domain_keyword', 'domain_regex', 'geoip', 'ip_cidr',
+])
+
 const SINGBOX_GROUP_TYPES = new Set([
   'selector',
   'urltest',
@@ -1030,20 +1035,30 @@ function singboxRules(
       ruleSetFormat: entry.format,
     }))
   if (ruleSetConditions.length) families.push({ conditions: ruleSetConditions })
+  let orFamily: Family | undefined
   for (const [key, value] of Object.entries(item)) {
     if (['outbound', 'action', 'invert', 'type', 'mode', 'rules', 'rule_set'].includes(key)) continue
     const mapped = key === 'ip_cidr' ? 'IP-CIDR' : SINGBOX_RULE_TYPES[key]
     if (!mapped) continue
     const values = stringList(value).map(unquote)
     if (!values.length) continue
-    families.push({
-      conditions: values.map((entry) => ({
-        type: key === 'ip_cidr'
-          ? (entry.includes(':') ? 'IP-CIDR6' : 'IP-CIDR')
-          : mapped,
-        value: entry,
-      })),
-    })
+    const conditions: Condition[] = values.map((entry) => ({
+      type: key === 'ip_cidr'
+        ? (entry.includes(':') ? 'IP-CIDR6' : 'IP-CIDR')
+        : mapped,
+      value: entry,
+    }))
+    if (SINGBOX_OR_FIELDS.has(key)) {
+      // domain、domain_suffix、geoip、ip_cidr 等属于同一个 OR 组；
+      // 如果当成独立 family，就会错误地生成 AND（要求域名和 IP 同时命中）。
+      if (!orFamily) {
+        orFamily = { conditions: [] }
+        families.push(orFamily)
+      }
+      orFamily.conditions.push(...conditions)
+    } else {
+      families.push({ conditions })
+    }
   }
   if (!families.length) return []
 

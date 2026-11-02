@@ -64,6 +64,16 @@ export function regionByCode(countryCode: string): NodeRegion | undefined {
   return { code, name: entry.cn, flag: flagEmoji(code), lat: entry.lat, lon: entry.lon }
 }
 
+/** 两位国家代码 → ISO_A3（地图 numeric id / 外部数据交换用）。 */
+export function iso3ForRegionCode(countryCode: string): string | undefined {
+  let code = countryCode.trim().toUpperCase()
+  if (code === 'UK') code = 'GB'
+  const entry = countries[code]
+  const iso3 = entry?.codes?.[0]?.trim().toUpperCase()
+  if (iso3) return iso3
+  return /^[A-Z]{3}$/.test(code) ? code : undefined
+}
+
 /** Regional-indicator pair the airport prefixed the name with, if any. */
 function flaggedCountryCode(name: string): string | undefined {
   const indicators = [...name].filter((c) => {
@@ -250,7 +260,7 @@ function matchedCode(text: string, allowCodes = true): string | undefined {
 }
 
 /** Where a node is, decided from what it is called. */
-export function regionForName(name: string): NodeRegion | undefined {
+function resolveRegionForName(name: string): NodeRegion | undefined {
   const flagged = flaggedCountryCode(name)
   if (flagged) {
     const region = regionByCode(flagged)
@@ -258,6 +268,25 @@ export function regionForName(name: string): NodeRegion | undefined {
   }
   const code = matchedCode(name)
   return code ? regionByCode(code) : undefined
+}
+
+/**
+ * 节点名 → 地区会在订阅列表、地图和筛选器里被反复查询；命中缓存后
+ * 避免每次重新分词、匹配多语言国家名。名称可能很长，超长名称直接跳过缓存。
+ */
+const REGION_NAME_CACHE_LIMIT = 16384
+const regionNameCache = new Map<string, NodeRegion | undefined>()
+
+export function regionForName(name: string): NodeRegion | undefined {
+  if (name.length > 256) return resolveRegionForName(name)
+  if (regionNameCache.has(name)) return regionNameCache.get(name)
+  const region = resolveRegionForName(name)
+  if (regionNameCache.size >= REGION_NAME_CACHE_LIMIT) {
+    const oldest = regionNameCache.keys().next().value
+    if (oldest !== undefined) regionNameCache.delete(oldest)
+  }
+  regionNameCache.set(name, region)
+  return region
 }
 
 /** Manual override > name > offline IP lookup. */
@@ -282,11 +311,14 @@ export function filterNodesByRegionCodes(nodes: ProxyNode[], codes: string[]): P
 }
 
 /** Every country available for manual overrides, including non-curated ones. */
+let allRegionsCache: NodeRegion[] | undefined
 export function allRegions(): NodeRegion[] {
+  if (allRegionsCache) return allRegionsCache
   const merged = new Map<string, NodeRegion>(curatedRegions)
   for (const code of Object.keys(countries)) {
     const region = regionByCode(code)
     if (region && !merged.has(region.code)) merged.set(region.code, region)
   }
-  return [...merged.values()].sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'))
+  allRegionsCache = [...merged.values()].sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'))
+  return allRegionsCache
 }

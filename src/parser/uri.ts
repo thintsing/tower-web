@@ -90,7 +90,9 @@ function parseWireGuardURL(raw: string, sourceID?: string): ProxyNode | undefine
   node.name = normalizedName(fragment ?? 'WireGuard', normalizedHost(rawHost))
   node.server = normalizedHost(rawHost)
   node.port = port
-  node.wireGuardPrivateKey = url.username || undefined
+  // URL.username 保留百分号编码（`%2B` 不会变回 `+`）；WireGuard 私钥常带
+  // `+` / `/` / `=`，必须先解码一次，否则导出时会被二次编码。
+  node.wireGuardPrivateKey = url.username ? safeDecode(url.username) : undefined
   node.wireGuardPublicKey = query['publickey'] ?? query['public-key']
   node.wireGuardPreSharedKey = query['presharedkey'] ?? query['pre-shared-key'] ?? query['preshared-key']
   node.wireGuardIPv4 = ipv4
@@ -376,7 +378,9 @@ function parseVMess(raw: string, sourceID?: string): ProxyNode | undefined {
   const server = str(json['add'])
   const port = int(json['port'])
   const uuid = str(json['id'])
-  if (!server || !port || !uuid) return parseLegacyVMess(raw, sourceID)
+  if (!server || port === undefined || !Number.isInteger(port) || port < 1 || port > 65535 || !uuid) {
+    return parseLegacyVMess(raw, sourceID)
+  }
 
   const tlsValue = str(json['tls'])?.toLowerCase()
   const network = str(json['net']) ?? str(json['network'])
@@ -464,7 +468,7 @@ function parseLegacyVMess(raw: string, sourceID?: string): ProxyNode | undefined
     node.hostHeader = obfsParam?.split(/[|@,]/)[0]
     node.path = safeDecode(query['path']) ?? '/'
   }
-  node.alterID = query['alterid'] ? Number(query['alterid']) : undefined
+  node.alterID = intOrUndefined(query['alterid'])
   return node
 }
 
@@ -533,10 +537,11 @@ function parseStandardURL(raw: string, kind: ProxyKind, sourceID?: string): Prox
   const flow =
     query['flow'] ?? (kind === 'vless' && query['xtls'] === '2' ? 'xtls-rprx-vision' : undefined)
 
-  // URL userinfo is already percent-decoded once by the URL parser. Do not
-  // decode again: a literal `%41` in a secret must stay literal.
-  const credential = url.username || undefined
-  const passwordPart = url.password || undefined
+  // URL 的 username / password getter 仍保留百分号编码，并不会自动解码；
+  // 这里只解码一次，生成分享链接时再编码一次，才能保证密码里的 @ : / + 等
+  // 字符往返后保持原值。不能直接对 url.username 使用两次 decode。
+  const credential = url.username ? safeDecode(url.username) : undefined
+  const passwordPart = url.password ? safeDecode(url.password) : undefined
 
   // TUIC v5: `tuic://uuid:password@host`; Shadowrocket dialect puts both in query.
   const tuicUUID = [credential, query['uuid']].find((v) => v)
@@ -563,6 +568,12 @@ function parseStandardURL(raw: string, kind: ProxyKind, sourceID?: string): Prox
   } else if (kind === 'hysteria') {
     node.password = credential ?? query['auth'] ?? query['auth_str'] ?? query['authstr']
   } else if (kind === 'trojan' || kind === 'hysteria2' || kind === 'anytls') {
+    node.password = credential
+  } else if (kind === 'ssh') {
+    node.username = credential
+    node.password = passwordPart
+  } else if (kind === 'snell') {
+    // Snell 分享链接把 PSK 放在 userinfo，而不是 password 参数。
     node.password = credential
   } else {
     node.password = passwordPart
@@ -617,6 +628,8 @@ function parseStandardURL(raw: string, kind: ProxyKind, sourceID?: string): Prox
   if (kind === 'hysteria2') {
     node.obfs = query['obfs']
     node.obfsParam = query['obfs-password'] ?? query['obfspassword'] ?? query['obfs_password']
+    node.upMbps = mbps(query['upmbps'] ?? query['up'])
+    node.downMbps = mbps(query['downmbps'] ?? query['down'])
   }
   if (kind === 'anytls') {
     node.idleSessionCheckInterval = intOrUndefined(

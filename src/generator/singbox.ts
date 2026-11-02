@@ -353,6 +353,10 @@ function singboxWireGuardOutbound(node: ProxyNode, name: string): Outbound | und
   const outbound: Outbound = {
     type: 'wireguard',
     tag: name,
+    // 旧式 outbound 不会从顶层 endpoint 继承服务端地址；漏掉这两个字段
+    // 时 Hiddify 能导入配置，但这个 WireGuard 节点永远无法拨号。
+    server: node.server,
+    server_port: node.port,
     local_address: wireGuardAddresses(node),
     private_key: node.wireGuardPrivateKey,
     peer_public_key: node.wireGuardPublicKey,
@@ -750,27 +754,30 @@ export function generateSingBox(
   const remoteRuleSetDefs: Record<string, unknown>[] = []
   const dnsRuleSetDefs: Record<string, unknown>[] = []
   const dnsRuleSetTags = new Map<string, string>()
-  const remoteRuleRules: Record<string, unknown>[] = []
   const ruleSetTags = new Map<string, string>()
   for (const rule of filteredRules) {
     if (rule.type !== 'RULE-SET' || !rule.value) continue
     if (!supportsRuleSetReference(rule, 'json', options.target)) continue
     const format = ruleSetFormatOfRule(rule)
     if (!format) continue
-    const tag = `tower-rule-set-${remoteRuleSetDefs.length + 1}`
-    remoteRuleSetDefs.push({
-      type: 'remote',
-      tag,
-      format: format === 'singbox-binary' ? 'binary' : 'source',
-      url: rule.value,
-      update_interval: '1d',
-    })
-    ruleSetTags.set(rule.value, tag)
+    let tag = ruleSetTags.get(rule.value)
+    if (!tag) {
+      tag = `tower-rule-set-${remoteRuleSetDefs.length + 1}`
+      remoteRuleSetDefs.push({
+        type: 'remote',
+        tag,
+        format: format === 'singbox-binary' ? 'binary' : 'source',
+        url: rule.value,
+        update_interval: '1d',
+      })
+      ruleSetTags.set(rule.value, tag)
+    }
     // DNS 规则不能引用含 IP 条件的 SRS；用同一列表的 domain-only 版本。
     if (rule.ruleSetDNSURL
       && options.target === 'sing-box'
       && dnsProxyGroup
-      && protection !== 'follow-scheme') {
+      && protection !== 'follow-scheme'
+      && !dnsRuleSetTags.has(rule.value)) {
       const dnsTag = `tower-rule-set-dns-${dnsRuleSetDefs.length + 1}`
       dnsRuleSetDefs.push({
         type: 'remote',
@@ -781,59 +788,61 @@ export function generateSingBox(
       })
       dnsRuleSetTags.set(rule.value, dnsTag)
     }
-    remoteRuleRules.push(
-      rule.group.toUpperCase() === 'REJECT'
-        ? { rule_set: [tag], action: 'reject' }
-        : { rule_set: [tag], outbound: rule.group },
-    )
   }
 
-  // Route rules, bucketed per group.
+  // 路由规则必须保持源方案里的先后顺序：sing-box 是第一条命中即生效。
+  // 只合并“连续且同一策略”的规则（同一规则内 domain/ip 条件本来就是 OR），
+  // 不能按策略组全局分桶，否则 A/B/A 这类交错规则会被改成 A/A/B。
   const rules: Record<string, unknown>[] = []
   const finalRule = filteredRules.find((r) => r.type === 'FINAL')
   const rejectAll = finalRule?.group === 'REJECT'
   const finalGroup = rejectAll
     ? 'DIRECT'
     : finalRule?.group ?? resolved[0]?.group.name ?? 'DIRECT'
-  const byGroup = new Map<string, {
-    domain: string[]
-    domain_suffix: string[]
-    domain_keyword: string[]
-    domain_regex: string[]
-    ip_cidr: string[]
-  }>()
+  let pending: { key: string; rule: Record<string, unknown> } | undefined
+  const flushPending = () => {
+    if (!pending) return
+    rules.push(pending.rule)
+    pending = undefined
+  }
   for (const rule of filteredRules) {
-    if (rule.type === 'FINAL' || !rule.value) continue
+    if (rule.type === 'FINAL') continue
+    if (rule.type === 'RULE-SET') {
+      if (!rule.value) continue
+      const tag = ruleSetTags.get(rule.value)
+      if (!tag) continue
+      flushPending()
+      rules.push(rule.group.toUpperCase() === 'REJECT'
+        ? { rule_set: [tag], action: 'reject' }
+        : { rule_set: [tag], outbound: rule.group })
+      continue
+    }
+    if (!rule.value) continue
     // sing-box 1.12 移除了 route 规则里的 geoip 字段（要用 rule_set）。
     // 离线生成的配置没有 GeoIP 库，跳过而不是让整份配置被内核拒绝。
     if (rule.type === 'GEOIP') continue
-    const bucket = byGroup.get(rule.group) ?? { domain: [], domain_suffix: [], domain_keyword: [], domain_regex: [], ip_cidr: [] }
-    switch (rule.type) {
-      case 'DOMAIN': bucket.domain.push(rule.value); break
-      case 'DOMAIN-SUFFIX': bucket.domain_suffix.push(rule.value); break
-      case 'DOMAIN-KEYWORD': bucket.domain_keyword.push(rule.value); break
-      case 'DOMAIN-REGEX': bucket.domain_regex.push(rule.value); break
-      case 'IP-CIDR':
-      case 'IP-CIDR6': bucket.ip_cidr.push(rule.value); break
-      default: continue
+    const field = rule.type === 'DOMAIN' ? 'domain'
+      : rule.type === 'DOMAIN-SUFFIX' ? 'domain_suffix'
+        : rule.type === 'DOMAIN-KEYWORD' ? 'domain_keyword'
+          : rule.type === 'DOMAIN-REGEX' ? 'domain_regex'
+            : rule.type === 'IP-CIDR' || rule.type === 'IP-CIDR6' ? 'ip_cidr'
+              : undefined
+    if (!field) continue
+    const reject = rule.group.toUpperCase() === 'REJECT'
+    const key = reject ? 'reject' : `route:${rule.group}`
+    if (!pending || pending.key !== key) {
+      flushPending()
+      pending = {
+        key,
+        // 拦截规则用动作表达，DIRECT 走内置 direct 出站。
+        rule: reject ? { action: 'reject' } : { outbound: rule.group },
+      }
     }
-    byGroup.set(rule.group, bucket)
+    const list = pending.rule[field]
+    if (Array.isArray(list)) list.push(rule.value)
+    else pending.rule[field] = [rule.value]
   }
-  for (const [group, bucket] of byGroup) {
-    const hasMatch =
-      bucket.domain.length || bucket.domain_suffix.length || bucket.domain_keyword.length
-      || bucket.domain_regex.length || bucket.ip_cidr.length
-    if (!hasMatch) continue
-    rules.push({
-      ...(bucket.domain.length ? { domain: bucket.domain } : {}),
-      ...(bucket.domain_suffix.length ? { domain_suffix: bucket.domain_suffix } : {}),
-      ...(bucket.domain_keyword.length ? { domain_keyword: bucket.domain_keyword } : {}),
-      ...(bucket.domain_regex.length ? { domain_regex: bucket.domain_regex } : {}),
-      ...(bucket.ip_cidr.length ? { ip_cidr: bucket.ip_cidr } : {}),
-      // 拦截规则用动作表达，DIRECT 走内置 direct 出站。
-      ...(group === 'REJECT' ? { action: 'reject' } : { outbound: group }),
-    })
-  }
+  flushPending()
   if (rejectAll) rules.push({ action: 'reject' })
 
   const directFinal = defaultsToDirect(finalGroup, definitions)
@@ -914,7 +923,7 @@ export function generateSingBox(
     ? [{ clash_mode: '规则判定', action: 'route', outbound: finalGroup }]
     : []
   const route: Record<string, unknown> = {
-    rules: [...modeRulesStart, ...remoteRuleRules, ...rules, ...modeRulesEnd],
+    rules: [...modeRulesStart, ...rules, ...modeRulesEnd],
     final: finalGroup,
     // 1.12 起引导解析出站服务器域名必须显式指定解析器，否则 1.14 直接拒绝启动。
     default_domain_resolver: dnsPlan.localTag,

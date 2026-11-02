@@ -166,8 +166,11 @@ export function parse(data: string, sourceID?: string): ParsedContent {
   const candidates = rawLines
     .flatMap((line) => {
       const trimmed = line.trim()
-      if (trimmed.includes(' ') && (trimmed.match(/:/g) ?? []).length > 1) {
-        return trimmed.split(/\s+/).filter((part) => containsNodeScheme(part))
+      // 有的面板会把多条链接写在同一行；只有确实解析出两个以上带 scheme
+      // 的片段时才拆行。否则 `#My Node` 这种带空格的名字会被截断成 `#My`。
+      const parts = trimmed.split(/\s+/)
+      if (parts.filter((part) => containsNodeScheme(part)).length > 1) {
+        return parts.filter((part) => containsNodeScheme(part))
       }
       return [trimmed]
     })
@@ -221,8 +224,20 @@ function deduplicated(nodes: ProxyNode[]): ProxyNode[] {
       node.cipher ?? '',
       node.password ?? '',
       node.uuid ?? '',
+      node.username ?? '',
       node.transport ?? '',
       node.sni ?? '',
+      node.path ?? '',
+      node.hostHeader ?? '',
+      node.protocolName ?? '',
+      node.obfs ?? '',
+      node.wireGuardPrivateKey ?? '',
+      node.wireGuardPublicKey ?? '',
+      node.wireGuardIPv4 ?? '',
+      node.wireGuardIPv6 ?? '',
+      node.masque?.privateKey ?? '',
+      node.masque?.publicKey ?? '',
+      node.ssh?.privateKey ?? '',
     ].join('|')
     if (seen.has(key)) continue
     seen.add(key)

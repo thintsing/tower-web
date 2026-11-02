@@ -6,10 +6,11 @@ import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as
 import { ComposableMap, Geographies, Geography, Graticule } from 'react-simple-maps'
 import { geoEqualEarth, type GeoProjection } from 'd3-geo'
 import { PROXY_KIND_TITLES, type ProxyNode } from '../models/types'
-import { regionForNode, type NodeRegion } from '../models/region'
+import { regionForNode, iso3ForRegionCode, type NodeRegion } from '../models/region'
 import { nodeShareText } from '../generator/shareLink'
 import { copyToClipboard } from '../util/browser'
 import { clusterPoints, type ClusterGroup } from './clustering'
+import { countryNumericCode } from './countryCodes'
 import {
   BASE_MAP_VIEW,
   focusMapView,
@@ -26,60 +27,6 @@ const BASE_WIDTH = WORLD_MAP_WIDTH
 const BASE_HEIGHT = WORLD_MAP_HEIGHT
 const MAX_ZOOM = WORLD_MAP_MAX_ZOOM
 const CLUSTER_RADIUS_PX = 26
-
-// world-atlas v2 TopoJSON 只有 numeric ISO id (如 "840" for USA)，我们 regions.ts 用 ISO_A3。
-// 从 curated regions 反推的常用 numeric → A3 映射；缺失项 fallback 为 code itself。
-const NUMERIC_TO_A3: Record<string, string> = {
-  '004': 'AFG', '008': 'ALB', '012': 'DZA', '024': 'AGO', '032': 'ARG', '036': 'AUS', '040': 'AUT',
-  '044': 'BHS', '048': 'BHR', '050': 'BGD', '051': 'ARM', '052': 'BRB', '056': 'BEL', '064': 'BTN',
-  '068': 'BOL', '070': 'BIH', '072': 'BWA', '076': 'BRA', '084': 'BLZ', '096': 'BRN', '100': 'BGR',
-  '104': 'MMR', '108': 'BDI', '112': 'BLR', '116': 'KHM', '120': 'CMR', '124': 'CAN', '140': 'CAF',
-  '144': 'LKA', '148': 'TCD', '152': 'CHL', '156': 'CHN', '158': 'TWN', '170': 'COL', '174': 'COM',
-  '178': 'COG', '180': 'COD', '188': 'CRI', '191': 'HRV', '192': 'CUB', '196': 'CYP', '203': 'CZE',
-  '204': 'BEN', '208': 'DNK', '214': 'DOM', '218': 'ECU', '222': 'SLV', '226': 'GNQ', '231': 'ETH',
-  '232': 'ERI', '233': 'EST', '242': 'FJI', '246': 'FIN', '250': 'FRA', '254': 'GUF', '260': 'ATF',
-  '262': 'DJI', '266': 'GAB', '268': 'GEO', '270': 'GMB', '275': 'PSE', '276': 'DEU', '288': 'GHA',
-  '292': 'GIB', '296': 'GRD', '300': 'GRC', '304': 'GRL', '308': 'GRP', '320': 'GTM', '324': 'GIN',
-  '328': 'GUY', '332': 'HTI', '340': 'HND', '344': 'HKG', '348': 'HUN', '352': 'ISL', '356': 'IND',
-  '360': 'IDN', '364': 'IRN', '368': 'IRQ', '372': 'IRL', '376': 'ISR', '380': 'ITA', '384': 'CIV',
-  '388': 'JAM', '392': 'JPN', '398': 'KAZ', '400': 'JOR', '404': 'KEN', '408': 'PRK', '410': 'KOR',
-  '414': 'KWT', '417': 'KGZ', '418': 'LAO', '422': 'LBN', '426': 'LSO', '428': 'LVA', '430': 'LBR',
-  '434': 'LBY', '438': 'LIE', '440': 'LTU', '442': 'LUX', '450': 'MDG', '454': 'MWI', '458': 'MYS',
-  '462': 'MDV', '466': 'MLI', '470': 'MLT', '474': 'MTQ', '478': 'MRT', '484': 'MEX', '496': 'MNG',
-  '498': 'MDA', '499': 'MNE', '504': 'MAR', '508': 'MOZ', '512': 'OMN', '516': 'NAM', '520': 'NRU',
-  '524': 'NPL', '528': 'NLD', '540': 'NCL', '548': 'VUT', '554': 'NZL', '558': 'NIC', '562': 'NER',
-  '566': 'NGA', '578': 'NOR', '586': 'PAK', '591': 'PAN', '598': 'PNG', '600': 'PRY', '604': 'PER',
-  '608': 'PHL', '616': 'POL', '620': 'PRT', '624': 'GNB', '626': 'TLS', '630': 'PRI', '634': 'QAT',
-  '642': 'ROU', '643': 'RUS', '646': 'RWA', '682': 'SAU', '686': 'SEN', '688': 'SRB', '694': 'SLE',
-  '702': 'SGP', '703': 'SVK', '704': 'VNM', '705': 'SVN', '706': 'SOM', '710': 'ZAF', '716': 'ZWE',
-  '724': 'ESP', '728': 'SSD', '729': 'SDN', '732': 'ESH', '740': 'SUR', '748': 'SWZ', '752': 'SWE',
-  '756': 'CHE', '760': 'SYR', '762': 'TJK', '764': 'THA', '768': 'TGO', '776': 'TON', '780': 'TTO',
-  '784': 'ARE', '788': 'TUN', '792': 'TUR', '795': 'TKM', '796': 'TUV', '800': 'UGA', '804': 'UKR',
-  '807': 'MKD', '818': 'EGY', '826': 'GBR', '834': 'TZA', '840': 'USA', '850': 'VIR', '854': 'BFA',
-  '858': 'URY', '860': 'UZB', '862': 'VEN', '882': 'WSM', '887': 'YEM', '894': 'ZMB',
-}
-
-function toISO3(code: string): string {
-  const c = code.toUpperCase().trim()
-  if (c.length === 3) return c // 已经是 A3
-  const ISO2_A3: Record<string, string> = {
-    CN: 'CHN', JP: 'JPN', KR: 'KOR', HK: 'HKG', TW: 'TWN',
-    US: 'USA', CA: 'CAN', GB: 'GBR', DE: 'DEU', FR: 'FRA', IT: 'ITA', ES: 'ESP',
-    NL: 'NLD', BE: 'BEL', CH: 'CHE', SE: 'SWE', NO: 'NOR', FI: 'FIN', DK: 'DNK',
-    RU: 'RUS', UA: 'UKR', PL: 'POL', AU: 'AUS', NZ: 'NZL', IN: 'IND', ID: 'IDN',
-    TH: 'THA', SG: 'SGP', VN: 'VNM', MY: 'MYS', PH: 'PHL', TR: 'TUR', BR: 'BRA',
-    MX: 'MEX', AR: 'ARG', EG: 'EGY', AE: 'ARE', SA: 'SAU', IL: 'ISR', ZA: 'ZAF',
-  }
-  return ISO2_A3[c] ?? c
-}
-
-function toNumeric(code: string): string | undefined {
-  const a3 = toISO3(code)
-  for (const [num, a3c] of Object.entries(NUMERIC_TO_A3)) {
-    if (a3c === a3) return num.padStart(3, '0')
-  }
-  return undefined
-}
 
 /** Latency color bands —— 与 Tower iOS 一致：≤100 / ≤200 / ≤350 / >350ms。 */
 const BANDS: { max: number; fill: string }[] = [
@@ -132,12 +79,13 @@ function computeCountryStats(
     if (node.isSubscriptionMetadata) continue
     const region = regionForNode(node)
     if (!region) { unlocatedCount += 1; continue }
-    const numeric = toNumeric(region.code) ?? toISO3(region.code)
+    const iso3 = iso3ForRegionCode(region.code) ?? region.code.toUpperCase()
+    const numeric = countryNumericCode(region.code) ?? iso3
     let stat = stats.get(numeric)
     if (!stat) {
       stat = {
         numeric,
-        iso3: toISO3(region.code),
+        iso3,
         code: region.code,
         region,
         nodes: [],

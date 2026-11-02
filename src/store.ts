@@ -588,29 +588,46 @@ export const useStore = create<Store>()(
           }
           if (!isCurrent() || !get().sources.some((s) => s.id === id)) return
           const oldNodes = get().nodes.filter((n) => n.sourceID === id)
+          const removedNodeIds = oldNodes.map((node) => node.id)
           const carried = carriedOverExclusions(oldNodes, parsed.nodes, source.excludedNodeKeys)
 
-          set((s) => ({
-            nodes: [...s.nodes.filter((n) => n.sourceID !== id), ...parsed.nodes],
-            sources: s.sources.map((src) =>
-              src.id === id
-                ? {
-                    ...src,
-                    updatedAt: Date.now(),
-                    usage: usage ?? src.usage,
-                    notices: parsed.notices,
-                    excludedNodeKeys: carried,
-                  }
-                : src,
-            ),
-            loadingSourceIDs: s.loadingSourceIDs.filter((x) => x !== id),
-            // 刷新成功后清掉上一次的错误提示
-            errors: (() => {
-              const next = { ...s.errors }
-              delete next[id]
-              return next
-            })(),
-          }))
+          set((s) => {
+            // 刷新会重新生成节点 id；旧 id 的测速结果如果不清理，会一直留在
+            // 内存里（每天自动刷新时尤其明显），也不会再被任何 UI 引用。
+            const latencyByNodeId = { ...s.latencyByNodeId }
+            const latencyMethodByNodeId = { ...s.latencyMethodByNodeId }
+            const probeErrorByNodeId = { ...s.probeErrorByNodeId }
+            for (const nodeID of removedNodeIds) {
+              delete latencyByNodeId[nodeID]
+              delete latencyMethodByNodeId[nodeID]
+              delete probeErrorByNodeId[nodeID]
+            }
+            return {
+              nodes: [...s.nodes.filter((n) => n.sourceID !== id), ...parsed.nodes],
+              sources: s.sources.map((src) =>
+                src.id === id
+                  ? {
+                      ...src,
+                      updatedAt: Date.now(),
+                      usage: usage ?? src.usage,
+                      notices: parsed.notices,
+                      excludedNodeKeys: carried,
+                    }
+                  : src,
+              ),
+              loadingSourceIDs: s.loadingSourceIDs.filter((x) => x !== id),
+              testingNodeIds: s.testingNodeIds.filter((x) => !removedNodeIds.includes(x)),
+              latencyByNodeId,
+              latencyMethodByNodeId,
+              probeErrorByNodeId,
+              // 刷新成功后清掉上一次的错误提示
+              errors: (() => {
+                const next = { ...s.errors }
+                delete next[id]
+                return next
+              })(),
+            }
+          })
         } catch (error) {
           // 已删除或已被更新请求取代的订阅不再挂错误提示。
           if (!isCurrent() || !get().sources.some((s) => s.id === id)) return

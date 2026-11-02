@@ -1,5 +1,5 @@
 // Surge full-config generation (INI).
-import type { ProxyNode, RoutingRule, RuleScheme } from '../models/types'
+import type { ClientTarget, ProxyNode, RoutingRule, RuleScheme } from '../models/types'
 import { confName } from './naming'
 import { compileRuleLine, resolveGroups, uniqueDisplayNames, type OutputOptions } from './groups'
 import {
@@ -59,8 +59,11 @@ function surgeWireGuardSections(nodes: ProxyNode[]): string[] {
   return out
 }
 
-function surgeNode(node: ProxyNode, name: string): string | undefined {
-  if (!nodeSupportedForTarget(node, 'surge')) return undefined
+function surgeNode(node: ProxyNode, name: string, target?: ClientTarget): string | undefined {
+  // Surge Mac 与 iOS 的能力表不同（例如 Hysteria 2 Salamander 只在 Mac 文档
+  // 中出现）；不能一律按 iOS 检查。
+  const capabilityTarget: ClientTarget = target === 'surge-mac' ? 'surge-mac' : 'surge'
+  if (!nodeSupportedForTarget(node, capabilityTarget)) return undefined
   const n = confName(name)
   const server = node.server.includes(':') ? `[${node.server}]` : node.server
   const tlsFlags = () => {
@@ -124,6 +127,17 @@ function surgeNode(node: ProxyNode, name: string): string | undefined {
     }
     case 'hysteria2': {
       const parts = [`${n} = hysteria2, ${server}, ${node.port}`, `password=${node.password ?? ''}`, ...tlsFlags()]
+      if (node.obfs) {
+        const obfs = node.obfs.toLowerCase()
+        if (obfs !== 'salamander' || !node.obfsParam) return undefined
+        parts.push(`salamander-password=${node.obfsParam}`)
+      }
+      if (node.portHopping) {
+        // Surge 用分号分隔端口段；URI / Clash 里常见逗号写法。
+        const ports = node.portHopping.split(/[\s,，]+/).filter(Boolean).join(';')
+        if (ports) parts.push(`port-hopping=${ports}`)
+      }
+      if (node.downMbps !== undefined) parts.push(`download-bandwidth=${node.downMbps}`)
       return parts.join(', ')
     }
     case 'tuic': {
@@ -233,7 +247,7 @@ export function generateSurge(
       skipped += 1
       continue
     }
-    const line = surgeNode(node, displayName(node))
+    const line = surgeNode(node, displayName(node), options.target)
     if (line) {
       proxyLines.push(line)
       emitted.add(node.id)

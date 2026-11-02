@@ -94,7 +94,7 @@ function validSource(value: unknown): value is SubscriptionSource {
     && isString(value.id)
     && isString(value.name)
     && isString(value.url)
-    && (!value.isEnabled || typeof value.isEnabled === 'boolean')
+    && (value.isEnabled === undefined || typeof value.isEnabled === 'boolean')
     && (value.excludedNodeKeys === undefined || stringArray(value.excludedNodeKeys) !== undefined)
 }
 

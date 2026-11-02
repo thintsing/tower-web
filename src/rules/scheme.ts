@@ -87,6 +87,23 @@ function localFileForURL(url: string, index: Record<string, string>): string | u
 }
 
 export async function loadScheme(meta: SchemeMeta): Promise<RuleScheme> {
+  // 内置方案由 /rulesets 下的静态文件组成；切换 Tab、编辑自定义方案后回到
+  // 导出页都会重新调用这里。缓存 Promise 后，第二次起不再重复发起 20+ 个
+  // 请求，也不再重复解析上万条规则。失败不缓存，方便用户重试。
+  const key = `${meta.id}\u0000${meta.file}`
+  const cached = schemeLoadCache.get(key)
+  if (cached) return cached
+  const promise = loadSchemeUncached(meta)
+  schemeLoadCache.set(key, promise)
+  void promise.catch(() => {
+    if (schemeLoadCache.get(key) === promise) schemeLoadCache.delete(key)
+  })
+  return promise
+}
+
+const schemeLoadCache = new Map<string, Promise<RuleScheme>>()
+
+async function loadSchemeUncached(meta: SchemeMeta): Promise<RuleScheme> {
   const [ini, index] = await Promise.all([
     fetch(`/rulesets/${meta.file}`).then((r) => {
       if (!r.ok) throw new Error(`规则方案加载失败：HTTP ${r.status}`)
@@ -257,13 +274,25 @@ export async function parseSchemeINI(
   }
 
   const rulesByGroup = new Map<string, Omit<RoutingRule, 'group'>[]>()
-  for (const rs of rulesets) {
+  const textCache = new Map<string, Promise<string>>()
+  const fetchOnce = (key: string, load: () => Promise<string>): Promise<string> => {
+    const cached = textCache.get(key)
+    if (cached) return cached
+    const request = load()
+    textCache.set(key, request)
+    return request
+  }
+  // 同一方案里可能引用几十个列表；逐个 await 会让导入耗时随列表数线性增长。
+  // 先按唯一 URL / 文件并行抓取，再按原顺序合并，保持规则分组语义不变。
+  const loaded = await Promise.all(rulesets.map(async (rs) => {
     const reference = subconverterRulesetReference(rs.target)
-    let text = ''
     const local = localFileForURL(reference.target, localIndex)
-    if (local) text = await fileFetch(local)
-    else if (/^https?:\/\//i.test(reference.target)) text = await urlFetch(reference.target)
-    if (!text.trim()) continue
+    const text = local
+      ? await fetchOnce(`file:${local}`, () => fileFetch(local))
+      : /^https?:\/\//i.test(reference.target)
+        ? await fetchOnce(`url:${reference.target}`, () => urlFetch(reference.target))
+        : ''
+    if (!text.trim()) return { group: rs.group, rules: [] as Omit<RoutingRule, 'group'>[] }
 
     let parsed: Omit<RoutingRule, 'group'>[] = []
     const looksStructured = text.trim().startsWith('{') || /^\s*(payload:|proxies:|rules:)/m.test(text)
@@ -279,7 +308,11 @@ export async function parseSchemeINI(
         parsed = parseRuleList(text)
       }
     }
-    if (parsed.length) rulesByGroup.set(rs.group, [...(rulesByGroup.get(rs.group) ?? []), ...parsed])
+    return { group: rs.group, rules: parsed }
+  }))
+  for (const { group, rules: parsed } of loaded) {
+    if (!parsed.length) continue
+    rulesByGroup.set(group, [...(rulesByGroup.get(group) ?? []), ...parsed])
   }
 
   const rules: RoutingRule[] = []

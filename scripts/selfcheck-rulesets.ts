@@ -383,8 +383,12 @@ function main(): void {
     }))
     assert.equal(singbox.format, 'singbox')
     assert.equal(singbox.rules[0].type, 'DOMAIN-SUFFIX')
-    assert.equal(singbox.rules[1].type, 'AND')
-    assert.equal(singbox.rules[1].raw, 'AND,((DOMAIN,foo.example),(IP-CIDR,1.2.3.0/24))')
+    // domain 与 ip_cidr 在 sing-box 里属于同一个 OR 组，拆成两条规则才等价。
+    assert.equal(singbox.rules[1].type, 'DOMAIN')
+    assert.equal(singbox.rules[1].value, 'foo.example')
+    assert.equal(singbox.rules[2].type, 'IP-CIDR')
+    assert.equal(singbox.rules[2].value, '1.2.3.0/24')
+    assert.equal(singbox.rules.length, 3)
   })
 
   check('规则集导入：自动识别与 FINAL 拒绝', () => {

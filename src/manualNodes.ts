@@ -20,8 +20,20 @@ function identity(node: ProxyNode): string {
     node.cipher ?? '',
     node.password ?? '',
     node.uuid ?? '',
+    node.username ?? '',
     node.transport ?? '',
     node.sni ?? '',
+    node.path ?? '',
+    node.hostHeader ?? '',
+    node.protocolName ?? '',
+    node.obfs ?? '',
+    node.wireGuardPrivateKey ?? '',
+    node.wireGuardPublicKey ?? '',
+    node.wireGuardIPv4 ?? '',
+    node.wireGuardIPv6 ?? '',
+    node.masque?.privateKey ?? '',
+    node.masque?.publicKey ?? '',
+    node.ssh?.privateKey ?? '',
   ].join('|')
 }
 
