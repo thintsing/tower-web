@@ -185,7 +185,7 @@ selfcheck:map         地图地区聚合
 selfcheck:matching    策略组拖动后的规则顺序
 selfcheck:protocols   协议解析与客户端降级
 selfcheck:qr          二维码生成与解码
-selfcheck:regressions 审计回归：凭据编码 / Clash 嵌套字段 / sing-box 顺序 / 地图国家码
+selfcheck:regressions 审计回归：凭据编码 / Clash 嵌套字段 / 客户端配置导入 / sing-box 顺序 / 地图国家码
 selfcheck:remote      代理集合与远程规则集
 selfcheck:rulesets    规则集方言转换
 selfcheck:yaml        Clash YAML 结构
@@ -199,7 +199,11 @@ selfcheck:yaml        Clash YAML 结构
 
 - 服务端面向本机或可信局域网；可选管理 API 密钥和局域网共享开关，但没有用户隔离、限流或公网级防护，`/api/health`、订阅 / 分享 / 托管规则集等 GET 端点仍按独立凭证或公开规则处理。
 - 不能部署到 GitHub Pages，需要 Node 运行环境；公网部署必须额外加安全层。
-- 订阅解析对 Surge `[Proxy]` 目前只识别 Shadowsocks、MASQUE 和单节点 URI；Loon `[Proxy]`、Quantumult X `[server_local]` 的节点行尚未完整导入，会按无法识别行处理。需要这些格式时请优先使用 Clash YAML / URI 列表。
+- 订阅解析对 Surge / Loon / Quantumult X 节点段的覆盖：
+  - Surge `[Proxy]`：Shadowsocks（simple-obfs / ShadowTLS）、ShadowsocksR、VMess（TLS / WebSocket）、VLESS、Trojan（TLS / WebSocket）、Hysteria2（Salamander / gecko 密码、端口跳跃）、TUIC v5（`tuic-v5`）、WireGuard（`[WireGuard <name>]`，单 peer）、HTTP / HTTPS、SOCKS5、Snell、SSH（密码登录）、AnyTLS、TrustTunnel、MASQUE。
+  - Loon `[Proxy]`：Shadowsocks（simple-obfs / ShadowTLS）、ShadowsocksR、VMess、VLESS、Trojan、Hysteria2、WireGuard（单 peer）、HTTP / HTTPS、SOCKS5。
+  - Quantumult X `[server_local]`：Shadowsocks（simple-obfs / over-tls / v2ray-plugin ws、wss）、ShadowsocksR、VMess、VLESS（含 REALITY 与 flow）、Trojan（含 wss / REALITY）、HTTP、SOCKS5（含 over-tls）。
+- 仍不支持的节点段：Loon 的 TUIC / SSH / Snell / MASQUE / TrustTunnel / AnyTLS；Quantumult X 的 Hysteria2 / TUIC / WireGuard / Snell / SSH / AnyTLS / TrustTunnel / MASQUE（这些客户端本身没有对应节点语法）；Surge TUIC v4 的 `token` 模式；Surge / Loon WireGuard 多 peer 配置（内部模型只保存一个 peer，整节会跳过）；Quantumult X 的 `tls13` 等握手展示字段。Surge SSH 的 Keystore 私钥引用只记录密码登录，无法导入实际私钥。
 - 手动编辑 SSH 节点时表单只保留密码登录；导入时携带的私钥和口令不会回填到表单，保存后会丢失，请重新导入。
 - SSR、部分协议和部分规则类型只在支持它的客户端保留，导出页会列出跳过项。
 - 规则兼容性、协议能力、Tailscale 和 DNS / ECS 的具体限制随客户端不同，导出前请查看页面提示。

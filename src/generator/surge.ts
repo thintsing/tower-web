@@ -26,6 +26,13 @@ function wireGuardEndpoint(node: ProxyNode): string {
   return `${host}:${node.port}`
 }
 
+/** Surge 用分号分隔端口段；URI / Clash 里常见逗号写法。 */
+function surgePortHopping(value: string | undefined): string | undefined {
+  if (!value) return undefined
+  const ports = value.split(/[\s,，;]+/).filter(Boolean).join(';')
+  return ports || undefined
+}
+
 function wireGuardReserved(node: ProxyNode): number[] | undefined {
   const values = (node.wireGuardReserved ?? '').split(',').map((item) => item.trim()).filter(Boolean)
   if (!values.length) return []
@@ -70,6 +77,7 @@ function surgeNode(node: ProxyNode, name: string, target?: ClientTarget): string
     const parts: string[] = []
     if (node.sni) parts.push(`sni=${node.sni}`)
     if (node.skipCertificateVerification) parts.push('skip-cert-verify=true')
+    if (node.alpn) parts.push(`alpn=${node.alpn}`)
     return parts
   }
   switch (node.kind) {
@@ -133,16 +141,22 @@ function surgeNode(node: ProxyNode, name: string, target?: ClientTarget): string
         parts.push(`salamander-password=${node.obfsParam}`)
       }
       if (node.portHopping) {
-        // Surge 用分号分隔端口段；URI / Clash 里常见逗号写法。
-        const ports = node.portHopping.split(/[\s,，]+/).filter(Boolean).join(';')
+        const ports = surgePortHopping(node.portHopping)
         if (ports) parts.push(`port-hopping=${ports}`)
       }
       if (node.downMbps !== undefined) parts.push(`download-bandwidth=${node.downMbps}`)
       return parts.join(', ')
     }
     case 'tuic': {
-      const parts = [`${n} = tuic, ${server}, ${node.port}`,
+      // 内部模型是 TUIC v5（UUID + password）；Surge 的 v5 关键字是 tuic-v5，
+      // 不能写成 v4 的 tuic（那个类型只接受 token）。
+      const parts = [`${n} = tuic-v5, ${server}, ${node.port}`,
         `uuid=${node.uuid ?? ''}`, `password=${node.password ?? ''}`, ...tlsFlags()]
+      if (node.alpn) parts.push(`alpn=${node.alpn}`)
+      if (node.portHopping) {
+        const ports = surgePortHopping(node.portHopping)
+        if (ports) parts.push(`port-hopping=${ports}`)
+      }
       return parts.join(', ')
     }
     case 'snell': {

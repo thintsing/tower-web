@@ -244,6 +244,210 @@ check('Surge Mac 写出 Hysteria 2 Salamander 与端口跳跃', () => {
   assert.equal(ios.skipped, 1)
 })
 
+// ---------- 7. Surge / Loon / QuanX 节点配置往返 ----------
+const roundTrip = (target: string, sample: string) => {
+  const parsed = parse(sample).nodes
+  const client = CLIENTS.find((item) => item.target === target)!
+  const generated = generateConfig(client, parsed, SCHEME, { contentMode: 'full' })
+  const reparsed = parse(generated.text).nodes
+  return { parsed, generated, reparsed }
+}
+const byName = (nodes: ProxyNode[], name: string): ProxyNode => {
+  const node = nodes.find((item) => item.name === name)
+  assert.ok(node, `缺少节点 ${name}`)
+  return node
+}
+
+check('Surge [Proxy] / [WireGuard] 真实语法导入并在 Surge Mac 往返', () => {
+  const sample = `[Proxy]
+SS1 = ss, ss.example.com, 8388, encrypt-method=aes-256-gcm, password=p1, udp-relay=true, obfs=http, obfs-host=obfs.example.com
+VM1 = vmess, vm.example.com, 443, username=11111111-2222-3333-4444-555555555555, encrypt-method=aes-128-gcm, vmess-aead=true, ws=true, ws-path=/ws, ws-headers=Host:cdn.example.com|X-Test:1, tls=true, sni=cdn.example.com, skip-cert-verify=true
+TR1 = trojan, tr.example.com, 443, password=p2, ws=true, ws-path=/tr, ws-headers=Host:tr.example.com, sni=tr.example.com
+HY1 = hysteria2, hy.example.com, 8443, password=p3, sni=hy.example.com, salamander-password=obfs-password, port-hopping=8443;9000-9100, download-bandwidth=200
+TU1 = tuic-v5, tu.example.com, 443, uuid=11111111-2222-3333-4444-555555555555, password=p4, alpn=h3
+WG1 = wireguard, section-name=wg1
+[WireGuard wg1]
+private-key = wg-private
+self-ip = 10.0.0.2
+self-ip-v6 = fd00::2
+dns-server = 10.0.0.1
+mtu = 1420
+peer = (public-key = wg-public, allowed-ips = "0.0.0.0/0, ::/0", endpoint = wg.example.com:51820, preshared-key = wg-psk, keepalive = 30, client-id = 1/2/3)
+[Rule]
+FINAL,SS1
+`
+  const parsed = parse(sample)
+  assert.equal(parsed.rejectedLineCount, 0)
+  assert.equal(parsed.nodes.length, 6)
+  const ss = byName(parsed.nodes, 'SS1')
+  assert.equal(ss.cipher, 'aes-256-gcm')
+  assert.equal(ss.obfs, 'http')
+  assert.equal(ss.obfsParam, 'obfs.example.com')
+  const vm = byName(parsed.nodes, 'VM1')
+  assert.equal(vm.transport, 'ws')
+  assert.equal(vm.path, '/ws')
+  assert.equal(vm.hostHeader, 'cdn.example.com')
+  assert.equal(vm.sni, 'cdn.example.com')
+  assert.equal(vm.skipCertificateVerification, true)
+  const hy = byName(parsed.nodes, 'HY1')
+  assert.equal(hy.obfs, 'salamander')
+  assert.equal(hy.obfsParam, 'obfs-password')
+  assert.equal(hy.portHopping, '8443,9000-9100')
+  assert.equal(hy.downMbps, 200)
+  const tu = byName(parsed.nodes, 'TU1')
+  assert.equal(tu.uuid, '11111111-2222-3333-4444-555555555555')
+  assert.equal(tu.alpn, 'h3')
+  const wg = byName(parsed.nodes, 'WG1')
+  assert.equal(wg.server, 'wg.example.com')
+  assert.equal(wg.port, 51820)
+  assert.equal(wg.wireGuardPrivateKey, 'wg-private')
+  assert.equal(wg.wireGuardPublicKey, 'wg-public')
+  assert.equal(wg.wireGuardPreSharedKey, 'wg-psk')
+  assert.equal(wg.wireGuardIPv4, '10.0.0.2')
+  assert.equal(wg.wireGuardIPv6, 'fd00::2')
+  assert.equal(wg.wireGuardReserved, '1,2,3')
+  assert.equal(wg.wireGuardDNS, '10.0.0.1')
+  assert.equal(wg.wireGuardMTU, 1420)
+  assert.equal(wg.wireGuardPersistentKeepalive, 30)
+
+  const round = roundTrip('surge-mac', sample)
+  assert.equal(round.generated.skipped, 0)
+  assert.equal(round.reparsed.length, 6)
+  const hy2 = byName(round.reparsed, 'HY1')
+  assert.equal(hy2.obfs, 'salamander')
+  assert.equal(hy2.obfsParam, 'obfs-password')
+  assert.equal(hy2.portHopping, '8443,9000-9100')
+  assert.equal(hy2.downMbps, 200)
+  const tu2 = byName(round.reparsed, 'TU1')
+  assert.equal(tu2.uuid, '11111111-2222-3333-4444-555555555555')
+  assert.equal(tu2.alpn, 'h3')
+  const wg2 = byName(round.reparsed, 'WG1')
+  assert.equal(wg2.wireGuardIPv6, 'fd00::2')
+  assert.equal(wg2.wireGuardReserved, '1,2,3')
+  assert.equal(wg2.wireGuardDNS, '10.0.0.1')
+})
+
+check('Loon [Proxy] 真实语法导入并往返', () => {
+  const sample = `[Proxy]
+SS1 = Shadowsocks,ss.example.com,8388,aes-256-gcm,"p1",obfs-name=http,obfs-host=obfs.example.com,obfs-uri=/obfs,udp=true
+SSR1 = ShadowsocksR,ssr.example.com,32103,aes-256-cfb,"p2",protocol=auth_aes128_md5,protocol-param=10102:demo,obfs=tls1.2_ticket_auth,obfs-param=obfs.example.com,udp=true
+VM1 = vmess,vm.example.com,443,aes-128-gcm,"11111111-2222-3333-4444-555555555555",transport=ws,path=/ws,host=cdn.example.com,over-tls=true,tls-name=cdn.example.com,skip-cert-verify=true,alterId=0
+VL1 = VLESS, vl.example.com, 443, "22222222-3333-4444-5555-666666666666", transport=ws, path=/vl, host=vl.example.com, over-tls=true, tls-name=vl.example.com
+TR1 = trojan, tr.example.com, 443, "p3", transport=ws, path=/tr, host=tr.example.com, tls-name=tr.example.com, udp=true
+HY1 = Hysteria2, hy.example.com, 8443, "p4", skip-cert-verify=true, tls-name=hy.example.com, udp=true
+WG1 = wireguard,interface-ip=10.0.0.2,interface-ipV6=fd00::2,private-key="wg-private",mtu=1420,dns=10.0.0.1,dnsV6=fd00::1,keeyalive=30,peers=[{public-key="wg-public",preshared-key="wg-psk",reserved=[1,2,3],allowed-ips="0.0.0.0/0,::/0",endpoint=wg.example.com:51820}]
+HTTP1 = http, http.example.com, 8080, "user", "pass"
+[Proxy Group]
+G = select, SS1
+`
+  const parsed = parse(sample)
+  assert.equal(parsed.rejectedLineCount, 0)
+  assert.equal(parsed.nodes.length, 8)
+  const ss = byName(parsed.nodes, 'SS1')
+  assert.equal(ss.obfs, 'http')
+  assert.equal(ss.path, '/obfs')
+  const vm = byName(parsed.nodes, 'VM1')
+  assert.equal(vm.cipher, 'aes-128-gcm')
+  assert.equal(vm.transport, 'ws')
+  assert.equal(vm.path, '/ws')
+  assert.equal(vm.hostHeader, 'cdn.example.com')
+  assert.equal(vm.sni, 'cdn.example.com')
+  assert.equal(vm.skipCertificateVerification, true)
+  const vl = byName(parsed.nodes, 'VL1')
+  assert.equal(vl.uuid, '22222222-3333-4444-5555-666666666666')
+  assert.equal(vl.transport, 'ws')
+  const tr = byName(parsed.nodes, 'TR1')
+  assert.equal(tr.transport, 'ws')
+  assert.equal(tr.sni, 'tr.example.com')
+  const hy = byName(parsed.nodes, 'HY1')
+  assert.equal(hy.tls, true)
+  assert.equal(hy.sni, 'hy.example.com')
+  const wg = byName(parsed.nodes, 'WG1')
+  assert.equal(wg.wireGuardDNS, '10.0.0.1,fd00::1')
+  assert.equal(wg.wireGuardPersistentKeepalive, 30)
+  const http = byName(parsed.nodes, 'HTTP1')
+  assert.equal(http.username, 'user')
+  assert.equal(http.password, 'pass')
+
+  const round = roundTrip('loon', sample)
+  assert.equal(round.generated.skipped, 0)
+  assert.equal(round.reparsed.length, 8)
+  const vm2 = byName(round.reparsed, 'VM1')
+  assert.equal(vm2.cipher, 'aes-128-gcm')
+  assert.equal(vm2.transport, 'ws')
+  assert.equal(vm2.path, '/ws')
+  assert.equal(vm2.hostHeader, 'cdn.example.com')
+  assert.equal(vm2.sni, 'cdn.example.com')
+  const wg2 = byName(round.reparsed, 'WG1')
+  assert.equal(wg2.wireGuardDNS, '10.0.0.1,fd00::1')
+  assert.equal(wg2.wireGuardIPv6, 'fd00::2')
+  assert.equal(wg2.wireGuardReserved, '1,2,3')
+  const http2 = byName(round.reparsed, 'HTTP1')
+  assert.equal(http2.username, 'user')
+  assert.equal(http2.password, 'pass')
+})
+
+check('Quantumult X [server_local] 真实语法导入并往返', () => {
+  const sample = `[server_local]
+shadowsocks=ss.example.com:8388, method=aes-256-gcm, password=p1, obfs=wss, obfs-host=cdn.example.com, obfs-uri=/ssws, udp-relay=false, tag=SS1
+shadowsocks=ss2.example.com:8080, method=aes-128-gcm, password=p2, obfs=http, obfs-host=obfs.example.com, obfs-uri=/obfs, udp-relay=false, tag=SS2
+shadowsocks=ssr.example.com:32103, method=aes-256-cfb, password=p3, ssr-protocol=auth_aes128_md5, ssr-protocol-param=10102:demo, obfs=tls1.2_ticket_auth, obfs-host=obfs.example.com, tag=SSR1
+vmess=vm.example.com:443, method=aes-128-gcm, password=11111111-2222-3333-4444-555555555555, obfs=wss, obfs-host=cdn.example.com, obfs-uri=/ws, tag=VM1
+vless=vl.example.com:443, method=none, password=22222222-3333-4444-5555-666666666666, obfs=over-tls, obfs-host=vl.example.com, tls-alpn=02683208687474702f312e31, reality-base64-pubkey=pub, reality-hex-shortid=0123456789abcdef, vless-flow=xtls-rprx-vision, tag=VL1
+trojan=tr.example.com:443, password=p4, over-tls=true, tls-host=tr.example.com, tls-verification=false, tag=TR1
+http=http.example.com:8080, username=user, password=pass, over-tls=true, tls-host=http.example.com, tag=HTTP1
+socks5=socks.example.com:1080, username=user, password=pass, over-tls=true, tls-host=socks.example.com, tag=SOCKS1
+`
+  const parsed = parse(sample)
+  assert.equal(parsed.rejectedLineCount, 0)
+  assert.equal(parsed.nodes.length, 8)
+  const ss = byName(parsed.nodes, 'SS1')
+  assert.equal(ss.plugin, 'v2ray-plugin')
+  assert.equal(ss.pluginMux, false)
+  assert.equal(ss.transport, 'ws')
+  assert.equal(ss.path, '/ssws')
+  assert.equal(ss.tls, true)
+  const ss2 = byName(parsed.nodes, 'SS2')
+  assert.equal(ss2.obfs, 'http')
+  assert.equal(ss2.path, '/obfs')
+  const vm = byName(parsed.nodes, 'VM1')
+  assert.equal(vm.cipher, 'aes-128-gcm')
+  assert.equal(vm.transport, 'ws')
+  assert.equal(vm.tls, true)
+  const vl = byName(parsed.nodes, 'VL1')
+  assert.equal(vl.realityPublicKey, 'pub')
+  assert.equal(vl.realityShortID, '0123456789abcdef')
+  assert.equal(vl.flow, 'xtls-rprx-vision')
+  assert.equal(vl.alpn, 'h2,http/1.1')
+  const tr = byName(parsed.nodes, 'TR1')
+  assert.equal(tr.tls, true)
+  assert.equal(tr.skipCertificateVerification, true)
+  const http = byName(parsed.nodes, 'HTTP1')
+  assert.equal(http.tls, true)
+  assert.equal(http.username, 'user')
+  const socks = byName(parsed.nodes, 'SOCKS1')
+  assert.equal(socks.tls, true)
+
+  const round = roundTrip('quanx', sample)
+  assert.equal(round.generated.skipped, 0)
+  assert.equal(round.reparsed.length, 8)
+  const ss3 = byName(round.reparsed, 'SS1')
+  assert.equal(ss3.plugin, 'v2ray-plugin')
+  assert.equal(ss3.pluginMux, false)
+  assert.equal(ss3.path, '/ssws')
+  const vm2 = byName(round.reparsed, 'VM1')
+  assert.equal(vm2.cipher, 'aes-128-gcm')
+  assert.equal(vm2.transport, 'ws')
+  assert.equal(vm2.hostHeader, 'cdn.example.com')
+  const vl2 = byName(round.reparsed, 'VL1')
+  assert.equal(vl2.realityPublicKey, 'pub')
+  assert.equal(vl2.realityShortID, '0123456789abcdef')
+  assert.equal(vl2.flow, 'xtls-rprx-vision')
+  assert.equal(vl2.alpn, 'h2,http/1.1')
+  const socks2 = byName(round.reparsed, 'SOCKS1')
+  assert.equal(socks2.tls, true)
+})
+
 // ---------- 8. 地图国家代码映射 ----------
 check('地图使用完整 ISO2 → numeric 映射', () => {
   assert.equal(iso3ForRegionCode('PT'), 'PRT')

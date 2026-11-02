@@ -1,12 +1,14 @@
 // Subscription content orchestration, ported from Tower iOS
-// SubscriptionParser.parse: base64 → JSON → Surge [Proxy] → Clash YAML →
-// line-by-line URIs, with STATUS= lines, notice detection and dedupe.
+// SubscriptionParser.parse: base64 → JSON → Surge/Loon/Quantumult X node
+// sections → Clash YAML → line-by-line URIs, with STATUS= lines, notice
+// detection and dedupe.
 import type { ProxyNode, SubscriptionUsage } from '../models/types'
 import { regionForNode } from '../models/region'
 import { parseClashYAML } from './clash'
 import { parseSingBoxEndpoints } from './singbox'
 import { parseURI } from './uri'
-import { boolString, decodeBase64String, normalizedHost, normalizedName, nextNodeID } from './util'
+import { decodeBase64String } from './util'
+import { containsClientProxySection, parseClientProxyConfiguration } from './clientConfigs'
 
 export interface ParsedContent {
   nodes: ProxyNode[]
@@ -122,10 +124,6 @@ function containsNodeScheme(text: string): boolean {
   return NODE_SCHEMES.some((s) => lower.includes(s))
 }
 
-function containsSurgeProxySection(text: string): boolean {
-  return text.split('\n').some((line) => line.trim().toLowerCase() === '[proxy]')
-}
-
 export function parse(data: string, sourceID?: string): ParsedContent {
   let text = data.trim()
 
@@ -141,8 +139,8 @@ export function parse(data: string, sourceID?: string): ParsedContent {
     if (endpoints) return finish(endpoints.nodes, endpoints.rejected)
   }
 
-  if (containsSurgeProxySection(text)) {
-    const parsed = parseSurgeProxyConfiguration(text, sourceID)
+  if (containsClientProxySection(text)) {
+    const parsed = parseClientProxyConfiguration(text, sourceID)
     return finish(parsed.nodes, parsed.rejected)
   }
 
@@ -244,168 +242,6 @@ function deduplicated(nodes: ProxyNode[]): ProxyNode[] {
     out.push(node)
   }
   return out
-}
-
-// ---------- Surge [Proxy] section ----------
-
-function parseSurgeProxyConfiguration(
-  text: string,
-  sourceID?: string,
-): { nodes: ProxyNode[]; rejected: number } {
-  let inside = false
-  const nodes: ProxyNode[] = []
-  let rejected = 0
-
-  for (const rawLine of text.split('\n')) {
-    const line = rawLine.trim()
-    if (!line || line.startsWith('#') || line.startsWith(';') || line.startsWith('//')) continue
-    if (line.startsWith('[') && line.endsWith(']') && !line.includes('=')) {
-      inside = line.toLowerCase() === '[proxy]'
-      continue
-    }
-    if (!inside) continue
-    const node = parseSurgeMasqueLine(line, sourceID)
-      ?? parseSurgeShadowsocksLine(line, sourceID)
-      ?? parseURI(line, sourceID)
-    if (node) nodes.push(node)
-    else rejected += 1
-  }
-  return { nodes, rejected: nodes.length === 0 ? Math.max(rejected, 1) : rejected }
-}
-
-/** `名称 = masque, 主机, 端口, username=…, password=…`（Surge Basic-auth CONNECT）。 */
-function parseSurgeMasqueLine(raw: string, sourceID?: string): ProxyNode | undefined {
-  const sep = raw.indexOf('=')
-  if (sep < 0) return undefined
-  const name = raw.slice(0, sep).trim()
-  const fields = surgeProxyFields(raw.slice(sep + 1))
-  if (!name || fields.length < 3 || fields[0].toLowerCase() !== 'masque') return undefined
-  const port = Number(fields[2])
-  if (!Number.isInteger(port) || port < 1 || port > 65535) return undefined
-  const host = normalizedHost(fields[1])
-  if (!host || /[\s,/\\@?#=]/.test(host)) return undefined
-
-  const allowed = new Set([
-    'username', 'password', 'sni', 'alpn', 'skip-cert-verify', 'server-cert-fingerprint-sha256',
-  ])
-  const options: Record<string, string> = {}
-  for (const field of fields.slice(3)) {
-    const eq = field.indexOf('=')
-    if (eq < 0) return undefined
-    const key = field.slice(0, eq).trim().toLowerCase()
-    const value = surgeProxyScalar(field.slice(eq + 1), false)
-    if (!allowed.has(key) || options[key] !== undefined) return undefined
-    if (/[\r\n\0,]/.test(value)) return undefined
-    options[key] = value
-  }
-  if (options.sni && /[\s,/%\\@?#=]/.test(options.sni)) return undefined
-  if (options['skip-cert-verify']
-    && !['true', 'false', '1', '0', 'yes', 'no'].includes(options['skip-cert-verify'].toLowerCase())) {
-    return undefined
-  }
-  const pin = options['server-cert-fingerprint-sha256']
-  if (pin) {
-    const compact = pin.replace(/[:\-]/g, '')
-    if (compact.length !== 64 || !/^[0-9a-f]+$/i.test(compact)) return undefined
-  }
-  const username = options.username
-  if (username?.includes(':')) return undefined
-
-  return {
-    id: nextNodeID(),
-    sourceID,
-    kind: 'masque',
-    name: normalizedName(name, host),
-    server: host,
-    port,
-    username,
-    password: options.password,
-    tls: true,
-    sni: options.sni,
-    alpn: options.alpn,
-    certificateFingerprint: pin,
-    skipCertificateVerification: boolString(options['skip-cert-verify']),
-    rawURI: raw,
-  }
-}
-
-/** `名称 = ss, 主机, 端口, encrypt-method=…, password=…` */
-function parseSurgeShadowsocksLine(raw: string, sourceID?: string): ProxyNode | undefined {
-  const sep = raw.indexOf('=')
-  if (sep < 0) return undefined
-  const name = raw.slice(0, sep).trim()
-  const fields = surgeProxyFields(raw.slice(sep + 1))
-  if (!name || fields.length < 3 || fields[0].toLowerCase() !== 'ss' || !fields[1]) {
-    return undefined
-  }
-  const port = Number(fields[2])
-  if (!Number.isInteger(port) || port < 1 || port > 65535) return undefined
-
-  const options: Record<string, string> = {}
-  for (const field of fields.slice(3)) {
-    const eq = field.indexOf('=')
-    if (eq < 0) continue
-    options[field.slice(0, eq).trim().toLowerCase()] = surgeProxyScalar(field.slice(eq + 1))
-  }
-  const cipher = options['encrypt-method'] ?? options['method'] ?? options['cipher']
-  const password = options['password']
-  if (!cipher || !password) return undefined
-
-  const node: ProxyNode = {
-    id: nextNodeID(),
-    sourceID,
-    kind: 'ss',
-    name: normalizedName(name, fields[1]),
-    server: normalizedHost(fields[1]),
-    port,
-    cipher,
-    password,
-    obfs: options['obfs'],
-    obfsParam: options['obfs-host'],
-    udpRelayEnabled: boolString(options['udp-relay'] ?? options['udp']),
-    tls: false,
-    skipCertificateVerification: false,
-    rawURI: raw,
-  }
-  return node
-}
-
-function surgeProxyFields(value: string): string[] {
-  const fields: string[] = []
-  let current = ''
-  let quote: string | undefined
-  for (const ch of value) {
-    if (ch === '"' || ch === "'") {
-      if (quote === ch) quote = undefined
-      else if (quote === undefined) quote = ch
-      current += ch
-    } else if (ch === ',' && quote === undefined) {
-      fields.push(surgeProxyScalar(current, false))
-      current = ''
-    } else {
-      current += ch
-    }
-  }
-  fields.push(surgeProxyScalar(current, false))
-  return fields
-}
-
-function surgeProxyScalar(value: string, decodePercent = true): string {
-  const trimmed = value.trim()
-  let unquoted = trimmed
-  if (trimmed.length >= 2) {
-    const first = trimmed[0]
-    const last = trimmed[trimmed.length - 1]
-    if ((first === '"' || first === "'") && first === last) {
-      unquoted = trimmed.slice(1, -1)
-    }
-  }
-  if (!decodePercent) return unquoted
-  try {
-    return decodeURIComponent(unquoted)
-  } catch {
-    return unquoted
-  }
 }
 
 // Re-export for views that show region badges.

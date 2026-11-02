@@ -22,23 +22,38 @@ function loonQuoted(value: string): string {
   return JSON.stringify(value.replace(/\r\n/g, ' ').replace(/\r/g, ' '))
 }
 
+/** Loon 文档统一使用 over-tls / tls-name；旧版别名不在生成器里继续写。 */
+function loonTlsParts(node: ProxyNode, overTls: boolean): string[] {
+  const parts: string[] = []
+  if (overTls) parts.push('over-tls=true')
+  if (node.sni) parts.push(`tls-name=${node.sni}`)
+  if (node.skipCertificateVerification) parts.push('skip-cert-verify=true')
+  if (node.alpn) parts.push(`alpn=${node.alpn}`)
+  return parts
+}
+
+function loonTransportParts(node: ProxyNode): string[] {
+  const parts: string[] = []
+  if (node.transport === 'ws') {
+    parts.push('transport=ws', `path=${node.path || '/'}`)
+    if (node.hostHeader) parts.push(`host=${node.hostHeader}`)
+  } else if (node.transport === 'http') {
+    parts.push('transport=http', `path=${node.path || '/'}`)
+    if (node.hostHeader) parts.push(`host=${node.hostHeader}`)
+  } else if (node.transport === 'tcp' || node.transport === undefined) {
+    parts.push('transport=tcp')
+  }
+  return parts
+}
+
 function loonNode(node: ProxyNode, name: string): string | undefined {
   if (!nodeSupportedForTarget(node, 'loon')) return undefined
   const n = confName(name)
   const host = node.server.includes(':') ? `[${node.server}]` : node.server
-  const tlsTail = (): string[] => {
-    const parts: string[] = []
-    if (node.tls || node.sni || node.kind === 'trojan' || node.kind === 'hysteria2' || node.kind === 'tuic') {
-      parts.push('tls=true')
-    }
-    if (node.sni) parts.push(`sni=${node.sni}`)
-    if (node.skipCertificateVerification) parts.push('skip-cert-verify=true')
-    return parts
-  }
 
   switch (node.kind) {
     case 'ss': {
-      const parts = [`${n} = Shadowsocks, ${host}, ${node.port}`, node.cipher ?? 'aes-256-gcm', node.password ?? '']
+      const parts = [`${n} = Shadowsocks, ${host}, ${node.port}`, node.cipher ?? 'aes-256-gcm', loonQuoted(node.password ?? '')]
       if (node.shadowTLS) {
         parts.push(`shadow-tls-password=${node.shadowTLS.password}`)
         parts.push(`shadow-tls-sni=${node.shadowTLS.host}`)
@@ -47,6 +62,7 @@ function loonNode(node: ProxyNode, name: string): string | undefined {
         // Loon 里 `obfs` 是 SSR 专用字段；simple-obfs 要用 obfs-name / obfs-host。
         parts.push(`obfs-name=${node.obfs}`)
         if (node.obfsParam) parts.push(`obfs-host=${node.obfsParam}`)
+        if (node.path) parts.push(`obfs-uri=${node.path}`)
       }
       if (node.udpRelayEnabled !== undefined) parts.push(`udp=${node.udpRelayEnabled}`)
       return parts.join(', ')
@@ -55,7 +71,7 @@ function loonNode(node: ProxyNode, name: string): string | undefined {
       // Loon 的 SSR 行：Name = ShadowsocksR, host, port, cipher, password, protocol=…, obfs=…
       const parts = [`${n} = ShadowsocksR, ${host}, ${node.port}`,
         node.cipher ?? 'aes-256-cfb',
-        node.password ?? '',
+        loonQuoted(node.password ?? ''),
         `protocol=${node.protocolName ?? 'origin'}`,
         `obfs=${node.obfs ?? 'plain'}`]
       if (node.protocolParam) parts.push(`protocol-param=${node.protocolParam}`)
@@ -64,38 +80,32 @@ function loonNode(node: ProxyNode, name: string): string | undefined {
       return parts.join(', ')
     }
     case 'vmess': {
-      const parts = [`${n} = VMess, ${host}, ${node.port}`, `username=${node.uuid ?? ''}`, `alterId=${node.alterID ?? 0}`]
-      if (node.transport === 'ws') {
-        parts.push('ws=true', `ws-path=${node.path || '/'}`)
-        if (node.hostHeader) parts.push(`ws-headers=Host:${node.hostHeader}`)
-      }
-      parts.push(...tlsTail())
+      const cipher = node.cipher && node.cipher !== 'auto' ? node.cipher : 'aes-128-gcm'
+      const parts = [`${n} = VMess, ${host}, ${node.port}`, cipher, loonQuoted(node.uuid ?? '')]
+      parts.push(...loonTransportParts(node), `alterId=${node.alterID ?? 0}`)
+      parts.push(...loonTlsParts(node, node.tls))
       return parts.join(', ')
     }
     case 'vless': {
-      const parts = [`${n} = VLESS, ${host}, ${node.port}`, `username=${node.uuid ?? ''}`]
-      if (node.transport === 'ws') {
-        parts.push('ws=true', `ws-path=${node.path || '/'}`)
-        if (node.hostHeader) parts.push(`ws-headers=Host:${node.hostHeader}`)
-      }
-      parts.push(...tlsTail())
+      const parts = [`${n} = VLESS, ${host}, ${node.port}`, loonQuoted(node.uuid ?? '')]
+      parts.push(...loonTransportParts(node))
+      parts.push(...loonTlsParts(node, node.tls))
       return parts.join(', ')
     }
     case 'trojan': {
-      const parts = [`${n} = Trojan, ${host}, ${node.port}`, node.password ?? '']
-      if (node.transport === 'ws') {
-        parts.push('ws=true', `ws-path=${node.path || '/'}`)
-        if (node.hostHeader) parts.push(`ws-headers=Host:${node.hostHeader}`)
-      }
-      parts.push(...tlsTail())
+      const parts = [`${n} = Trojan, ${host}, ${node.port}`, loonQuoted(node.password ?? '')]
+      parts.push(...loonTransportParts(node))
+      parts.push(...loonTlsParts(node, false))
+      if (node.udpRelayEnabled !== undefined) parts.push(`udp=${node.udpRelayEnabled}`)
       return parts.join(', ')
     }
     case 'hysteria2': {
-      const parts = [`${n} = Hysteria2, ${host}, ${node.port}`, node.password ?? '']
-      if (node.sni) parts.push(`sni=${node.sni}`)
+      const parts = [`${n} = Hysteria2, ${host}, ${node.port}`, loonQuoted(node.password ?? '')]
+      if (node.sni) parts.push(`tls-name=${node.sni}`)
       if (node.skipCertificateVerification) parts.push('skip-cert-verify=true')
       if (node.obfs) parts.push(`obfs=${node.obfs}`)
       if (node.obfsParam) parts.push(`obfs-password=${node.obfsParam}`)
+      if (node.udpRelayEnabled !== undefined) parts.push(`udp=${node.udpRelayEnabled}`)
       return parts.join(', ')
     }
     case 'wireguard': {
@@ -111,10 +121,14 @@ function loonNode(node: ProxyNode, name: string): string | undefined {
         `${n} = wireguard`,
         `interface-ip=${node.wireGuardIPv4 ?? ''}`,
       ]
-      if (node.wireGuardIPv6) parts.push(`interface-ipv6=${node.wireGuardIPv6}`)
+      if (node.wireGuardIPv6) parts.push(`interface-ipV6=${node.wireGuardIPv6}`)
       parts.push(`private-key=${loonQuoted(node.wireGuardPrivateKey)}`)
       if (node.wireGuardMTU !== undefined) parts.push(`mtu=${node.wireGuardMTU}`)
-      if (node.wireGuardDNS) parts.push(`dns=${node.wireGuardDNS}`)
+      const dns = (node.wireGuardDNS ?? '').split(',').map((item) => item.trim()).filter(Boolean)
+      const dns4 = dns.filter((item) => !item.includes(':'))
+      const dns6 = dns.filter((item) => item.includes(':'))
+      if (dns4.length) parts.push(`dns=${dns4.join(',')}`)
+      if (dns6.length) parts.push(`dnsV6=${dns6.join(',')}`)
       if (node.wireGuardPersistentKeepalive !== undefined) {
         parts.push(`keepalive=${node.wireGuardPersistentKeepalive}`)
       }
@@ -136,13 +150,13 @@ function loonNode(node: ProxyNode, name: string): string | undefined {
     }
     case 'http': {
       const parts = [`${n} = ${node.tls ? 'HTTPS' : 'HTTP'}, ${host}, ${node.port}`]
-      if (node.username) parts.push(`username=${node.username}`)
-      if (node.password) parts.push(`password=${node.password}`)
-      if (node.tls) parts.push(...tlsTail())
+      if (node.username) parts.push(loonQuoted(node.username))
+      if (node.password) parts.push(loonQuoted(node.password))
+      if (node.tls) parts.push(...loonTlsParts(node, false))
       return parts.join(', ')
     }
     default:
-      // snell / wireguard / ssh / ssr：Loon 无对应语法
+      // snell / ssh / trusttunnel / masque / anytls / TUIC：Loon 无对应语法
       return undefined
   }
 }

@@ -15,7 +15,7 @@ import {
   queryDictionary,
 } from './util'
 
-function baseNode(kind: ProxyKind, raw: string, sourceID?: string): ProxyNode {
+export function baseNode(kind: ProxyKind, raw: string, sourceID?: string): ProxyNode {
   return {
     id: nextNodeID(),
     sourceID,

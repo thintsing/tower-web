@@ -27,6 +27,34 @@ function qxPolicy(name: string): string {
   return confName(name)
 }
 
+/** QuanX 的 ALPN 是「长度前缀 + ASCII」的十六进制串。 */
+function encodeQuanXALPN(value: string): string | undefined {
+  const protocols = value.split(',').map((item) => item.trim()).filter(Boolean)
+  if (!protocols.length) return undefined
+  const bytes: number[] = []
+  for (const protocol of protocols) {
+    if (protocol.length > 255) return undefined
+    bytes.push(protocol.length, ...protocol.split('').map((char) => char.charCodeAt(0)))
+  }
+  return bytes.map((byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+/** QuanX 的 Reality / 证书 pin / VLESS flow 都写在同一条 server_local 行。 */
+function qxTlsExtras(node: ProxyNode): string[] {
+  const parts: string[] = []
+  if (node.tls && node.alpn) {
+    const alpn = encodeQuanXALPN(node.alpn)
+    if (alpn) parts.push(`tls-alpn=${alpn}`)
+  }
+  if (node.realityPublicKey) {
+    parts.push(`reality-base64-pubkey=${node.realityPublicKey}`)
+    if (node.realityShortID) parts.push(`reality-hex-shortid=${node.realityShortID}`)
+  }
+  if (node.certificateFingerprint) parts.push(`tls-cert-sha256=${node.certificateFingerprint}`)
+  if (node.kind === 'vless' && node.flow) parts.push(`vless-flow=${node.flow}`)
+  return parts
+}
+
 function qxNode(node: ProxyNode, tag: string): string | undefined {
   if (!nodeSupportedForTarget(node, 'quanx')) return undefined
   const host = node.server.includes(':') ? `[${node.server}]` : node.server
@@ -35,7 +63,7 @@ function qxNode(node: ProxyNode, tag: string): string | undefined {
     const parts: string[] = []
     if (node.sni) parts.push(`tls-host=${node.sni}`)
     if (node.skipCertificateVerification) parts.push('tls-verification=false')
-    return parts
+    return [...parts, ...qxTlsExtras(node)]
   }
   switch (node.kind) {
     case 'ss': {
@@ -44,13 +72,16 @@ function qxNode(node: ProxyNode, tag: string): string | undefined {
         parts.push(`obfs=${node.tls ? 'wss' : 'ws'}`)
         if (node.hostHeader) parts.push(`obfs-host=${node.hostHeader}`)
         if (node.path) parts.push(`obfs-uri=${node.path}`)
+        if (node.tls) parts.push(...qxTlsExtras(node))
       } else if (node.tls) {
         parts.push('obfs=over-tls')
         if (node.sni) parts.push(`obfs-host=${node.sni}`)
+        parts.push(...qxTlsExtras(node))
       } else if (node.obfs) {
         // QuanX 的 ss obfs 只有 simple-obfs 的 http / tls 两种
         if (node.obfs === 'http' || node.obfs === 'tls') parts.push(`obfs=${node.obfs}`)
         if (node.obfsParam) parts.push(`obfs-host=${node.obfsParam}`)
+        if (node.path) parts.push(`obfs-uri=${node.path}`)
       }
       parts.push('fast-open=false', 'udp-relay=false', `tag=${tag}`)
       return parts.join(', ')
@@ -68,7 +99,10 @@ function qxNode(node: ProxyNode, tag: string): string | undefined {
       return parts.join(', ')
     }
     case 'vmess': {
-      const parts = [`vmess=${addr}`, 'method=none', `password=${node.uuid ?? ''}`]
+      const method = node.cipher && !['auto', 'none'].includes(node.cipher.toLowerCase())
+        ? node.cipher
+        : 'none'
+      const parts = [`vmess=${addr}`, `method=${method}`, `password=${node.uuid ?? ''}`]
       if (node.transport === 'ws') {
         parts.push('obfs=ws', `obfs-uri=${node.path || '/'}`)
         if (node.hostHeader) parts.push(`obfs-host=${node.hostHeader}`)
@@ -78,11 +112,13 @@ function qxNode(node: ProxyNode, tag: string): string | undefined {
         if (node.sni) parts.push(`tls-host=${node.sni}`)
         parts.push(`tls-verification=${node.skipCertificateVerification ? 'false' : 'true'}`)
       }
+      if (node.alterID !== undefined && node.alterID > 0) parts.push('aead=false')
+      parts.push(...qxTlsExtras(node))
       parts.push('fast-open=false', 'udp-relay=false', `tag=${tag}`)
       return parts.join(', ')
     }
     case 'vless': {
-      const parts = [`vless=${addr}`, `password=${node.uuid ?? ''}`]
+      const parts = [`vless=${addr}`, 'method=none', `password=${node.uuid ?? ''}`]
       if (node.transport === 'ws') {
         parts.push('obfs=ws', `obfs-uri=${node.path || '/'}`)
         if (node.hostHeader) parts.push(`obfs-host=${node.hostHeader}`)
@@ -90,6 +126,7 @@ function qxNode(node: ProxyNode, tag: string): string | undefined {
       if (node.tls || node.realityPublicKey) {
         parts.push('over-tls=true')
         if (node.sni) parts.push(`tls-host=${node.sni}`)
+        parts.push(...qxTlsExtras(node))
       }
       parts.push('udp-relay=false', `tag=${tag}`)
       return parts.join(', ')
@@ -107,19 +144,21 @@ function qxNode(node: ProxyNode, tag: string): string | undefined {
       const parts = [`socks5=${addr}`]
       if (node.username) parts.push(`username=${node.username}`)
       if (node.password) parts.push(`password=${node.password}`)
+      if (node.tls) parts.push('over-tls=true', ...tls())
       parts.push('udp-relay=false', `tag=${tag}`)
       return parts.join(', ')
     }
     case 'http': {
-      const parts = [`${node.tls ? 'https' : 'http'}=${addr}`]
+      // QuanX 文档用 http + over-tls=true 表达 HTTPS，而不是 https= 类型。
+      const parts = [`http=${addr}`]
       if (node.username) parts.push(`username=${node.username}`)
       if (node.password) parts.push(`password=${node.password}`)
-      if (node.tls) parts.push(...tls())
+      if (node.tls) parts.push('over-tls=true', ...tls())
       parts.push(`tag=${tag}`)
       return parts.join(', ')
     }
     default:
-      // snell / wireguard / ssh / ssr：QuanX 无对应语法
+      // snell / wireguard / ssh / hysteria2 / tuic / anytls：QuanX 无对应语法
       return undefined
   }
 }
