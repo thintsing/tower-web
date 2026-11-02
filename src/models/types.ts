@@ -475,7 +475,10 @@ export const CLIENTS: ClientInfo[] = [
     subtitle: 'Clash / mihomo YAML',
     icon: 'clash-verge.png', color: '#2F82F7',
     contentMode: 'full', format: 'yaml',
-    importScheme: (url) => `clash-verge://install-config?url=${enc(url)}`,
+    // Clash Verge 2.5.8（Windows）在已有实例时只把 `clash://install-config`
+    // 转交给运行中的进程；`clash-verge://` 会激活窗口但不会导入。客户端源码
+    // 同时接受两种 scheme，这里用兼容性更好的 `clash://`。
+    importScheme: (url) => `clash://install-config?url=${enc(url)}`,
   },
   {
     target: 'mihomo-party',

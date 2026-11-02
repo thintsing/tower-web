@@ -388,7 +388,7 @@ for (const target of ['v2box', 'anywhere'] as ClientTarget[]) {
   if (!clientSupportsImport(client(target), 'nodes')) problems.push(`${target}: 缺少仅节点一键导入`)
 }
 const schemeExpectations: Partial<Record<ClientTarget, string>> = {
-  'clash-verge': 'clash-verge://install-config',
+  'clash-verge': 'clash://install-config',
   'mihomo-party': 'mihomo://install-config',
   flclash: 'flclash://install-config',
   'clash-mi': 'clashmi://install-config',
@@ -404,6 +404,19 @@ for (const [target, prefix] of Object.entries(schemeExpectations) as [ClientTarg
   const mode = target === 'v2box' || target === 'anywhere' ? 'nodes' : 'full'
   const scheme = client(target).importScheme?.('https://example.com/sub', 'tower', mode) ?? ''
   if (!scheme.startsWith(prefix)) problems.push(`${target}: 一键导入链接前缀错误`)
+}
+// Clash Verge 2.5.8 的 deep link 解析器把 url= 后面的整个 query 当作订阅地址；
+// url 内部只能出现 %26，不能把 &name 之类未编码参数追加在后面。
+const clashVergeInner = 'https://example.com/sub?format=yaml&target=clash-verge'
+const clashVergeScheme = client('clash-verge').importScheme?.(clashVergeInner, 'tower', 'full') ?? ''
+const clashVergePrefix = 'clash://install-config?url='
+if (!clashVergeScheme.startsWith(clashVergePrefix)) {
+  problems.push('clash-verge: 一键导入链接不是 clash://install-config')
+} else {
+  const payload = clashVergeScheme.slice(clashVergePrefix.length)
+  if (payload.includes('&') || decodeURIComponent(payload) !== clashVergeInner) {
+    problems.push('clash-verge: url 参数未正确编码')
+  }
 }
 const karingScheme = client('karing').importScheme?.('https://example.com/sub.yaml', 'tower', 'full') ?? ''
 if (!karingScheme.startsWith('karing://install-config') || !karingScheme.includes('tower-import')) {
