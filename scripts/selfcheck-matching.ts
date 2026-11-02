@@ -7,6 +7,13 @@ import {
   matchingOrderAfterDragging,
   reorderRulesByMatchingOrder,
 } from '../src/rules/matchingOrder'
+import {
+  buildNodeFilterGroup,
+  nextGroupName,
+  previewNodeMatches,
+  removePolicyGroup,
+  validateNodeGroupDraft,
+} from '../src/rules/groupEditing'
 import { prepareSchemeForExport } from '../src/generator/groups'
 
 let failures = 0
@@ -83,6 +90,79 @@ function main(): void {
       matchingGroupNames(prepared.rules.slice(1)),
       ['B', 'A', 'C'],
     )
+  })
+
+  check('新建节点组使用唯一名称并校验正则', () => {
+    const scheme: RuleScheme = {
+      id: 'new-group',
+      name: '测试',
+      description: '',
+      groups: [group('自定义节点'), group('B')],
+      rules: RULES,
+    }
+    assert.equal(nextGroupName(scheme), '自定义节点 2')
+    assert.equal(
+      validateNodeGroupDraft(scheme, { name: 'B', type: 'select', pattern: '.*' }),
+      '已经有同名策略组',
+    )
+    assert.equal(
+      validateNodeGroupDraft(scheme, { name: 'DIRECT', type: 'select', pattern: '.*' }),
+      '不能使用内置策略名',
+    )
+    assert.equal(
+      validateNodeGroupDraft(scheme, { name: '韩国', type: 'select', pattern: '[' }),
+      '节点名称匹配不是有效的正则表达式',
+    )
+    assert.equal(
+      validateNodeGroupDraft(scheme, { name: '韩国', type: 'select', pattern: '韩国|KR' }),
+      undefined,
+    )
+  })
+
+  check('节点组预览与默认参数', () => {
+    const preview = previewNodeMatches('首尔|KR', [
+      { id: '1', kind: 'ss', name: '🇰🇷 首尔 01', server: 'a.example.com', port: 1, tls: false, skipCertificateVerification: false, rawURI: '' },
+      { id: '2', kind: 'ss', name: '🇯🇵 东京 01', server: 'b.example.com', port: 1, tls: false, skipCertificateVerification: false, rawURI: '' },
+    ])
+    assert.deepEqual(preview.names, ['🇰🇷 首尔 01'])
+    const built = buildNodeFilterGroup({ name: '韩国节点', type: 'url-test', pattern: '韩国|KR' })
+    assert.equal(built.options.length, 0)
+    assert.equal(built.nodeFilter, '韩国|KR')
+    assert.equal(built.url, 'http://www.gstatic.com/generate_204')
+    assert.equal(built.interval, 300)
+    assert.equal(built.tolerance, 50)
+  })
+
+  check('删除策略组会清理规则、引用和规则集快照', () => {
+    const scheme: RuleScheme = {
+      id: 'delete-group',
+      name: '测试',
+      description: '',
+      groups: [
+        group('A'),
+        { ...group('B'), options: ['A', 'DIRECT'] },
+      ],
+      rules: [...A, ...B],
+      customRules: [rule('A', 'custom-a.example.com', 'DOMAIN-SUFFIX')],
+      matchingOrder: ['A', 'B'],
+      ruleSets: [
+        {
+          id: 'set-a', name: 'A 规则集', group: 'A',
+          rules: [rule('A', 'set-a.example.com', 'DOMAIN-SUFFIX')],
+          sourceKind: 'local', updatedAt: 1,
+        },
+      ],
+    }
+    const removed = removePolicyGroup(scheme, 'A')
+    assert.deepEqual(removed.scheme.groups.map((item) => item.name), ['B'])
+    assert.deepEqual(removed.scheme.groups[0].options, ['DIRECT'])
+    assert.equal(removed.scheme.rules.some((item) => item.group === 'A'), false)
+    assert.equal(removed.scheme.customRules?.length, 0)
+    assert.equal(removed.scheme.ruleSets?.length, 0)
+    assert.deepEqual(removed.scheme.matchingOrder, ['B'])
+    assert.equal(removed.removedRules, A.length)
+    assert.equal(removed.removedCustomRules, 1)
+    assert.equal(removed.removedRuleSets, 1)
   })
 
   if (failures) {

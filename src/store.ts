@@ -95,6 +95,8 @@ export interface Store extends AppState {
   setSourceExclusions: (id: string, excludedKeys: string[]) => void
   setScheme: (id: string) => void
   setPolicy: (group: string, selection: string) => void
+  /** Clear a stored preferred member after its policy group is deleted. */
+  removePolicy: (group: string) => void
   renamePolicySelection: (oldName: string, newName: string) => void
   startTesting: (nodeIds: string[]) => void
   stopTesting: () => void
@@ -534,6 +536,7 @@ export const useStore = create<Store>()(
                     ...src,
                     updatedAt: Date.now(),
                     usage: usage ?? src.usage,
+                    notices: parsed.notices,
                     excludedNodeKeys: carried,
                   }
                 : src,
@@ -605,6 +608,13 @@ export const useStore = create<Store>()(
       setScheme: (id) => set({ selectedSchemeID: id, policySelections: {} }),
       setPolicy: (group, selection) =>
         set((s) => ({ policySelections: { ...s.policySelections, [group]: selection } })),
+      removePolicy: (group) =>
+        set((s) => {
+          if (!(group in s.policySelections)) return s
+          const policySelections = { ...s.policySelections }
+          delete policySelections[group]
+          return { policySelections }
+        }),
 
       renamePolicySelection: (oldName, newName) =>
         set((s) => {

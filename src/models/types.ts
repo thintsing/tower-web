@@ -168,6 +168,8 @@ export interface SubscriptionSource {
   url: string
   updatedAt?: number
   usage?: SubscriptionUsage
+  /** Airport announcements parsed from metadata pseudo nodes. */
+  notices?: string[]
   /** 订阅是否启用；旧快照没有这个字段时按启用处理。 */
   isEnabled?: boolean
   /** 仅对这个订阅生效的请求身份与加密解析地址。 */
@@ -332,6 +334,8 @@ export interface RuleScheme {
   sourceKind?: RuleSchemeSource
   sourceFormat?: RuleSchemeFormat
   sourceURL?: string
+  /** Original imported text, used by the full-text scheme editor. */
+  rawConfigurationText?: string
   /** DNS / IPv6 / 延迟测试等网络设置。 */
   networkSettings?: RuleSchemeNetworkSettings
   updatedAt?: number

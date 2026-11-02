@@ -468,7 +468,13 @@ export function generateClashYAML(
   const inlineNodes = usable.filter((n) => !(n.sourceID && remoteSourceIDs.has(n.sourceID)))
   const names = uniqueDisplayNames(usable, (s) => s.replace(/["\\]/g, '').trim() || '节点', options.nameForNode)
   const displayName = (n: ProxyNode) => names.get(n.id)!
-  const resolved = nodesOnly ? [] : resolveGroups(scheme, usable, displayName)
+  if (nodesOnly) {
+    // Node-only subscriptions are merged into an existing profile; a full
+    // skeleton would overwrite the host's ports, DNS and mode.
+    if (inlineNodes.length === 0) return 'proxies: []\n'
+    return ['proxies:', ...inlineNodes.map((node) => clashNode(node, displayName(node), options.target))].join('\n') + '\n'
+  }
+  const resolved = resolveGroups(scheme, usable, displayName)
   const network = effectiveNetworkSettings(scheme.networkSettings)
   const testURL = latencyTestURL(scheme.networkSettings)
   const providerKeys = new Map(remoteSources.map((source, index) => [source.id, `tower-source-${index + 1}`]))

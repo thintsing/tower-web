@@ -26,6 +26,7 @@ import { BUILTIN_SCHEMES, allSchemeMetas, loadScheme, parseRuleList } from './ru
 import { detectRuleSchemeFormat, parseRuleSchemeText, RULE_SCHEME_FORMAT_TITLES } from './rules/importers'
 import { fetchRuleSet, parseRuleSetText, RULE_SET_FORMAT_TITLES, type RuleSetRule } from './rules/ruleSets'
 import { matchingGroupNames, matchingOrderAfterDragging } from './rules/matchingOrder'
+import { buildNodeFilterGroup, nextGroupName, previewNodeMatches, removePolicyGroup, validateNodeGroupDraft, type NodeGroupDraft } from './rules/groupEditing'
 import { ONLINE_RULE_CATALOG } from './rules/ruleCatalog'
 import type { ManualNodeImportResult } from './manualNodes'
 import { MAX_BATCH_SUBSCRIPTIONS, splitSubscriptionURLs, subscriptionLabel } from './batchSubscriptions'
@@ -42,6 +43,9 @@ import { GroupIcon, groupDisplayName } from './components/GroupIcon'
 import { TailnetIllustration } from './components/TailnetIllustration'
 import { ManualNodeEditorDialog } from './components/ManualNodeEditorDialog'
 import { QrScanner } from './components/QrScanner'
+
+const SELF_CONFIGURATION_NAME = 'Self-Configuration'
+const SELF_CONFIGURATION_URL = 'https://raw.githubusercontent.com/ClashConnectRules/Self-Configuration/main/Clash.yaml'
 
 /** 顶部工作区。跨页面跳转（上手流程 / 导出补救）需要它。 */
 type TabKey = 'sub' | 'rules' | 'tailnet' | 'export'
@@ -1198,6 +1202,7 @@ function SubscriptionSettingsDialog({
   const [backupError, setBackupError] = useState('')
   const [backupNotice, setBackupNotice] = useState('')
   const [history, setHistory] = useState<BackupHistoryItem[]>([])
+  const [resetConfirm, setResetConfirm] = useState(false)
 
   const refreshHistory = () => setHistory(backupHistoryItems(readBackupHistory()))
 
@@ -1208,6 +1213,7 @@ function SubscriptionSettingsDialog({
       setBackupBusy(false)
       setBackupError('')
       setBackupNotice('')
+      setResetConfirm(false)
       refreshHistory()
     } else {
       ref.current?.close()
@@ -1449,6 +1455,33 @@ function SubscriptionSettingsDialog({
         )}
         {backupError && <div className="form-error" role="alert"><span>{backupError}</span></div>}
         {backupNotice && <div className="inline-notice" role="status">{backupNotice}</div>}
+        <div className="settings-divider" />
+        <div className="settings-data-head">
+          <div>
+            <strong className="danger-text">重置所有配置</strong>
+            <small>删除本机的订阅、节点、方案、规则集、导出设置、版本历史和 Tailscale Auth Key，然后重新加载页面。</small>
+          </div>
+          <button type="button" className="btn danger" onClick={() => setResetConfirm(true)}>重置所有配置</button>
+        </div>
+        {resetConfirm && (
+          <div className="restore-confirm" role="alert">
+            <div>
+              <strong>确认清空本机数据？</strong>
+              <small>此操作不可撤销。服务器上已发布的订阅 token 不会被删除；如需让旧链接失效，请在导出页重新发布或清理服务器数据。</small>
+            </div>
+            <div className="row" style={{ gap: 8 }}>
+              <button
+                type="button"
+                className="btn danger"
+                onClick={() => {
+                  localStorage.clear()
+                  window.location.reload()
+                }}
+              >确认重置</button>
+              <button type="button" className="btn ghost" onClick={() => setResetConfirm(false)}>取消</button>
+            </div>
+          </div>
+        )}
         {pendingBackup && pendingCounts && (
           <div className="restore-confirm" role="alert">
             <div>
@@ -2419,8 +2452,15 @@ function SourceCard({
             {(u?.total !== undefined || u?.expire !== undefined) && (
               <div className="usage">
                 {u?.total !== undefined && <span>已用 {formatBytes(usedBytes)} / {formatBytes(u.total)}</span>}
+                {u?.total !== undefined && <span>剩余 {formatBytes(Math.max(0, u.total - usedBytes))}</span>}
                 {u?.expire !== undefined && <span>到期 {new Date(u.expire * 1000).toLocaleDateString('zh-CN')}</span>}
               </div>
+            )}
+            {(source.notices?.length ?? 0) > 0 && (
+              <details className="source-notices">
+                <summary>订阅公告 · {source.notices!.length}</summary>
+                {source.notices!.map((notice, index) => <div key={`${notice}-${index}`}>{notice}</div>)}
+              </details>
             )}
           </div>
         </div>
@@ -3477,6 +3517,58 @@ function SchemeEditDialog({
   )
 }
 
+function SchemeTextDialog({
+  scheme,
+  onClose,
+  onSave,
+}: {
+  scheme: RuleScheme
+  onClose: () => void
+  onSave: (text: string) => Promise<string | undefined>
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const [text, setText] = useState(scheme.rawConfigurationText ?? '')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => { ref.current?.showModal() }, [])
+
+  const save = async () => {
+    setBusy(true)
+    setError('')
+    const message = await onSave(text)
+    setBusy(false)
+    if (message) setError(message)
+    else ref.current?.close()
+  }
+
+  return (
+    <dialog ref={ref} className="scheme-text-dialog" onClose={onClose}>
+      <h3>编辑方案全文</h3>
+      <form className="dialog-form" onSubmit={(event) => { event.preventDefault(); void save() }}>
+        <div className="hint">
+          文本来自最近一次导入或刷新。保存会按文本重建策略组和方案规则，自定义规则与已加入的规则集会尽量保留。
+          如果之后在表单里改过策略组，文本可能尚未同步。
+        </div>
+        <textarea
+          className="field mono scheme-text-area"
+          rows={18}
+          value={text}
+          onChange={(event) => { setText(event.target.value); setError('') }}
+          spellCheck={false}
+        />
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <div className="actions">
+          <button type="submit" className="btn primary" disabled={busy || !text.trim()}>
+            {busy ? '解析中…' : '保存全文'}
+          </button>
+          <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
+        </div>
+      </form>
+    </dialog>
+  )
+}
+
 function AddCustomRuleDialog({
   scheme,
   initialGroup,
@@ -3946,6 +4038,91 @@ function GroupEditorDialog({
           ) : (
             <button type="button" className="btn primary" onClick={() => ref.current?.close()}>关闭</button>
           )}
+        </div>
+      </form>
+    </dialog>
+  )
+}
+
+function GroupCreateDialog({
+  scheme,
+  nodes,
+  onClose,
+  onCreate,
+}: {
+  scheme: RuleScheme
+  nodes: ProxyNode[]
+  onClose: () => void
+  onCreate: (group: PolicyGroup) => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const [name, setName] = useState(() => nextGroupName(scheme))
+  const [type, setType] = useState<NodeGroupDraft['type']>('select')
+  const [pattern, setPattern] = useState('')
+  const [error, setError] = useState('')
+
+  useEffect(() => { ref.current?.showModal() }, [])
+
+  const preview = useMemo(() => previewNodeMatches(pattern, nodes), [pattern, nodes])
+
+  const save = () => {
+    const validation = validateNodeGroupDraft(scheme, { name, type, pattern })
+    if (validation) {
+      setError(validation)
+      return
+    }
+    onCreate(buildNodeFilterGroup({ name, type, pattern }))
+    ref.current?.close()
+  }
+
+  return (
+    <dialog ref={ref} className="group-detail-dialog" onClose={onClose}>
+      <h3>新建策略组</h3>
+      <form className="dialog-form" onSubmit={(event) => { event.preventDefault(); save() }}>
+        <div className="field">
+          <label>名称</label>
+          <input
+            className="field"
+            value={name}
+            onChange={(event) => { setName(event.target.value); setError('') }}
+            autoFocus
+          />
+          <div className="hint">名称会出现在客户端策略组列表里。</div>
+        </div>
+        <div className="field">
+          <label>策略类型</label>
+          <select className="input" value={type} onChange={(event) => setType(event.target.value as NodeGroupDraft['type'])}>
+            <option value="select">手动选择</option>
+            <option value="url-test">自动测速</option>
+            <option value="fallback">故障转移</option>
+          </select>
+        </div>
+        <div className="field">
+          <label>节点名称匹配（正则）</label>
+          <input
+            className="field mono"
+            value={pattern}
+            placeholder="韩国|KR|首尔 或 台湾|TW 或 .*"
+            onChange={(event) => { setPattern(event.target.value); setError('') }}
+          />
+          <div className={`hint${preview.error ? ' is-error' : ''}`}>
+            {preview.error ?? (pattern.trim()
+              ? `当前匹配 ${preview.names.length} 个已启用节点`
+              : '区分大小写；留空不会创建组。')}
+          </div>
+          {preview.names.length > 0 && (
+            <div className="candidate-list">
+              {preview.names.slice(0, 6).map((nodeName) => (
+                <span className="candidate-chip" key={nodeName}>{nodeName}</span>
+              ))}
+              {preview.names.length > 6 && <span className="hint">另有 {preview.names.length - 6} 个节点</span>}
+            </div>
+          )}
+        </div>
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <div className="actions">
+          <button type="submit" className="btn primary">创建策略组</button>
+          <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
         </div>
       </form>
     </dialog>
@@ -4546,6 +4723,7 @@ function RulesTab() {
   const setScheme = useStore((s) => s.setScheme)
   const policySelections = useStore((s) => s.policySelections)
   const setPolicy = useStore((s) => s.setPolicy)
+  const removePolicy = useStore((s) => s.removePolicy)
   const scheme = useScheme()
   const nodes = useStore((s) => s.nodes)
   const sources = useStore((s) => s.sources)
@@ -4563,6 +4741,9 @@ function RulesTab() {
   const [schemeLoading, setSchemeLoading] = useState(false)
   const [pendingSchemeDelete, setPendingSchemeDelete] = useState<RuleScheme | null>(null)
   const [editingScheme, setEditingScheme] = useState<RuleScheme | null>(null)
+  const [textEditorScheme, setTextEditorScheme] = useState<RuleScheme | null>(null)
+  const [creatingGroup, setCreatingGroup] = useState<RuleScheme | null>(null)
+  const [pendingGroupDelete, setPendingGroupDelete] = useState<PolicyGroup | null>(null)
   const [customRuleTarget, setCustomRuleTarget] = useState<RuleScheme | null>(null)
   const [customRuleGroup, setCustomRuleGroup] = useState<string | undefined>()
   const [groupEditor, setGroupEditor] = useState<{
@@ -4632,10 +4813,10 @@ function RulesTab() {
     return parsed
   }
 
-  const importSchemeFromURL = async () => {
-    if (!schemeName.trim()) { setSchemeError('请先填写方案名称'); return }
-    if (!schemeURL.trim()) { setSchemeError('请填写方案地址'); return }
-    const sourceURL = normalizeRemoteTextURL(schemeURL)
+  const importSchemeFromRemote = async (name: string, rawURL: string) => {
+    if (!name.trim()) { setSchemeError('请先填写方案名称'); return }
+    if (!rawURL.trim()) { setSchemeError('请填写方案地址'); return }
+    const sourceURL = normalizeRemoteTextURL(rawURL)
     setSchemeLoading(true); setSchemeError(null)
     try {
       const res = await fetch(`/api/fetch?url=${encodeURIComponent(sourceURL)}`)
@@ -4643,13 +4824,14 @@ function RulesTab() {
       const text = await res.text()
       const format = detectRuleSchemeFormat(text)
       const parsed = validateScheme(await parseRuleSchemeText(
-        `custom-${Date.now()}`, schemeName.trim(), '从 URL 导入', text, format,
+        `custom-${Date.now()}`, name.trim(), '从 URL 导入', text, format,
       ))
       addCustomScheme({
         ...parsed,
         sourceKind: 'url',
         sourceFormat: format,
         sourceURL,
+        rawConfigurationText: text,
         updatedAt: Date.now(),
         customRules: [],
       })
@@ -4659,6 +4841,10 @@ function RulesTab() {
       setSchemeError(e.message ?? '导入失败')
     } finally { setSchemeLoading(false) }
   }
+
+  const importSchemeFromURL = () => importSchemeFromRemote(schemeName, schemeURL)
+
+  const importSelfConfiguration = () => importSchemeFromRemote(SELF_CONFIGURATION_NAME, SELF_CONFIGURATION_URL)
 
   const importSchemeFromText = async () => {
     if (!schemeName.trim()) { setSchemeError('请先填写方案名称'); return }
@@ -4674,6 +4860,7 @@ function RulesTab() {
         ...parsed,
         sourceKind: schemeFileName ? 'file' : 'paste',
         sourceFormat: format,
+        rawConfigurationText: schemeText,
         updatedAt: Date.now(),
         customRules: [],
       })
@@ -4731,6 +4918,35 @@ function RulesTab() {
   const saveSchemeMeta = (next: RuleScheme) => {
     addCustomScheme({ ...next, updatedAt: Date.now() })
     setFlash(`已保存方案「${next.name}」。`)
+  }
+
+  const createNodeGroup = (source: RuleScheme, group: PolicyGroup) => {
+    const editable = makeEditableScheme(source)
+    addCustomScheme({
+      ...editable,
+      groups: [...editable.groups, group],
+      updatedAt: Date.now(),
+    })
+    setCreatingGroup(null)
+    setFlash(`已新建策略组「${group.name}」。它现在还没有规则，可在「自定义规则」里把域名或 IP 加进来。`)
+  }
+
+  const deleteNodeGroup = (source: RuleScheme, group: PolicyGroup) => {
+    if (source.groups.length <= 1) {
+      setPendingGroupDelete(null)
+      setFlash('至少保留一个策略组，不能删除最后一个组。')
+      return
+    }
+    const editable = makeEditableScheme(source)
+    const result = removePolicyGroup(editable, group.name)
+    addCustomScheme(result.scheme)
+    removePolicy(group.name)
+    setPendingGroupDelete(null)
+    const details: string[] = []
+    if (result.removedRules > 0) details.push(`${result.removedRules} 条规则`)
+    if (result.removedCustomRules > 0) details.push(`${result.removedCustomRules} 条自定义规则`)
+    if (result.removedRuleSets > 0) details.push(`${result.removedRuleSets} 组规则集`)
+    setFlash(`已删除策略组「${group.name}」${details.length ? `，同时移除了 ${details.join('、')}` : ''}。`)
   }
 
   const beginEditNetwork = () => {
@@ -4855,6 +5071,46 @@ function RulesTab() {
     }
   }
 
+  const saveSchemeText = async (text: string): Promise<string | undefined> => {
+    const editable = customScheme
+    if (!editable) return '请先选择一个自定义方案'
+    if (!text.trim()) return '配置内容不能为空'
+    try {
+      const format = detectRuleSchemeFormat(text)
+      const parsed = validateScheme(await parseRuleSchemeText(
+        editable.id, editable.name, editable.description, text, format,
+      ))
+      const validGroups = new Set(parsed.groups.map((group) => group.name))
+      const customRules = (editable.customRules ?? []).filter((rule) => validGroups.has(rule.group))
+      const ruleSets = (editable.ruleSets ?? [])
+        .filter((set) => validGroups.has(set.group))
+        .map((set) => ({
+          ...set,
+          rules: set.rules.filter((rule) => validGroups.has(rule.group)),
+        }))
+        .filter((set) => set.rules.length > 0)
+      addCustomScheme({
+        ...parsed,
+        id: editable.id,
+        name: editable.name,
+        description: editable.description,
+        sourceKind: editable.sourceKind ?? 'paste',
+        sourceURL: editable.sourceURL,
+        sourceFormat: format,
+        rawConfigurationText: text,
+        networkSettings: parsed.networkSettings ?? editable.networkSettings,
+        customRules,
+        ruleSets,
+        matchingOrder: editable.matchingOrder?.filter((group) => validGroups.has(group)),
+        updatedAt: Date.now(),
+      })
+      setFlash('已按全文重建方案；自定义规则和规则集快照已尽量保留。')
+      return undefined
+    } catch (e: any) {
+      return e.message ?? '解析失败'
+    }
+  }
+
   const refreshImportedScheme = async () => {
     const editable = customScheme
     if (!editable?.sourceURL) return
@@ -4893,6 +5149,7 @@ function RulesTab() {
         sourceKind: 'url',
         sourceFormat: format,
         sourceURL,
+        rawConfigurationText: text,
         networkSettings: editable.networkSettings ?? parsed.networkSettings,
         updatedAt: Date.now(),
         groups,
@@ -5163,6 +5420,9 @@ function RulesTab() {
                 {customScheme ? '编辑方案' : '复制并编辑'}
               </button>
             )}
+            {customScheme?.rawConfigurationText && (
+              <button className="btn ghost" onClick={() => setTextEditorScheme(customScheme)}>编辑全文</button>
+            )}
             {customScheme?.sourceURL && (
               <button className="btn ghost" disabled={refreshingScheme} onClick={() => void refreshImportedScheme()}>
                 {refreshingScheme ? '刷新中…' : '刷新方案'}
@@ -5262,6 +5522,9 @@ function RulesTab() {
             <button className="btn" disabled={schemeLoading || !schemeText.trim()} onClick={importSchemeFromText}>
               {schemeLoading ? '处理中…' : schemeFileName ? '导入文件内容' : '粘贴导入'}
             </button>
+            <button className="btn ghost" disabled={schemeLoading} onClick={() => void importSelfConfiguration()}>
+              Self-Configuration 预设
+            </button>
             <button className="btn ghost" onClick={() => { setImportingScheme(false); setSchemeError(null); }}>取消</button>
           </div>
         </div>
@@ -5271,7 +5534,10 @@ function RulesTab() {
         <div className="card">
           <div className="card-head">
             <h3>策略组</h3>
-            <span className="meta">{groupCardMeta}</span>
+            <div className="row wrap" style={{ gap: 8, alignItems: 'center' }}>
+              <span className="meta">{groupCardMeta}</span>
+              <button className="btn ghost" onClick={() => setCreatingGroup(scheme)}>+ 新建策略组</button>
+            </div>
           </div>
           <div className="group-list" tabIndex={0} aria-label="策略组列表">
           {scheme.groups.map((g, index) => {
@@ -5375,6 +5641,13 @@ function RulesTab() {
                     title="下移"
                     onClick={() => moveGroup(scheme, index, 1)}
                   >↓</button>
+                  <button
+                    className="icon-btn"
+                    disabled={scheme.groups.length <= 1}
+                    aria-label={`删除策略组「${g.name}」`}
+                    title={scheme.groups.length <= 1 ? '至少保留一个策略组' : '删除策略组'}
+                    onClick={() => setPendingGroupDelete(g)}
+                  >×</button>
                 </div>
               </div>
             )
@@ -5600,6 +5873,14 @@ function RulesTab() {
           onSave={saveSchemeMeta}
         />
       )}
+      {textEditorScheme && (
+        <SchemeTextDialog
+          key={textEditorScheme.id}
+          scheme={textEditorScheme}
+          onClose={() => setTextEditorScheme(null)}
+          onSave={saveSchemeText}
+        />
+      )}
       {customRuleTarget && (
         <AddCustomRuleDialog
           key={`${customRuleTarget.id}-${customRuleGroup ?? ''}`}
@@ -5626,6 +5907,15 @@ function RulesTab() {
           onClose={() => setGroupEditor(null)}
           onSave={(updated) => saveGroupEdit(groupEditor, updated)}
           onAddRule={(rule) => saveCustomRule(groupEditor.scheme, rule)}
+        />
+      )}
+      {creatingGroup && (
+        <GroupCreateDialog
+          key={`${creatingGroup.id}-create-group`}
+          scheme={creatingGroup}
+          nodes={enabledForRules}
+          onClose={() => setCreatingGroup(null)}
+          onCreate={(group) => createNodeGroup(creatingGroup, group)}
         />
       )}
       {libraryOpen && scheme && (
@@ -5675,6 +5965,22 @@ function RulesTab() {
           scheme={scheme}
           onClose={() => setLocalSetAddTarget(null)}
           onAdd={(group) => addLocalSetToScheme(scheme, localSetAddTarget, group)}
+        />
+      )}
+      {pendingGroupDelete && scheme && (
+        <ConfirmDialog
+          open
+          title="删除策略组？"
+          body={(
+            <>
+              将删除 <b>「{pendingGroupDelete.name}」</b>，并移除 {schemeRules.filter((rule) => rule.group === pendingGroupDelete.name).length} 条规则。
+              其他策略组和规则里对它的引用也会一并移除。此操作会先复制为自定义方案，内置方案本身不受影响。
+            </>
+          )}
+          confirmLabel="删除策略组"
+          danger
+          onCancel={() => setPendingGroupDelete(null)}
+          onConfirm={() => deleteNodeGroup(scheme, pendingGroupDelete)}
         />
       )}
       <ConfirmDialog

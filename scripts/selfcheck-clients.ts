@@ -63,6 +63,8 @@ const clashVerge = generateConfig(client('clash-verge'), SAMPLE, scheme, { conte
 const surgeNodes = generateConfig(client('surge'), SAMPLE, scheme, { contentMode: 'nodes' })
 const loonNodes = generateConfig(client('loon'), SAMPLE, scheme, { contentMode: 'nodes' })
 const quanxNodes = generateConfig(client('quanx'), SAMPLE, scheme, { contentMode: 'nodes' })
+const clashNodes = generateConfig(client('clash-verge'), SAMPLE, scheme, { contentMode: 'nodes' })
+const shadowrocketNodes = generateConfig(client('shadowrocket'), SAMPLE, scheme, { contentMode: 'nodes' })
 const hiddify = generateConfig(client('hiddify'), SAMPLE, scheme, { contentMode: 'full' })
 const generic = generateSubscriptionFormats(SAMPLE, {
   ...scheme,
@@ -250,6 +252,17 @@ if (quanxNodes.extension !== 'txt' || quanxNodes.text.includes('[general]') || q
 }
 if (!quanxNodes.text.includes('shadowsocks=ss.example.com:8388')) problems.push('quanx: 仅节点缺少 SS 行')
 if (quanxNodes.skipped !== 1) problems.push(`quanx: Hysteria2 应跳过 1 个，实际 ${quanxNodes.skipped}`)
+const nodeYamlChecks: Array<[string, typeof clashNodes]> = [
+  ['clash', clashNodes],
+  ['shadowrocket', shadowrocketNodes],
+]
+for (const [label, generated] of nodeYamlChecks) {
+  if (!generated.text.startsWith('proxies:')) problems.push(`${label}: 仅节点应以 proxies: 开头`)
+  if (generated.text.includes('mixed-port:') || generated.text.includes('proxy-groups:')) {
+    problems.push(`${label}: 仅节点不应写入完整配置骨架`)
+  }
+  if (!generated.text.includes('ss.example.com')) problems.push(`${label}: 仅节点缺少 SS`)
+}
 
 if (!clientSupportsImport(client('surge'), 'full') || clientSupportsImport(client('surge'), 'nodes')) {
   problems.push('surge: 一键导入只应支持完整配置')
