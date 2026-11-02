@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { renderSVG } from 'uqr'
 import { CLIENTS, PROXY_KIND_TITLES, clientSupportsImport, subFormatFor, type ClientInfo, type ClientTarget, type ExportContentMode, type LatencyTestMode, type LocalRuleSet, type NodeNameFilterSettings, type PolicyGroup, type ProxyKind, type ProxyNode, type RemoteSubscriptionEntry, type RoutingRule, type RuleScheme, type RuleSetFormat, type SchemeRuleSet, type SubFormat, type SubscriptionSource, type TailnetConnection, type TailnetExport } from './models/types'
-import { allRegions, regionForName, regionForNode } from './models/region'
+import { allRegions, filterNodesByRegionCodes, regionForName, regionForNode } from './models/region'
 import { defaultTailnetConnection, normalizeTailnetAuthKey, normalizeTailnetControlURL, normalizeTailnetDeviceName, normalizeTailnetMagicDNSSuffix, normalizeTailnetSubnets, tailnetPolicyName, TailnetValidationError } from './models/tailnet'
 import {
   DNS_MODE_SUMMARIES,
@@ -2903,6 +2903,7 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const [renamingManualNode, setRenamingManualNode] = useState<ProxyNode | null>(null)
   const [pendingManualDelete, setPendingManualDelete] = useState<ProxyNode | null>(null)
   const [batchFailures, setBatchFailures] = useState<SourceAddFailure[] | null>(null)
+  const [refreshProgress, setRefreshProgress] = useState<{ done: number; total: number } | null>(null)
   const removeManualNode = useStore((s) => s.removeManualNode)
 
   // 手动「刷新全部」和打开时自动刷新都只处理启用中的 URL 订阅。
@@ -2912,7 +2913,20 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   )
   const refreshing = refreshableSources.some((s) => loadingSourceIDs.includes(s.id))
   const refreshAll = async () => {
-    await Promise.all(refreshableSources.map((s) => refreshSource(s.id)))
+    if (refreshProgress) return
+    const targets = refreshableSources
+    if (!targets.length) return
+    let done = 0
+    setRefreshProgress({ done, total: targets.length })
+    await Promise.all(targets.map(async (source) => {
+      try {
+        await refreshSource(source.id)
+      } finally {
+        done += 1
+        setRefreshProgress({ done, total: targets.length })
+      }
+    }))
+    setRefreshProgress(null)
   }
   const selectedSources = sources.filter((s) => checkedSources.has(s.id))
   const selectedAllEnabled = selectedSources.length > 0 && selectedSources.every(isSourceEnabled)
@@ -3412,9 +3426,11 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
             <button
               className="btn ghost refresh-all"
               onClick={() => void refreshAll()}
-              disabled={refreshing}
+              disabled={refreshing || !!refreshProgress}
             >
-              {refreshing ? '刷新中…' : `刷新全部（${refreshableSources.length}）`}
+              {refreshProgress
+                ? `刷新中… ${refreshProgress.done}/${refreshProgress.total}`
+                : refreshing ? '刷新中…' : `刷新全部（${refreshableSources.length}）`}
             </button>
           )}
         </div>
@@ -6413,6 +6429,8 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const setNodeNameFilter = useStore((s) => s.setNodeNameFilter)
   const exportProtocols = useStore((s) => s.exportProtocols)
   const setExportProtocols = useStore((s) => s.setExportProtocols)
+  const exportRegions = useStore((s) => s.exportRegions)
+  const setExportRegions = useStore((s) => s.setExportRegions)
   const exportConfigName = useStore((s) => s.exportConfigName)
   const setExportConfigName = useStore((s) => s.setExportConfigName)
   const appendSourceName = useStore((s) => s.appendSourceName)
@@ -6526,17 +6544,35 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     () => filterNodesByName(enabled, nodeNameFilter),
     [enabled, nodeNameFilter],
   )
+  // 地区多选：空数组表示全部；未识别地区的节点只在“全部”时导出。
+  const regionOptions = useMemo(() => {
+    const counts = new Map<string, { code: string; name: string; flag: string; count: number }>()
+    for (const node of nameFilterResult.nodes) {
+      const region = regionForNode(node)
+      if (!region) continue
+      const current = counts.get(region.code)
+      if (current) current.count += 1
+      else counts.set(region.code, { ...region, count: 1 })
+    }
+    return [...counts.values()].sort(
+      (left, right) => right.count - left.count || left.name.localeCompare(right.name, 'zh-CN'),
+    )
+  }, [nameFilterResult.nodes])
+  const regionFilteredNodes = useMemo(
+    () => filterNodesByRegionCodes(nameFilterResult.nodes, exportRegions),
+    [exportRegions, nameFilterResult.nodes],
+  )
   const protocolCounts = useMemo(() => {
     const counts = new Map<ProxyKind, number>()
-    for (const node of nameFilterResult.nodes) counts.set(node.kind, (counts.get(node.kind) ?? 0) + 1)
+    for (const node of regionFilteredNodes) counts.set(node.kind, (counts.get(node.kind) ?? 0) + 1)
     return [...counts.entries()].sort(
       (a, b) => b[1] - a[1] || PROXY_KIND_TITLES[a[0]].localeCompare(PROXY_KIND_TITLES[b[0]], 'zh-CN'),
     )
-  }, [nameFilterResult.nodes])
+  }, [regionFilteredNodes])
   const usable = useMemo(() => {
-    if (exportProtocols.length === 0) return nameFilterResult.nodes
-    return nameFilterResult.nodes.filter((node) => exportProtocols.includes(node.kind))
-  }, [nameFilterResult.nodes, exportProtocols])
+    if (exportProtocols.length === 0) return regionFilteredNodes
+    return regionFilteredNodes.filter((node) => exportProtocols.includes(node.kind))
+  }, [regionFilteredNodes, exportProtocols])
   const remoteSubscriptions = useMemo<RemoteSubscriptionEntry[]>(() => {
     if (!embedRemoteSubscriptions) return []
     return sources
@@ -7025,6 +7061,13 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       setExportProtocols([...exportProtocols, kind])
     }
   }
+  const toggleRegion = (code: string) => {
+    if (exportRegions.includes(code)) {
+      setExportRegions(exportRegions.filter((item) => item !== code))
+    } else {
+      setExportRegions([...exportRegions, code])
+    }
+  }
 
   const moveClient = (client: ClientInfo, delta: number) => {
     const order = orderedClients.map((item) => item.target)
@@ -7263,10 +7306,49 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
 
         <div className="export-field protocol-field">
           <div className="export-field-head">
+            <span>地区筛选</span>
+            <span className="hint">
+              {exportRegions.length === 0
+                ? `全部 ${nameFilterResult.nodes.length} 个命中节点`
+                : `已选 ${exportRegions.length} 个地区 · ${regionFilteredNodes.length} 个节点`}
+            </span>
+          </div>
+          {regionOptions.length === 0 ? (
+            <div className="hint">还没有识别到地区的节点。</div>
+          ) : (
+            <div className="protocol-chips" role="group" aria-label="按地区筛选节点">
+              <button
+                type="button"
+                className={`protocol-chip${exportRegions.length === 0 ? ' active' : ''}`}
+                aria-pressed={exportRegions.length === 0}
+                onClick={() => setExportRegions([])}
+              >
+                全部 <span className="num">{nameFilterResult.nodes.length}</span>
+              </button>
+              {regionOptions.map((region) => {
+                const active = exportRegions.includes(region.code)
+                return (
+                  <button
+                    key={region.code}
+                    type="button"
+                    className={`protocol-chip${active ? ' active' : ''}`}
+                    aria-pressed={active}
+                    onClick={() => toggleRegion(region.code)}
+                  >
+                    <span aria-hidden="true">{region.flag}</span> {region.name} <span className="num">{region.count}</span>
+                  </button>
+                )
+              })}
+            </div>
+          )}
+        </div>
+
+        <div className="export-field protocol-field">
+          <div className="export-field-head">
             <span>协议筛选</span>
             <span className="hint">
               {exportProtocols.length === 0
-                ? `全部 ${nameFilterResult.nodes.length} 个命中节点`
+                ? `全部 ${regionFilteredNodes.length} 个命中节点`
                 : `已选 ${exportProtocols.length} 种协议 · ${usable.length} 个节点`}
             </span>
           </div>
@@ -7280,7 +7362,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                 aria-pressed={exportProtocols.length === 0}
                 onClick={() => setExportProtocols([])}
               >
-                全部 <span className="num">{nameFilterResult.nodes.length}</span>
+                全部 <span className="num">{regionFilteredNodes.length}</span>
               </button>
               {protocolCounts.map(([kind, count]) => {
                 const active = exportProtocols.includes(kind)

@@ -1,6 +1,8 @@
 // 自检：地图地区聚合的贪心分组、加权中心和选中项独立显示。
 // 用法：npm run selfcheck:map
 import assert from 'node:assert/strict'
+import { filterNodesByRegionCodes } from '../src/models/region'
+import type { ProxyNode } from '../src/models/types'
 import { clusterPoints } from '../src/worldmap/clustering'
 import {
   BASE_MAP_VIEW,
@@ -122,6 +124,19 @@ check('聚焦地区时居中并遵守最大倍率', () => {
   assert.equal(extreme.w, WORLD_MAP_WIDTH / WORLD_MAP_MAX_ZOOM)
   assert.equal(extreme.x, 0)
   assert.equal(extreme.y, 0)
+})
+
+check('地区多选筛选：空选全部，未识别节点不混入具体地区', () => {
+  const base = { kind: 'ss', server: 'example.com', port: 1, tls: false, skipCertificateVerification: false, rawURI: '' } as const
+  const nodes: ProxyNode[] = [
+    { ...base, id: 'hk', name: '🇭🇰 香港 01' },
+    { ...base, id: 'jp', name: '🇯🇵 日本 01' },
+    { ...base, id: 'unknown', name: '节点 03' },
+  ]
+  assert.deepEqual(filterNodesByRegionCodes(nodes, []), nodes)
+  assert.deepEqual(filterNodesByRegionCodes(nodes, ['HK']).map((node) => node.id), ['hk'])
+  assert.deepEqual(filterNodesByRegionCodes(nodes, ['jp', 'HK']).map((node) => node.id), ['hk', 'jp'])
+  assert.deepEqual(filterNodesByRegionCodes(nodes, ['US']), [])
 })
 
 if (failures) {

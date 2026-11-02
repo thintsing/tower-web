@@ -31,6 +31,7 @@ export interface PersistedData {
   exportContentModes: Partial<Record<ClientTarget, ExportContentMode>>
   embedRemoteSubscriptions: boolean
   exportProtocols: ProxyKind[]
+  exportRegions: string[]
   exportConfigName: string
   appendSourceName: boolean
   clientOrder: ClientTarget[]
@@ -218,6 +219,9 @@ export function parseBackup(text: string): BackupFile {
       exportContentModes: normalizeContentModes(data.exportContentModes),
       embedRemoteSubscriptions: booleanOr(data.embedRemoteSubscriptions, false),
       exportProtocols: (stringArray(data.exportProtocols) ?? []) as ProxyKind[],
+      exportRegions: (stringArray(data.exportRegions) ?? [])
+        .map((code) => code.trim().toUpperCase())
+        .filter((code) => /^[A-Z]{2}$/.test(code)),
       exportConfigName: stringOr(data.exportConfigName, 'tower').slice(0, 48),
       appendSourceName: booleanOr(data.appendSourceName, false),
       clientOrder: (stringArray(data.clientOrder) ?? []) as ClientTarget[],

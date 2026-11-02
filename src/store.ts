@@ -41,6 +41,8 @@ export interface Store extends AppState {
   embedRemoteSubscriptions: boolean
   /** 只导出这些协议；空数组表示全部协议。 */
   exportProtocols: ProxyKind[]
+  /** 只导出这些地区代码；空数组表示全部地区。 */
+  exportRegions: string[]
   /** 配置名称，同时用于下载文件名与订阅 profile 标题。 */
   exportConfigName: string
   /** 节点名称后追加来源订阅名，便于多订阅合并时区分。 */
@@ -70,6 +72,7 @@ export interface Store extends AppState {
   setPreferRuleSets: (enabled: boolean) => void
   setExportContentMode: (mode: ExportContentMode) => void
   setExportProtocols: (kinds: ProxyKind[]) => void
+  setExportRegions: (codes: string[]) => void
   setExportConfigName: (name: string) => void
   setAppendSourceName: (enabled: boolean) => void
   setClientOrder: (order: ClientTarget[]) => void
@@ -122,6 +125,51 @@ export interface Store extends AppState {
 export interface ManualNodePatch {
   name?: string
   isEnabled?: boolean
+}
+
+/**
+ * 同一订阅的并发刷新以最后一次为准；旧请求即使晚返回也不能覆盖新结果。
+ * 同 URL 的并发抓取共享一次请求，同 host 的不同路径仍排队，避免机场限流。
+ */
+const refreshGenerations = new Map<string, number>()
+const inFlightFetches = new Map<string, Promise<SubscriptionFetch>>()
+const hostQueues = new Map<string, Promise<void>>()
+
+async function withHostQueue<T>(url: string, task: () => Promise<T>): Promise<T> {
+  let host = ''
+  try {
+    host = new URL(url).hostname.toLowerCase()
+  } catch {
+    return task()
+  }
+  const previous = hostQueues.get(host) ?? Promise.resolve()
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const tail = previous.then(() => gate)
+  hostQueues.set(host, tail)
+  await previous.catch(() => {})
+  try {
+    return await task()
+  } finally {
+    release()
+    if (hostQueues.get(host) === tail) hostQueues.delete(host)
+  }
+}
+
+function fetchSubscriptionShared(
+  url: string,
+  userAgent?: string,
+  dnsOverHTTPSURL?: string,
+): Promise<SubscriptionFetch> {
+  const key = `${url}\n${userAgent ?? ''}\n${dnsOverHTTPSURL ?? ''}`
+  const existing = inFlightFetches.get(key)
+  if (existing) return existing
+  const promise = withHostQueue(url, () => fetchSubscription(url, userAgent, dnsOverHTTPSURL))
+    .finally(() => {
+      if (inFlightFetches.get(key) === promise) inFlightFetches.delete(key)
+    })
+  inFlightFetches.set(key, promise)
+  return promise
 }
 
 /** 可编辑的订阅字段；未出现的字段保持原值。 */
@@ -265,6 +313,7 @@ export function persistedSnapshot(s: Store): PersistedData {
     exportContentModes: s.exportContentModes,
     embedRemoteSubscriptions: s.embedRemoteSubscriptions,
     exportProtocols: s.exportProtocols,
+    exportRegions: s.exportRegions,
     exportConfigName: s.exportConfigName,
     appendSourceName: s.appendSourceName,
     clientOrder: s.clientOrder,
@@ -302,6 +351,7 @@ export const useStore = create<Store>()(
       exportContentModes: {},
       embedRemoteSubscriptions: false,
       exportProtocols: [],
+      exportRegions: [],
       exportConfigName: 'tower',
       appendSourceName: false,
       clientOrder: [],
@@ -376,6 +426,7 @@ export const useStore = create<Store>()(
       setPreferRuleSets: (enabled) => set({ preferRuleSets: enabled }),
       setExportContentMode: (mode) => set({ exportContentMode: mode }),
       setExportProtocols: (kinds) => set({ exportProtocols: [...new Set(kinds)] }),
+      setExportRegions: (codes) => set({ exportRegions: [...new Set(codes.map((code) => code.trim().toUpperCase()).filter(Boolean))] }),
       setExportConfigName: (name) =>
         set({ exportConfigName: String(name).replace(/[\r\n]/g, '').slice(0, 48) }),
       setAppendSourceName: (enabled) => set({ appendSourceName: enabled }),
@@ -474,6 +525,9 @@ export const useStore = create<Store>()(
         const source = get().sources.find((s) => s.id === id)
         if (!source) return
         if (!source.url) return // pasted content has nothing to refresh
+        const generation = (refreshGenerations.get(id) ?? 0) + 1
+        refreshGenerations.set(id, generation)
+        const isCurrent = () => refreshGenerations.get(id) === generation
         set((s) => ({
           loadingSourceIDs: [...s.loadingSourceIDs.filter((x) => x !== id), id],
           errors: { ...s.errors, [id]: '' },
@@ -488,13 +542,14 @@ export const useStore = create<Store>()(
           let lastError: unknown
           for (const attempt of userAgentAttempts) {
             try {
-              const result = await fetchSubscription(
+              const result = await fetchSubscriptionShared(
                 source.url,
                 attempt,
                 source.dnsOverHTTPSURL?.trim(),
               )
-              // 用户可能在请求途中删掉了这个订阅；不要把它以「无主节点」的形式写回来。
-              if (!get().sources.some((s) => s.id === id)) return
+              // 用户可能在请求途中删掉了这个订阅，或又发起了一次刷新；
+              // 旧请求不能把过期节点写回来。
+              if (!isCurrent() || !get().sources.some((s) => s.id === id)) return
               const candidate = parse(result.text, id)
               if (!candidate.nodes.some((n) => !n.isSubscriptionMetadata)) {
                 lastError = new Error(
@@ -512,7 +567,7 @@ export const useStore = create<Store>()(
             }
           }
           if (!fetched || !parsed) throw lastError
-          if (!get().sources.some((s) => s.id === id)) return
+          if (!isCurrent() || !get().sources.some((s) => s.id === id)) return
           let usage = fetched.usage ?? parsed.status
           // Some panels only send quota on a Clash-dialect request. Use only
           // its response headers; its node body may silently drop protocols.
@@ -520,7 +575,7 @@ export const useStore = create<Store>()(
             const probe = quotaProbeURL(source.url)
             if (probe) {
               try {
-                const probeResult = await fetchSubscription(
+                const probeResult = await fetchSubscriptionShared(
                   probe,
                   fetched.userAgent,
                   source.dnsOverHTTPSURL?.trim(),
@@ -531,7 +586,7 @@ export const useStore = create<Store>()(
               }
             }
           }
-          if (!get().sources.some((s) => s.id === id)) return
+          if (!isCurrent() || !get().sources.some((s) => s.id === id)) return
           const oldNodes = get().nodes.filter((n) => n.sourceID === id)
           const carried = carriedOverExclusions(oldNodes, parsed.nodes, source.excludedNodeKeys)
 
@@ -557,8 +612,8 @@ export const useStore = create<Store>()(
             })(),
           }))
         } catch (error) {
-          // 已删除的订阅不再挂错误提示。
-          if (!get().sources.some((s) => s.id === id)) return
+          // 已删除或已被更新请求取代的订阅不再挂错误提示。
+          if (!isCurrent() || !get().sources.some((s) => s.id === id)) return
           set((s) => ({
             loadingSourceIDs: s.loadingSourceIDs.filter((x) => x !== id),
             errors: { ...s.errors, [id]: String((error as Error).message) },

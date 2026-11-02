@@ -271,6 +271,16 @@ export function regionForNode(node: ProxyNode): NodeRegion | undefined {
   return node.detectedCountry ? regionByCode(node.detectedCountry) : undefined
 }
 
+/** 地区多选筛选；空数组表示全部，未识别地区的节点只在“全部”时保留。 */
+export function filterNodesByRegionCodes(nodes: ProxyNode[], codes: string[]): ProxyNode[] {
+  const selected = new Set(codes.map((code) => code.trim().toUpperCase()).filter(Boolean))
+  if (!selected.size) return nodes
+  return nodes.filter((node) => {
+    const region = regionForNode(node)
+    return !!region && selected.has(region.code)
+  })
+}
+
 /** Every country available for manual overrides, including non-curated ones. */
 export function allRegions(): NodeRegion[] {
   const merged = new Map<string, NodeRegion>(curatedRegions)
