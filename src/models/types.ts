@@ -370,11 +370,37 @@ export interface ClientInfo {
   /** 'full' config with rules, or node-only subscription. */
   contentMode: 'full' | 'nodes'
   format: 'yaml' | 'ini' | 'json' | 'base64'
-  /** URL scheme for one-click import, if the client supports it. */
-  importScheme?: (url: string, name: string, mode?: ExportContentMode) => string
+  /** URL scheme for one-click import, if the client supports it.
+   *  Returns undefined when that client cannot take the current content mode. */
+  importScheme?: (url: string, name: string, mode?: ExportContentMode) => string | undefined
+  /** Content modes that have a one-click handoff. Defaults to full config. */
+  importModes?: ExportContentMode[]
 }
 
 const enc = encodeURIComponent
+
+/** Whether a client can take the given content mode through a URL scheme. */
+export function clientSupportsImport(client: ClientInfo, mode: ExportContentMode): boolean {
+  return !!client.importScheme && (client.importModes ?? ['full']).includes(mode)
+}
+
+/** Karing silently skips a URL it already has, so make each import unique. */
+function karingImportScheme(url: string, name: string): string {
+  try {
+    const parsed = new URL(url)
+    parsed.searchParams.set('tower-import', String(Date.now()))
+    const stamp = new Date().toISOString().slice(11, 19)
+    return `karing://install-config?url=${enc(parsed.href)}&name=${enc(`${name} ${stamp}`)}`
+  } catch {
+    return `karing://install-config?url=${enc(url)}&name=${enc(name)}`
+  }
+}
+
+/** QuanX imports a nodes-only list as a `server_remote` resource. */
+function quanxNodeResource(url: string, name: string): string {
+  const tag = name.replace(/,/g, ' ').trim() || 'tower'
+  return JSON.stringify({ server_remote: [`${url}, tag=${tag}, as-policy=static`] })
+}
 
 /** 订阅载体：服务端 /api/sub/:token?format=… 按此分发。 */
 export type SubFormat = 'yaml' | 'surge' | 'loon' | 'quanx' | 'json' | 'base64' | 'egern'
@@ -441,7 +467,7 @@ export const CLIENTS: ClientInfo[] = [
     subtitle: 'Clash / mihomo YAML',
     icon: 'clash-verge.png', color: '#2F82F7',
     contentMode: 'full', format: 'yaml',
-    importScheme: (url, name) => `clash://install-config?url=${enc(url)}&name=${enc(name)}`,
+    importScheme: (url) => `clash-verge://install-config?url=${enc(url)}`,
   },
   {
     target: 'mihomo-party',
@@ -449,7 +475,7 @@ export const CLIENTS: ClientInfo[] = [
     subtitle: 'Clash / mihomo YAML',
     icon: 'mihomo-party.png', color: '#2F82F7',
     contentMode: 'full', format: 'yaml',
-    importScheme: (url, name) => `clash://install-config?url=${enc(url)}&name=${enc(name)}`,
+    importScheme: (url, name) => `mihomo://install-config?url=${enc(url)}&name=${enc(name)}`,
   },
   {
     target: 'flclash',
@@ -457,6 +483,7 @@ export const CLIENTS: ClientInfo[] = [
     subtitle: 'Clash YAML',
     icon: 'flclash.png', color: '#2F82F7',
     contentMode: 'full', format: 'yaml',
+    importScheme: (url) => `flclash://install-config?url=${enc(url)}`,
   },
   {
     target: 'clash-mi',
@@ -464,6 +491,7 @@ export const CLIENTS: ClientInfo[] = [
     subtitle: 'Mihomo YAML',
     icon: 'clash-mi.jpg', color: '#224D7A',
     contentMode: 'full', format: 'yaml',
+    importScheme: (url, name) => `clashmi://install-config?url=${enc(url)}&name=${enc(name)}`,
   },
   {
     target: 'clash-apple',
@@ -471,6 +499,7 @@ export const CLIENTS: ClientInfo[] = [
     subtitle: 'Clash YAML',
     icon: 'clash-apple.png', color: '#2F82F7',
     contentMode: 'full', format: 'yaml',
+    importScheme: (url) => `clashmeta://install-config?url=${enc(url)}`,
   },
   {
     target: 'clashmac',
@@ -493,6 +522,7 @@ export const CLIENTS: ClientInfo[] = [
     subtitle: 'Clash YAML',
     icon: 'karing.jpg', color: '#5367F7',
     contentMode: 'full', format: 'yaml',
+    importScheme: karingImportScheme,
   },
   // —— Surge 系 ——
   {
@@ -501,7 +531,7 @@ export const CLIENTS: ClientInfo[] = [
     subtitle: '完整配置',
     icon: 'surge.jpg', color: '#3157D5',
     contentMode: 'full', format: 'ini',
-    importScheme: (url, name) => `surge:///install-config?url=${enc(url)}&name=${enc(name)}`,
+    importScheme: (url) => `surge:///install-config?url=${enc(url)}`,
   },
   {
     target: 'surge-mac',
@@ -509,6 +539,7 @@ export const CLIENTS: ClientInfo[] = [
     subtitle: '完整配置',
     icon: 'surge-mac.png', color: '#3157D5',
     contentMode: 'full', format: 'ini',
+    importScheme: (url) => `surgeconfig:///install-config?url=${enc(url)}`,
   },
   // —— sing-box 系 ——
   {
@@ -517,6 +548,7 @@ export const CLIENTS: ClientInfo[] = [
     subtitle: 'sing-box JSON',
     icon: 'sing-box.png', color: '#334854',
     contentMode: 'full', format: 'json',
+    importScheme: (url, name) => `sing-box://import-remote-profile?url=${enc(url)}#${enc(name)}`,
   },
   {
     target: 'hiddify',
@@ -524,6 +556,8 @@ export const CLIENTS: ClientInfo[] = [
     subtitle: 'sing-box JSON',
     icon: 'hiddify.jpg', color: '#6047D9',
     contentMode: 'full', format: 'json',
+    importScheme: (url) => `hiddify://import/${url}`,
+    importModes: ['full', 'nodes'],
   },
   // —— Loon / QuanX ——
   {
@@ -535,6 +569,7 @@ export const CLIENTS: ClientInfo[] = [
     importScheme: (url, _name, mode) => mode === 'nodes'
       ? `loon://import?nodelist=${enc(url)}`
       : `loon://import?sub=${enc(url)}`,
+    importModes: ['full', 'nodes'],
   },
   {
     target: 'quanx',
@@ -542,6 +577,8 @@ export const CLIENTS: ClientInfo[] = [
     subtitle: '完整配置',
     icon: 'quanx.jpg', color: '#14A69A',
     contentMode: 'full', format: 'ini',
+    importScheme: (url, name) => `quantumult-x:///add-resource?remote-resource=${enc(quanxNodeResource(url, name))}`,
+    importModes: ['nodes'],
   },
   // —— 手机订阅 / 轻量 ——
   {
@@ -553,6 +590,7 @@ export const CLIENTS: ClientInfo[] = [
     importScheme: (url, _name, mode) => mode === 'nodes'
       ? `shadowrocket://add/${url}`
       : `shadowrocket://config/add/${url}`,
+    importModes: ['full', 'nodes'],
   },
   {
     target: 'egern',
@@ -568,6 +606,8 @@ export const CLIENTS: ClientInfo[] = [
     subtitle: '节点订阅',
     icon: 'v2box.jpg', color: '#246BFD',
     contentMode: 'nodes', format: 'base64',
+    importScheme: (url, name) => `v2box://install-sub?url=${enc(url)}&name=${enc(name)}`,
+    importModes: ['nodes'],
   },
   {
     target: 'anywhere',
@@ -575,6 +615,8 @@ export const CLIENTS: ClientInfo[] = [
     subtitle: '节点链接',
     icon: 'anywhere.png', color: '#286BF5',
     contentMode: 'nodes', format: 'base64',
+    importScheme: (url) => `anywhere://add-proxy?link=${enc(url)}`,
+    importModes: ['nodes'],
   },
 ]
 

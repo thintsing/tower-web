@@ -63,6 +63,8 @@
 - sing-box 没有 SSR 出站，SSR 节点不会写入 JSON。
 - 发布订阅时，YAML / Surge / Loon / QuanX / Egern 会按各自规则白名单过滤，避免把其他客户端的规则写进去。
 - mihomo 的 ECS 需要较新内核并支持 `#代理组` DNS 后缀；sing-box 的 ECS 需要官方 1.14+，Hiddify 1.13 会跳过 ECS 提示。
+- Surge 的仅节点输出是纯 `policy-path` 列表；Quantumult X 的仅节点作为 `server_remote` 资源导入；sing-box MT 完整配置提供「规则判定 / 全局代理 / 直接连接」三种模式。
+- 订阅默认请求没有解析到节点时，会自动用 `clash.meta` 兼容 UA 重试；流量或到期信息缺失时会补请求一次配额响应头。
 - 闭源客户端按规则白名单和引用完整性自检，仍建议在目标客户端实际导入确认。
 
 ## 快速开始

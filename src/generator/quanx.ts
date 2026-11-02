@@ -152,6 +152,9 @@ export function generateQuanX(
       skipped += 1
     }
   }
+  if (nodesOnly) {
+    return { text: serverLines.join('\n') + (serverLines.length ? '\n' : ''), skipped }
+  }
   const emittedNodes = remotePlan.localNodes.filter((n) => emitted.has(n.id))
   const remoteNodes = usable.filter((n) => n.sourceID && remotePlan.sourceIDs.has(n.sourceID))
   const groupNodes = remotePlan.sources.length ? [...emittedNodes, ...remoteNodes] : emittedNodes

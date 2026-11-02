@@ -594,6 +594,41 @@ export function generateSingBox(
     groupTags.map((group) => [group.tag as string, group]),
   )
   const nodeTags = new Set(emittedNodes.map(displayName))
+  // Official sing-box MT exposes the Clash API's mode switch. Add a global
+  // selector and the matching route/DNS rules; Hiddify keeps its 1.13 dialect.
+  let globalProxyTag: string | undefined
+  let globalAutoTag: string | undefined
+  if (options.target === 'sing-box' && nodeTags.size > 0) {
+    const used = new Set<string>([
+      ...nodeTags,
+      ...groupTags.map((group) => group.tag as string),
+      'direct',
+    ])
+    globalAutoTag = uniqueTag('全局自动选择', used)
+    used.add(globalAutoTag)
+    const automatic: Outbound = {
+      type: 'urltest',
+      tag: globalAutoTag,
+      outbounds: [...nodeTags],
+      url: testURL,
+      interval: '300s',
+      tolerance: 50,
+    }
+    groupTags.push(automatic)
+    definitions.set(globalAutoTag, automatic)
+    globalProxyTag = uniqueTag('全局代理', used)
+    used.add(globalProxyTag)
+    const selector: Outbound = {
+      type: 'selector',
+      tag: globalProxyTag,
+      outbounds: [globalAutoTag, ...nodeTags],
+      default: globalAutoTag,
+      interrupt_exist_connections: true,
+    }
+    // Keep the mode selector at the top so the client shows it first.
+    groupTags.unshift(selector)
+    definitions.set(globalProxyTag, selector)
+  }
   let dnsProxyGroup = protection === 'follow-scheme' || nodeTags.size === 0
     ? undefined
     : pureNodeGroupTag(groupTags, nodeTags)
@@ -617,6 +652,19 @@ export function generateSingBox(
     definitions.set(tag, group)
   }
   const dnsPlan = singBoxDNS(network, dnsProxyGroup)
+  let globalDNSTag: string | undefined
+  if (options.target === 'sing-box' && globalProxyTag) {
+    const remote = dnsPlan.servers.find((server) => server.tag === dnsPlan.remoteTag)
+    if (remote) {
+      const used = new Set(dnsPlan.servers.map((server) => String(server.tag ?? '')))
+      globalDNSTag = uniqueTag('remote-global', used)
+      dnsPlan.servers.push({
+        ...remote,
+        tag: globalDNSTag,
+        detour: globalProxyTag,
+      })
+    }
+  }
 
   // 远程规则集：只引用 sing-box 自己的 source JSON / SRS。
   const remoteRuleSetDefs: Record<string, unknown>[] = []
@@ -703,17 +751,24 @@ export function generateSingBox(
     ? chinaECSServer(network, dnsProxyGroup, dnsPlan.servers, dnsPlan.localTag)
     : undefined
   if (ecs) dnsPlan.servers.push(ecs.server)
-  const dnsRules = dnsProxyGroup && protection !== 'follow-scheme'
-    ? projectedDNSRules(
-        filteredRules,
-        definitions,
-        protection,
-        dnsPlan.domesticTag,
-        dnsPlan.remoteTag,
-        ecs?.tag,
-        ruleSetTags,
-      )
-    : []
+  const dnsRules: Record<string, unknown>[] = []
+  if (options.target === 'sing-box') {
+    dnsRules.push({ clash_mode: '直接连接', action: 'route', server: dnsPlan.localTag })
+    dnsRules.push(globalDNSTag
+      ? { clash_mode: '全局代理', action: 'route', server: globalDNSTag }
+      : { clash_mode: '全局代理', action: 'reject' })
+  }
+  if (dnsProxyGroup && protection !== 'follow-scheme') {
+    dnsRules.push(...projectedDNSRules(
+      filteredRules,
+      definitions,
+      protection,
+      dnsPlan.domesticTag,
+      dnsPlan.remoteTag,
+      ecs?.tag,
+      ruleSetTags,
+    ))
+  }
   if (ecs) {
     dnsRules.push({
       query_type: ['A', 'AAAA'],
@@ -749,8 +804,19 @@ export function generateSingBox(
     if (detour) for (const definition of remoteRuleSetDefs) definition.download_detour = detour
   }
 
+  const modeRulesStart = options.target === 'sing-box'
+    ? [
+        globalProxyTag
+          ? { clash_mode: '全局代理', action: 'route', outbound: globalProxyTag }
+          : { clash_mode: '全局代理', action: 'reject' },
+        { clash_mode: '直接连接', action: 'route', outbound: 'direct' },
+      ]
+    : []
+  const modeRulesEnd = options.target === 'sing-box'
+    ? [{ clash_mode: '规则判定', action: 'route', outbound: finalGroup }]
+    : []
   const route: Record<string, unknown> = {
-    rules: [...remoteRuleRules, ...rules],
+    rules: [...modeRulesStart, ...remoteRuleRules, ...rules, ...modeRulesEnd],
     final: finalGroup,
     // 1.12 起引导解析出站服务器域名必须显式指定解析器，否则 1.14 直接拒绝启动。
     default_domain_resolver: dnsPlan.localTag,
@@ -776,6 +842,9 @@ export function generateSingBox(
     ],
     ...(endpoints.length ? { endpoints } : {}),
     route,
+    ...(options.target === 'sing-box'
+      ? { experimental: { clash_api: { default_mode: '规则判定' } } }
+      : {}),
   }
   // sing-box 1.14 不再使用隐式下载器；独立 sing-box 目标显式提供 Go HTTP 客户端。
   // Hiddify 内嵌的 1.13 不认识这个顶层字段，因此不写。

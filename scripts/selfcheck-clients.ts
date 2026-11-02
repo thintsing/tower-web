@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { parse } from 'yaml'
 import { generateBase64Subscription } from '../src/generator/base64Sub'
 import { generateConfig, generateSubscriptionFormats } from '../src/generator'
-import { CLIENTS, type ClientTarget, type ProxyNode, type RuleScheme } from '../src/models/types'
+import { CLIENTS, clientSupportsImport, type ClientTarget, type ProxyNode, type RuleScheme } from '../src/models/types'
 
 const base = { tls: false, skipCertificateVerification: false } as const
 
@@ -60,6 +60,10 @@ const anywhere = generateConfig(client('anywhere'), SAMPLE, scheme, { contentMod
 const egern = generateConfig(client('egern'), SAMPLE, scheme, { contentMode: 'full' })
 const shadowrocket = generateConfig(client('shadowrocket'), SAMPLE, scheme, { contentMode: 'full' })
 const clashVerge = generateConfig(client('clash-verge'), SAMPLE, scheme, { contentMode: 'full' })
+const surgeNodes = generateConfig(client('surge'), SAMPLE, scheme, { contentMode: 'nodes' })
+const loonNodes = generateConfig(client('loon'), SAMPLE, scheme, { contentMode: 'nodes' })
+const quanxNodes = generateConfig(client('quanx'), SAMPLE, scheme, { contentMode: 'nodes' })
+const hiddify = generateConfig(client('hiddify'), SAMPLE, scheme, { contentMode: 'full' })
 const generic = generateSubscriptionFormats(SAMPLE, {
   ...scheme,
   rules: [
@@ -232,6 +236,89 @@ if (!(clashVergeDoc?.dns?.nameserver as string[] | undefined)
 
 console.log(`egern: 节点 ${egernProxies} · 分组 ${egernGroups} · 规则 ${egernRules}`)
 console.log(`shadowrocket: 节点 ${shadowProxies} · 分组 ${shadowGroups} · 规则 ${shadowRules}`)
+
+// ---------- 仅节点交接 / 一键导入 ----------
+if (surgeNodes.extension !== 'txt' || surgeNodes.text.includes('[General]') || surgeNodes.text.includes('[Proxy]')) {
+  problems.push('surge: 仅节点应输出纯 policy-path 行，不能带回 [General]/[Proxy] 段')
+}
+if (!surgeNodes.text.includes('hy.example.com')) problems.push('surge: 仅节点缺少 Hysteria2')
+if (loonNodes.extension !== 'txt' || loonNodes.text.includes('[General]')) {
+  problems.push('loon: 仅节点应输出纯 nodelist 行')
+}
+if (quanxNodes.extension !== 'txt' || quanxNodes.text.includes('[general]') || quanxNodes.text.includes('[server_local]')) {
+  problems.push('quanx: 仅节点应输出纯 server_remote 行')
+}
+if (!quanxNodes.text.includes('shadowsocks=ss.example.com:8388')) problems.push('quanx: 仅节点缺少 SS 行')
+if (quanxNodes.skipped !== 1) problems.push(`quanx: Hysteria2 应跳过 1 个，实际 ${quanxNodes.skipped}`)
+
+if (!clientSupportsImport(client('surge'), 'full') || clientSupportsImport(client('surge'), 'nodes')) {
+  problems.push('surge: 一键导入只应支持完整配置')
+}
+if (!clientSupportsImport(client('quanx'), 'nodes') || clientSupportsImport(client('quanx'), 'full')) {
+  problems.push('quanx: 一键导入只应支持仅节点')
+}
+for (const target of ['surge-mac', 'flclash', 'clash-mi', 'clash-apple', 'karing', 'sing-box'] as ClientTarget[]) {
+  if (!clientSupportsImport(client(target), 'full')) problems.push(`${target}: 缺少完整配置一键导入`)
+}
+for (const target of ['hiddify', 'loon', 'shadowrocket'] as ClientTarget[]) {
+  if (!clientSupportsImport(client(target), 'full') || !clientSupportsImport(client(target), 'nodes')) {
+    problems.push(`${target}: 完整配置 / 仅节点一键导入不完整`)
+  }
+}
+for (const target of ['v2box', 'anywhere'] as ClientTarget[]) {
+  if (!clientSupportsImport(client(target), 'nodes')) problems.push(`${target}: 缺少仅节点一键导入`)
+}
+const schemeExpectations: Partial<Record<ClientTarget, string>> = {
+  'clash-verge': 'clash-verge://install-config',
+  'mihomo-party': 'mihomo://install-config',
+  flclash: 'flclash://install-config',
+  'clash-mi': 'clashmi://install-config',
+  'clash-apple': 'clashmeta://install-config',
+  'surge-mac': 'surgeconfig:///install-config',
+  'sing-box': 'sing-box://import-remote-profile',
+  hiddify: 'hiddify://import/',
+  'v2box': 'v2box://install-sub',
+  anywhere: 'anywhere://add-proxy',
+  egern: 'egern:/profiles/new',
+}
+for (const [target, prefix] of Object.entries(schemeExpectations) as [ClientTarget, string][]) {
+  const mode = target === 'v2box' || target === 'anywhere' ? 'nodes' : 'full'
+  const scheme = client(target).importScheme?.('https://example.com/sub', 'tower', mode) ?? ''
+  if (!scheme.startsWith(prefix)) problems.push(`${target}: 一键导入链接前缀错误`)
+}
+const karingScheme = client('karing').importScheme?.('https://example.com/sub.yaml', 'tower', 'full') ?? ''
+if (!karingScheme.startsWith('karing://install-config') || !karingScheme.includes('tower-import')) {
+  problems.push('karing: 一键导入链接缺少唯一版本参数')
+}
+const quanxScheme = client('quanx').importScheme?.('https://example.com/sub.txt', 'tower', 'nodes') ?? ''
+if (!quanxScheme.startsWith('quantumult-x:///add-resource') || !quanxScheme.includes('server_remote')) {
+  problems.push('quanx: 仅节点一键导入链接格式不正确')
+}
+
+// ---------- sing-box MT 三模式 ----------
+const singboxDoc = JSON.parse(singbox.text) as any
+const singboxTags = (singboxDoc?.outbounds ?? []).map((outbound: any) => outbound.tag)
+if (!singboxTags.includes('全局代理') || !singboxTags.includes('全局自动选择')) {
+  problems.push('sing-box: 缺少全局代理 / 自动选择')
+}
+if (singboxDoc?.experimental?.clash_api?.default_mode !== '规则判定') {
+  problems.push('sing-box: 未把 clash_api 默认模式设为规则判定')
+}
+const modeValues = ['规则判定', '全局代理', '直接连接']
+if (!modeValues.every((mode) => (singboxDoc?.route?.rules ?? []).some((rule: any) => rule.clash_mode === mode))) {
+  problems.push('sing-box: route 缺少三种 clash_mode 规则')
+}
+if (!['全局代理', '直接连接'].every((mode) => (singboxDoc?.dns?.rules ?? []).some((rule: any) => rule.clash_mode === mode))) {
+  problems.push('sing-box: DNS 缺少全局代理 / 直接连接模式规则')
+}
+if (!(singboxDoc?.dns?.servers ?? []).some((server: any) => server.tag === 'remote-global')) {
+  problems.push('sing-box: 缺少 remote-global 解析器')
+}
+const hiddifyDoc = JSON.parse(hiddify.text) as any
+const hiddifyTags = (hiddifyDoc?.outbounds ?? []).map((outbound: any) => outbound.tag)
+if (hiddifyDoc?.experimental?.clash_api || hiddifyTags.includes('全局代理')) {
+  problems.push('hiddify: 不应写入 1.14 的 clash_api / 三模式')
+}
 
 const uriCount = Buffer.from(b64.text, 'base64')
   .toString('utf8')

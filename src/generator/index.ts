@@ -149,7 +149,7 @@ export function generateConfig(
       case 'surge': {
         const { text, skipped } = generateSurge(nodes, scheme, targetOptions)
         return {
-          text, extension: 'conf', mime: 'text/plain', skipped,
+          text, extension: contentMode === 'nodes' ? 'txt' : 'conf', mime: 'text/plain', skipped,
           exportedNodeCount: Math.max(0, localNodes.length - skipped),
           remoteSourceCount: remoteSources.length,
         }
@@ -157,7 +157,7 @@ export function generateConfig(
       case 'loon': {
         const { text, skipped } = generateLoon(nodes, scheme, targetOptions)
         return {
-          text, extension: 'conf', mime: 'text/plain', skipped,
+          text, extension: contentMode === 'nodes' ? 'txt' : 'conf', mime: 'text/plain', skipped,
           exportedNodeCount: Math.max(0, localNodes.length - skipped),
           remoteSourceCount: remoteSources.length,
         }
@@ -165,7 +165,7 @@ export function generateConfig(
       case 'quanx': {
         const { text, skipped } = generateQuanX(nodes, scheme, targetOptions)
         return {
-          text, extension: 'conf', mime: 'text/plain', skipped,
+          text, extension: contentMode === 'nodes' ? 'txt' : 'conf', mime: 'text/plain', skipped,
           exportedNodeCount: Math.max(0, localNodes.length - skipped),
           remoteSourceCount: remoteSources.length,
         }

@@ -151,13 +151,14 @@ function main(): void {
     assert.equal(last?.server, 'remote')
   })
 
-  check('sing-box 没有纯节点组时补 DNS 自动选择', () => {
+  check('sing-box 使用纯节点组作为 DNS 解析路径', () => {
     const config = singbox(scheme(false, 'standard'))
-    const group = config.outbounds.find((outbound: Record<string, any>) => outbound.tag === 'DNS 自动选择')
+    const group = config.outbounds.find((outbound: Record<string, any>) =>
+      ['DNS 自动选择', '全局自动选择'].includes(outbound.tag))
     assert.ok(group)
     assert.equal(group.type, 'urltest')
     const remote = config.dns.servers.find((server: Record<string, any>) => server.tag === 'remote')
-    assert.equal(remote?.detour, 'DNS 自动选择')
+    assert.equal(remote?.detour, group.tag)
   })
 
   check('sing-box 严格保护把直连域名送去带中国子网的远程 DNS', () => {
@@ -189,11 +190,13 @@ function main(): void {
     assert.equal(config.dns.servers.some((server: Record<string, any>) => server.tag === 'remote-cn'), false)
   })
 
-  check('sing-box 跟随方案不写 detour 和 DNS 规则', () => {
+  check('sing-box 跟随方案保留模式 DNS 规则，但不投影域名规则', () => {
     const config = singbox(scheme(true, 'follow-scheme'))
     const remote = config.dns.servers.find((server: Record<string, any>) => server.tag === 'remote')
     assert.equal(remote?.detour, undefined)
-    assert.equal(config.dns.rules, undefined)
+    const modes = dnsRules(config).filter((rule) => rule.clash_mode)
+    assert.deepEqual(modes.map((rule) => rule.clash_mode), ['直接连接', '全局代理'])
+    assert.equal(dnsRules(config).some((rule) => rule.domain_suffix), false)
     assert.equal(config.dns.final, 'domestic')
   })
 

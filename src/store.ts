@@ -3,7 +3,7 @@
 // subscription fetches the user explicitly triggers (via /api/fetch).
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import type { AppState, ClientTarget, ExportContentMode, LatencyTestMethod, LatencyTestMode, LocalRuleSet, NodeNameFilterSettings, ProxyKind, ProxyNode, RuleScheme, SubscriptionRequestOptions, SubscriptionSource, TailnetConnection } from './models/types'
+import type { AppState, ClientTarget, ExportContentMode, LatencyTestMethod, LatencyTestMode, LocalRuleSet, NodeNameFilterSettings, ProxyKind, ProxyNode, RuleScheme, SubscriptionRequestOptions, SubscriptionSource, SubscriptionUsage, TailnetConnection } from './models/types'
 import { loadTailnetAuthKeys, persistTailnetAuthKeys, pruneTailnetAuthKeys } from './models/tailnetAuthKeys'
 import type { PersistedData } from './backup'
 import { prepareManualNodes, type ManualNodeImportResult } from './manualNodes'
@@ -130,6 +130,54 @@ export interface SourcePatch {
 function normalizeUserAgent(value?: string): string | undefined {
   const trimmed = String(value ?? '').replace(/[\r\n]/g, '').trim()
   return trimmed ? trimmed.slice(0, 400) : undefined
+}
+
+/** The compatibility UA airports commonly use for their Clash converter. */
+const COMPATIBILITY_USER_AGENT = 'clash.meta'
+
+interface SubscriptionFetch {
+  text: string
+  usage?: SubscriptionUsage
+  userAgent?: string
+}
+
+/**
+ * Fetch one subscription through the local proxy. A custom UA pinned by the
+ * user is never silently replaced; only the default request gets the
+ * compatibility retry in `refreshSource`.
+ */
+async function fetchSubscription(
+  url: string,
+  userAgent?: string,
+  dnsOverHTTPSURL?: string,
+): Promise<SubscriptionFetch> {
+  const params = new URLSearchParams({ url })
+  if (userAgent) params.set('ua', userAgent)
+  if (dnsOverHTTPSURL) params.set('doh', dnsOverHTTPSURL)
+  const res = await fetch(`/api/fetch?${params.toString()}`)
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.error ?? `HTTP ${res.status}`)
+  }
+  return {
+    text: await res.text(),
+    usage: parseUserinfoHeader(res.headers.get('x-subscription-userinfo')),
+    userAgent,
+  }
+}
+
+/** Append `flag=clash` once to read quota headers without replacing node data. */
+function quotaProbeURL(raw: string): string | undefined {
+  try {
+    const url = new URL(raw)
+    if ([...url.searchParams.keys()].some((key) => key.toLowerCase() === 'flag')) {
+      return undefined
+    }
+    url.searchParams.set('flag', 'clash')
+    return url.href
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -422,27 +470,59 @@ export const useStore = create<Store>()(
           errors: { ...s.errors, [id]: '' },
         }))
         try {
-          const params = new URLSearchParams({ url: source.url })
-          const userAgent = normalizeUserAgent(source.userAgent)
-          if (userAgent) params.set('ua', userAgent)
-          if (source.dnsOverHTTPSURL?.trim()) params.set('doh', source.dnsOverHTTPSURL.trim())
-          const res = await fetch(`/api/fetch?${params.toString()}`)
-          if (!res.ok) {
-            const body = await res.json().catch(() => ({}))
-            throw new Error(body.error ?? `HTTP ${res.status}`)
+          const customUserAgent = normalizeUserAgent(source.userAgent)
+          const userAgentAttempts: (string | undefined)[] = customUserAgent
+            ? [customUserAgent]
+            : [undefined, COMPATIBILITY_USER_AGENT]
+          let fetched: SubscriptionFetch | undefined
+          let parsed: ReturnType<typeof parse> | undefined
+          let lastError: unknown
+          for (const attempt of userAgentAttempts) {
+            try {
+              const result = await fetchSubscription(
+                source.url,
+                attempt,
+                source.dnsOverHTTPSURL?.trim(),
+              )
+              // 用户可能在请求途中删掉了这个订阅；不要把它以「无主节点」的形式写回来。
+              if (!get().sources.some((s) => s.id === id)) return
+              const candidate = parse(result.text, id)
+              if (!candidate.nodes.some((n) => !n.isSubscriptionMetadata)) {
+                lastError = new Error(
+                  candidate.rejectedLineCount
+                    ? `没有解析到可用节点（${candidate.rejectedLineCount} 行无法识别），请检查订阅内容或地址`
+                    : '没有解析到可用节点，请检查订阅内容或地址',
+                )
+                continue
+              }
+              fetched = result
+              parsed = candidate
+              break
+            } catch (error) {
+              lastError = error
+            }
           }
-          const text = await res.text()
-          // 用户可能在请求途中删掉了这个订阅；不要把它以「无主节点」的形式写回来。
+          if (!fetched || !parsed) throw lastError
           if (!get().sources.some((s) => s.id === id)) return
-          const headerUsage = parseUserinfoHeader(res.headers.get('x-subscription-userinfo'))
-          const parsed = parse(text, id)
-          if (!parsed.nodes.some((n) => !n.isSubscriptionMetadata)) {
-            throw new Error(
-              parsed.rejectedLineCount
-                ? `没有解析到可用节点（${parsed.rejectedLineCount} 行无法识别），请检查订阅内容或地址`
-                : '没有解析到可用节点，请检查订阅内容或地址',
-            )
+          let usage = fetched.usage ?? parsed.status
+          // Some panels only send quota on a Clash-dialect request. Use only
+          // its response headers; its node body may silently drop protocols.
+          if (!usage?.total && !usage?.expire) {
+            const probe = quotaProbeURL(source.url)
+            if (probe) {
+              try {
+                const probeResult = await fetchSubscription(
+                  probe,
+                  fetched.userAgent,
+                  source.dnsOverHTTPSURL?.trim(),
+                )
+                if (probeResult.usage) usage = { ...(usage ?? {}), ...probeResult.usage }
+              } catch {
+                // Quota is optional; keep the successfully parsed node list.
+              }
+            }
           }
+          if (!get().sources.some((s) => s.id === id)) return
           const oldNodes = get().nodes.filter((n) => n.sourceID === id)
           const carried = carriedOverExclusions(oldNodes, parsed.nodes, source.excludedNodeKeys)
 
@@ -453,7 +533,7 @@ export const useStore = create<Store>()(
                 ? {
                     ...src,
                     updatedAt: Date.now(),
-                    usage: headerUsage ?? parsed.status ?? src.usage,
+                    usage: usage ?? src.usage,
                     excludedNodeKeys: carried,
                   }
                 : src,

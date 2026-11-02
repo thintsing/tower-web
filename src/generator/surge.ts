@@ -215,6 +215,12 @@ export function generateSurge(
   let skipped = 0
   const emitted = new Set<string>()
   for (const node of inlineNodes) {
+    // Surge's policy-path list is proxy lines only and cannot carry the
+    // separate [WireGuard …] section, so keep those in full-profile export.
+    if (nodesOnly && node.kind === 'wireguard') {
+      skipped += 1
+      continue
+    }
     const line = surgeNode(node, displayName(node))
     if (line) {
       proxyLines.push(line)
@@ -222,6 +228,9 @@ export function generateSurge(
     } else {
       skipped += 1
     }
+  }
+  if (nodesOnly) {
+    return { text: proxyLines.join('\n') + (proxyLines.length ? '\n' : ''), skipped }
   }
   const emittedNodes = inlineNodes.filter((n) => emitted.has(n.id))
   const allNames = new Set(usable.map(displayName))

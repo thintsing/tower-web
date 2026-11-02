@@ -165,6 +165,9 @@ export function generateLoon(
       skipped += 1
     }
   }
+  if (nodesOnly) {
+    return { text: proxyLines.join('\n') + (proxyLines.length ? '\n' : ''), skipped }
+  }
   const emittedNodes = remotePlan.localNodes.filter((n) => emitted.has(n.id))
   const remoteNodes = usable.filter((n) => n.sourceID && remotePlan.sourceIDs.has(n.sourceID))
   const groupNodes = remotePlan.sources.length ? [...emittedNodes, ...remoteNodes] : emittedNodes

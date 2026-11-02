@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { renderSVG } from 'uqr'
-import { CLIENTS, PROXY_KIND_TITLES, subFormatFor, type ClientInfo, type ClientTarget, type ExportContentMode, type LatencyTestMode, type LocalRuleSet, type NodeNameFilterSettings, type PolicyGroup, type ProxyKind, type ProxyNode, type RemoteSubscriptionEntry, type RoutingRule, type RuleScheme, type RuleSetFormat, type SchemeRuleSet, type SubFormat, type SubscriptionSource, type TailnetConnection, type TailnetExport } from './models/types'
+import { CLIENTS, PROXY_KIND_TITLES, clientSupportsImport, subFormatFor, type ClientInfo, type ClientTarget, type ExportContentMode, type LatencyTestMode, type LocalRuleSet, type NodeNameFilterSettings, type PolicyGroup, type ProxyKind, type ProxyNode, type RemoteSubscriptionEntry, type RoutingRule, type RuleScheme, type RuleSetFormat, type SchemeRuleSet, type SubFormat, type SubscriptionSource, type TailnetConnection, type TailnetExport } from './models/types'
 import { allRegions, regionForName, regionForNode } from './models/region'
 import { defaultTailnetConnection, normalizeTailnetAuthKey, normalizeTailnetControlURL, normalizeTailnetDeviceName, normalizeTailnetMagicDNSSuffix, normalizeTailnetSubnets, tailnetPolicyName, TailnetValidationError } from './models/tailnet'
 import {
@@ -5775,6 +5775,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const [target, setTarget] = useState<ClientInfo>(CLIENTS[0])
   const targetFormat = subFormatFor(target)
   const contentMode = effectiveContentMode(target, exportContentModes, exportContentMode)
+  const canImport = clientSupportsImport(target, contentMode)
   const orderedClients = useMemo(() => clientsInOrder(clientOrder), [clientOrder])
   const visibleClients = useMemo(() => {
     const shown = orderedClients.filter((client) => !hiddenClients.includes(client.target))
@@ -6016,8 +6017,9 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   // importScheme 可用时包装成客户端 deep link，否则直接给订阅地址。
   const clientImportURL = useMemo(() => {
     if (!clientSubURL) return ''
-    return target.importScheme ? target.importScheme(clientSubURL, configName, contentMode) : clientSubURL
-  }, [target, clientSubURL, configName, contentMode])
+    if (!canImport) return ''
+    return target.importScheme?.(clientSubURL, configName, contentMode) ?? ''
+  }, [target, clientSubURL, configName, contentMode, canImport])
 
   // 本机打开的页面，手机端要用局域网地址而不是 127.0.0.1。
   const clientLanSubURL = useMemo(() => {
@@ -6096,7 +6098,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   }
 
   const importIntoClient = async () => {
-    if (!target.importScheme) return
+    if (!canImport) return
     if (!exportScheme) {
       setCheckResult({ ok: false, text: '规则方案还没加载完成，稍后再试' })
       return
@@ -6128,7 +6130,9 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         if (!url) throw new Error('服务端没有返回导入链接')
         abs = new URL(url, window.location.origin).href
       }
-      window.location.href = target.importScheme(abs, configName, contentMode)
+      const scheme = target.importScheme?.(abs, configName, contentMode)
+      if (!scheme) throw new Error('当前内容模式没有一键导入链接')
+      window.location.href = scheme
       setImportNotice(`已同步最新配置并尝试唤起 ${target.name}；若没有反应，复制下面的订阅地址，在客户端里手动添加。`)
     } catch {
       setImportNotice(`唤起 ${target.name} 失败，请复制订阅地址手动添加。`)
@@ -6574,6 +6578,15 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                 : '只输出节点，省略策略组与规则，适合合并进已有配置。'}
               {target.contentMode === 'nodes' ? ` ${target.name} 本身只接收节点订阅。` : ' 每个客户端会单独记住这个模式。'}
             </div>
+            {contentMode === 'nodes' && (target.target === 'surge' || target.target === 'surge-mac') && (
+              <div className="hint">Surge 仅节点内容用于外部策略 policy-path：复制下面的订阅地址，在 Surge 的策略组里粘贴到 URL / 本地路径。</div>
+            )}
+            {contentMode === 'nodes' && target.target === 'quanx' && (
+              <div className="hint">Quantumult X 仅节点内容会作为 server_remote 资源导入；也可以复制订阅地址手动添加。</div>
+            )}
+            {contentMode === 'nodes' && target.target === 'loon' && (
+              <div className="hint">Loon 仅节点内容用于 nodelist 导入。</div>
+            )}
           </div>
 
           <div className="export-field">
@@ -6590,7 +6603,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
               onChange={(e) => setExportConfigName(e.target.value)}
             />
             <div className="hint">
-              下载为 <span className="mono">{fileStem}.{targetFormat === 'json' ? 'json' : targetFormat === 'base64' ? 'txt' : targetFormat === 'yaml' ? 'yaml' : 'conf'}</span>
+              下载为 <span className="mono">{fileStem}.{targetFormat === 'json' ? 'json' : targetFormat === 'base64' || (contentMode === 'nodes' && ['surge', 'loon', 'quanx'].includes(targetFormat)) ? 'txt' : targetFormat === 'yaml' ? 'yaml' : 'conf'}</span>
             </div>
           </div>
         </div>
@@ -6855,7 +6868,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         <div className="row" style={{ gap: 8, marginBottom: 14 }}>
           <button className="btn" disabled={!scheme || !hasExportable} onClick={download}>{downloaded ? '已下载' : '下载文件'}</button>
           <button className="btn ghost" disabled={!hasExportable || !generated} onClick={copy}>{copied ? '已复制' : '复制'}</button>
-          {target.importScheme && (
+          {canImport && (
             <button className="btn ghost" disabled={importing || !hasExportable} onClick={importIntoClient}>
               {importing ? '生成链接…' : `导入到 ${target.name}`}
             </button>
@@ -6947,7 +6960,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                 <div className="sub-url-label">{target.name} 订阅地址（{subFormatFor(target)}）</div>
                 <input readOnly className="input" value={clientSubURL} style={{ fontFamily: '"IBM Plex Mono", ui-monospace, monospace', fontSize: 12 }} />
               </div>
-              {target.importScheme && (
+              {canImport && (
                 <div className="sub-url-wrap" style={{ marginTop: 10 }}>
                   <div className="sub-url-label">一键导入链接（deep link）</div>
                   <input readOnly className="input" value={clientImportURL} style={{ fontFamily: '"IBM Plex Mono", ui-monospace, monospace', fontSize: 12, color: 'var(--muted)' }} />
@@ -6984,9 +6997,11 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                 <button className="btn ghost" onClick={() => copyText('sub', clientSubURL)}>
                   {copiedField === 'sub' ? '已复制订阅地址' : '复制订阅地址'}
                 </button>
-                <button className="btn ghost" onClick={() => copyText('import', clientImportURL)}>
-                  {copiedField === 'import' ? '已复制导入链接' : '复制导入链接'}
-                </button>
+                {canImport && (
+                  <button className="btn ghost" onClick={() => copyText('import', clientImportURL)}>
+                    {copiedField === 'import' ? '已复制导入链接' : '复制导入链接'}
+                  </button>
+                )}
                 {lanSubURL && (
                   <button className="btn ghost" onClick={() => copyText('lan', lanSubURL)}>
                     {copiedField === 'lan' ? '已复制局域网地址' : '复制局域网地址'}
@@ -7009,7 +7024,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
               <div className="next-steps">
                 <div className="next-steps-title">下一步</div>
                 <ol>
-                  {target.importScheme && (
+                  {canImport && (
                     <li>点「导入到 {target.name}」直接唤起客户端；没反应就复制下面的订阅地址手动添加。</li>
                   )}
                   <li>
@@ -7034,7 +7049,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                 <div className="next-steps-title">生成后会得到什么</div>
                 <ol>
                   <li>一条订阅地址：同一 token 下按客户端自动分发 6 种格式。</li>
-                  <li>复制地址或点「导入到 {target.name}」把它交给客户端。</li>
+                  <li>{canImport ? `复制地址或点「导入到 ${target.name}」把它交给客户端。` : `复制地址，在 ${target.name} 里添加订阅或粘贴节点。`}</li>
                   <li>在客户端更新一次订阅，节点与规则随即生效。</li>
                 </ol>
               </div>
