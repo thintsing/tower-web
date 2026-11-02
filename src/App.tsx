@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode, type SyntheticEvent } from 'react'
 import { renderSVG } from 'uqr'
 import { CLIENTS, PROXY_KIND_TITLES, clientSupportsImport, subFormatFor, type ClientInfo, type ClientTarget, type ExportContentMode, type LatencyTestMode, type LocalRuleSet, type NodeNameFilterSettings, type PolicyGroup, type ProxyKind, type ProxyNode, type RemoteSubscriptionEntry, type RoutingRule, type RuleScheme, type RuleSetFormat, type SchemeRuleSet, type SubFormat, type SubscriptionSource, type TailnetConnection, type TailnetExport } from './models/types'
 import { allRegions, filterNodesByRegionCodes, regionForName, regionForNode } from './models/region'
@@ -41,6 +41,7 @@ import { formatSupportsProxyCollections, prepareSchemeForExport } from './genera
 import { autoFillGroupEmojis } from './generator/groupIcons'
 import { maskTailnetAuthKeys, tailnetSupports } from './generator/tailnet'
 import { copyToClipboard, newID } from './util/browser'
+import { placeDetailsPanel, placeOpenDetailsPanels } from './util/menuPlacement'
 import { apiFetch, clearAPIKey, getAPIKey, setAPIKey } from './util/apiAuth'
 import { normalizeRemoteTextURL } from './util/remoteURL'
 import { GITHUB_REPO_URL } from './config'
@@ -55,6 +56,12 @@ const SELF_CONFIGURATION_URL = 'https://raw.githubusercontent.com/ClashConnectRu
 
 /** 顶部工作区。跨页面跳转（上手流程 / 导出补救）需要它。 */
 type TabKey = 'sub' | 'rules' | 'tailnet' | 'export'
+
+/** details 菜单打开/关闭后按视口可用空间决定向上或向下展开。 */
+function updateDetailsPlacement(event: SyntheticEvent<HTMLDetailsElement>): void {
+  const details = event.currentTarget
+  requestAnimationFrame(() => placeDetailsPanel(details))
+}
 
 function formatBytes(bytes?: number): string {
   if (bytes === undefined) return ''
@@ -2344,7 +2351,7 @@ function NodeRow({
       {latencyBadge}
       {showKind && <span className="kind">{PROXY_KIND_TITLES[node.kind] ?? node.kind}</span>}
       {node.isManual && (onRenameManual || onEditManual || onDeleteManual) && (
-        <details className="menu node-row-menu" onClick={(event) => event.stopPropagation()}>
+        <details className="menu node-row-menu" onClick={(event) => event.stopPropagation()} onToggle={updateDetailsPlacement}>
           <summary className="icon-btn" aria-label={`自有节点操作：${node.name}`} title="自有节点操作">⋯</summary>
           <div className="menu-panel">
             {onEditManual && (
@@ -2752,7 +2759,7 @@ function SourceCard({
             <button className="btn ghost" aria-expanded={expanded} aria-controls={`nodes-${id}`} onClick={() => setExpanded(!expanded)}>
               {expanded ? '收起' : '展开'}
             </button>
-            <details className="menu" ref={menuRef}>
+            <details className="menu" ref={menuRef} onToggle={updateDetailsPlacement}>
               <summary className="icon-btn" aria-label="更多操作" title="更多操作">⋯</summary>
               <div className="menu-panel">
                 <button onClick={() => { closeMenu(); onEdit?.() }}>编辑订阅</button>
@@ -2822,7 +2829,7 @@ function SourceCard({
                   包含在配置 <span className="num">{includedAll.length}</span>/<span className="num">{real.length}</span>
                 </span>
               </label>
-              <details className="legend" ref={legendRef}>
+              <details className="legend" ref={legendRef} onToggle={updateDetailsPlacement}>
                 <summary className="legend-trigger">图例</summary>
                 <div className="legend-body">
                   <div className="legend-row">
@@ -2905,6 +2912,13 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const [batchFailures, setBatchFailures] = useState<SourceAddFailure[] | null>(null)
   const [refreshProgress, setRefreshProgress] = useState<{ done: number; total: number } | null>(null)
   const removeManualNode = useStore((s) => s.removeManualNode)
+
+  // 视口尺寸变化后，已打开的菜单需要重新判断向下 / 向上展开。
+  useEffect(() => {
+    const onResize = () => placeOpenDetailsPanels()
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
 
   // 手动「刷新全部」和打开时自动刷新都只处理启用中的 URL 订阅。
   const refreshableSources = useMemo(

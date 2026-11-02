@@ -312,6 +312,12 @@ mark {
   padding: var(--card-pad);
   margin-bottom: var(--gap);
 }
+/* 卡片动画/位移会创建层叠上下文，打开菜单时提升整张卡，避免后续卡片覆盖浮层。 */
+.source-card:has(.menu[open]),
+.source-card:has(.legend[open]) {
+  position: relative;
+  z-index: 2;
+}
 .card:last-child { margin-bottom: 0; }
 .card > header, .card .card-head {
   display: flex;
@@ -767,12 +773,16 @@ dialog.confirm { width: min(420px, 92vw); }
   top: calc(100% + 6px);
   z-index: 30;
   min-width: 184px;
+  max-height: min(calc(100vh - 16px), 420px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 4px;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12); /* taste-skill-ignore：浮层菜单 */
 }
+.menu-panel.is-up { top: auto; bottom: calc(100% + 6px); }
 .menu-panel button {
   display: block;
   width: 100%;
@@ -877,7 +887,11 @@ dialog.confirm { width: min(420px, 92vw); }
   white-space: nowrap;
   min-width: 240px;
   max-width: min(340px, calc(100vw - 32px));
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
+.legend-body.is-up { top: auto; bottom: calc(100% + 6px); }
 .legend-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; }
 .legend-label { color: var(--text); font-weight: 500; min-width: 28px; }
 .legend-row span { display: inline-flex; align-items: center; gap: 4px; }
@@ -1762,7 +1776,7 @@ input[type='checkbox'], input[type='radio'] { accent-color: var(--accent); }
   max-width: 1480px;
   width: 100%;
   margin: 0 auto;
-  animation: page-in 500ms var(--ease-out) both;
+  animation: page-in 500ms var(--ease-out) backwards;
 }
 .page-head { position: relative; gap: 18px; margin-bottom: 30px; }
 .page-head > * { position: relative; z-index: 1; }
@@ -2323,6 +2337,7 @@ mark { background: var(--accent-soft); color: var(--text); }
   top: calc(100% + 4px);
   min-width: 148px;
 }
+.node-row .node-row-menu .menu-panel.is-up { top: auto; bottom: calc(100% + 4px); }
 
 /* onboarding */
 .first-run {
@@ -2731,7 +2746,7 @@ dialog h3 { font-family: var(--font-display); font-size: 20px; font-weight: 600;
   to { opacity: 1; transform: none; }
 }
 .page-head, .stat-strip, .search-wrap, .first-run, .setup-banner, .card {
-  animation: rise-in 460ms var(--ease-out) both;
+  animation: rise-in 460ms var(--ease-out) backwards;
 }
 .stat-strip { animation-delay: 40ms; }
 .search-wrap { animation-delay: 80ms; }
