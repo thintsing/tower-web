@@ -38,18 +38,19 @@
 
 ## 功能
 
-- **订阅与节点**：支持订阅 URL、Base64、Clash YAML、Surge / Loon / Quantumult X 配置、sing-box endpoint JSON 和单节点 URI；支持批量添加、刷新、停用、节点排除、搜索、订阅公告、已用 / 剩余流量和到期日展示。
-- **协议**：Shadowsocks / SSR / VMess / VLESS / Trojan / Hysteria / Hysteria 2 / TUIC / WireGuard / AnyTLS / Snell / SOCKS5 / HTTP / SSH / TrustTunnel / MASQUE；按客户端能力自动跳过无法表达的节点。
-- **自有节点**：可从链接、配置文本、文件导入，也可逐协议手动新建 / 编辑；不随订阅刷新，可单独启用、停用、改名、删除和标记地区。
+- **订阅与节点**：支持订阅 URL、Base64、Clash YAML、Surge / Loon / Quantumult X 配置、sing-box endpoint JSON 和单节点 URI；支持批量添加、刷新、停用、节点排除、搜索、订阅公告、已用 / 剩余流量和到期日展示。并发刷新同一订阅时以最后一次为准，同一 URL 共享请求、同一 host 排队，批量刷新会显示完成进度。
+- **协议**：Shadowsocks / SSR / VMess / VLESS / Trojan / Hysteria / Hysteria 2 / TUIC / WireGuard / AnyTLS / Snell / SOCKS5 / HTTP / SSH / TrustTunnel / MASQUE；按客户端能力自动跳过无法表达的节点。ShadowTLS、SIP003 `v2ray-plugin`、SS cipher 白名单、Snell / VLESS 版本限制和 Stash 证书 pin 都会按目标客户端校验。
+- **自有节点**：可从链接、配置文本、文件导入，也可逐协议手动新建 / 编辑；MASQUE 支持 mihomo 密钥 CONNECT-IP 与 sing-box basic CONNECT-IP 两套方言。节点不随订阅刷新，可单独启用、停用、改名、删除和标记地区。
 - **测速与健康**：本机 TCP / ICMP 测速；订阅页汇总正常、异常、未测节点，可重测失败节点，并在节点详情显示来源、地区、ASN 网络组织和 TLS 信息。
-- **分布地图**：按延迟给国家着色；支持按钮 / Ctrl+滚轮缩放、放大后拖动、低倍率地区聚合圆点、地区清单和选中地区的节点列表。
-- **规则方案**：内置 ACL4SSR；支持粘贴、文件或 URL 导入 INI、Clash / mihomo、Surge、Egern 和 sing-box 方案，也可一键导入 Self-Configuration 预设。策略组可新建、删除、改名、按节点名正则建组、改类型、编辑候选、调整匹配顺序；导入来源方案支持全文编辑，复制自内置方案后还可恢复初始规则。
-- **策略组展示**：可按组名识别并自动补全 Emoji，规则页可切换显示或隐藏；拖动组改变匹配顺序时，会提示哪些域名从原组改走新组，避免分流被悄悄改变。
-- **规则集**：内置 ACL4SSR 快照与 871 个在线列表；支持本地 / 在线规则集、刷新、暂停、跨客户端引用或无损展开。开启「优先引用规则集」后，经典列表会自动压成 mihomo / Stash 的 MRS 与 sing-box / Hiddify 的 SRS 二进制规则集，表达不了的类型保持逐条内联。
-- **DNS 与 ECS**：普通 / 国内 / 远程 DNS，跟随方案 / 标准保护 / 严格保护；mihomo 和 sing-box 使用纯节点解析组、DNS 投影与中国子网（ECS）。
-- **导出与分享**：一次生成 7 种载体，按客户端设置完整配置 / 仅节点、协议筛选、排序和命名；支持代理集合、Tailscale 内网、二维码和 `clash://` / `surge://` 一键导入。
+- **分布地图**：按四档延迟（≤100 / ≤200 / ≤350 / >350ms）给国家着色；支持按钮 / Ctrl+滚轮缩放、放大后拖动、低倍率地区聚合圆点、地区清单、地图上的全部测速按钮，以及选中地区节点列表内的一键分享。
+- **规则方案**：内置 ACL4SSR；支持粘贴、文件或 URL 导入 INI、Clash / mihomo、Surge、Egern 和 sing-box 方案，也可一键导入 Self-Configuration 预设。策略组可新建、删除、改名、按节点名正则建组、改类型、编辑候选、调整匹配顺序；导入来源方案支持全文编辑，复制自内置方案后还可恢复初始规则。条件组（Surge `subnet` / Egern `conditional`）和同方言标量参数会原样写回，其他客户端退回默认策略。
+- **策略组展示**：可按组名识别并自动补全 Emoji，规则页可切换显示或隐藏；拖动组改变匹配顺序时，会提示哪些域名从原组改走新组，避免分流被悄悄改变。补充规则按最具体优先排序，规则集插到第一条冲突规则之前，FINAL 不参与拖动。
+- **规则集**：内置 ACL4SSR 快照与 871 个在线列表；支持本地 / 在线规则集、刷新、暂停、跨客户端引用或无损展开。开启「优先引用规则集」后，经典列表会自动压成 mihomo / Stash 的 MRS 与 sing-box / Hiddify 的 SRS 二进制规则集，表达不了的类型保持逐条内联；sing-box DNS 投影会额外引用同一列表的 domain-only SRS。
+- **DNS 与 ECS**：普通 / 国内 / 远程 DNS，跟随方案 / 标准保护 / 严格保护；mihomo 和 sing-box 使用纯节点解析组、DNS 投影与中国子网（ECS）。GEOIP / Surge IP 规则会补 `no-resolve`，仅在 DNS 已走代理时释放末尾 GEOIP 的该选项。
+- **导出与分享**：一次生成 7 种载体，按客户端设置完整配置 / 仅节点、地区 / 协议筛选、排序和命名；支持代理集合、Tailscale 内网、二维码和 `clash://` / `surge://` 一键导入。
 - **局域网与访问密钥**：可关闭局域网共享；也可生成管理 API 密钥，局域网页面用 `?key=` 打开一次后自动记住。订阅、一次性分享和托管规则集仍是独立凭证。
 - **备份**：导出 / 恢复本机 JSON；覆盖恢复前自动保存，本机保留最近 3 份版本；支持一键重置所有本机配置。
+- **外观**：跟随系统浅色 / 深色模式，深色模式使用同一套信号轨道设计变量。
 - **本地优先**：订阅、节点、规则和设置只在本机处理；无账号、云同步、遥测或第三方统计。
 
 ## 支持的客户端

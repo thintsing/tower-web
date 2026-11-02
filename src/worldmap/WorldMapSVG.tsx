@@ -7,6 +7,8 @@ import { ComposableMap, Geographies, Geography, Graticule } from 'react-simple-m
 import { geoEqualEarth, type GeoProjection } from 'd3-geo'
 import { PROXY_KIND_TITLES, type ProxyNode } from '../models/types'
 import { regionForNode, type NodeRegion } from '../models/region'
+import { nodeShareText } from '../generator/shareLink'
+import { copyToClipboard } from '../util/browser'
 import { clusterPoints, type ClusterGroup } from './clustering'
 import {
   BASE_MAP_VIEW,
@@ -79,11 +81,12 @@ function toNumeric(code: string): string | undefined {
   return undefined
 }
 
-/** Latency color bands — 与节点列表的三档语义保持一致：良好 / 一般 / 较差。 */
+/** Latency color bands —— 与 Tower iOS 一致：≤100 / ≤200 / ≤350 / >350ms。 */
 const BANDS: { max: number; fill: string }[] = [
-  { max: 100, fill: '#1f7a52' },      // 良好 <100ms（--positive）
-  { max: 300, fill: '#9a671f' },      // 一般 100–299ms（--warning）
-  { max: Infinity, fill: '#b13a32' }, // 较差 ≥300ms（--negative）
+  { max: 100, fill: '#1f7a52' },      // 很快 ≤100ms
+  { max: 200, fill: '#2f7f78' },      // 正常 101–200ms
+  { max: 350, fill: '#9a671f' },      // 偏慢 201–350ms
+  { max: Infinity, fill: '#b13a32' }, // 很慢 >350ms
 ]
 const UNREACHABLE_FILL = '#b13a32'
 const HAS_NODES_UNTESTED = '#c8ccc4'
@@ -194,7 +197,8 @@ function latencyTone(value: number | null | undefined): string {
   if (value === null) return 'negative'
   if (value === undefined) return 'muted'
   if (value < 100) return 'positive'
-  if (value < 300) return 'warning'
+  if (value < 200) return 'normal'
+  if (value < 350) return 'warning'
   return 'negative'
 }
 
@@ -224,12 +228,23 @@ export interface WorldMapSVGProps {
   latencyByNodeId: Map<string, number | null>
   selectedCode: string | null
   onSelect: (code: string | null) => void
+  /** 地图上的全部测速 / 取消按钮；不传时不显示。 */
+  onTest?: () => void
+  testing?: boolean
 }
 
-export function WorldMapSVG({ nodes, latencyByNodeId, selectedCode, onSelect }: WorldMapSVGProps) {
+export function WorldMapSVG({
+  nodes,
+  latencyByNodeId,
+  selectedCode,
+  onSelect,
+  onTest,
+  testing = false,
+}: WorldMapSVGProps) {
   const [geo, setGeo] = useState<unknown>(null)
   const [geoFailed, setGeoFailed] = useState(false)
   const [hover, setHover] = useState<HoverInfo | null>(null)
+  const [copiedNodeID, setCopiedNodeID] = useState<string | null>(null)
   const [view, setView] = useState<ViewBox>(BASE_MAP_VIEW)
   const [dragging, setDragging] = useState(false)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -599,6 +614,16 @@ export function WorldMapSVG({ nodes, latencyByNodeId, selectedCode, onSelect }: 
           </g>
         </ComposableMap>
         {hover && <MapTooltip hover={hover} />}
+        {onTest && (
+          <button
+            type="button"
+            className="wm-test"
+            onClick={onTest}
+            aria-label={testing ? '取消地图测速' : '对地图中的节点全部测速'}
+          >
+            {testing ? '取消测速' : '全部测速'}
+          </button>
+        )}
         <div className="wm-controls" aria-label="地图缩放控制">
           <button
             type="button"
@@ -686,11 +711,27 @@ export function WorldMapSVG({ nodes, latencyByNodeId, selectedCode, onSelect }: 
           <ul className="wm-node-list">
             {selectedStat.nodes.map((node) => {
               const latency = latencyByNodeId.get(node.id)
+              const share = nodeShareText(node)
               return (
                 <li key={node.id}>
                   <span className="wm-node-name">{node.name}</span>
                   <span className="wm-node-protocol">{PROXY_KIND_TITLES[node.kind]}</span>
                   <span className={`wm-node-latency ${latencyTone(latency)}`}>{latencyText(latency)}</span>
+                  {share && (
+                    <button
+                      type="button"
+                      className="wm-node-share"
+                      onClick={async () => {
+                        if (!(await copyToClipboard(share))) return
+                        setCopiedNodeID(node.id)
+                        window.setTimeout(() => {
+                          setCopiedNodeID((current) => current === node.id ? null : current)
+                        }, 1600)
+                      }}
+                    >
+                      {copiedNodeID === node.id ? '已复制' : '分享'}
+                    </button>
+                  )}
                 </li>
               )
             })}
@@ -755,7 +796,10 @@ function WorldMapLegend() {
       {BANDS.map((band, index) => (
         <span key={index} className="wm-lg">
           <span className="wm-sq" style={{ background: band.fill }} />
-          {index === 0 ? '良好 <100ms' : index === 1 ? '一般 100–299ms' : '较差 ≥300ms'}
+          {index === 0 ? '很快 ≤100ms'
+            : index === 1 ? '正常 101–200ms'
+              : index === 2 ? '偏慢 201–350ms'
+                : '很慢 >350ms'}
         </span>
       ))}
       <span className="wm-lg"><span className="wm-sq" style={{ background: UNREACHABLE_FILL, opacity: BAND_UNREACHABLE_OPAQ }} />不可达</span>

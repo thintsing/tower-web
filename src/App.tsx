@@ -3582,6 +3582,11 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
             latencyByNodeId={latencyMap}
             selectedCode={selectedCode}
             onSelect={setSelectedCode}
+            testing={testingAny}
+            onTest={() => {
+              if (testingAny) stopTesting()
+              else startTesting(enabledIds)
+            }}
           />
         </div>
       )}

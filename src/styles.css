@@ -23,6 +23,7 @@
   --positive: #1f7a52;
   --negative: #b13a32;
   --warning: #8d5a1c;
+  --latency-normal: #2f7f78;
   --chart-1: #1f7a52;
   --chart-2: #8d5a1c;
   --chart-3: #b13a32;
@@ -2449,6 +2450,20 @@ mark { background: var(--accent-soft); color: var(--text); }
   border-radius: 6px;
   background: rgba(255, 255, 255, 0.94);
 }
+.wm-test {
+  position: absolute;
+  z-index: 4;
+  top: 52px;
+  right: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.94);
+  color: var(--accent-ink);
+  font: 600 11px/1 var(--font-body);
+  cursor: pointer;
+}
+.wm-test:hover { background: #fff; border-color: var(--accent); }
 
 .wm-control {
   width: 28px;
@@ -2529,6 +2544,8 @@ mark { background: var(--accent-soft); color: var(--text); }
 
 .wm-chip-lat.positive,
 .wm-node-latency.positive { color: var(--positive); }
+.wm-chip-lat.normal,
+.wm-node-latency.normal { color: var(--latency-normal); }
 .wm-chip-lat.warning,
 .wm-node-latency.warning { color: var(--warning); }
 .wm-chip-lat.negative,
@@ -2571,7 +2588,7 @@ mark { background: var(--accent-soft); color: var(--text); }
 
 .wm-node-list li {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
   align-items: center;
   gap: 10px;
   padding: 7px 12px;
@@ -2583,12 +2600,20 @@ mark { background: var(--accent-soft); color: var(--text); }
 .wm-node-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
 .wm-node-protocol { color: var(--muted); font-size: 10.5px; white-space: nowrap; }
 .wm-node-latency { font-family: var(--font-mono); font-size: 10.5px; white-space: nowrap; }
+.wm-node-share {
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  font: 500 10px/1.2 var(--font-body);
+}
+.wm-node-share:hover { color: var(--accent-ink); border-color: var(--accent); }
 
 .wm-hint { color: var(--muted); font-size: 11px; line-height: 1.5; }
 
 @media (max-width: 860px) {
   .wm-regions-head { flex-direction: column; gap: 2px; }
-  .wm-node-list li { grid-template-columns: minmax(0, 1fr) auto; }
+  .wm-node-list li { grid-template-columns: minmax(0, 1fr) auto auto; }
   .wm-node-protocol { display: none; }
   .wm-hint { display: none; }
 }
@@ -3594,4 +3619,53 @@ body.no-scroll { overflow: hidden; }
 .lan-gate-card .actions {
   display: flex;
   gap: 8px;
+}
+
+/* ---------- dark mode: follow the system appearance ---------- */
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --rail: #080b09;
+    --rail-ink: #eef1e9;
+    --accent: #ff6b3d;
+    --accent-ink: #ffb095;
+    --accent-soft: rgba(255, 107, 61, 0.16);
+
+    --ground: #0d110f;
+    --surface: #151a17;
+    --raised: #1b211d;
+    --active: #232a25;
+    --border: #2b332d;
+    --rule: #232a25;
+    --control: #414a43;
+    --text: #edf1e8;
+    --muted: #a3aaa0;
+    --faint: #8c9389;
+    --primary: #f1f4eb;
+    --primary-ink: #141815;
+    --positive: #68d6a2;
+    --negative: #ff8578;
+    --warning: #f1bd6b;
+    --latency-normal: #6fc6bb;
+
+    --pill-positive-bg: #16362a;
+    --pill-positive-ink: #baf2d5;
+    --pill-negative-bg: #41211d;
+    --pill-negative-ink: #ffd0c8;
+    --pill-warning-bg: #3d2f17;
+    --pill-warning-ink: #fbe3b9;
+    --pill-neutral-bg: #232a25;
+    --pill-neutral-ink: #d5dcd1;
+  }
+  .btn.danger:hover { background: rgba(255, 133, 120, 0.12); }
+  .node-row.is-testing { background: color-mix(in srgb, var(--accent) 12%, var(--surface)); }
+  .setup-list li.current { background: color-mix(in srgb, var(--accent) 10%, var(--surface)); }
+  .setup-banner .btn { background: var(--surface); border-color: var(--border); }
+  .setup-banner .btn:hover { background: var(--raised); border-color: var(--control); }
+  .client-current.client-card:hover,
+  .client-option.active { background: color-mix(in srgb, var(--accent) 10%, var(--surface)); }
+  .detail-tab.active { background: var(--surface); }
+  .wm-tooltip { box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5); }
+  .qr-code { background: #ffffff; }
+  ::selection { color: #141815; }
 }
