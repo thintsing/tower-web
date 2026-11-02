@@ -54,11 +54,25 @@ export interface ManualNodeDraft {
   idleSessionTimeout: string
   minIdleSession: string
   sshHostKeys: string
+  /** MASQUE 的两套方言：mihomo 密钥 CONNECT-IP / sing-box basic CONNECT-IP。 */
+  masqueMode: 'keyConnectIP' | 'basicConnectIP'
+  masquePrivateKey: string
+  masquePublicKey: string
+  masqueIPv4: string
+  masqueIPv6: string
+  masqueNetwork: string
+  masqueHTTPVersion: string
+  masqueDisableVersionFallback: boolean
+  masqueMTU: string
+  masqueDNS: string
+  masqueRemoteDNSResolve: boolean
+  masqueHeaders: string
+  masqueCertificate: string
 }
 
 export const MANUAL_FORM_KINDS: ProxyKind[] = [
   'ss', 'vmess', 'vless', 'trojan', 'hysteria2', 'tuic', 'anytls',
-  'ssr', 'hysteria', 'snell', 'socks5', 'http', 'wireguard', 'ssh', 'trusttunnel',
+  'ssr', 'hysteria', 'snell', 'socks5', 'http', 'wireguard', 'ssh', 'trusttunnel', 'masque',
 ]
 
 const TLS_REQUIRED: ProxyKind[] = ['trojan', 'hysteria', 'hysteria2', 'tuic', 'anytls', 'trusttunnel']
@@ -81,6 +95,7 @@ const DEFAULTS: Partial<Record<ProxyKind, Partial<ManualNodeDraft>>> = {
   },
   ssh: { port: '22' },
   trusttunnel: { tls: true, quic: true },
+  masque: { masqueMode: 'basicConnectIP', masqueHTTPVersion: '3', masqueMTU: '1280' },
 }
 
 export function emptyManualDraft(kind: ProxyKind = 'ss'): ManualNodeDraft {
@@ -133,6 +148,19 @@ export function emptyManualDraft(kind: ProxyKind = 'ss'): ManualNodeDraft {
     idleSessionTimeout: '',
     minIdleSession: '',
     sshHostKeys: '',
+    masqueMode: 'basicConnectIP',
+    masquePrivateKey: '',
+    masquePublicKey: '',
+    masqueIPv4: '',
+    masqueIPv6: '',
+    masqueNetwork: '',
+    masqueHTTPVersion: '3',
+    masqueDisableVersionFallback: false,
+    masqueMTU: '',
+    masqueDNS: '',
+    masqueRemoteDNSResolve: false,
+    masqueHeaders: '',
+    masqueCertificate: '',
     ...DEFAULTS[kind],
   }
 }
@@ -204,6 +232,19 @@ export function manualDraftFromNode(node: ProxyNode): ManualNodeDraft {
     idleSessionTimeout: node.idleSessionTimeout !== undefined ? String(node.idleSessionTimeout) : '',
     minIdleSession: node.minIdleSession !== undefined ? String(node.minIdleSession) : '',
     sshHostKeys: (node.ssh?.hostKeys ?? []).join('\n'),
+    masqueMode: node.masque?.mode ?? 'basicConnectIP',
+    masquePrivateKey: node.masque?.privateKey ?? '',
+    masquePublicKey: node.masque?.publicKey ?? '',
+    masqueIPv4: node.masque?.ipv4 ?? '',
+    masqueIPv6: node.masque?.ipv6 ?? '',
+    masqueNetwork: node.masque?.network ?? '',
+    masqueHTTPVersion: node.masque?.httpVersion !== undefined ? String(node.masque.httpVersion) : '3',
+    masqueDisableVersionFallback: node.masque?.disableVersionFallback ?? false,
+    masqueMTU: node.masque?.mtu !== undefined ? String(node.masque.mtu) : '1280',
+    masqueDNS: (node.masque?.dns ?? []).join(', '),
+    masqueRemoteDNSResolve: node.masque?.remoteDNSResolve ?? false,
+    masqueHeaders: node.masque?.headers ? JSON.stringify(node.masque.headers) : '',
+    masqueCertificate: (node.masque?.certificate ?? []).join('\n'),
   }
 }
 
@@ -291,6 +332,61 @@ export function buildManualNode(draft: ManualNodeDraft, existing?: ProxyNode): P
     }
   }
 
+  let masque: ProxyNode['masque']
+  if (kind === 'masque') {
+    if (draft.masqueMode === 'keyConnectIP') {
+      if (!draft.masquePrivateKey.trim() || !draft.masquePublicKey.trim()) {
+        throw new Error('MASQUE 密钥模式必须填写客户端私钥和服务器公钥')
+      }
+      if (!draft.masqueIPv4.trim() && !draft.masqueIPv6.trim()) {
+        throw new Error('MASQUE 密钥模式至少需要填写一个本机 IPv4 / IPv6 地址')
+      }
+      if (username || password || alpn || draft.certificateFingerprint.trim()
+        || draft.skipCertificateVerification) {
+        throw new Error('MASQUE 密钥模式不能带用户名、密码、ALPN、证书指纹或跳过证书校验')
+      }
+      masque = {
+        mode: 'keyConnectIP',
+        privateKey: draft.masquePrivateKey.trim(),
+        publicKey: draft.masquePublicKey.trim(),
+        ipv4: optional(draft.masqueIPv4),
+        ipv6: optional(draft.masqueIPv6),
+        network: optional(draft.masqueNetwork),
+        mtu: numberOrUndefined(draft.masqueMTU, 'MASQUE MTU', 1280, 1500),
+        remoteDNSResolve: draft.masqueRemoteDNSResolve || undefined,
+      }
+    } else {
+      const httpVersion = numberOrUndefined(draft.masqueHTTPVersion || '3', 'MASQUE HTTP 版本', 1, 3)
+      if (httpVersion !== 3 && !tls) {
+        throw new Error('MASQUE HTTP/1.1 与 HTTP/2 需要启用 TLS')
+      }
+      if (username.includes(':')) throw new Error('MASQUE 用户名不能包含冒号')
+      let headers: Record<string, string> | undefined
+      if (draft.masqueHeaders.trim()) {
+        try {
+          const parsed = JSON.parse(draft.masqueHeaders)
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+            || Object.values(parsed).some((value) => typeof value !== 'string')) {
+            throw new Error('格式不正确')
+          }
+          headers = parsed as Record<string, string>
+        } catch {
+          throw new Error('MASQUE 请求头必须是 JSON 对象，例如 {"User-Agent":"tower"}')
+        }
+      }
+      masque = {
+        mode: 'basicConnectIP',
+        httpVersion,
+        disableVersionFallback: draft.masqueDisableVersionFallback || undefined,
+        headers,
+        mtu: numberOrUndefined(draft.masqueMTU, 'MASQUE MTU', 1280, 1500),
+        dns: draft.masqueDNS.split(',').map((item) => item.trim()).filter(Boolean),
+        remoteDNSResolve: draft.masqueRemoteDNSResolve || undefined,
+        certificate: draft.masqueCertificate.split(/[\n,]+/).map((item) => item.trim()).filter(Boolean),
+      }
+    }
+  }
+
   let upMbps: number | undefined
   let downMbps: number | undefined
   if (kind === 'hysteria') {
@@ -331,13 +427,13 @@ export function buildManualNode(draft: ManualNodeDraft, existing?: ProxyNode): P
     cipher: kind === 'ss' || kind === 'ssr'
       ? cipher
       : kind === 'vmess' ? (cipher || 'auto') : undefined,
-    password: kind === 'tuic' || ['trusttunnel', 'ssh', 'socks5', 'http'].includes(kind)
+    password: kind === 'tuic' || ['trusttunnel', 'ssh', 'socks5', 'http', 'masque'].includes(kind)
       ? (password || secret || undefined)
       : ['ss', 'ssr', 'trojan', 'hysteria', 'hysteria2', 'anytls', 'snell'].includes(kind)
         ? (secret || undefined)
         : undefined,
     uuid: kind === 'vmess' || kind === 'vless' || kind === 'tuic' ? secret : undefined,
-    username: ['trusttunnel', 'ssh', 'socks5', 'http'].includes(kind) ? username || undefined : undefined,
+    username: ['trusttunnel', 'ssh', 'socks5', 'http', 'masque'].includes(kind) ? username || undefined : undefined,
     transport: ['vmess', 'vless', 'trojan'].includes(kind) ? transport : undefined,
     transportMode: transport === 'xhttp' ? 'packet-up' : undefined,
     tls,
@@ -379,6 +475,7 @@ export function buildManualNode(draft: ManualNodeDraft, existing?: ProxyNode): P
     minIdleSession,
     trustTunnel: kind === 'trusttunnel' ? { quic: draft.quic } : undefined,
     ssh: kind === 'ssh' ? { hostKeys: hostKeyList(draft.sshHostKeys) } : undefined,
+    masque,
     rawURI: '',
     isManual: true,
     isEnabled: existing?.isEnabled !== false,

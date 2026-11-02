@@ -48,11 +48,12 @@ export function ManualNodeEditorDialog({
 
   const kind = draft.kind
   const hasTransport = ['vmess', 'vless', 'trojan'].includes(kind)
-  const tlsOptional = ['vmess', 'vless', 'socks5', 'http'].includes(kind)
+  const tlsOptional = ['vmess', 'vless', 'socks5', 'http', 'masque'].includes(kind)
   const tlsAlways = ['trojan', 'hysteria', 'hysteria2', 'tuic', 'anytls', 'trusttunnel'].includes(kind)
   const hasTls = tlsAlways || draft.tls
+  const keyMasque = kind === 'masque' && draft.masqueMode === 'keyConnectIP'
   const usesSecret = ['ss', 'ssr', 'vmess', 'vless', 'trojan', 'hysteria', 'hysteria2', 'tuic', 'anytls', 'snell'].includes(kind)
-  const usesPassword = ['trusttunnel', 'ssh', 'socks5', 'http'].includes(kind)
+  const usesPassword = ['trusttunnel', 'ssh', 'socks5', 'http', 'masque'].includes(kind) && !keyMasque
   const secretLabel = kind === 'vmess' || kind === 'vless' || kind === 'tuic'
     ? 'UUID'
     : kind === 'snell' ? 'PSK' : '密码'
@@ -290,7 +291,7 @@ export function ManualNodeEditorDialog({
 
         {usesPassword && (
           <div className="manual-form-grid">
-            {['trusttunnel', 'ssh', 'socks5', 'http'].includes(kind) && (
+            {['trusttunnel', 'ssh', 'socks5', 'http', 'masque'].includes(kind) && (
               <Field label="用户名">
                 <input className="input" value={draft.username} onChange={(event) => patch({ username: event.target.value })} />
               </Field>
@@ -340,7 +341,72 @@ export function ManualNodeEditorDialog({
           </div>
         )}
 
-        {tlsAlways || tlsOptional ? (
+        {kind === 'masque' && (
+          <div className="manual-form-grid">
+            <Field label="CONNECT-IP 方言">
+              <select className="input" value={draft.masqueMode} onChange={(event) => patch({ masqueMode: event.target.value as ManualNodeDraft['masqueMode'] })}>
+                <option value="basicConnectIP">basic（sing-box / Hiddify）</option>
+                <option value="keyConnectIP">密钥（mihomo / Shadowrocket）</option>
+              </select>
+            </Field>
+            {draft.masqueMode === 'keyConnectIP' ? (
+              <>
+                <Field label="客户端私钥" hint="mihomo 的 MASQUE key CONNECT-IP。">
+                  <input className="input mono" value={draft.masquePrivateKey} onChange={(event) => patch({ masquePrivateKey: event.target.value })} />
+                </Field>
+                <Field label="服务器公钥">
+                  <input className="input mono" value={draft.masquePublicKey} onChange={(event) => patch({ masquePublicKey: event.target.value })} />
+                </Field>
+                <Field label="本机 IPv4">
+                  <input className="input" placeholder="10.0.0.2" value={draft.masqueIPv4} onChange={(event) => patch({ masqueIPv4: event.target.value })} />
+                </Field>
+                <Field label="本机 IPv6（可选）">
+                  <input className="input" placeholder="fd00::2" value={draft.masqueIPv6} onChange={(event) => patch({ masqueIPv6: event.target.value })} />
+                </Field>
+                <Field label="网络">
+                  <select className="input" value={draft.masqueNetwork} onChange={(event) => patch({ masqueNetwork: event.target.value })}>
+                    <option value="">默认（quic）</option>
+                    <option value="quic">QUIC</option>
+                    <option value="h3">HTTP/3</option>
+                    <option value="h2">HTTP/2</option>
+                  </select>
+                </Field>
+              </>
+            ) : (
+              <>
+                <Field label="HTTP 版本">
+                  <select className="input" value={draft.masqueHTTPVersion} onChange={(event) => patch({ masqueHTTPVersion: event.target.value })}>
+                    <option value="3">HTTP/3 · QUIC</option>
+                    <option value="2">HTTP/2 + TLS</option>
+                    <option value="1">HTTP/1.1 + TLS</option>
+                  </select>
+                </Field>
+                <Field label="MTU">
+                  <input className="input" type="number" min={1280} max={1500} value={draft.masqueMTU} onChange={(event) => patch({ masqueMTU: event.target.value })} />
+                </Field>
+                <Field label="DNS（可选，逗号分隔）">
+                  <input className="input" placeholder="1.1.1.1, 8.8.8.8" value={draft.masqueDNS} onChange={(event) => patch({ masqueDNS: event.target.value })} />
+                </Field>
+                <Field label="请求头 JSON（可选）">
+                  <input className="input mono" placeholder='{"User-Agent":"tower"}' value={draft.masqueHeaders} onChange={(event) => patch({ masqueHeaders: event.target.value })} />
+                </Field>
+                <Field label="证书（可选，每行一个）" hint="PEM 证书链，固定服务器身份。">
+                  <textarea className="input mono" rows={2} value={draft.masqueCertificate} onChange={(event) => patch({ masqueCertificate: event.target.value })} />
+                </Field>
+                <label className="manual-check">
+                  <input type="checkbox" checked={draft.masqueDisableVersionFallback} onChange={(event) => patch({ masqueDisableVersionFallback: event.target.checked })} />
+                  禁用 HTTP 版本回退
+                </label>
+              </>
+            )}
+            <label className="manual-check">
+              <input type="checkbox" checked={draft.masqueRemoteDNSResolve} onChange={(event) => patch({ masqueRemoteDNSResolve: event.target.checked })} />
+              远程 DNS 解析
+            </label>
+          </div>
+        )}
+
+        {(tlsAlways || (tlsOptional && !keyMasque)) ? (
           <div className="manual-form-grid">
             {tlsOptional ? (
               <label className="manual-check">

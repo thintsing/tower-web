@@ -110,6 +110,78 @@ function main(): void {
     assert.equal(switched.tls, true)
   })
 
+  check('MASQUE basic CONNECT-IP 写出 HTTP/3、请求头与 DNS', () => {
+    const draft = {
+      ...emptyManualDraft('masque'),
+      server: 'masque.example.com',
+      port: '443',
+      masqueMode: 'basicConnectIP' as const,
+      masqueHTTPVersion: '3',
+      masqueMTU: '1400',
+      masqueDNS: '1.1.1.1, 8.8.8.8',
+      masqueHeaders: '{"User-Agent":"tower"}',
+      masqueDisableVersionFallback: true,
+      username: 'user',
+      password: 'pass',
+    }
+    const node = buildManualNode(draft)
+    assert.equal(node.kind, 'masque')
+    assert.equal(node.masque?.mode, 'basicConnectIP')
+    assert.equal(node.masque?.httpVersion, 3)
+    assert.equal(node.masque?.mtu, 1400)
+    assert.deepEqual(node.masque?.dns, ['1.1.1.1', '8.8.8.8'])
+    assert.deepEqual(node.masque?.headers, { 'User-Agent': 'tower' })
+    assert.equal(node.masque?.disableVersionFallback, true)
+    assert.equal(node.username, 'user')
+    assert.equal(node.password, 'pass')
+  })
+
+  check('MASQUE basic 的 HTTP/2 必须启用 TLS，请求头必须是 JSON 对象', () => {
+    const draft = {
+      ...emptyManualDraft('masque'),
+      server: 'masque.example.com',
+      port: '443',
+      masqueMode: 'basicConnectIP' as const,
+      masqueHTTPVersion: '2',
+    }
+    assert.throws(() => buildManualNode(draft), /TLS/)
+    const withTls = buildManualNode({ ...draft, tls: true })
+    assert.equal(withTls.tls, true)
+    assert.throws(
+      () => buildManualNode({ ...draft, tls: true, masqueHeaders: '[]' }),
+      /JSON/,
+    )
+  })
+
+  check('MASQUE 密钥模式校验密钥与本机地址', () => {
+    const base = {
+      ...emptyManualDraft('masque'),
+      server: 'masque.example.com',
+      port: '443',
+      masqueMode: 'keyConnectIP' as const,
+      masqueMTU: '1280',
+    }
+    assert.throws(() => buildManualNode(base), /私钥/)
+    assert.throws(
+      () => buildManualNode({ ...base, masquePrivateKey: 'priv', masquePublicKey: 'pub' }),
+      /IPv4/,
+    )
+    const node = buildManualNode({
+      ...base,
+      masquePrivateKey: 'priv',
+      masquePublicKey: 'pub',
+      masqueIPv4: '10.0.0.2',
+      masqueNetwork: 'quic',
+    })
+    assert.equal(node.masque?.mode, 'keyConnectIP')
+    assert.equal(node.masque?.privateKey, 'priv')
+    assert.equal(node.masque?.publicKey, 'pub')
+    assert.equal(node.masque?.ipv4, '10.0.0.2')
+    assert.equal(node.masque?.network, 'quic')
+    assert.equal(node.username, undefined)
+    assert.equal(node.password, undefined)
+  })
+
   if (failures) {
     console.error(`\n${failures} 项检查失败`)
     process.exit(1)
