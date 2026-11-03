@@ -43,20 +43,86 @@ export function isNoticeNode(node: ProxyNode): boolean {
 
 export const STATUS_PREFIX = 'STATUS='
 
-/** Tolerant STATUS= line: `STATUS=↑:1.2GB ↓:34GB TOT:500GB EXPIRES:2027-01-01` */
+/**
+ * Tolerant STATUS= / TRAFFIC= line, also accepts key=value declarations:
+ * `STATUS=↑:1.2GB ↓:34GB TOT:500GB EXPIRES:2027-01-01`
+ * `TRAFFIC=upload=1.2GB; download=34GB; total=500GB; expire=2027-01-01`
+ */
 export function parseStatusLine(line: string): SubscriptionUsage | undefined {
-  const text = line.startsWith(STATUS_PREFIX) ? line.slice(STATUS_PREFIX.length) : line
+  let text = line.trim()
+  if (/^(?:STATUS|TRAFFIC)\s*=/i.test(text)) {
+    text = text.replace(/^(?:STATUS|TRAFFIC)\s*=/i, '').trim()
+  }
   const usage: SubscriptionUsage = {}
   let matched = false
   const up = bytesAfter('↑:', text)
   if (up !== undefined) { usage.upload = up; matched = true }
   const down = bytesAfter('↓:', text)
   if (down !== undefined) { usage.download = down; matched = true }
-  const total = bytesAfter('TOT:', text)
+  const total = bytesAfter('TOT:', text) ?? bytesAfter('TOTAL:', text)
   if (total !== undefined) { usage.total = total; matched = true }
-  const expires = dayAfter('EXPIRES:', text)
+  const expires = timeAfter('EXPIRES:', text) ?? timeAfter('EXPIRE:', text)
   if (expires !== undefined) { usage.expire = expires; matched = true }
+
+  // `upload=…; download=…; total=…; expire=…` (with optional units / dates).
+  const setKeyValue = (key: string, raw: string) => {
+    const value = raw.replace(/^["']|["']$/g, '').trim()
+    if (!value) return
+    if (key === 'expire' || key === 'expires') {
+      const expire = parseExpiryValue(value)
+      if (expire !== undefined) { usage.expire = expire; matched = true }
+      return
+    }
+    const bytes = parseBytesValue(value)
+    if (bytes !== undefined) {
+      if (key === 'upload') usage.upload = bytes
+      else if (key === 'download') usage.download = bytes
+      else if (key === 'total') usage.total = bytes
+      matched = true
+    }
+  }
+  const keyPattern = /(?:^|[\s;,|])(upload|download|total|expire|expires)\s*=\s*("[^"]*"|'[^']*'|[^\s;,|]+)/gi
+  for (const match of text.matchAll(keyPattern)) setKeyValue(match[1].toLowerCase(), match[2])
   return matched ? usage : undefined
+}
+
+/** Merge quota sources field by field；后面的来源覆盖前面的同名字段。 */
+export function mergeUsage(
+  ...values: (SubscriptionUsage | undefined)[]
+): SubscriptionUsage | undefined {
+  let merged: SubscriptionUsage | undefined
+  let matched = false
+  for (const value of values) {
+    if (!value) continue
+    for (const key of ['upload', 'download', 'total', 'expire'] as const) {
+      const item = value[key]
+      if (typeof item !== 'number' || !Number.isFinite(item)) continue
+      merged = { ...(merged ?? {}), [key]: item }
+      matched = true
+    }
+  }
+  return matched ? merged : undefined
+}
+
+/**
+ * 从订阅正文里挑出配额声明行。只接受明确的 STATUS=/TRAFFIC= 行、以
+ * upload/download/total/expire 开头的行，或至少含两个配额键的行；
+ * 含节点 scheme 的行一律跳过，避免把节点参数当成套餐信息。
+ */
+export function parseUsageDeclaration(data: string): SubscriptionUsage | undefined {
+  let merged: SubscriptionUsage | undefined
+  for (const rawLine of data.split(/\r?\n/)) {
+    const line = rawLine.replace(/\uFEFF/g, '').trim()
+    if (!line || line.length > 400 || line.includes('://')) continue
+    const stripped = line.replace(/^(?:#|;|\/\/)\s*/, '')
+    const markerLine = /^(?:STATUS|TRAFFIC)\s*=/i.test(stripped)
+    const startsWithKey = /^(?:upload|download|total|expire|expires)\s*=/i.test(stripped)
+    const keyCount = (stripped.match(/\b(?:upload|download|total|expire|expires)\s*=/gi) ?? []).length
+    if (!markerLine && !startsWithKey && keyCount < 2) continue
+    const parsed = parseStatusLine(stripped)
+    if (parsed) merged = mergeUsage(merged, parsed)
+  }
+  return merged
 }
 
 const UNIT_MULTIPLIERS: Record<string, number> = {
@@ -67,31 +133,49 @@ const UNIT_MULTIPLIERS: Record<string, number> = {
   t: 1099511627776, tb: 1099511627776,
 }
 
-function bytesAfter(marker: string, text: string): number | undefined {
-  const index = text.toUpperCase().indexOf(marker.toUpperCase())
-  if (index < 0) return undefined
-  const rest = text.slice(index + marker.length)
-  const m = rest.match(/^\s*([\d.]+)\s*([kmgt]?i?b?)/i)
-  if (!m) return undefined
-  const value = Number(m[1])
-  const unit = m[2].toLowerCase().replace('i', '')
+function toBytes(value: string, unitText: string): number | undefined {
+  const amount = Number(value)
+  const unit = unitText.toLowerCase().replace('i', '')
   const multiplier = UNIT_MULTIPLIERS[unit]
-  if (!Number.isFinite(value) || multiplier === undefined) return undefined
-  const bytes = value * multiplier
+  if (!Number.isFinite(amount) || multiplier === undefined) return undefined
+  const bytes = amount * multiplier
   // Saturate instead of overflowing (providers write nonsense).
   if (bytes <= 0) return 0
   if (bytes >= Number.MAX_SAFE_INTEGER) return Number.MAX_SAFE_INTEGER
   return Math.floor(bytes)
 }
 
-function dayAfter(marker: string, text: string): number | undefined {
+function parseBytesValue(raw: string): number | undefined {
+  const m = raw.trim().match(/^([\d.]+)\s*([kmgt]?i?b?)$/i)
+  return m ? toBytes(m[1], m[2]) : undefined
+}
+
+function bytesAfter(marker: string, text: string): number | undefined {
   const index = text.toUpperCase().indexOf(marker.toUpperCase())
   if (index < 0) return undefined
-  const rest = text.slice(index + marker.length)
-  const m = rest.match(/^\s*(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/)
+  // 允许后面继续跟其它 STATUS/TRAFFIC 字段，所以只匹配开头的数值。
+  const m = text.slice(index + marker.length).match(/^\s*([\d.]+)\s*([kmgt]?i?b?)/i)
+  return m ? toBytes(m[1], m[2]) : undefined
+}
+
+/** Unix 秒 / Unix 毫秒 / YYYY-MM-DD（按 UTC 午夜，和旧解析保持一致）。 */
+function parseExpiryValue(raw: string): number | undefined {
+  const text = raw.trim()
+  if (/^\d+(?:\.\d+)?$/.test(text)) {
+    const value = Number(text)
+    if (!Number.isFinite(value) || value < 0) return undefined
+    return Math.floor(value > 1e12 ? value / 1000 : value)
+  }
+  const m = text.replace(/[./]/g, '-').match(/^(\d{4})-(\d{1,2})-(\d{1,2})/)
   if (!m) return undefined
   const date = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
   return Number.isFinite(date) ? Math.floor(date / 1000) : undefined
+}
+
+function timeAfter(marker: string, text: string): number | undefined {
+  const index = text.toUpperCase().indexOf(marker.toUpperCase())
+  if (index < 0) return undefined
+  return parseExpiryValue(text.slice(index + marker.length))
 }
 
 /** `subscription-userinfo: upload=…; download=…; total=…; expire=…` header. */
@@ -103,12 +187,12 @@ export function parseUserinfoHeader(header: string | undefined | null): Subscrip
     const eq = part.indexOf('=')
     if (eq < 0) continue
     const key = part.slice(0, eq).trim().toLowerCase()
-    const value = Number(part.slice(eq + 1).trim())
-    if (!Number.isFinite(value)) continue
-    if (key === 'upload') { usage.upload = value; matched = true }
-    else if (key === 'download') { usage.download = value; matched = true }
-    else if (key === 'total') { usage.total = value; matched = true }
-    else if (key === 'expire' && value > 0) { usage.expire = value; matched = true }
+    const value = Number(part.slice(eq + 1).trim().replace(/^["']|["']$/g, ''))
+    if (!Number.isFinite(value) || value < 0) continue
+    if (key === 'upload') { usage.upload = Math.floor(value); matched = true }
+    else if (key === 'download') { usage.download = Math.floor(value); matched = true }
+    else if (key === 'total') { usage.total = Math.floor(value); matched = true }
+    else if (key === 'expire') { usage.expire = Math.floor(value); matched = true }
   }
   return matched ? usage : undefined
 }
@@ -134,19 +218,21 @@ export function parse(data: string, sourceID?: string): ParsedContent {
     }
   }
 
+  const declaredStatus = parseUsageDeclaration(text)
+
   if (text.startsWith('{') || text.startsWith('[')) {
     const endpoints = parseSingBoxEndpoints(text, sourceID)
-    if (endpoints) return finish(endpoints.nodes, endpoints.rejected)
+    if (endpoints) return finish(endpoints.nodes, endpoints.rejected, declaredStatus)
   }
 
   if (containsClientProxySection(text)) {
     const parsed = parseClientProxyConfiguration(text, sourceID)
-    return finish(parsed.nodes, parsed.rejected)
+    return finish(parsed.nodes, parsed.rejected, declaredStatus)
   }
 
   if (text.includes('proxies:')) {
     const parsed = parseClashYAML(text, sourceID)
-    return finish(parsed.nodes, parsed.rejected)
+    return finish(parsed.nodes, parsed.rejected, declaredStatus)
   }
 
   // Line-by-line URI list. Some panels paste several links on one line.
@@ -187,7 +273,7 @@ export function parse(data: string, sourceID?: string): ParsedContent {
     if (node) nodes.push(node)
     else rejected += 1
   }
-  return finish(nodes, rejected, status)
+  return finish(nodes, rejected, mergeUsage(declaredStatus, status))
 }
 
 function finish(
@@ -197,11 +283,12 @@ function finish(
 ): ParsedContent {
   const marked = deduplicated(rawNodes.map(markingSubscriptionMetadata))
   const notices = marked.filter((n) => n.isSubscriptionMetadata).map((n) => n.name)
+  const noticeStatus = notices.map(parseStatusLine).find((s) => s)
   return {
     nodes: marked,
     rejectedLineCount: rejected,
     notices,
-    status: status ?? notices.map(parseStatusLine).find((s) => s),
+    status: mergeUsage(noticeStatus, status),
   }
 }
 

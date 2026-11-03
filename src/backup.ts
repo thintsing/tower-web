@@ -14,8 +14,10 @@ import type {
   RuleScheme,
   SchemeRuleSet,
   SubscriptionSource,
+  SubscriptionUsage,
   TailnetConnection,
 } from './models/types'
+import { usageFieldsFrom } from './models/types'
 
 export const BACKUP_APP = 'tower-web'
 export const BACKUP_VERSION = 1
@@ -132,6 +134,38 @@ function validSource(value: unknown): value is SubscriptionSource {
     && (value.excludedNodeKeys === undefined || stringArray(value.excludedNodeKeys) !== undefined)
 }
 
+function normalizedUsage(value: unknown): SubscriptionUsage | undefined {
+  if (!isRecord(value)) return undefined
+  const usage: SubscriptionUsage = {}
+  let matched = false
+  for (const key of ['upload', 'download', 'total', 'expire'] as const) {
+    const item = value[key]
+    if (typeof item !== 'number' || !Number.isFinite(item) || item < 0) continue
+    usage[key] = Math.floor(item)
+    matched = true
+  }
+  return matched ? usage : undefined
+}
+
+function normalizeSource(value: SubscriptionSource): SubscriptionSource {
+  const usage = normalizedUsage(value.usage)
+  const derived = usageFieldsFrom(usage)
+  return {
+    ...value,
+    usage,
+    // 旧备份只有 usage；恢复时补出新字段，损坏字段则回退到 usage 推导。
+    expireAt: typeof value.expireAt === 'number' && Number.isFinite(value.expireAt) && value.expireAt >= 0
+      ? value.expireAt
+      : derived.expireAt,
+    totalBytes: typeof value.totalBytes === 'number' && Number.isFinite(value.totalBytes) && value.totalBytes > 0
+      ? value.totalBytes
+      : derived.totalBytes,
+    usedBytes: typeof value.usedBytes === 'number' && Number.isFinite(value.usedBytes) && value.usedBytes >= 0
+      ? value.usedBytes
+      : derived.usedBytes,
+  }
+}
+
 function validNode(value: unknown): value is ProxyNode {
   return isRecord(value)
     && isString(value.id)
@@ -223,7 +257,7 @@ export function parseBackup(text: string): BackupFile {
   if (!isString(data.selectedSchemeID)) throw new Error('备份文件缺少 selectedSchemeID')
 
   const sourceValues = data.sources as unknown[]
-  const sources = sourceValues.filter(validSource)
+  const sources = sourceValues.filter(validSource).map(normalizeSource)
   if (sources.length !== sourceValues.length) throw new Error('备份文件里的订阅数据不完整')
   const nodeValues = data.nodes as unknown[]
   const nodes = nodeValues.filter(validNode)

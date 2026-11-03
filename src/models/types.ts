@@ -168,6 +168,12 @@ export interface SubscriptionSource {
   url: string
   updatedAt?: number
   usage?: SubscriptionUsage
+  /** Unix 毫秒时间戳；0 表示长期有效，undefined 表示未知。 */
+  expireAt?: number
+  /** 套餐总量（字节）；0 或 undefined 表示未知。 */
+  totalBytes?: number
+  /** 已用流量（字节）；undefined 表示未知。 */
+  usedBytes?: number
   /** Airport announcements parsed from metadata pseudo nodes. */
   notices?: string[]
   /** 订阅是否启用；旧快照没有这个字段时按启用处理。 */
@@ -177,6 +183,91 @@ export interface SubscriptionSource {
   dnsOverHTTPSURL?: string
   /** Node ids the user unchecked; carried over across refreshes. */
   excludedNodeKeys: string[]
+}
+
+export interface SubscriptionUsageFields {
+  expireAt?: number
+  totalBytes?: number
+  usedBytes?: number
+}
+
+/**
+ * 把响应头 / 正文解析出的 usage 转成订阅卡直接使用的字段。
+ * total<=0 视为未知（部分面板用它表示“不限量”），expire=0 表示长期有效。
+ */
+export function usageFieldsFrom(usage?: SubscriptionUsage): SubscriptionUsageFields {
+  const fields: SubscriptionUsageFields = {}
+  if (!usage) return fields
+  if (typeof usage.total === 'number' && usage.total > 0) {
+    fields.totalBytes = Math.floor(usage.total)
+  }
+  if (typeof usage.upload === 'number' || typeof usage.download === 'number') {
+    const used = (usage.upload ?? 0) + (usage.download ?? 0)
+    if (Number.isFinite(used) && used >= 0) fields.usedBytes = Math.floor(used)
+  }
+  if (typeof usage.expire === 'number' && Number.isFinite(usage.expire) && usage.expire >= 0) {
+    fields.expireAt = usage.expire === 0 ? 0 : Math.floor(usage.expire * 1000)
+  }
+  return fields
+}
+
+export interface SubscriptionUsageSummary extends SubscriptionUsageFields {
+  remainingBytes?: number
+  /** 剩余比例 0..1，仅在总量和已用都已知时存在。 */
+  remainingRatio?: number
+  /** 距到期天数；已过期为负数，长期有效 / 未知为 undefined。 */
+  daysUntilExpiry?: number
+  expired: boolean
+  longTerm: boolean
+  lowTraffic: boolean
+}
+
+/** 兼容旧快照：新字段缺失时回退到 usage 推导。 */
+export function subscriptionUsageSummary(
+  source: Pick<SubscriptionSource, 'usage' | 'expireAt' | 'totalBytes' | 'usedBytes'>,
+  now = Date.now(),
+): SubscriptionUsageSummary {
+  const derived = usageFieldsFrom(source.usage)
+  const totalBytes = typeof source.totalBytes === 'number' && source.totalBytes > 0
+    ? source.totalBytes
+    : typeof source.totalBytes === 'undefined'
+      ? derived.totalBytes
+      : undefined
+  const usedBytes = typeof source.usedBytes === 'number' && source.usedBytes >= 0
+    ? source.usedBytes
+    : typeof source.usedBytes === 'undefined'
+      ? derived.usedBytes
+      : undefined
+  const expireAt = typeof source.expireAt === 'number' && source.expireAt >= 0
+    ? source.expireAt
+    : typeof source.expireAt === 'undefined'
+      ? derived.expireAt
+      : undefined
+  const remainingBytes = totalBytes !== undefined && usedBytes !== undefined
+    ? Math.max(0, totalBytes - usedBytes)
+    : undefined
+  const remainingRatio = totalBytes !== undefined && totalBytes > 0 && remainingBytes !== undefined
+    ? remainingBytes / totalBytes
+    : undefined
+  const longTerm = expireAt === 0
+  const expired = expireAt !== undefined && expireAt > 0 && expireAt <= now
+  const rawDays = expireAt !== undefined && expireAt > 0
+    ? Math.ceil((expireAt - now) / 86_400_000)
+    : undefined
+  // Math.ceil(-0.0001) 会得到 -0，统一成 0 避免比较/展示异常。
+  const daysUntilExpiry = rawDays === 0 ? 0 : rawDays
+  const lowTraffic = remainingRatio !== undefined && remainingRatio < 0.1
+  return {
+    totalBytes,
+    usedBytes,
+    expireAt,
+    remainingBytes,
+    remainingRatio,
+    daysUntilExpiry,
+    expired,
+    longTerm,
+    lowTraffic,
+  }
 }
 
 /** 订阅请求的进阶选项（只作用于该订阅的抓取请求）。 */

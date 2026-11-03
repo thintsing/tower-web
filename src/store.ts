@@ -4,11 +4,13 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type { AppState, ClientTarget, ExportContentMode, LatencyTestMethod, LatencyTestMode, LocalRuleSet, NodeNameFilterSettings, ProxyKind, ProxyNode, RuleScheme, SubscriptionRequestOptions, SubscriptionSource, SubscriptionUsage, TailnetConnection } from './models/types'
+import { usageFieldsFrom } from './models/types'
 import { loadTailnetAuthKeys, persistTailnetAuthKeys, pruneTailnetAuthKeys } from './models/tailnetAuthKeys'
 import type { PersistedData } from './backup'
 import { prepareManualNodes, type ManualNodeImportResult } from './manualNodes'
-import { parse, parseUserinfoHeader } from './parser'
+import { mergeUsage, parse, parseUserinfoHeader } from './parser'
 import { apiFetch } from './util/apiAuth'
+import { nodeTransportCapability } from './generator/nodeCapabilities'
 import { newID } from './util/browser'
 
 export interface Store extends AppState {
@@ -513,6 +515,7 @@ export const useStore = create<Store>()(
         }
         const parsed = parse(text, source.id)
         source.usage = parsed.status
+        Object.assign(source, usageFieldsFrom(parsed.status))
         source.updatedAt = Date.now()
         const nodes = parsed.nodes
         set((s) => ({
@@ -568,10 +571,10 @@ export const useStore = create<Store>()(
           }
           if (!fetched || !parsed) throw lastError
           if (!isCurrent() || !get().sources.some((s) => s.id === id)) return
-          let usage = fetched.usage ?? parsed.status
+          let usage = mergeUsage(parsed.status, fetched.usage)
           // Some panels only send quota on a Clash-dialect request. Use only
           // its response headers; its node body may silently drop protocols.
-          if (!usage?.total && !usage?.expire) {
+          if ((usage?.total === undefined || usage.total <= 0) && usage?.expire === undefined) {
             const probe = quotaProbeURL(source.url)
             if (probe) {
               try {
@@ -580,7 +583,7 @@ export const useStore = create<Store>()(
                   fetched.userAgent,
                   source.dnsOverHTTPSURL?.trim(),
                 )
-                if (probeResult.usage) usage = { ...(usage ?? {}), ...probeResult.usage }
+                usage = mergeUsage(usage, probeResult.usage)
               } catch {
                 // Quota is optional; keep the successfully parsed node list.
               }
@@ -604,17 +607,22 @@ export const useStore = create<Store>()(
             }
             return {
               nodes: [...s.nodes.filter((n) => n.sourceID !== id), ...parsed.nodes],
-              sources: s.sources.map((src) =>
-                src.id === id
-                  ? {
-                      ...src,
-                      updatedAt: Date.now(),
-                      usage: usage ?? src.usage,
-                      notices: parsed.notices,
-                      excludedNodeKeys: carried,
-                    }
-                  : src,
-              ),
+              sources: s.sources.map((src) => {
+                if (src.id !== id) return src
+                // 解析失败时 usage 为 undefined，保留旧值；部分字段缺失时也逐项回退。
+                const nextUsage = mergeUsage(src.usage, usage)
+                const fields = usageFieldsFrom(nextUsage)
+                return {
+                  ...src,
+                  updatedAt: Date.now(),
+                  usage: nextUsage,
+                  expireAt: fields.expireAt ?? src.expireAt,
+                  totalBytes: fields.totalBytes ?? src.totalBytes,
+                  usedBytes: fields.usedBytes ?? src.usedBytes,
+                  notices: parsed.notices,
+                  excludedNodeKeys: carried,
+                }
+              }),
               loadingSourceIDs: s.loadingSourceIDs.filter((x) => x !== id),
               testingNodeIds: s.testingNodeIds.filter((x) => !removedNodeIds.includes(x)),
               latencyByNodeId,
@@ -714,8 +722,6 @@ export const useStore = create<Store>()(
         const CONCURRENCY = 5
         const PROBE_TIMEOUT = 5000
         const testMode = get().latencyTestMode
-        // 纯 UDP 协议没有 TCP 端口可握手；ICMP / 自动模式仍可测服务器可达性。
-        const UDP_KINDS = new Set<ProxyNode['kind']>(['hysteria', 'hysteria2', 'tuic', 'wireguard'])
 
         const probeOne = async (node: ProxyNode): Promise<{
           id: string
@@ -723,11 +729,13 @@ export const useStore = create<Store>()(
           method?: LatencyTestMethod
           error?: string
         }> => {
-          const udpOnly = UDP_KINDS.has(node.kind)
+          // 自动模式按节点传输层选择：TCP 承载走握手，UDP/QUIC 只能 ICMP 近似。
+          const capability = nodeTransportCapability(node)
+          const udpOnly = capability.probeMethod === 'icmp'
           if (udpOnly && testMode === 'tcp') {
             return { id: node.id, latency: null, error: 'tcp_not_applicable' }
           }
-          const requestMode = udpOnly && testMode === 'automatic' ? 'icmp' : testMode
+          const requestMode = testMode === 'automatic' ? capability.probeMethod : testMode
           // 浏览器侧网络抖动也可能导致 fetch 失败，这里再补一次。
           for (let attempt = 0; attempt < 2; attempt++) {
             const res = await apiFetch(

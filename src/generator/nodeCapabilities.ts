@@ -196,3 +196,83 @@ export function nodeSupportedForTarget(node: ProxyNode, target?: ClientTarget): 
     && hysteria2ObfsSupported(node, target)
     && socksTLSSupported(node, target)
 }
+
+/** 节点实际承载在哪种传输层上；用于选择更合适的测速方式。 */
+export type NodeTransportLayer = 'tcp' | 'udp' | 'quic'
+export type UdpForwardingSupport = 'supported' | 'unsupported' | 'unknown'
+
+export interface NodeTransportCapability {
+  transport: NodeTransportLayer
+  udpForwarding: UdpForwardingSupport
+  /**
+   * 自动测速建议：TCP 承载用 TCP 握手；UDP / QUIC 承载只能用 ICMP 做近似。
+   * 这不是 UDP RTT，UI 必须按“近似值”展示。
+   */
+  probeMethod: 'tcp' | 'icmp'
+}
+
+function protocolTransport(node: ProxyNode): NodeTransportLayer {
+  const transport = (node.transport ?? '').toLowerCase()
+  if (transport === 'quic') return 'quic'
+  switch (node.kind) {
+    case 'hysteria':
+    case 'hysteria2':
+    case 'tuic':
+      return 'quic'
+    case 'wireguard':
+      return 'udp'
+    case 'trusttunnel':
+      return node.trustTunnel?.quic ? 'quic' : 'tcp'
+    case 'masque':
+      if (node.masque?.mode === 'basicConnectIP') {
+        return node.masque.httpVersion === 1 || node.masque.httpVersion === 2 ? 'tcp' : 'quic'
+      }
+      return node.masque?.network && node.masque.network.toLowerCase() !== 'quic' ? 'tcp' : 'quic'
+    default:
+      return 'tcp'
+  }
+}
+
+function protocolUdpForwarding(node: ProxyNode): UdpForwardingSupport {
+  switch (node.kind) {
+    case 'http':
+    case 'ssh':
+      return 'unsupported'
+    case 'ssr':
+    case 'trusttunnel':
+      return 'unknown'
+    case 'snell':
+      return (node.version ?? 4) >= 3 ? 'supported' : 'unsupported'
+    case 'ss':
+      // SIP003 插件只承诺 TCP 转发；没有显式声明时不冒充支持 UDP。
+      return node.plugin ? 'unknown' : 'supported'
+    case 'vmess':
+    case 'vless':
+    case 'trojan':
+    case 'anytls':
+    case 'hysteria':
+    case 'hysteria2':
+    case 'tuic':
+    case 'wireguard':
+    case 'masque':
+    case 'socks5':
+      return 'supported'
+    default:
+      return 'unknown'
+  }
+}
+
+export function nodeTransportCapability(node: ProxyNode): NodeTransportCapability {
+  const transport = protocolTransport(node)
+  const explicitUdp = node.udpRelayEnabled
+  const udpForwarding = explicitUdp === true
+    ? 'supported'
+    : explicitUdp === false
+      ? 'unsupported'
+      : protocolUdpForwarding(node)
+  return {
+    transport,
+    udpForwarding,
+    probeMethod: transport === 'tcp' ? 'tcp' : 'icmp',
+  }
+}

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode, type SyntheticEvent } from 'react'
 import { renderSVG } from 'uqr'
-import { CLIENTS, PROXY_KIND_TITLES, clientSupportsImport, subFormatFor, type ClientInfo, type ClientTarget, type ExportContentMode, type LatencyTestMode, type LocalRuleSet, type NodeNameFilterSettings, type PolicyGroup, type ProxyKind, type ProxyNode, type RemoteSubscriptionEntry, type RoutingRule, type RuleScheme, type RuleSetFormat, type SchemeRuleSet, type SubFormat, type SubscriptionSource, type TailnetConnection, type TailnetExport } from './models/types'
+import { CLIENTS, PROXY_KIND_TITLES, clientSupportsImport, subFormatFor, subscriptionUsageSummary, type ClientInfo, type ClientTarget, type ExportContentMode, type LatencyTestMode, type LocalRuleSet, type NodeNameFilterSettings, type PolicyGroup, type ProxyKind, type ProxyNode, type RemoteSubscriptionEntry, type RoutingRule, type RuleScheme, type RuleSetFormat, type SchemeRuleSet, type SubFormat, type SubscriptionSource, type TailnetConnection, type TailnetExport } from './models/types'
 import { allRegions, filterNodesByRegionCodes, regionForName, regionForNode } from './models/region'
 import { defaultTailnetConnection, normalizeTailnetAuthKey, normalizeTailnetControlURL, normalizeTailnetDeviceName, normalizeTailnetMagicDNSSuffix, normalizeTailnetSubnets, tailnetPolicyName, TailnetValidationError } from './models/tailnet'
 import {
@@ -36,6 +36,7 @@ import { MAX_BATCH_SUBSCRIPTIONS, splitSubscriptionURLs, subscriptionLabel } fro
 import { WorldMapSVG } from './worldmap/WorldMapSVG'
 import { generateConfig, generateSubscriptionFormats } from './generator'
 import { nodeShareText } from './generator/shareLink'
+import { nodeTransportCapability } from './generator/nodeCapabilities'
 import { analyzeRuleCompatibility } from './generator/compatibility'
 import { formatSupportsProxyCollections, prepareSchemeForExport } from './generator/groups'
 import { autoFillGroupEmojis } from './generator/groupIcons'
@@ -63,10 +64,11 @@ function updateDetailsPlacement(event: SyntheticEvent<HTMLDetailsElement>): void
   requestAnimationFrame(() => placeDetailsPanel(details))
 }
 
+/** 流量未知时显示「—」，不要用 0 冒充真实值。 */
 function formatBytes(bytes?: number): string {
-  if (bytes === undefined) return ''
+  if (bytes === undefined || !Number.isFinite(bytes)) return '—'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  let v = bytes
+  let v = Math.max(0, bytes)
   let i = 0
   while (v >= 1024 && i < units.length - 1) { v /= 1024; i++ }
   return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`
@@ -75,6 +77,11 @@ function formatBytes(bytes?: number): string {
 function formatDate(ts?: number): string {
   if (!ts) return ''
   return new Date(ts).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+/** 到期日期按浏览器本地时区展示。 */
+function formatExpiryDate(ts: number): string {
+  return new Date(ts).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' })
 }
 
 /** 高级请求设置：只影响这一条订阅的抓取请求。 */
@@ -1558,10 +1565,13 @@ function SubscriptionSettingsDialog({
             onChange={(e) => setLatencyTestMode(e.target.value as LatencyTestMode)}
           >
             <option value="tcp">TCP 端口握手（默认）</option>
-            <option value="automatic">自动：ICMP 优先，失败回退 TCP</option>
-            <option value="icmp">仅 ICMP</option>
+            <option value="automatic">自动：按传输层选择（TCP 握手 / ICMP 近似）</option>
+            <option value="icmp">仅 ICMP（近似可达性）</option>
           </select>
-          <div className="hint">ICMP 测的是服务器网络可达性；UDP 节点在仅 TCP 模式下会提示不适用。</div>
+          <div className="hint">
+            TCP 节点用握手耗时；UDP / QUIC 节点只能发 ICMP 近似，代表服务器可达性，不是真实 UDP RTT。
+            仅 TCP 模式下 UDP / QUIC 节点会显示「不适用」。
+          </div>
         </div>
         <div className="local-note">
           <i aria-hidden="true" />
@@ -2237,12 +2247,19 @@ function NodeRow({
       ? '节点名称'
       : node.detectedCountry ? '离线 IP' : '未知'
   const shareURI = nodeShareText(node)
+  const capability = nodeTransportCapability(node)
   const method = latencyMethodMap[node.id]
+  const methodText = method === 'icmp'
+    ? 'ICMP 近似（服务器可达性，非 UDP RTT）'
+    : 'TCP 握手'
   const latencyText = latency === undefined
     ? (testing ? '测速中' : '未测')
     : latency === null
       ? `不可达（${probeError ?? 'unknown'}）`
-      : `${latency} ms · ${method === 'icmp' ? 'ICMP' : 'TCP'}`
+      : `${latency} ms · ${methodText}`
+  const udpForwardingText = capability.udpForwarding === 'supported'
+    ? '支持'
+    : capability.udpForwarding === 'unsupported' ? '不支持' : '未知'
   const copyShareURI = async () => {
     if (!shareURI) return
     if (await copyToClipboard(shareURI)) {
@@ -2276,7 +2293,7 @@ function NodeRow({
     if (latency === null) {
       if (probeError === 'tcp_not_applicable') {
         return (
-          <span className="latency untested" title="UDP 节点不适用 TCP 测速，请改用 ICMP / 自动">
+          <span className="latency untested" title="UDP/QUIC 承载节点无法用 TCP 握手测速，请改用自动或 ICMP">
             不适用
           </span>
         )
@@ -2287,12 +2304,19 @@ function NodeRow({
         </span>
       )
     }
+    const measured = latencyMethodMap[node.id]
+    // ICMP 只是服务器可达性参考，不套用 TCP 延迟的三档色阶。
+    if (measured === 'icmp') {
+      return (
+        <span className="latency approx" title={`可达性参考 · ICMP 近似 ${latency}ms（非 UDP RTT）`}>
+          ≈{latency}<span className="unit">ms</span>
+        </span>
+      )
+    }
     const grade = latency < 100 ? '良好' : latency < 300 ? '一般' : '较差'
     const color = grade === '良好' ? 'var(--positive)' : grade === '一般' ? 'var(--warning)' : 'var(--negative)'
-    const method = latencyMethodMap[node.id]
-    const methodLabel = method === 'icmp' ? 'ICMP' : 'TCP'
     return (
-      <span className="latency" style={{ color }} title={`${grade} · ${methodLabel} ${latency}ms`}>
+      <span className="latency" style={{ color }} title={`${grade} · TCP 握手 ${latency}ms`}>
         {latency}<span className="unit">ms</span>
       </span>
     )
@@ -2348,6 +2372,12 @@ function NodeRow({
         <span className="node-disclosure" aria-hidden="true">{expanded ? '▾' : '▸'}</span>
       </button>
       {matchHint && <span className="node-match" title={matchHint}>{matchHint}</span>}
+      <span
+        className={`transport-badge transport-${capability.transport}`}
+        title={`${capability.transport.toUpperCase()} 承载 · UDP 转发：${udpForwardingText}`}
+      >
+        {capability.transport.toUpperCase()}
+      </span>
       {latencyBadge}
       {showKind && <span className="kind">{PROXY_KIND_TITLES[node.kind] ?? node.kind}</span>}
       {node.isManual && (onRenameManual || onEditManual || onDeleteManual) && (
@@ -2403,6 +2433,8 @@ function NodeRow({
             </span>
             <span>延迟</span>
             <span>{latencyText}</span>
+            <span>传输层</span>
+            <span>{capability.transport.toUpperCase()} · UDP 转发{udpForwardingText}</span>
             {node.transport && node.transport !== 'tcp' && (
               <>
                 <span>传输</span>
@@ -2674,8 +2706,7 @@ function SourceCard({
   if (!source) return null
   const sourceEnabled = isSourceEnabled(source)
   const real = realAll
-  const u = source.usage
-  const usedBytes = (u?.upload ?? 0) + (u?.download ?? 0)
+  const usage = subscriptionUsageSummary(source)
   const thisSourceIds = real.map((n) => n.id)
   const testingThisSource = testingIds.some((tid) => thisSourceIds.includes(tid))
   const testedCount = thisSourceIds.filter((id) => latencyMap[id] !== undefined).length
@@ -2716,11 +2747,38 @@ function SourceCard({
               {source.dnsOverHTTPSURL ? ' · DoH' : ''}
               {needle && !sourceNameMatches ? ` · 匹配 ${visibleRealCount}/${real.length}` : ''}
             </div>
-            {(u?.total !== undefined || u?.expire !== undefined) && (
+            {(usage.totalBytes !== undefined
+              || usage.usedBytes !== undefined
+              || usage.expireAt !== undefined) && (
               <div className="usage">
-                {u?.total !== undefined && <span>已用 {formatBytes(usedBytes)} / {formatBytes(u.total)}</span>}
-                {u?.total !== undefined && <span>剩余 {formatBytes(Math.max(0, u.total - usedBytes))}</span>}
-                {u?.expire !== undefined && <span>到期 {new Date(u.expire * 1000).toLocaleDateString('zh-CN')}</span>}
+                {(usage.totalBytes !== undefined || usage.usedBytes !== undefined) && (
+                  <span
+                    className={`usage-item${usage.lowTraffic ? ' warn' : ''}`}
+                    title={usage.usedBytes !== undefined
+                      ? `已用 ${formatBytes(usage.usedBytes)}${usage.remainingRatio !== undefined
+                        ? ` · 剩余 ${Math.round(Math.max(0, usage.remainingRatio) * 100)}%`
+                        : ''}`
+                      : '已用流量未知'}
+                  >
+                    剩余 {formatBytes(usage.remainingBytes)} / 共 {formatBytes(usage.totalBytes)}
+                  </span>
+                )}
+                {usage.expireAt !== undefined && (
+                  <span
+                    className={`usage-item${usage.expired
+                      ? ' expired'
+                      : usage.daysUntilExpiry !== undefined && usage.daysUntilExpiry <= 7 ? ' warn' : ''}`}
+                    title={usage.longTerm
+                      ? '订阅未设置到期时间'
+                      : `到期日期 ${formatExpiryDate(usage.expireAt)}（按本地时区）`}
+                  >
+                    {usage.longTerm
+                      ? '长期有效'
+                      : usage.expired
+                        ? `已过期 · ${formatExpiryDate(usage.expireAt)}`
+                        : `还有 ${usage.daysUntilExpiry} 天到期 · ${formatExpiryDate(usage.expireAt)}`}
+                  </span>
+                )}
               </div>
             )}
             {(source.notices?.length ?? 0) > 0 && (
@@ -2845,6 +2903,11 @@ function SourceCard({
                     <span><i style={{ background: 'var(--negative)' }} />失败</span>
                     <span><i className="swatch-off" />已排除</span>
                   </div>
+                  <div className="legend-row">
+                    <span className="legend-label">测速</span>
+                    <span><b className="num">TCP</b> 握手</span>
+                    <span><b className="num">≈ ICMP</b> 近似，仅用于 UDP / QUIC，不参与延迟色阶</span>
+                  </div>
                 </div>
               </details>
             </div>
@@ -2854,6 +2917,7 @@ function SourceCard({
               <span className="cb-space" />
               <span className="flag" />
               <span className="name">节点</span>
+              <span className="transport">传输</span>
               <span className="latency">延迟</span>
               {showKind && <span className="kind">协议</span>}
             </div>
@@ -3083,10 +3147,10 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     const now = Date.now()
     return sources.flatMap((source) => {
       if (!isSourceEnabled(source)) return []
-      const usage = source.usage
+      const summary = subscriptionUsageSummary(source, now)
       const alerts: { id: string; name: string; text: string; tone: 'warning' | 'error' }[] = []
-      if (usage?.expire) {
-        const days = Math.ceil((usage.expire * 1000 - now) / 86_400_000)
+      if (summary.expireAt !== undefined && !summary.longTerm) {
+        const days = summary.daysUntilExpiry ?? Math.ceil((summary.expireAt - now) / 86_400_000)
         if (days <= 7) {
           alerts.push({
             id: `${source.id}-expire`,
@@ -3096,16 +3160,14 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           })
         }
       }
-      if (usage?.total && usage.total > 0) {
-        const ratio = ((usage.upload ?? 0) + (usage.download ?? 0)) / usage.total
-        if (ratio >= 0.9) {
-          alerts.push({
-            id: `${source.id}-usage`,
-            name: source.name,
-            text: `流量已用 ${Math.round(ratio * 100)}%`,
-            tone: ratio >= 1 ? 'error' : 'warning',
-          })
-        }
+      if (summary.lowTraffic && summary.remainingRatio !== undefined) {
+        const remaining = Math.round(Math.max(0, summary.remainingRatio) * 100)
+        alerts.push({
+          id: `${source.id}-usage`,
+          name: source.name,
+          text: remaining <= 0 ? '流量已用尽' : `剩余流量 ${remaining}%`,
+          tone: remaining <= 0 ? 'error' : 'warning',
+        })
       }
       return alerts
     })

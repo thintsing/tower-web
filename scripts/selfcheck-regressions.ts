@@ -9,7 +9,9 @@ import { networkInterfaces, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { parse } from '../src/parser'
+import { parse, parseStatusLine, parseUsageDeclaration, parseUserinfoHeader } from '../src/parser'
+import { subscriptionUsageSummary, usageFieldsFrom } from '../src/models/types'
+import { nodeTransportCapability } from '../src/generator/nodeCapabilities'
 import { parseClashYAML } from '../src/parser/clash'
 import { canonicalNodeURI } from '../src/generator/base64Sub'
 import { generateSingBox } from '../src/generator/singbox'
@@ -742,6 +744,176 @@ await checkAsync('畸形 Host 不崩溃；容器内伪造 Host 不能绕过管�
     if (originalLocalStorage === undefined) delete (globalThis as unknown as { localStorage?: unknown }).localStorage
     else (globalThis as unknown as { localStorage: unknown }).localStorage = originalLocalStorage
   }
+})
+
+// ---------- 12. 订阅套餐信息解析 ----------
+const GB = 1024 ** 3
+
+check('订阅配额：响应头 / STATUS / TRAFFIC / 正文 key=value 都能解析', () => {
+  const header = parseUserinfoHeader(
+    'upload=1048576; download=10737418240; total=107374182400; expire=0',
+  )
+  assert.ok(header)
+  assert.equal(header.expire, 0, 'expire=0 应保留为「长期有效」')
+  assert.equal(header.total, 107374182400)
+  assert.equal(header.upload, 1048576)
+
+  const status = parseStatusLine('STATUS=↑:1.2GB ↓:34GB TOT:500GB EXPIRES:2027-01-01')
+  assert.ok(status)
+  assert.equal(status.upload, Math.floor(1.2 * GB))
+  assert.equal(status.download, 34 * GB)
+  assert.equal(status.total, 500 * GB)
+  assert.equal(status.expire, Date.UTC(2027, 0, 1) / 1000)
+
+  const traffic = parseStatusLine('TRAFFIC=upload=1.2GB; download=34GB; total=500GB; expire=2027-01-01')
+  assert.ok(traffic)
+  assert.equal(traffic.total, 500 * GB)
+  assert.equal(traffic.expire, Date.UTC(2027, 0, 1) / 1000)
+
+  const declared = parseUsageDeclaration('upload=1GB\n download=2GB\n total=100GB\nexpire=0')
+  assert.ok(declared)
+  assert.equal(declared.upload, GB)
+  assert.equal(declared.download, 2 * GB)
+  assert.equal(declared.expire, 0)
+
+  const auth = Buffer.from('aes-256-gcm:pass').toString('base64').replace(/=+$/, '')
+  const parsed = parse(
+    'upload=1GB; download=2GB; total=100GB; expire=2027-01-01\n'
+    + `ss://${auth}@1.2.3.4:8388#Quota-Node`,
+  )
+  assert.equal(parsed.nodes.length, 1)
+  assert.ok(parsed.status)
+  assert.equal(parsed.status.total, 100 * GB)
+
+  // 节点 URI 里的 total= 参数不能被当成套餐信息。
+  const withParam = parse(
+    'vless://11111111-2222-3333-4444-555555555555@v.example.com:443'
+    + '?encryption=none&security=tls&type=ws&path=%2Ftotal%3D1GB#Param-Nodel',
+  )
+  assert.equal(withParam.status, undefined)
+})
+
+// ---------- 13. 剩余流量 / 到期计算 ----------
+check('剩余流量、到期天数、低流量与旧快照兼容', () => {
+  const now = Date.UTC(2026, 10, 3)
+  const expire = (now + 3 * 86_400_000) / 1000
+  const usage = {
+    upload: 10 * GB,
+    download: 81 * GB,
+    total: 100 * GB,
+    expire,
+  }
+  const fields = usageFieldsFrom(usage)
+  assert.equal(fields.totalBytes, 100 * GB)
+  assert.equal(fields.usedBytes, 91 * GB)
+  assert.equal(fields.expireAt, now + 3 * 86_400_000)
+
+  const summary = subscriptionUsageSummary({ usage }, now)
+  assert.equal(summary.remainingBytes, 9 * GB)
+  assert.equal(summary.remainingRatio, 0.09)
+  assert.equal(summary.lowTraffic, true)
+  assert.equal(summary.daysUntilExpiry, 3)
+  assert.equal(summary.expired, false)
+  assert.equal(summary.longTerm, false)
+
+  // 恰好 10% 不算低流量（需求是 <10%）。
+  const boundary = subscriptionUsageSummary({
+    totalBytes: 100 * GB,
+    usedBytes: 90 * GB,
+    expireAt: now + 8 * 86_400_000,
+  }, now)
+  assert.equal(boundary.remainingRatio, 0.1)
+  assert.equal(boundary.lowTraffic, false)
+  assert.equal(boundary.daysUntilExpiry, 8)
+
+  const expired = subscriptionUsageSummary({ expireAt: now - 1 }, now)
+  assert.equal(expired.expired, true)
+  assert.equal(expired.daysUntilExpiry, 0)
+
+  const longTerm = subscriptionUsageSummary({ usage: { expire: 0 } }, now)
+  assert.equal(longTerm.longTerm, true)
+  assert.equal(longTerm.expired, false)
+  assert.equal(longTerm.daysUntilExpiry, undefined)
+
+  const unknown = subscriptionUsageSummary({}, now)
+  assert.equal(unknown.totalBytes, undefined)
+  assert.equal(unknown.usedBytes, undefined)
+  assert.equal(unknown.remainingBytes, undefined)
+  assert.equal(unknown.expireAt, undefined)
+
+  // 新字段优先，旧快照只有 usage 时自动回退。
+  const priority = subscriptionUsageSummary({
+    usage: { total: 100 * GB, upload: 1 },
+    totalBytes: 50 * GB,
+    usedBytes: 5 * GB,
+    expireAt: 0,
+  }, now)
+  assert.equal(priority.totalBytes, 50 * GB)
+  assert.equal(priority.usedBytes, 5 * GB)
+  assert.equal(priority.longTerm, true)
+})
+
+// ---------- 14. 协议传输层 / UDP 能力映射 ----------
+check('协议传输层与 UDP 转发能力映射', () => {
+  const node = (patch: Partial<ProxyNode>): ProxyNode => ({
+    ...base,
+    id: patch.kind ?? 'cap',
+    kind: 'ss',
+    name: 'cap',
+    server: 'cap.example.com',
+    port: 443,
+    ...patch,
+  })
+
+  const hy2 = nodeTransportCapability(node({ kind: 'hysteria2' }))
+  assert.equal(hy2.transport, 'quic')
+  assert.equal(hy2.probeMethod, 'icmp')
+  assert.equal(hy2.udpForwarding, 'supported')
+
+  assert.equal(nodeTransportCapability(node({ kind: 'tuic' })).transport, 'quic')
+  assert.equal(nodeTransportCapability(node({ kind: 'wireguard' })).transport, 'udp')
+  assert.equal(nodeTransportCapability(node({ kind: 'wireguard' })).probeMethod, 'icmp')
+
+  assert.equal(nodeTransportCapability(node({
+    kind: 'masque',
+    masque: { mode: 'basicConnectIP', httpVersion: 3 },
+  })).transport, 'quic')
+  assert.equal(nodeTransportCapability(node({
+    kind: 'masque',
+    masque: { mode: 'basicConnectIP', httpVersion: 2 },
+  })).transport, 'tcp')
+
+  assert.equal(nodeTransportCapability(node({
+    kind: 'trusttunnel',
+    trustTunnel: { quic: true },
+  })).transport, 'quic')
+  assert.equal(nodeTransportCapability(node({
+    kind: 'trusttunnel',
+    trustTunnel: { quic: false },
+  })).transport, 'tcp')
+
+  assert.equal(nodeTransportCapability(node({ kind: 'ss' })).udpForwarding, 'supported')
+  assert.equal(nodeTransportCapability(node({
+    kind: 'ss',
+    plugin: 'v2ray-plugin',
+  })).udpForwarding, 'unknown')
+  assert.equal(nodeTransportCapability(node({
+    kind: 'snell',
+    version: 2,
+  })).udpForwarding, 'unsupported')
+  assert.equal(nodeTransportCapability(node({
+    kind: 'snell',
+    version: 3,
+  })).udpForwarding, 'supported')
+  assert.equal(nodeTransportCapability(node({ kind: 'http' })).udpForwarding, 'unsupported')
+  assert.equal(nodeTransportCapability(node({
+    kind: 'vmess',
+    transport: 'quic',
+  })).transport, 'quic')
+  assert.equal(nodeTransportCapability(node({
+    kind: 'hysteria2',
+    udpRelayEnabled: false,
+  })).udpForwarding, 'unsupported')
 })
 
 if (failures) {
