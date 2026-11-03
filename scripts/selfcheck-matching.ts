@@ -16,6 +16,10 @@ import {
 } from '../src/rules/groupEditing'
 import { findRuleOrderConflicts } from '../src/rules/orderConflicts'
 import { prepareSchemeForExport } from '../src/generator/groups'
+import { explainQuery, compileScheme, explainWith, type CompiledScheme } from '../src/rules/ruleExplain'
+import { parseQuery, evaluateRule } from '../src/rules/ruleMatcher'
+import { lintScheme } from '../src/rules/schemeLint'
+import { CLIENTS, type ProxyNode } from '../src/models/types'
 
 let failures = 0
 
@@ -266,6 +270,233 @@ function main(): void {
     assert.equal(removed.removedRules, A.length)
     assert.equal(removed.removedCustomRules, 1)
     assert.equal(removed.removedRuleSets, 1)
+  })
+
+  const explainWithIndex = (compiled: CompiledScheme, raw: string) => {
+    const result = explainWith(compiled, raw)
+    return { result, match: result.match?.index }
+  }
+
+  check('输入解析：URL / 端口 / IPv4 / IPv6 / 路径', () => {
+    assert.equal(parseQuery('https://www.google.com/search?q=1').host, 'www.google.com')
+    assert.equal(parseQuery('https://www.google.com/search?q=1').port, 443)
+    assert.equal(parseQuery('example.com:8080').port, 8080)
+    assert.equal(parseQuery('example.com/path').host, 'example.com')
+    assert.equal(parseQuery('1.2.3.4').kind, 'ipv4')
+    assert.equal(parseQuery('[2001:db8::1]:443').kind, 'ipv6')
+    assert.equal(parseQuery('[2001:db8::1]:443').ip, '2001:db8::1')
+  })
+
+  check('规则判定：后缀 / IPv4 CIDR / IPv6 CIDR / 端口 / 地址族', () => {
+    const target = parseQuery('https://www.google.com/a')
+    assert.equal(evaluateRule({ type: 'DOMAIN', value: 'google.com' }, target).status, 'miss')
+    assert.equal(evaluateRule({ type: 'DOMAIN-SUFFIX', value: 'google.com' }, target).status, 'match')
+    assert.equal(evaluateRule({ type: 'DOMAIN-KEYWORD', value: 'GOOGLE' }, target).status, 'match')
+    assert.equal(evaluateRule({ type: 'DOMAIN-WILDCARD', value: '*.google.com' }, target).status, 'match')
+    assert.equal(evaluateRule({ type: 'DOMAIN-REGEX', value: '^www\\.google\\.' }, target).status, 'match')
+    const v4 = parseQuery('1.2.3.4:443')
+    assert.equal(evaluateRule({ type: 'IP-CIDR', value: '1.2.3.0/24' }, v4).status, 'match')
+    assert.equal(evaluateRule({ type: 'DST-PORT', value: '443' }, v4).status, 'match')
+    assert.equal(evaluateRule({ type: 'DST-PORT', value: '80' }, v4).status, 'miss')
+    const v6 = parseQuery('[2001:db8::1]')
+    assert.equal(evaluateRule({ type: 'IP-CIDR6', value: '2001:db8::/32' }, v6).status, 'match')
+    assert.equal(evaluateRule({ type: 'IP-CIDR', value: '2001:db8::/32' }, v6).status, 'miss')
+    assert.equal(evaluateRule({ type: 'DOMAIN-SUFFIX', value: 'google.com' }, v4).status, 'miss')
+  })
+
+  check('DOMAIN-WILDCARD 与 mihomo 一致：* 不包含根域，可跨点', () => {
+    assert.equal(evaluateRule({ type: 'DOMAIN-WILDCARD', value: '*.example.com' }, parseQuery('example.com')).status, 'miss')
+    assert.equal(evaluateRule({ type: 'DOMAIN-WILDCARD', value: '*.example.com' }, parseQuery('a.example.com')).status, 'match')
+    assert.equal(evaluateRule({ type: 'DOMAIN-WILDCARD', value: '*.example.com' }, parseQuery('a.b.example.com')).status, 'match')
+    assert.equal(evaluateRule({ type: 'DOMAIN-WILDCARD', value: 'example.*' }, parseQuery('example.com')).status, 'match')
+    // 长通配串以前被翻译成 `.*.*...` 的正则，会在这里卡死几十秒。
+    const hostile = parseQuery(`${'a'.repeat(200)}.com`)
+    const started = performance.now()
+    const result = evaluateRule({ type: 'DOMAIN-WILDCARD', value: `${'*a'.repeat(240)}b` }, hostile)
+    const elapsed = performance.now() - started
+    assert.equal(result.status, 'miss')
+    assert.ok(elapsed < 20, `耗时 ${elapsed.toFixed(1)}ms`)
+  })
+
+  check('IP-SUFFIX 按末尾 prefix 位比较（mihomo 语义）', () => {
+    // 1.2.3.4/16 的末尾 16 位是 3.4：任意 x.y.3.4 都应命中，而文本前缀比较会漏掉。
+    assert.equal(evaluateRule({ type: 'IP-SUFFIX', value: '1.2.3.4/16' }, parseQuery('9.9.3.4')).status, 'match')
+    assert.equal(evaluateRule({ type: 'IP-SUFFIX', value: '1.2.3.4/16' }, parseQuery('1.2.4.3')).status, 'miss')
+    assert.equal(evaluateRule({ type: 'IP-SUFFIX', value: '1.2.3.0/24' }, parseQuery('1.2.3.4')).status, 'miss')
+    assert.equal(evaluateRule({ type: 'IP-SUFFIX', value: '1.2.3.0/24' }, parseQuery('9.2.3.0')).status, 'match')
+    assert.equal(evaluateRule({ type: 'IP-SUFFIX', value: '1.2.3.4' }, parseQuery('1.2.3.4')).status, 'unknown')
+  })
+
+  check('非法 CIDR / 前导零 / 多余斜杠不会被误判命中', () => {
+    const ip = parseQuery('1.2.3.4')
+    assert.equal(evaluateRule({ type: 'IP-CIDR', value: '1.2.3.4/24/8' }, ip).status, 'unknown')
+    assert.equal(evaluateRule({ type: 'IP-CIDR', value: '1.2.3.4/' }, ip).status, 'unknown')
+    assert.equal(evaluateRule({ type: 'IP-CIDR', value: '1.2.3.4/abc' }, ip).status, 'unknown')
+    assert.equal(evaluateRule({ type: 'IP-CIDR', value: '001.2.3.4/24' }, ip).status, 'unknown')
+    assert.equal(evaluateRule({ type: 'IP-CIDR', value: '1.2.3.0/24' }, ip).status, 'match')
+  })
+
+  check('IPv4 映射 IPv6 按 IPv4 处理（对齐 mihomo Unmap）', () => {
+    const mapped = parseQuery('[::ffff:1.2.3.4]')
+    assert.equal(mapped.kind, 'ipv4')
+    assert.equal(mapped.ip, '1.2.3.4')
+    assert.equal(evaluateRule({ type: 'IP-CIDR', value: '1.2.3.0/24' }, mapped).status, 'match')
+    const urlMapped = parseQuery('http://[::ffff:1.2.3.4]:8080/')
+    assert.equal(urlMapped.ip, '1.2.3.4')
+    assert.equal(urlMapped.port, 8080)
+  })
+
+  check('DOMAIN-REGEX 区分大小写，通配符不区分', () => {
+    // 主机名统一小写后再匹配；正则不再强制忽略大小写，和客户端 regexp.Compile 一致。
+    const target = parseQuery('www.Google.com')
+    assert.equal(evaluateRule({ type: 'DOMAIN-REGEX', value: '^www\\.google' }, target).status, 'match')
+    assert.equal(evaluateRule({ type: 'DOMAIN-REGEX', value: '^www\\.Google' }, target).status, 'miss')
+    assert.equal(evaluateRule({ type: 'DOMAIN-WILDCARD', value: '*.Google.com' }, target).status, 'match')
+  })
+
+  check('逻辑规则 AND / OR / NOT 递归判定', () => {
+    const target = parseQuery('https://www.google.com:443')
+    const and = evaluateRule({ type: 'AND', raw: 'AND,((DOMAIN-SUFFIX,google.com),(DST-PORT,443))' }, target)
+    assert.equal(and.status, 'match')
+    const or = evaluateRule({ type: 'OR', raw: 'OR,((DOMAIN-SUFFIX,bing.com),(DOMAIN-SUFFIX,google.com))' }, target)
+    assert.equal(or.status, 'match')
+    const not = evaluateRule({ type: 'NOT', raw: 'NOT,((DOMAIN-SUFFIX,bing.com))' }, target)
+    assert.equal(not.status, 'match')
+  })
+
+  check('输入大小写 / 末尾点 / 空串 / 超长', () => {
+    assert.equal(evaluateRule({ type: 'DOMAIN', value: 'google.com' }, parseQuery('GOOGLE.COM.')).status, 'match')
+    assert.equal(evaluateRule({ type: 'DOMAIN-SUFFIX', value: 'google.com' }, parseQuery('WWW.GOOGLE.COM')).status, 'match')
+    assert.equal(parseQuery('').kind, 'unknown')
+    assert.equal(parseQuery('a'.repeat(5000)).kind, 'unknown')
+    assert.equal(parseQuery(`${'a'.repeat(300)}.com`).kind, 'unknown')
+    assert.equal(parseQuery(`${'a'.repeat(4090)}.com`).kind, 'unknown')
+    assert.equal(parseQuery('example.com:99999').kind, 'unknown')
+    assert.equal(parseQuery('[2001:db8::1]:99999').kind, 'unknown')
+  })
+
+  check('DOMAIN-REGEX 拦截灾难性回溯，不阻塞页面', () => {
+    const host = parseQuery(`${'a'.repeat(30)}.com`)
+    const started = performance.now()
+    const result = evaluateRule({ type: 'DOMAIN-REGEX', value: '(a+)+$' }, host)
+    const elapsed = performance.now() - started
+    assert.equal(result.status, 'unknown')
+    assert.match(result.reason ?? '', /灾难性回溯/)
+    assert.ok(elapsed < 50, `耗时 ${elapsed.toFixed(1)}ms`)
+  })
+
+  const explainScheme: RuleScheme = {
+    id: 'explain',
+    name: '解释',
+    description: '',
+    groups: [
+      { name: '代理', type: 'select', options: ['🇭🇰 香港 01', 'DIRECT'], nodeFilter: '香港' },
+      { name: '自动', type: 'url-test', options: [], nodeFilter: '香港' },
+    ],
+    rules: [
+      rule('代理', 'google.com'),
+      rule('代理', 'google.com', 'DOMAIN-SUFFIX'),
+      rule('代理', '1.2.3.0/24', 'IP-CIDR'),
+      rule('代理', '2001:db8::/32', 'IP-CIDR6'),
+      rule('代理', '443', 'DST-PORT'),
+      rule('DIRECT', 'ads.example.com', 'DOMAIN-SUFFIX'),
+      { ...rule('代理', '10.0.0.0/8', 'IP-CIDR'), noResolve: true },
+      { type: 'MATCH', group: '代理' },
+    ],
+    ruleSets: [
+      { id: 'empty-set', name: '空规则集', group: '代理', sourceKind: 'local', updatedAt: 1, rules: [] },
+    ],
+  }
+  const explainNodes: ProxyNode[] = [
+    { id: 'n1', kind: 'ss', name: '🇭🇰 香港 01', server: 'hk.example.com', port: 443, tls: true, skipCertificateVerification: false, rawURI: '' },
+  ]
+
+  check('命中解释器按导出顺序 first-match，并解析策略组节点', () => {
+    const result = explainQuery({ scheme: explainScheme, nodes: explainNodes, policySelections: {} }, 'https://www.google.com/a')
+    assert.equal(result.steps.length, 2)
+    assert.equal(result.steps[0].evaluation.status, 'miss')
+    assert.equal(result.match?.index, 2)
+    assert.equal(result.match?.rule.type, 'DOMAIN-SUFFIX')
+    assert.equal(result.final.group, '代理')
+    assert.equal(result.final.candidates, 1)
+    assert.equal(result.final.node, '🇭🇰 香港 01')
+    assert.equal(result.notes.some((note) => note.includes('空规则集')), true)
+  })
+
+  check('命中解释器区分 IPv4 / IPv6 / 端口与兜底', () => {
+    const compiled = compileScheme({ scheme: explainScheme, nodes: explainNodes, policySelections: {} })
+    assert.equal(explainWithIndex(compiled, '1.2.3.4').match, 3)
+    assert.equal(explainWithIndex(compiled, '[2001:db8::1]:8443').match, 4)
+    assert.equal(explainWithIndex(compiled, '8.8.8.8:443').match, 5)
+    const fallback = explainWithIndex(compiled, 'unmatched.example.org')
+    assert.equal(fallback.result.match?.rule.type, 'MATCH')
+    assert.equal(fallback.result.final.isFallback, true)
+  })
+
+  check('IP 规则对域名输入给出跳过原因而不是误判未命中', () => {
+    const result = explainQuery({ scheme: explainScheme, nodes: explainNodes, policySelections: {} }, 'unknown.example.org')
+    const skipped = result.steps.find((step) => step.rule.type === 'IP-CIDR')
+    assert.equal(skipped?.evaluation.status, 'skip')
+    assert.match(skipped?.evaluation.reason ?? '', /解析|no-resolve/)
+  })
+
+  check('方案 lint：重复 / 死规则 / 缺失组 / 空规则集 / 类型候选', () => {
+    const lintGroups: PolicyGroup[] = [
+      { name: '代理', type: 'select', options: ['🇭🇰 香港 01', 'DIRECT'] },
+      { name: '自动', type: 'url-test', options: [], nodeFilter: '香港' },
+      { name: '空组', type: 'select', options: [] },
+    ]
+    const issues = lintScheme({
+      scheme: {
+        id: 'lint',
+        name: 'lint',
+        description: '',
+        groups: lintGroups,
+        rules: [
+          rule('代理', 'example.com', 'DOMAIN-SUFFIX'),
+          rule('代理', 'ads.example.com', 'DOMAIN'),
+          rule('代理', 'example.com', 'DOMAIN'),
+          rule('代理', 'dup.example.com', 'DOMAIN-SUFFIX'),
+          rule('代理', 'dup.example.com', 'DOMAIN-SUFFIX'),
+          rule('不存在的组', 'missing.example.com'),
+          { type: 'FINAL', group: '代理' },
+        ],
+        ruleSets: [{ id: 'empty', name: '空规则集', group: '代理', sourceKind: 'local', updatedAt: 1, rules: [] }],
+      },
+      nodes: explainNodes,
+      clients: [],
+    })
+    const codes = issues.map((issue) => issue.code)
+    assert.ok(codes.includes('duplicateRuleSameGroup'))
+    assert.ok(codes.includes('shadowedRule'))
+    assert.ok(codes.includes('missingRuleTarget'))
+    assert.ok(codes.includes('emptyRuleSet'))
+    assert.ok(codes.includes('groupTypeCandidateMismatch'))
+    assert.ok(codes.includes('emptyGroup'))
+    // 死规则 / 跨组重复只作为提示（info），不把内置方案刷成一片警告。
+    assert.equal(issues.find((issue) => issue.code === 'shadowedRule')?.level, 'info')
+    // 同一条完全重复的规则只报一次重复，不再叠加「死规则」（重复项本身不产生 dead）。
+    assert.equal(issues.filter((issue) => issue.code === 'shadowedRule').length, 4)
+    assert.equal(issues.some((issue) => issue.code === 'dead:4'), false)
+    // 空组只报 emptyGroup，不再重复报 selectGroupEmpty。
+    assert.equal(codes.filter((code) => code === 'selectGroupEmpty').length, 0)
+  })
+
+  check('方案 lint 复用客户端兼容性判断', () => {
+    const qx = CLIENTS.find((client) => client.name.includes('Quantumult X'))
+    assert.ok(qx)
+    const issues = lintScheme({
+      scheme: {
+        id: 'compat',
+        name: 'compat',
+        description: '',
+        groups: [{ name: '代理', type: 'select', options: ['DIRECT'] }],
+        rules: [{ type: 'PROCESS-NAME', value: 'curl', group: '代理' }, { type: 'FINAL', group: '代理' }],
+      },
+      nodes: explainNodes,
+      clients: [qx],
+    })
+    assert.ok(issues.some((issue) => issue.code === 'unsupportedRuleType'))
   })
 
   if (failures) {

@@ -16,6 +16,15 @@ import {
   RULE_SET_FORMAT_TITLES,
 } from '../src/rules/ruleSets'
 import { normalizeRemoteTextURL } from '../src/util/remoteURL'
+import { diffRules, diffTotal } from '../src/rules/ruleDiff'
+import {
+  clearRuleSetHistory,
+  digestRules,
+  historySetIDs,
+  previousRuleSetSnapshot,
+  readRuleSetHistory,
+  recordRuleSetSnapshot,
+} from '../src/rules/ruleSetHistory'
 
 let failures = 0
 function check(label: string, run: () => void): void {
@@ -441,6 +450,92 @@ function main(): void {
     assert.match(srsDomain ?? '', /format=srs-domain/)
     const local = makeSet({ sourceKind: 'local', sourceRef: 'local-1' })
     assert.equal(hostedRuleSetURL(local, 'singbox'), undefined)
+  })
+
+  check('规则集 diff：顺序变化不产生噪音', () => {
+    const before = [rule('DOMAIN', 'b.example'), rule('DOMAIN', 'a.example'), rule('DOMAIN-SUFFIX', 'example.com')]
+    const after = [rule('DOMAIN-SUFFIX', 'example.com'), rule('DOMAIN', 'a.example'), rule('DOMAIN', 'b.example')]
+    const result = diffRules(before, after)
+    assert.equal(diffTotal(result), 0)
+    assert.equal(result.unchanged, 3)
+  })
+
+  check('规则集 diff：新增 / 删除 / 修改分类正确', () => {
+    const before = [rule('DOMAIN', 'old.example'), rule('DOMAIN', 'same.example')]
+    const after = [rule('DOMAIN', 'new.example'), rule('DOMAIN', 'same.example'), rule('DOMAIN-SUFFIX', 'old.example')]
+    const result = diffRules(before, after)
+    assert.deepEqual(result.added.map((line) => line.text), ['DOMAIN,new.example'])
+    assert.equal(result.removed.length, 0)
+    assert.equal(result.modified.length, 1)
+    assert.equal(result.modified[0].before?.type, 'DOMAIN')
+    assert.equal(result.modified[0].after?.type, 'DOMAIN-SUFFIX')
+    assert.equal(result.unchanged, 1)
+  })
+
+  check('规则集 diff：重复条目去重且结果稳定', () => {
+    const before = [rule('DOMAIN', 'dup.example'), rule('DOMAIN', 'dup.example'), rule('DOMAIN', 'a.example')]
+    const after = [rule('DOMAIN', 'a.example'), rule('DOMAIN', 'dup.example')]
+    assert.equal(diffTotal(diffRules(before, after)), 0)
+    assert.equal(diffRules(before, after).unchanged, 2)
+    const first = diffRules(before, after)
+    const second = diffRules([...before].reverse(), [...after].reverse())
+    assert.deepEqual(first, second)
+  })
+
+  check('规则集 diff：正则大小写变化不再被当作未变化', () => {
+    const result = diffRules([rule('DOMAIN-REGEX', '^Example')], [rule('DOMAIN-REGEX', '^example')])
+    assert.equal(result.added.length, 1)
+    assert.equal(result.removed.length, 1)
+    assert.equal(result.unchanged, 0)
+    assert.equal(result.added[0].after?.value, '^example')
+  })
+
+  check('规则集摘要与顺序无关', () => {
+    const rules = [rule('DOMAIN', 'b.example'), rule('DOMAIN', 'a.example'), rule('DOMAIN-SUFFIX', 'example.com')]
+    assert.equal(digestRules(rules), digestRules([...rules].reverse()))
+  })
+
+  check('规则集历史：特殊 setID 可保存、清理，损坏明细退化为摘要', () => {
+    const data = new Map<string, string>()
+    const fakeStorage = {
+      getItem: (key: string) => data.get(key) ?? null,
+      setItem: (key: string, value: string) => { data.set(key, value) },
+      removeItem: (key: string) => { data.delete(key) },
+      clear: () => { data.clear() },
+      key: (index: number) => [...data.keys()][index] ?? null,
+      get length() { return data.size },
+    }
+    const original = (globalThis as { window?: unknown }).window
+    ;(globalThis as { window?: unknown }).window = { localStorage: fakeStorage }
+    try {
+      recordRuleSetSnapshot('__proto__', [rule('DOMAIN', 'a.example')])
+      assert.equal(readRuleSetHistory()['__proto__']?.previous?.count, 1)
+      assert.equal(previousRuleSetSnapshot('__proto__')?.digest, digestRules([rule('DOMAIN', 'a.example')]))
+      assert.deepEqual(historySetIDs(), ['__proto__'])
+      clearRuleSetHistory('__proto__')
+      assert.equal(previousRuleSetSnapshot('__proto__'), undefined)
+
+      recordRuleSetSnapshot('set-1', [rule('DOMAIN', 'a.example')])
+      assert.equal(previousRuleSetSnapshot('set-1')?.count, 1)
+      clearRuleSetHistory()
+      assert.deepEqual(historySetIDs(), [])
+
+      // 超过 5000 条时只保留摘要，不写明细。
+      const huge = Array.from({ length: 5001 }, (_, index) => rule('DOMAIN', `d${index}.example`))
+      recordRuleSetSnapshot('big', huge)
+      assert.equal(previousRuleSetSnapshot('big')?.truncated, true)
+      assert.equal(previousRuleSetSnapshot('big')?.rules, undefined)
+
+      // 明细里混入损坏条目时丢弃整份明细，只保留摘要，diff 面板不会读到坏数据。
+      fakeStorage.setItem('tower-web-ruleset-history-v1', JSON.stringify({
+        bad: { previous: { at: 1, count: 1, digest: 'deadbeef', rules: [{ value: 'no-type' }] } },
+      }))
+      const broken = readRuleSetHistory().bad?.previous
+      assert.equal(broken?.rules, undefined)
+      assert.equal(broken?.truncated, true)
+    } finally {
+      ;(globalThis as { window?: unknown }).window = original
+    }
   })
 
   if (failures) {
