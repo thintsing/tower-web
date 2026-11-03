@@ -4,13 +4,22 @@
 // 所有数据均从本地构建资产获取，不联网第三方。
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { ComposableMap, Geographies, Geography, Graticule } from 'react-simple-maps'
-import { geoEqualEarth, type GeoProjection } from 'd3-geo'
+import { geoEqualEarth, geoPath, type GeoProjection } from 'd3-geo'
 import { PROXY_KIND_TITLES, type ProxyNode } from '../models/types'
 import { regionForNode, iso3ForRegionCode, type NodeRegion } from '../models/region'
 import { nodeShareText } from '../generator/shareLink'
 import { copyToClipboard } from '../util/browser'
 import { clusterPoints, type ClusterGroup } from './clustering'
 import { countryNumericCode } from './countryCodes'
+import {
+  LATENCY_BANDS,
+  toneForLatency,
+  TONE_NO_NODES,
+  TONE_UNREACHABLE,
+  TONE_UNTESTED,
+  UNREACHABLE_OPACITY,
+} from './mapTheme'
+import './map-theme.css'
 import {
   BASE_MAP_VIEW,
   focusMapView,
@@ -27,19 +36,6 @@ const BASE_WIDTH = WORLD_MAP_WIDTH
 const BASE_HEIGHT = WORLD_MAP_HEIGHT
 const MAX_ZOOM = WORLD_MAP_MAX_ZOOM
 const CLUSTER_RADIUS_PX = 26
-
-/** Latency color bands —— 与 Tower iOS 一致：≤100 / ≤200 / ≤350 / >350ms。 */
-const BANDS: { max: number; fill: string }[] = [
-  { max: 100, fill: '#1f7a52' },      // 很快 ≤100ms
-  { max: 200, fill: '#2f7f78' },      // 正常 101–200ms
-  { max: 350, fill: '#9a671f' },      // 偏慢 201–350ms
-  { max: Infinity, fill: '#b13a32' }, // 很慢 >350ms
-]
-const UNREACHABLE_FILL = '#b13a32'
-const HAS_NODES_UNTESTED = '#c8ccc4'
-const NO_NODES = '#ffffff'
-const BORDER = '#dfe2da'
-const BAND_UNREACHABLE_OPAQ = 0.55
 
 interface CountryStat {
   numeric: string
@@ -122,23 +118,22 @@ function computeCountryStats(
   return { stats, unlocatedCount }
 }
 
-function countryFill(stat: CountryStat | undefined): string {
-  if (!stat || stat.count === 0) return NO_NODES
-  if (stat.allUnreachable) return UNREACHABLE_FILL
-  if (stat.latencies.length === 0) return HAS_NODES_UNTESTED
-  const band = BANDS.find((item) => stat.avgLatency < item.max) ?? BANDS[BANDS.length - 1]
-  return band.fill
+/** 国家填充的色调类名；颜色由 map-theme.css 的 --wm-tone 决定。 */
+function countryTone(stat: CountryStat | undefined): string {
+  if (!stat || stat.count === 0) return TONE_NO_NODES
+  if (stat.allUnreachable) return TONE_UNREACHABLE
+  if (stat.latencies.length === 0) return TONE_UNTESTED
+  return toneForLatency(stat.avgLatency)
 }
 
-function clusterFill(countries: CountryStat[]): string {
+function clusterTone(countries: CountryStat[]): string {
   const total = countries.reduce((sum, stat) => sum + stat.count, 0)
   const unreachable = countries.reduce((sum, stat) => sum + stat.unreachableCount, 0)
-  if (total > 0 && unreachable === total) return UNREACHABLE_FILL
+  if (total > 0 && unreachable === total) return TONE_UNREACHABLE
   const latencies = countries.flatMap((stat) => stat.latencies)
-  if (latencies.length === 0) return HAS_NODES_UNTESTED
+  if (latencies.length === 0) return TONE_UNTESTED
   const average = latencies.reduce((sum, value) => sum + value, 0) / latencies.length
-  const band = BANDS.find((item) => average < item.max) ?? BANDS[BANDS.length - 1]
-  return band.fill
+  return toneForLatency(average)
 }
 
 function latencyTone(value: number | null | undefined): string {
@@ -212,6 +207,18 @@ export function WorldMapSVG({
     [],
   )
   const scale = BASE_WIDTH / view.w
+
+  // 赤道与本初子午线比普通经纬网略重，给纸感地图一个稳定的坐标骨架。
+  const majorGraticulePath = useMemo(() => {
+    const path = geoPath(projection)
+    return path({
+      type: 'MultiLineString',
+      coordinates: [
+        [[-180, 0], [180, 0]],
+        [[0, -90], [0, 90]],
+      ],
+    }) ?? ''
+  }, [projection])
 
   useEffect(() => {
     fetch(GEO_URL)
@@ -461,45 +468,57 @@ export function WorldMapSVG({
             <rect
               width={BASE_WIDTH}
               height={BASE_HEIGHT}
-              fill="#f3f4ee"
+              className="wm-ocean"
+              fill="transparent"
               onClick={() => {
                 if (suppressClickRef.current) { suppressClickRef.current = false; return }
                 onSelect(null)
               }}
             />
-            <Graticule stroke="#e3e5df" strokeWidth={0.5} strokeDasharray="2 3" />
+            <Graticule step={[20, 20]} className="wm-grat" />
+            {majorGraticulePath && <path className="wm-grat-major" d={majorGraticulePath} />}
             <Geographies geography={geo as any}>
               {({ geographies }) =>
                 geographies.map((geography: any) => {
                   const numeric: string = String(geography.id ?? '')
                   const stat = stats.get(numeric)
                   const selected = !!selectedCode && stat?.code === selectedCode
-                  const fill = countryFill(stat)
+                  const tone = countryTone(stat)
                   return (
-                    <Geography
-                      key={geography.rsmKey}
-                      geography={geography}
-                      fill={fill}
-                      stroke={selected ? '#131416' : BORDER}
-                      strokeWidth={selected ? 1.2 : 0.5}
-                      vectorEffect="non-scaling-stroke"
-                      style={{
-                        default: { outline: 'none' },
-                        hover: { outline: 'none', cursor: stat ? (scale > 1.001 ? 'grab' : 'pointer') : 'default' },
-                        pressed: { outline: 'none' },
-                      } as any}
-                      onClick={() => {
-                        if (suppressClickRef.current) { suppressClickRef.current = false; return }
-                        if (stat) handleCountryClick(stat)
-                        else onSelect(null)
-                      }}
-                      onMouseEnter={() => {
-                        if (!stat) return
-                        const point = projection([stat.region.lon, stat.region.lat])
-                        if (point) showHover([stat], point[0], point[1])
-                      }}
-                      onMouseLeave={() => setHover(null)}
-                    />
+                    <g key={geography.rsmKey}>
+                      {selected && (
+                        <Geography
+                          geography={geography}
+                          fill="none"
+                          className="wm-country-halo"
+                          strokeWidth={3.2}
+                          vectorEffect="non-scaling-stroke"
+                          pointerEvents="none"
+                        />
+                      )}
+                      <Geography
+                        geography={geography}
+                        className={`wm-country ${tone}${selected ? ' wm-country-selected' : ''}`}
+                        strokeWidth={0.5}
+                        vectorEffect="non-scaling-stroke"
+                        style={{
+                          default: { outline: 'none' },
+                          hover: { outline: 'none', cursor: stat ? (scale > 1.001 ? 'grab' : 'pointer') : 'default' },
+                          pressed: { outline: 'none' },
+                        } as any}
+                        onClick={() => {
+                          if (suppressClickRef.current) { suppressClickRef.current = false; return }
+                          if (stat) handleCountryClick(stat)
+                          else onSelect(null)
+                        }}
+                        onMouseEnter={() => {
+                          if (!stat) return
+                          const point = projection([stat.region.lon, stat.region.lat])
+                          if (point) showHover([stat], point[0], point[1])
+                        }}
+                        onMouseLeave={() => setHover(null)}
+                      />
+                    </g>
                   )
                 })
               }
@@ -509,12 +528,14 @@ export function WorldMapSVG({
               const total = countries.reduce((sum, stat) => sum + stat.count, 0)
               const selected = countries.some((stat) => stat.code === selectedCode)
               const clustered = countries.length > 1
-              const fill = clusterFill(countries)
+              const tone = clusterTone(countries)
+              const dim = countries.every((stat) => stat.allUnreachable) ? UNREACHABLE_OPACITY : 1
               const radius = Math.max(3, Math.min(clustered ? 12 : 10, 3 + Math.sqrt(total))) * screenScale
               const fontSize = 10 * screenScale
               return (
                 <g
                   key={group.id}
+                  className={`wm-marker wm-cluster ${tone}`}
                   transform={`translate(${group.x} ${group.y})`}
                   style={{ cursor: 'pointer' }}
                   onClick={(event) => {
@@ -525,33 +546,27 @@ export function WorldMapSVG({
                   onMouseLeave={() => setHover(null)}
                 >
                   <circle r={Math.max(radius, 12 * screenScale)} fill="transparent" />
-                  <circle
-                    r={radius}
-                    fill={fill}
-                    stroke="#fffdf6"
-                    strokeWidth={selected ? 1.5 : 1}
-                    vectorEffect="non-scaling-stroke"
-                    opacity={countries.every((stat) => stat.allUnreachable) ? BAND_UNREACHABLE_OPAQ : 1}
-                  />
-                  {selected && (
-                    <circle
-                      r={radius + 4 * screenScale}
-                      fill="none"
-                      stroke="var(--text)"
-                      strokeWidth={1}
-                      vectorEffect="non-scaling-stroke"
-                      opacity={0.7}
-                    />
+                  <circle className="wm-node-halo" r={radius * 2.1} opacity={dim} />
+                  {clustered && (
+                    <circle className="wm-cluster-ring" r={radius + 4.5 * screenScale} />
                   )}
+                  {selected && (
+                    <circle className="wm-cluster-focus" r={radius + 4 * screenScale} />
+                  )}
+                  <circle className="wm-node-core" r={radius} opacity={dim} />
+                  <circle
+                    className="wm-node-spark"
+                    r={Math.max(1.2, radius * 0.32)}
+                    cx={-radius * 0.26}
+                    cy={-radius * 0.26}
+                  />
                   {(clustered || total >= 2) && (
                     <text
+                      className="wm-cluster-count"
                       y={0.5}
                       textAnchor="middle"
                       dominantBaseline="middle"
                       fontSize={fontSize}
-                      fontWeight={700}
-                      fill="#ffffff"
-                      style={{ pointerEvents: 'none', userSelect: 'none' }}
                     >
                       {total}
                     </text>
@@ -739,18 +754,18 @@ function MapTooltip({ hover }: { hover: HoverInfo }) {
 function WorldMapLegend() {
   return (
     <div className="wm-legend">
-      <span className="wm-lg"><span className="wm-sq" style={{ background: NO_NODES }} />无节点</span>
-      <span className="wm-lg"><span className="wm-sq" style={{ background: HAS_NODES_UNTESTED }} />有节点（未测速）</span>
-      {BANDS.map((band, index) => (
-        <span key={index} className="wm-lg">
-          <span className="wm-sq" style={{ background: band.fill }} />
-          {index === 0 ? '很快 ≤100ms'
-            : index === 1 ? '正常 101–200ms'
-              : index === 2 ? '偏慢 201–350ms'
-                : '很慢 >350ms'}
+      <span className="wm-lg"><span className={`wm-sq ${TONE_NO_NODES}`} />无节点</span>
+      <span className="wm-lg"><span className={`wm-sq ${TONE_UNTESTED}`} />有节点（未测速）</span>
+      {LATENCY_BANDS.map((band) => (
+        <span key={band.tone} className="wm-lg">
+          <span className={`wm-sq ${band.tone}`} />
+          {band.label}
         </span>
       ))}
-      <span className="wm-lg"><span className="wm-sq" style={{ background: UNREACHABLE_FILL, opacity: BAND_UNREACHABLE_OPAQ }} />不可达</span>
+      <span className="wm-lg">
+        <span className={`wm-sq ${TONE_UNREACHABLE}`} style={{ opacity: UNREACHABLE_OPACITY }} />
+        不可达
+      </span>
     </div>
   )
 }

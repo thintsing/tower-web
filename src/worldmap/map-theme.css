@@ -1,0 +1,262 @@
+/* Editorial Atlas —— 地图专用主题。
+   只被 WorldMapSVG.tsx import；不改 styles.css / App.tsx。
+   颜色全部走 --wm-* 变量，浅色为默认，深色跟随系统 prefers-color-scheme。 */
+
+:root {
+  --wm-paper: #fdfcf8;
+  --wm-surface: #fdfcf8;
+  --wm-ocean-a: #faf9f4;
+  --wm-ocean-b: #e9ece3;
+  --wm-land: #f7f6ef;
+  --wm-land-none: #f7f6ef;
+  --wm-border: #dfe2da;
+  --wm-grat: #e7e9e2;
+  --wm-grat-major: #dfe2d8;
+
+  --wm-band0: #1f7a52;
+  --wm-band1: #2f7f78;
+  --wm-band2: #9a671f;
+  --wm-band3: #b13a32;
+  --wm-band-untested: #c8ccc4;
+  --wm-band-unreach: #dba79f;
+
+  --wm-ink: #141815;
+  --wm-halo: rgba(224, 82, 40, .42);
+  --wm-spark: #ffffff;
+  --wm-cluster-ink: #ffffff;
+  --wm-cluster-ring: rgba(20, 24, 21, .48);
+
+  --wm-legend-bg: rgba(253, 252, 248, .9);
+  --wm-legend-border: #e0e3dc;
+  --wm-legend-ink: #3a3f39;
+  --wm-muted: #62675f;
+  --wm-chip: rgba(253, 252, 248, .94);
+  --wm-chip-border: #dfe2da;
+
+  --wm-grain: #6f7469;
+  --wm-grain-alpha: .16;
+  --wm-hover-brightness: 1.04;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --wm-paper: #141613;
+    --wm-surface: #1a1d19;
+    --wm-ocean-a: #1d211a;
+    --wm-ocean-b: #10120e;
+    --wm-land: #232720;
+    --wm-land-none: #232720;
+    --wm-border: #3b4236;
+    --wm-grat: #2b3128;
+    --wm-grat-major: #343b2f;
+
+    --wm-band0: #43b286;
+    --wm-band1: #57a89f;
+    --wm-band2: #c99a4e;
+    --wm-band3: #d06b62;
+    --wm-band-untested: #4b5147;
+    --wm-band-unreach: #7c3732;
+
+    --wm-ink: #eceee6;
+    --wm-halo: rgba(224, 82, 40, .55);
+    --wm-spark: #f2f5eb;
+    --wm-cluster-ink: #10120e;
+    --wm-cluster-ring: rgba(236, 238, 230, .38);
+
+    --wm-legend-bg: rgba(20, 22, 19, .88);
+    --wm-legend-border: #363c31;
+    --wm-legend-ink: #d8dcd3;
+    --wm-muted: #9aa094;
+    --wm-chip: rgba(20, 22, 19, .92);
+    --wm-chip-border: #3b4236;
+
+    --wm-grain: #e8ebe0;
+    --wm-grain-alpha: .06;
+    --wm-hover-brightness: 1.12;
+  }
+}
+
+/* ---------- 色调类：只设置变量，颜色本身在 token 里 ---------- */
+.wm-tone-none { --wm-tone: var(--wm-land-none); }
+.wm-tone-untested { --wm-tone: var(--wm-band-untested); }
+.wm-tone-unreach { --wm-tone: var(--wm-band-unreach); }
+.wm-tone-0 { --wm-tone: var(--wm-band0); }
+.wm-tone-1 { --wm-tone: var(--wm-band1); }
+.wm-tone-2 { --wm-tone: var(--wm-band2); }
+.wm-tone-3 { --wm-tone: var(--wm-band3); }
+
+/* ---------- 画布：CSS 海洋渐变 + 点阵纸纹 ---------- */
+.wm-root .wm-wrap {
+  border-color: var(--wm-border);
+  background: linear-gradient(180deg, var(--wm-ocean-a) 0%, var(--wm-ocean-b) 100%);
+}
+
+.wm-root .wm-wrap::before {
+  background: var(--wm-chip);
+  border-left-color: var(--wm-chip-border);
+  color: var(--wm-muted);
+}
+
+.wm-root .wm-wrap::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  background-image: radial-gradient(var(--wm-grain) .4px, transparent .55px);
+  background-size: 11px 11px;
+  opacity: var(--wm-grain-alpha);
+}
+
+.wm-root .wm-ocean { fill: transparent; }
+
+/* ---------- 经纬网 ---------- */
+.wm-root .wm-grat {
+  fill: none;
+  stroke: var(--wm-grat);
+  stroke-width: .45;
+  stroke-dasharray: 1.5 3.5;
+  opacity: .9;
+  pointer-events: none;
+}
+
+.wm-root .wm-grat-major {
+  fill: none;
+  stroke: var(--wm-grat-major);
+  stroke-width: .75;
+  opacity: .9;
+  pointer-events: none;
+}
+
+/* ---------- 国家 ---------- */
+.wm-root .wm-country {
+  fill: var(--wm-tone, var(--wm-land));
+  stroke: var(--wm-border);
+  stroke-width: .5;
+  fill-rule: evenodd;
+  transition: filter .12s ease;
+}
+
+.wm-root .wm-country:hover {
+  filter: brightness(var(--wm-hover-brightness));
+}
+
+.wm-root .wm-country.wm-country-selected {
+  stroke: var(--wm-ink);
+  stroke-width: 1.4;
+}
+
+.wm-root .wm-country-halo {
+  fill: none;
+  stroke: var(--wm-halo);
+  stroke-width: 3.2;
+  opacity: .55;
+  filter: blur(1.2px);
+  pointer-events: none;
+}
+
+/* ---------- 节点三层 ---------- */
+.wm-root .wm-marker { cursor: pointer; }
+
+.wm-root .wm-node-halo {
+  fill: var(--wm-tone);
+  opacity: .22;
+  filter: blur(1.6px);
+  pointer-events: none;
+}
+
+.wm-root .wm-node-core {
+  fill: var(--wm-tone);
+  stroke: var(--wm-spark);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.wm-root .wm-node-spark {
+  fill: var(--wm-spark);
+  opacity: .92;
+  pointer-events: none;
+}
+
+/* ---------- 聚合圆 ---------- */
+.wm-root .wm-cluster { cursor: pointer; }
+
+.wm-root .wm-cluster-disc {
+  fill: var(--wm-tone);
+  stroke: var(--wm-spark);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.wm-root .wm-cluster-ring {
+  fill: none;
+  stroke: var(--wm-cluster-ring);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  pointer-events: none;
+}
+
+.wm-root .wm-cluster-focus {
+  fill: none;
+  stroke: var(--wm-ink);
+  stroke-width: 1;
+  opacity: .75;
+  pointer-events: none;
+}
+
+.wm-root .wm-cluster-count {
+  fill: var(--wm-cluster-ink);
+  font-family: var(--font-mono);
+  font-weight: 700;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* ---------- 图例 / 浮层：mono + 半透明 surface ---------- */
+.wm-root .wm-legend {
+  gap: 5px 12px;
+  padding: 7px 9px;
+  background: var(--wm-legend-bg);
+  border-color: var(--wm-legend-border);
+  color: var(--wm-legend-ink);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: .03em;
+  backdrop-filter: blur(6px);
+}
+
+.wm-root .wm-lg { font-family: var(--font-mono); }
+
+.wm-root .wm-sq {
+  width: 9px;
+  height: 9px;
+  border: 1px solid var(--wm-legend-border);
+  border-radius: 1px;
+  background: var(--wm-tone);
+}
+
+.wm-root .wm-controls,
+.wm-root .wm-test {
+  background: var(--wm-chip);
+  border-color: var(--wm-chip-border);
+  backdrop-filter: blur(6px);
+}
+
+.wm-root .wm-test:hover {
+  background: var(--wm-chip);
+  border-color: var(--wm-ink);
+}
+
+.wm-root .wm-control { color: var(--wm-legend-ink); }
+
+.wm-root .wm-tooltip {
+  background: var(--wm-surface);
+  border-color: var(--wm-legend-border);
+  color: var(--wm-legend-ink);
+}
+
+.wm-root .wm-t-row { color: var(--wm-muted); }
+
+@media (prefers-reduced-motion: reduce) {
+  .wm-root .wm-country { transition: none; }
+}
