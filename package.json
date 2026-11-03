@@ -40,6 +40,7 @@
     "selfcheck:catalog": "tsx scripts/selfcheck-catalog.ts",
     "selfcheck:clients": "tsx scripts/selfcheck-clients.ts",
     "selfcheck:dns": "tsx scripts/selfcheck-dns.ts",
+    "selfcheck:flow": "tsx scripts/selfcheck-flow.ts",
     "selfcheck:importers": "tsx scripts/selfcheck-importers.ts",
     "selfcheck:icons": "tsx scripts/selfcheck-icons.ts",
     "selfcheck:manual": "tsx scripts/selfcheck-manual.ts",

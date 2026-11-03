@@ -46,6 +46,7 @@ export interface PersistedData {
   filterSubscriptionInfoNodes: boolean
   renewalRemindersEnabled: boolean
   showGroupEmoji: boolean
+  ruleSetVersionHistory: boolean
   latencyTestMode: LatencyTestMode
   tailnets: TailnetConnection[]
 }
@@ -309,6 +310,7 @@ export function parseBackup(text: string): BackupFile {
       filterSubscriptionInfoNodes: booleanOr(data.filterSubscriptionInfoNodes, false),
       renewalRemindersEnabled: booleanOr(data.renewalRemindersEnabled, false),
       showGroupEmoji: booleanOr(data.showGroupEmoji, false),
+      ruleSetVersionHistory: booleanOr(data.ruleSetVersionHistory, true),
       latencyTestMode: data.latencyTestMode === 'icmp' || data.latencyTestMode === 'automatic'
         ? data.latencyTestMode
         : 'tcp',

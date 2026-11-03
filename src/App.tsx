@@ -51,12 +51,21 @@ import { GroupIcon, groupDisplayName } from './components/GroupIcon'
 import { TailnetIllustration } from './components/TailnetIllustration'
 import { ManualNodeEditorDialog } from './components/ManualNodeEditorDialog'
 import { QrScanner } from './components/QrScanner'
+import { RulesToolsCard } from './components/RulesToolsCard'
+import { DiagnosisPanel, type FixOutcome } from './components/DiagnosisPanel'
+import { FlowRail } from './components/FlowRail'
+import { AdvancedSection } from './components/AdvancedSection'
+import { buildFlow, explainNodePool, type FlowStepKey } from './flow/flow'
+import { markExported, readExportedAt } from './flow/prefs'
+import { applyFixAction, type FixAction } from './rules/diagnosis'
+import { clearRuleSetHistory, digestRules, recordRuleSetSnapshot } from './rules/ruleSetHistory'
+import { lintScheme, lintSummary, type SchemeLintIssue } from './rules/schemeLint'
 
 const SELF_CONFIGURATION_NAME = 'Self-Configuration'
 const SELF_CONFIGURATION_URL = 'https://raw.githubusercontent.com/ClashConnectRules/Self-Configuration/main/Clash.yaml'
 
 /** 顶部工作区。跨页面跳转（上手流程 / 导出补救）需要它。 */
-type TabKey = 'sub' | 'rules' | 'tailnet' | 'export'
+type TabKey = 'sub' | 'rules' | 'check' | 'tailnet' | 'export'
 
 /** details 菜单打开/关闭后按视口可用空间决定向上或向下展开。 */
 function updateDetailsPlacement(event: SyntheticEvent<HTMLDetailsElement>): void {
@@ -503,6 +512,12 @@ const Icon = {
   Export: () => (
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" className="icn">
       <path d="M8 2v7M5.5 6.5 8 9l2.5-2.5M3 13h10" />
+    </svg>
+  ),
+  Check: () => (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" className="icn">
+      <circle cx="7" cy="7" r="4.5" />
+      <path d="M10.3 10.3 14 14M5.2 7.2l1.4 1.4 2.5-2.6" />
     </svg>
   ),
   Network: () => (
@@ -1287,6 +1302,8 @@ function SubscriptionSettingsDialog({
   const setRenewalRemindersEnabled = useStore((s) => s.setRenewalRemindersEnabled)
   const showGroupEmoji = useStore((s) => s.showGroupEmoji)
   const setShowGroupEmoji = useStore((s) => s.setShowGroupEmoji)
+  const ruleSetVersionHistory = useStore((s) => s.ruleSetVersionHistory)
+  const setRuleSetVersionHistory = useStore((s) => s.setRuleSetVersionHistory)
   const latencyTestMode = useStore((s) => s.latencyTestMode)
   const setLatencyTestMode = useStore((s) => s.setLatencyTestMode)
   const restoreBackup = useStore((s) => s.restoreBackup)
@@ -1480,6 +1497,8 @@ function SubscriptionSettingsDialog({
       // 空间不足时仍然允许恢复，历史只是额外保障。
     }
     restoreBackup(pendingBackup.data)
+    // 备份不含规则集历史；恢复后旧快照的 setID 可能已不存在，直接清空避免错配。
+    clearRuleSetHistory()
     setPendingBackup(null)
     refreshHistory()
     onRestored?.(`已恢复 ${counts.sources} 个订阅、${counts.nodes} 个节点（含 ${counts.manualNodes} 个自有节点）、${counts.schemes} 个自定义方案和 ${counts.ruleSets} 个规则集。`)
@@ -1554,6 +1573,17 @@ function SubscriptionSettingsDialog({
           <span>
             <strong>显示策略组 Emoji</strong>
             <small>在策略组列表和规则标签里显示组名开头的 Emoji；关闭时只显示文字。</small>
+          </span>
+        </label>
+        <label className="setting-toggle">
+          <input
+            type="checkbox"
+            checked={ruleSetVersionHistory}
+            onChange={(e) => setRuleSetVersionHistory(e.target.checked)}
+          />
+          <span>
+            <strong>保留规则集刷新历史</strong>
+            <small>刷新在线规则集前保存上一版快照，用于规则页的版本对比；只保留最近一版，关闭后不再记录。</small>
           </span>
         </label>
         <div className="field">
@@ -2947,8 +2977,7 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const refreshSource = useStore((s) => s.refreshSource)
   const setSourcesEnabled = useStore((s) => s.setSourcesEnabled)
   const allNodes = useStore((s) => s.nodes)
-  const selectedSchemeID = useStore((s) => s.selectedSchemeID)
-  const customSchemes = useStore((s) => s.customSchemes)
+  const errors = useStore((s) => s.errors)
   const latencyRecord = useStore((s) => s.latencyByNodeId)
   const latencyMap = useMemo(() => new Map(Object.entries(latencyRecord)) as Map<string, number | null>, [latencyRecord])
   const probeErrors = useStore((s) => s.probeErrorByNodeId)
@@ -2963,7 +2992,6 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const [manageMode, setManageMode] = useState(false)
   const [checkedSources, setCheckedSources] = useState<Set<string>>(new Set())
   const [pendingDelete, setPendingDelete] = useState<{ ids: string[]; label: string } | null>(null)
-  const [setupDismissed, setSetupDismissed] = useState(() => localStorage.getItem('tower-setup-dismissed') === '1')
   const [issuesOpen, setIssuesOpen] = useState(false)
   const [flash, setFlash] = useState('')
   const [editingSource, setEditingSource] = useState<SubscriptionSource | null>(null)
@@ -3045,6 +3073,21 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
 
   /** 只统计会进入配置的节点；排除项不参与可用数、地区和状态汇总。 */
   const enabled = useMemo(() => enabledNodes({ sources, nodes: allNodes }), [sources, allNodes])
+  const poolReason = useMemo(() => {
+    const sourceErrors = sources.map((source) => errors[source.id]?.trim()).filter((value): value is string => !!value)
+    const excludedKeys = new Set(sources.flatMap((source) => source.excludedNodeKeys))
+    const excluded = allNodes.filter((node) =>
+      !node.isSubscriptionMetadata
+      && (excludedKeys.has(nodeExactKey(node)) || node.isEnabled === false)).length
+    return explainNodePool({
+      sourceCount: sources.length,
+      manualNodeCount: manualNodes.length,
+      nodeCount: allNodes.filter((node) => !node.isSubscriptionMetadata).length,
+      enabledNodeCount: enabled.length,
+      excludedNodeCount: excluded,
+      sourceErrors,
+    })
+  }, [sources, allNodes, enabled.length, manualNodes.length, errors])
   const enabledIds = useMemo(() => enabled.map((n) => n.id), [enabled])
   const nodeCountries = useMemo(() => {
     const set = new Set<string>()
@@ -3190,49 +3233,6 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     }
   }, [renewalAlerts])
 
-  // 上手引导：只有「添加订阅 → 导出 / 发布」是必做两步；
-  // 规则方案有可用默认值，作为可选的查看入口，不再计入进度。
-  const schemeLabel =
-    customSchemes.find((c) => c.id === selectedSchemeID)?.name ??
-    BUILTIN_SCHEMES.find((m) => m.id === selectedSchemeID)?.name ??
-    'ACL4SSR 默认'
-  const ruleConfirmed = selectedSchemeID !== 'acl4ssr-online' || customSchemes.length > 0
-  const hasLink = !!localStorage.getItem('tower-sub-token')
-  const setupSteps: {
-    key: TabKey
-    title: string
-    desc: string
-    done: boolean
-    action: string
-    run: () => void
-    required: boolean
-  }[] = [
-    {
-      key: 'sub', done: sources.length > 0, required: true,
-      title: '添加订阅', desc: '支持订阅 URL、Base64、Clash YAML 或单节点 URI',
-      action: '+ 添加订阅', run: () => setAdding(true),
-    },
-    {
-      key: 'rules', done: ruleConfirmed, required: false,
-      title: '规则方案', desc: `当前：${schemeLabel} · 内置规则可直接使用，需要时再调整`,
-      action: '查看规则方案', run: () => onGo?.('rules'),
-    },
-    {
-      key: 'export', done: hasLink, required: true,
-      title: '导出 / 发布', desc: '生成客户端配置，或发布订阅链接给手机',
-      action: '去导出', run: () => onGo?.('export'),
-    },
-  ]
-  const requiredSteps = setupSteps.filter((s) => s.required)
-  const setupDone = requiredSteps.filter((s) => s.done).length
-  const setupTotal = requiredSteps.length
-  const nextSetup = requiredSteps.find((s) => !s.done)
-
-  // 流程走完后清掉「稍后」记录，下次不会因为旧标记而看不到提示。
-  useEffect(() => {
-    if (!nextSetup) localStorage.removeItem('tower-setup-dismissed')
-  }, [nextSetup])
-
   // 全局测速时显示「正在测哪一个」，让进度有上下文。
   const testingNode = useMemo(() => {
     if (!testingIds.length) return undefined
@@ -3249,14 +3249,6 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           <div className="sub">添加订阅或自有节点、测速，并决定哪些节点进入配置</div>
         </div>
         <div className="row page-actions" style={{ gap: 8 }}>
-          {nextSetup && setupDismissed && (
-            <button
-              className="btn ghost"
-              onClick={() => { setSetupDismissed(false); localStorage.removeItem('tower-setup-dismissed') }}
-            >
-              上手进度 {setupDone}/{setupTotal}
-            </button>
-          )}
           {sources.length > 0 && !manageMode && (
             <button className="btn ghost" onClick={() => setSettingsOpen(true)}>订阅设置</button>
           )}
@@ -3335,15 +3327,29 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         </div>
       )}
 
-      {hasContent && nextSetup && !setupDismissed && (
-        <div className="setup-banner">
-          <div className="setup-banner-text">
-            <span className="setup-progress">上手进度 {setupDone}/{setupTotal}</span>
-            <span className="setup-next">下一步：{nextSetup.title} · {nextSetup.desc}</span>
-          </div>
-          <div className="row" style={{ gap: 6 }}>
-            <button className="btn" onClick={nextSetup.run}>{nextSetup.action}</button>
-            <button className="btn ghost" onClick={() => { setSetupDismissed(true); localStorage.setItem('tower-setup-dismissed', '1') }}>稍后</button>
+      {hasContent && poolReason.code !== 'ready' && (
+        <div className={`pool-reason${poolReason.code === 'source-error' ? ' is-error' : ''}`}>
+          <div className="pool-reason-body">
+            <strong>{poolReason.title}</strong>
+            <span>{poolReason.detail}</span>
+            <div className="pool-reason-actions">
+              {poolReason.action === 'retry-source' && (
+                <button
+                  className="btn"
+                  onClick={() => {
+                    const ids = sources.filter((source) => isSourceEnabled(source)).map((source) => source.id)
+                    if (ids.length) void Promise.all(ids.map((id) => refreshSource(id)))
+                  }}
+                >刷新全部订阅</button>
+              )}
+              {poolReason.action === 'enable-nodes' && (
+                <button className="btn" onClick={() => setManageMode(true)}>管理订阅与节点</button>
+              )}
+              {poolReason.action === 'add-source' && (
+                <button className="btn" onClick={() => setAdding(true)}>+ 添加订阅</button>
+              )}
+              <button className="btn ghost" onClick={() => setAddingManual(true)}>+ 自有节点</button>
+            </div>
           </div>
         </div>
       )}
@@ -4057,6 +4063,7 @@ function GroupEditorDialog({
   rules,
   customRules,
   initialTab = 'settings',
+  initialRuleQuery = '',
   onClose,
   onSave,
   onAddRule,
@@ -4067,6 +4074,7 @@ function GroupEditorDialog({
   rules: RoutingRule[]
   customRules: RoutingRule[]
   initialTab?: 'settings' | 'rules'
+  initialRuleQuery?: string
   onClose: () => void
   onSave: (updated: PolicyGroup) => void
   onAddRule: (rule: RoutingRule) => void
@@ -4083,7 +4091,7 @@ function GroupEditorDialog({
   const [tolerance, setTolerance] = useState(group.tolerance ? String(group.tolerance) : '')
   const [error, setError] = useState('')
   const [tab, setTab] = useState<'settings' | 'rules'>(initialTab)
-  const [ruleSearch, setRuleSearch] = useState('')
+  const [ruleSearch, setRuleSearch] = useState(initialRuleQuery)
   const [newDomain, setNewDomain] = useState('')
   const [ruleNotice, setRuleNotice] = useState('')
   const [addedRules, setAddedRules] = useState<RoutingRule[]>([])
@@ -5075,7 +5083,16 @@ function AddRuleSetToSchemeDialog({
   )
 }
 
-function RulesTab() {
+function RulesTab({
+  onGo,
+  locateIssue,
+  onLocateConsumed,
+}: {
+  onGo?: (tab: TabKey) => void
+  /** 从诊断页跳过来时待定位的检查项。 */
+  locateIssue?: SchemeLintIssue | null
+  onLocateConsumed?: () => void
+}) {
   const selectedSchemeID = useStore((s) => s.selectedSchemeID)
   const setScheme = useStore((s) => s.setScheme)
   const policySelections = useStore((s) => s.policySelections)
@@ -5083,6 +5100,9 @@ function RulesTab() {
   const removePolicy = useStore((s) => s.removePolicy)
   const showGroupEmoji = useStore((s) => s.showGroupEmoji)
   const setShowGroupEmoji = useStore((s) => s.setShowGroupEmoji)
+  const preferRuleSets = useStore((s) => s.preferRuleSets)
+  const latencyByNodeId = useStore((s) => s.latencyByNodeId)
+  const ruleSetVersionHistory = useStore((s) => s.ruleSetVersionHistory)
   const scheme = useScheme()
   const nodes = useStore((s) => s.nodes)
   const sources = useStore((s) => s.sources)
@@ -5110,6 +5130,7 @@ function RulesTab() {
     scheme: RuleScheme
     group: PolicyGroup
     tab?: 'settings' | 'rules'
+    query?: string
   } | null>(null)
   const [networkEditor, setNetworkEditor] = useState<RuleScheme | null>(null)
   const [dragFromIndex, setDragFromIndex] = useState<number | null>(null)
@@ -5434,11 +5455,44 @@ function RulesTab() {
     source: RuleScheme,
     group: PolicyGroup,
     tab: 'settings' | 'rules' = 'settings',
+    query?: string,
   ) => {
     const editable = makeEditableScheme(source)
     const target = editable.groups.find((g) => g.name === group.name) ?? group
-    setGroupEditor({ scheme: editable, group: target, tab })
+    setGroupEditor({ scheme: editable, group: target, tab, query })
   }
+
+  const locateLintIssue = (issue: SchemeLintIssue) => {
+    if (issue.location.kind === 'target') {
+      onGo?.('export')
+      return
+    }
+    let groupName = issue.location.group
+    // 规则集问题可能只带规则集名；回查它绑定的策略组，仍能落到具体规则。
+    if (!groupName && issue.location.ruleSet && scheme) {
+      const set = scheme.ruleSets?.find((item) =>
+        item.name === issue.location.ruleSet || item.id === issue.location.ruleSet)
+      groupName = set?.group
+    }
+    if (!groupName) return
+    const group = scheme?.groups.find((item) => item.name === groupName)
+    if (!group) {
+      window.alert(`策略组「${groupName}」当前不存在，无法定位。请先在方案里补充该策略组。`)
+      return
+    }
+    if (scheme) {
+      beginEditGroup(scheme, group, issue.location.kind === 'rule' || issue.location.kind === 'ruleSet' ? 'rules' : 'settings', issue.location.rule)
+    }
+  }
+
+  // 诊断页点「定位」后跳到本页：挂载后消费一次，避免重复弹窗。
+  useEffect(() => {
+    if (!locateIssue) return
+    locateLintIssue(locateIssue)
+    onLocateConsumed?.()
+    // locateLintIssue 依赖当前方案，方案切换时不应重放旧定位。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locateIssue])
 
   const saveGroupEdit = (target: { scheme: RuleScheme; group: PolicyGroup }, updated: PolicyGroup) => {
     const fresh = useStore.getState().customSchemes.find((c) => c.id === target.scheme.id) ?? target.scheme
@@ -5640,6 +5694,9 @@ function RulesTab() {
   const saveRemoteRuleSet = (set: LocalRuleSet, joinGroup?: string) => {
     // 同一地址只保留一条订阅，重复添加时更新快照。
     const existing = localRuleSets.find((item) => item.sourceURL === set.sourceURL)
+    if (existing && digestRules(existing.rules) !== digestRules(set.rules)) {
+      recordRuleSetSnapshot(existing.id, existing.rules, useStore.getState().ruleSetVersionHistory)
+    }
     const saved = existing ? { ...set, id: existing.id, paused: existing.paused } : set
     addLocalRuleSet(saved)
     if (joinGroup && scheme) {
@@ -5656,6 +5713,10 @@ function RulesTab() {
     setRuleSetError(null)
     try {
       const parsed = await fetchRuleSet(set.sourceURL)
+      // 只有内容真的变了才写快照：刷新成功但内容不变时不覆盖已有历史。
+      if (digestRules(parsed.rules) !== digestRules(set.rules)) {
+        recordRuleSetSnapshot(set.id, set.rules, useStore.getState().ruleSetVersionHistory)
+      }
       addLocalRuleSet({
         ...set,
         rules: parsed.rules,
@@ -5683,6 +5744,9 @@ function RulesTab() {
     for (const set of sets) {
       try {
         const parsed = await fetchRuleSet(set.sourceURL!)
+        if (digestRules(parsed.rules) !== digestRules(set.rules)) {
+          recordRuleSetSnapshot(set.id, set.rules, useStore.getState().ruleSetVersionHistory)
+        }
         addLocalRuleSet({
           ...set,
           rules: parsed.rules,
@@ -6276,6 +6340,25 @@ function RulesTab() {
         </div>
       )}
 
+      <AdvancedSection
+        scope="rules-tools"
+        title="规则工具与历史"
+        summary="全量检查 · 命中解释 · 规则集版本对比；默认收起，展开状态按设备记住"
+      >
+        <RulesToolsCard
+          scheme={scheme}
+          nodes={enabledForRules}
+          policySelections={policySelections}
+          latencyByNodeId={latencyByNodeId}
+          localRuleSets={localRuleSets}
+          preferRuleSets={preferRuleSets}
+          showGroupEmoji={showGroupEmoji}
+          versionHistoryEnabled={ruleSetVersionHistory}
+          onLocate={locateLintIssue}
+          onGoExport={() => onGo?.('export')}
+        />
+      </AdvancedSection>
+
       <ConfirmDialog
         open={!!pendingSchemeDelete}
         title="删除自定义方案？"
@@ -6332,6 +6415,7 @@ function RulesTab() {
           rules={orderedSchemeBaseRules(groupEditor.scheme)}
           customRules={groupEditor.scheme.customRules ?? []}
           initialTab={groupEditor.tab}
+          initialRuleQuery={groupEditor.query}
           onClose={() => setGroupEditor(null)}
           onSave={(updated) => saveGroupEdit(groupEditor, updated)}
           onAddRule={(rule) => saveCustomRule(groupEditor.scheme, rule)}
@@ -6439,10 +6523,127 @@ function RulesTab() {
           setPendingLocalSetDelete(null)
           if (target) {
             removeLocalRuleSet(target.id)
+            clearRuleSetHistory(target.id)
             setFlash(`已删除本地规则集「${target.name}」；已加入方案的快照保持不变。`)
           }
         }}
       />
+    </div>
+  )
+}
+
+// ---------------- 规则诊断 Tab ----------------
+
+function CheckTab({
+  onGo,
+  onLocate,
+}: {
+  onGo?: (tab: TabKey) => void
+  onLocate?: (issue: SchemeLintIssue) => void
+}) {
+  const scheme = useScheme()
+  const nodes = useStore((s) => s.nodes)
+  const sources = useStore((s) => s.sources)
+  const errors = useStore((s) => s.errors)
+  const policySelections = useStore((s) => s.policySelections)
+  const latencyByNodeId = useStore((s) => s.latencyByNodeId)
+  const localRuleSets = useStore((s) => s.localRuleSets)
+  const preferRuleSets = useStore((s) => s.preferRuleSets)
+  const showGroupEmoji = useStore((s) => s.showGroupEmoji)
+  const ruleSetVersionHistory = useStore((s) => s.ruleSetVersionHistory)
+  const enabledForRules = useMemo(() => enabledNodes({ sources, nodes }), [sources, nodes])
+  const sourceErrors = useMemo(
+    () => sources.map((source) => errors[source.id]?.trim()).filter((value): value is string => !!value),
+    [sources, errors],
+  )
+  const manualCount = useMemo(
+    () => nodes.filter((node) => node.isManual && node.isEnabled !== false).length,
+    [nodes],
+  )
+  const excludedCount = useMemo(() => {
+    const excludedKeys = new Set(sources.flatMap((source) => source.excludedNodeKeys))
+    return nodes.filter((node) =>
+      !node.isSubscriptionMetadata
+      && (excludedKeys.has(nodeExactKey(node)) || node.isEnabled === false)).length
+  }, [nodes, sources])
+  const pool = explainNodePool({
+    sourceCount: sources.length,
+    manualNodeCount: manualCount,
+    nodeCount: nodes.filter((node) => !node.isSubscriptionMetadata).length,
+    enabledNodeCount: enabledForRules.length,
+    excludedNodeCount: excludedCount,
+    sourceErrors,
+  })
+
+  const applyFix = (action: FixAction): FixOutcome => {
+    if (!scheme) return { ok: false, message: '规则方案还没加载完成。' }
+    const state = useStore.getState()
+    const existing = state.customSchemes.find((item) => item.id === scheme.id)
+    let editable = existing
+    if (!editable) {
+      const previousSelections = { ...state.policySelections }
+      editable = {
+        ...scheme,
+        id: `custom-${Date.now()}`,
+        name: `${stripSchemeCustomSuffix(scheme.name)} · 自定义`,
+        sourceKind: 'copy',
+        updatedAt: Date.now(),
+        customRules: [],
+      }
+      state.addCustomScheme(editable)
+      state.setScheme(editable.id)
+      for (const [group, selection] of Object.entries(previousSelections)) {
+        useStore.getState().setPolicy(group, selection)
+      }
+    }
+    const next = applyFixAction(editable, action)
+    if (!next) return { ok: false, message: '没有找到这条规则，可能已被修改。' }
+    useStore.getState().addCustomScheme({ ...next.scheme, updatedAt: Date.now() })
+    const where = next.removedFrom === 'custom' ? '自定义规则' : next.removedFrom === 'ruleset' ? '规则集' : '方案规则'
+    return { ok: true, message: `已从${where}删除「${next.removedText}」，方案已保存。` }
+  }
+
+  return (
+    <div>
+      <div className="page-head">
+        <div>
+          <div className="eyebrow">STEP 03 · 检查结果</div>
+          <h1>规则诊断</h1>
+          <p className="sub">一条流量为什么走这里、规则集最近变过什么、导出时会不会丢语义。</p>
+        </div>
+        <div className="page-actions">
+          <button className="btn ghost" onClick={() => onGo?.('rules')}>调整规则方案</button>
+          <button className="btn" onClick={() => onGo?.('export')}>去导出</button>
+        </div>
+      </div>
+
+      {pool.code !== 'ready' ? (
+        <div className={`pool-reason${pool.code === 'source-error' ? ' is-error' : ''}`}>
+          <div className="pool-reason-body">
+            <strong>{pool.title}</strong>
+            <span>{pool.detail}</span>
+            <div className="pool-reason-actions">
+              <button className="btn" onClick={() => onGo?.('sub')}>去添加或修复订阅</button>
+              {pool.code === 'source-error' && <button className="btn ghost" onClick={() => onGo?.('sub')}>查看订阅错误</button>}
+            </div>
+          </div>
+        </div>
+      ) : (
+        <DiagnosisPanel
+          scheme={scheme}
+          nodes={enabledForRules}
+          policySelections={policySelections}
+          latencyByNodeId={latencyByNodeId}
+          localRuleSets={localRuleSets}
+          preferRuleSets={preferRuleSets}
+          showGroupEmoji={showGroupEmoji}
+          versionHistoryEnabled={ruleSetVersionHistory}
+          historyRevision={ruleSetVersionHistory ? 1 : 0}
+          onLocate={(issue) => onLocate?.(issue)}
+          onApplyFix={applyFix}
+          onGo={(key) => onGo?.(key)}
+        />
+      )}
     </div>
   )
 }
@@ -6522,6 +6723,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const setClientHidden = useStore((s) => s.setClientHidden)
   const sources = useStore((s) => s.sources)
   const nodes = useStore((s) => s.nodes)
+  const localRuleSets = useStore((s) => s.localRuleSets)
   const tailnets = useStore((s) => s.tailnets)
   const tailnetAuthKeys = useStore((s) => s.tailnetAuthKeys)
   const [target, setTarget] = useState<ClientInfo>(CLIENTS[0])
@@ -6621,6 +6823,27 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   }
 
   const enabled = useMemo(() => enabledNodes({ sources, nodes }), [sources, nodes])
+  const lintIssues = useMemo(
+    () => (scheme ? lintScheme({ scheme, nodes: enabled, policySelections, localRuleSets, preferRuleSets, clients: [target] }) : []),
+    [scheme, enabled, policySelections, localRuleSets, preferRuleSets, target],
+  )
+  const lintState = lintSummary(lintIssues)
+  // key 里带上具体 error 的 id：同样数量的 error 换成另一批问题时，不能沿用上一次的「继续导出」确认。
+  const lintErrorKey = lintIssues
+    .filter((issue) => issue.level === 'error')
+    .map((issue) => issue.id)
+    .sort()
+    .join(',')
+  const lintKey = `${scheme?.id ?? ''}|${target}|${lintErrorKey}|${enabled.map((node) => node.id).join(',')}`
+  const [lintAck, setLintAck] = useState('')
+  const [pendingExport, setPendingExport] = useState<{ run: () => void; errors: number } | null>(null)
+  const guardExport = (run: () => void) => {
+    if (lintState.error > 0 && lintAck !== lintKey) {
+      setPendingExport({ run, errors: lintState.error })
+      return
+    }
+    run()
+  }
   const nameFilterResult = useMemo(
     () => filterNodesByName(enabled, nodeNameFilter),
     [enabled, nodeNameFilter],
@@ -6826,7 +7049,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     return { needle, count, rows, truncated: count > rows.length }
   }, [previewText, previewQuery])
 
-  const download = () => {
+  const downloadNow = () => {
     if (!exportScheme) {
       setCheckResult({ ok: false, text: '规则方案还没加载完成，稍后再试或到规则页重新选择方案' })
       return
@@ -6845,11 +7068,14 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     a.click()
     a.remove()
     window.setTimeout(() => URL.revokeObjectURL(a.href), 1000)
+    markExported()
     setDownloaded(true)
     setTimeout(() => setDownloaded(false), 1600)
   }
 
-  const copy = async () => {
+  const download = () => guardExport(downloadNow)
+
+  const copyNow = async () => {
     if (!hasExportable) {
       setCheckResult({ ok: false, text: emptyReason })
       return
@@ -6864,10 +7090,13 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       return
     }
     setCopied(true)
+    markExported()
     setTimeout(() => setCopied(false), 1500)
   }
 
-  const importIntoClient = async () => {
+  const copy = () => guardExport(() => void copyNow())
+
+  const importNow = async () => {
     if (!canImport) return
     if (!exportScheme) {
       setCheckResult({ ok: false, text: '规则方案还没加载完成，稍后再试' })
@@ -6910,6 +7139,8 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       setImporting(false)
     }
   }
+
+  const importIntoClient = () => guardExport(() => void importNow())
 
   /** 请求一个订阅地址，取回真实响应内容。 */
   const probeSubscription = async (u: string) => {
@@ -7052,6 +7283,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       const now = Date.now()
       setSubUpdatedAt(now)
       localStorage.setItem('tower-sub-updated-at', String(now))
+      markExported()
       return abs
     } catch (e: unknown) {
       setCheckResult({ ok: false, text: `发布失败：${e instanceof Error ? e.message : String(e)}` })
@@ -7061,7 +7293,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     }
   }
 
-  const publishSubscription = async () => {
+  const publishNowSubscription = async () => {
     const url = await publishNow()
     if (url) {
       const remoteLabel = remoteSubscriptions.length > 0 ? ` · ${remoteSubscriptions.length} 个代理集合` : ''
@@ -7072,6 +7304,8 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       })
     }
   }
+
+  const publishSubscription = () => guardExport(() => void publishNowSubscription())
 
   // 之前发布过的 token 里存的是旧内容（例如修好 DNS 之前的 YAML）。
   // 进入导出页时静默同步一次，地址不变，用户 Clash 刷新订阅就能拿到修复后的配置。
@@ -7385,6 +7619,17 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           </div>
         </div>
 
+        <AdvancedSection
+          scope="export-prefs"
+          title="导出偏好与筛选"
+          summary={[
+            exportRegions.length ? `${exportRegions.length} 个地区` : '',
+            exportProtocols.length ? `${exportProtocols.length} 种协议` : '',
+            (nodeNameFilter.include || nodeNameFilter.exclude) ? '名称筛选' : '',
+            embedRemoteSubscriptions ? '代理集合' : '',
+            appendSourceName ? '追加订阅名' : '',
+          ].filter(Boolean).join(' · ') || '地区 / 协议 / 名称筛选 · 代理集合 · 订阅名后缀；默认收起'}
+        >
         <div className="export-field protocol-field">
           <div className="export-field-head">
             <span>地区筛选</span>
@@ -7558,6 +7803,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         <div className="hint export-settings-note">
           这些设置同时影响预览、下载和订阅链接；修改后请点「同步节点到链接」更新已发布订阅。
         </div>
+        </AdvancedSection>
       </div>
 
       <div className="card">
@@ -7679,6 +7925,15 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
               )}
               <button className="btn ghost" onClick={() => onGo?.('sub')}>去订阅管理</button>
             </div>
+          </div>
+        )}
+        {scheme && (
+          <div className={`inline-notice${lintState.error ? ' error' : ''}`}>
+            <span>
+              导出前检查：{lintState.error} error · {lintState.warn} warn · {lintState.info} info。
+              {lintState.error > 0 ? ' 默认只提示，导出时会再次确认。' : ' 不影响导出。'}
+            </span>
+            <button className="btn ghost" onClick={() => onGo?.('check')}>查看检查结果</button>
           </div>
         )}
         <div className="row" style={{ gap: 8, marginBottom: 14 }}>
@@ -7882,6 +8137,29 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       </div>
 
       <ConfirmDialog
+        open={!!pendingExport}
+        title={`导出前检查发现 ${pendingExport?.errors ?? 0} 个错误`}
+        body={(
+          <>
+            这些问题不会阻止导出，但可能让规则或策略组在客户端里不生效：
+            <ul style={{ margin: '8px 0 0', paddingLeft: 18 }}>
+              {lintIssues.filter((issue) => issue.level === 'error').slice(0, 5).map((issue) => (
+                <li key={issue.id}>{issue.message}</li>
+              ))}
+            </ul>
+            {pendingExport && pendingExport.errors > 5 && <div className="hint">还有 {pendingExport.errors - 5} 个错误，可在规则诊断页查看。</div>}
+          </>
+        )}
+        confirmLabel="仍然导出"
+        onCancel={() => { setPendingExport(null); onGo?.('check') }}
+        onConfirm={() => {
+          const pending = pendingExport
+          setPendingExport(null)
+          setLintAck(lintKey)
+          pending?.run()
+        }}
+      />
+      <ConfirmDialog
         open={pendingRevoke}
         title="撤销订阅链接？"
         body={<>撤销后 <b>已经导入该链接的客户端</b> 将无法再更新订阅，需要重新生成。节点本身不会删除。</>}
@@ -7909,17 +8187,94 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
 
 const TABS: { key: TabKey; label: string; short: string; Icon: () => ReactNode }[] = [
   { key: 'sub', label: '订阅管理', short: '订阅', Icon: Icon.Subscriptions },
-  { key: 'tailnet', label: 'Tailscale', short: '内网', Icon: Icon.Network },
   { key: 'rules', label: '规则配置', short: '规则', Icon: Icon.Rules },
+  { key: 'check', label: '规则诊断', short: '检查', Icon: Icon.Check },
   { key: 'export', label: '导出', short: '导出', Icon: Icon.Export },
+  { key: 'tailnet', label: 'Tailscale', short: '内网', Icon: Icon.Network },
 ]
 
 export function App() {
   const [tab, setTab] = useState<TabKey>('sub')
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [pendingLocate, setPendingLocate] = useState<SchemeLintIssue | null>(null)
+  const [exportTick, setExportTick] = useState(0)
   const autoRefreshStarted = useRef(false)
   const ruleSetAutoRefreshStarted = useRef(false)
   const keysPruned = useRef(false)
+
+  // 四步主线需要跨页读取同一份数据；方案本身仍然走缓存加载。
+  const scheme = useScheme()
+  const sources = useStore((s) => s.sources)
+  const nodes = useStore((s) => s.nodes)
+  const errors = useStore((s) => s.errors)
+  const policySelections = useStore((s) => s.policySelections)
+  const localRuleSets = useStore((s) => s.localRuleSets)
+  const preferRuleSets = useStore((s) => s.preferRuleSets)
+  const customSchemes = useStore((s) => s.customSchemes)
+  const enabled = useMemo(() => enabledNodes({ sources, nodes }), [sources, nodes])
+
+  const flowLint = useMemo(() => {
+    if (!scheme) return { error: 0, warn: 0 }
+    try {
+      const issues = lintScheme({ scheme, nodes: enabled, policySelections, localRuleSets, preferRuleSets })
+      return lintSummary(issues)
+    } catch {
+      return { error: 0, warn: 0 }
+    }
+  }, [scheme, enabled, policySelections, localRuleSets, preferRuleSets])
+
+  const sourceErrors = useMemo(
+    () => sources.map((source) => errors[source.id]?.trim()).filter((value): value is string => !!value),
+    [sources, errors],
+  )
+  const manualNodeCount = useMemo(
+    () => nodes.filter((node) => node.isManual && node.isEnabled !== false).length,
+    [nodes],
+  )
+  const excludedNodeCount = useMemo(() => {
+    const excludedKeys = new Set(sources.flatMap((source) => source.excludedNodeKeys))
+    return nodes.filter((node) =>
+      !node.isSubscriptionMetadata
+      && (excludedKeys.has(nodeExactKey(node)) || node.isEnabled === false)).length
+  }, [nodes, sources])
+  const nodeCount = nodes.filter((node) => !node.isSubscriptionMetadata).length
+
+  const published = (() => {
+    try { return !!window.localStorage.getItem('tower-sub-token') } catch { return false }
+  })()
+  const exportedAt = useMemo(() => readExportedAt(), [exportTick])
+
+  useEffect(() => {
+    const handler = () => setExportTick((value) => value + 1)
+    window.addEventListener('tower:exported', handler)
+    return () => window.removeEventListener('tower:exported', handler)
+  }, [])
+
+  const flowSteps = buildFlow({
+    sourceCount: sources.length,
+    manualNodeCount,
+    nodeCount,
+    enabledNodeCount: enabled.length,
+    excludedNodeCount,
+    sourceErrors,
+    hasExportable: enabled.length > 0,
+    schemeReady: !!scheme,
+    schemeName: scheme?.name,
+    schemeCustomized: !!customSchemes.find((item) => item.id === scheme?.id),
+    lintErrors: flowLint.error,
+    lintWarnings: flowLint.warn,
+    published,
+    exportedAt,
+  })
+  const flowCurrent: FlowStepKey = tab === 'sub' ? 'import' : tab === 'rules' ? 'scheme' : tab === 'check' ? 'check' : 'export'
+  const showFlow = tab !== 'tailnet'
+
+  const goFlowStep = (key: FlowStepKey) => {
+    if (key === 'import') switchTab('sub')
+    else if (key === 'scheme') switchTab('rules')
+    else if (key === 'check') switchTab('check')
+    else switchTab('export')
+  }
 
   // 快照恢复后删除已删除连接留下的 Auth Key。
   useEffect(() => {
@@ -7969,6 +8324,9 @@ export function App() {
           const parsed = await fetchRuleSet(set.sourceURL!)
           const current = useStore.getState().localRuleSets.find((item) => item.id === set.id)
           if (!current) return
+          if (digestRules(parsed.rules) !== digestRules(set.rules)) {
+            recordRuleSetSnapshot(set.id, set.rules, useStore.getState().ruleSetVersionHistory)
+          }
           useStore.getState().addLocalRuleSet({
             ...current,
             rules: parsed.rules,
@@ -8135,10 +8493,23 @@ export function App() {
           </nav>
         </div>
         <div className="sheet">
+          {showFlow && <FlowRail steps={flowSteps} current={flowCurrent} onGo={goFlowStep} />}
           {tab === 'sub' && <SubscriptionTab onGo={switchTab} />}
-          {tab === 'tailnet' && <TailnetTab />}
-          {tab === 'rules' && <RulesTab />}
+          {tab === 'rules' && (
+            <RulesTab
+              onGo={switchTab}
+              locateIssue={pendingLocate}
+              onLocateConsumed={() => setPendingLocate(null)}
+            />
+          )}
+          {tab === 'check' && (
+            <CheckTab
+              onGo={switchTab}
+              onLocate={(issue) => { setPendingLocate(issue); switchTab('rules') }}
+            />
+          )}
           {tab === 'export' && <ExportTab onGo={switchTab} />}
+          {tab === 'tailnet' && <TailnetTab />}
         </div>
       </main>
     </div>

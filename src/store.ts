@@ -61,6 +61,8 @@ export interface Store extends AppState {
   renewalRemindersEnabled: boolean
   /** 在策略组列表和规则标签里显示组名开头的 Emoji。 */
   showGroupEmoji: boolean
+  /** 刷新在线规则集前保留上一版快照，用于版本对比；默认开启。 */
+  ruleSetVersionHistory: boolean
   /** Tailscale 内网连接；Auth Key 单独存在 tailnetAuthKeys。 */
   tailnets: TailnetConnection[]
   /** 本机保存的 Auth Key；不进入持久化快照，刷新前从独立 localStorage 读取。 */
@@ -85,6 +87,7 @@ export interface Store extends AppState {
   setFilterSubscriptionInfoNodes: (enabled: boolean) => void
   setRenewalRemindersEnabled: (enabled: boolean) => void
   setShowGroupEmoji: (enabled: boolean) => void
+  setRuleSetVersionHistory: (enabled: boolean) => void
   addTailnet: (connection: TailnetConnection) => void
   updateTailnet: (connection: TailnetConnection) => void
   deleteTailnet: (id: string) => void
@@ -324,6 +327,7 @@ export function persistedSnapshot(s: Store): PersistedData {
     filterSubscriptionInfoNodes: s.filterSubscriptionInfoNodes,
     renewalRemindersEnabled: s.renewalRemindersEnabled,
     showGroupEmoji: s.showGroupEmoji,
+    ruleSetVersionHistory: s.ruleSetVersionHistory,
     latencyTestMode: s.latencyTestMode,
     tailnets: s.tailnets,
   }
@@ -362,6 +366,7 @@ export const useStore = create<Store>()(
       filterSubscriptionInfoNodes: false,
       renewalRemindersEnabled: false,
       showGroupEmoji: false,
+      ruleSetVersionHistory: true,
       tailnets: [],
       tailnetAuthKeys: loadTailnetAuthKeys(),
 
@@ -447,6 +452,7 @@ export const useStore = create<Store>()(
       setFilterSubscriptionInfoNodes: (enabled) => set({ filterSubscriptionInfoNodes: enabled }),
       setRenewalRemindersEnabled: (enabled) => set({ renewalRemindersEnabled: enabled }),
       setShowGroupEmoji: (enabled) => set({ showGroupEmoji: enabled }),
+      setRuleSetVersionHistory: (enabled) => set({ ruleSetVersionHistory: enabled }),
       addTailnet: (connection) =>
         set((s) => ({
           tailnets: [...s.tailnets.filter((item) => item.id !== connection.id), connection],
