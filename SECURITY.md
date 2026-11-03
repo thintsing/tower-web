@@ -18,7 +18,8 @@ Tower Web 是一个本地优先的工具，默认设计用于本机或可信局�
 
 ## 敏感数据
 
-- `server/subscriptions.json` 会保存真实订阅内容（可能包含节点地址、密码、UUID、token，以及 Tailscale Auth Key）。
+- `server/subscriptions.json` 只保存已发布/生成好的客户端配置文本（按 token 索引），不是订阅源、解析后的节点或规则工作区；内容可能包含节点地址、密码、UUID、token，以及 Tailscale Auth Key。
+- 订阅源、解析后的节点、规则方案、规则集和当前选择保存在浏览器 localStorage（`tower-web-state`）；不同电脑或浏览器 profile 不共享，换机需要重新添加订阅或导出/导入备份。
 - `server/settings.json` 保存局域网共享开关和管理 API 访问密钥（Docker 下位于 `/app/data/settings.json`），同样不要提交或分享。
 - 这些运行数据文件已在 `.gitignore` 中排除，**不要提交到 GitHub，也不要在 Issue / 日志 / 截图中粘贴真实订阅内容或访问密钥**。
 - Tailscale 连接的 Auth Key 另存在浏览器 localStorage 的 `tower-web-tailnet-auth-keys` 记录里，不进入主快照；它不是操作系统钥匙串，同浏览器的其他脚本仍可读取，建议在可信设备上使用。
