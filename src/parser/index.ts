@@ -165,12 +165,19 @@ function bytesAfter(marker: string, text: string): number | undefined {
  * 纯日期按**本地日历日**解析（当天 0 点到期），不再用 UTC 午夜，
  * 否则东八区用户会看到「日期当天 08:00 才到期」，西半球则会提前一天。
  */
+const UNIX_SECONDS_MAX = Math.floor(Date.UTC(2100, 0, 1) / 1000)
+const UNIX_MILLIS_MAX = UNIX_SECONDS_MAX * 1000
+
 function parseExpiryValue(raw: string): number | undefined {
   const text = raw.trim()
   if (/^\d+(?:\.\d+)?$/.test(text)) {
     const value = Number(text)
     if (!Number.isFinite(value) || value < 0) return undefined
-    return Math.floor(value > 1e12 ? value / 1000 : value)
+    // 按合理年份区间判断单位，而不是单点阈值：2001 年以前的毫秒值
+    // （如 2000-01-01 的 946684800000）远大于“合法秒”的上限，必须当毫秒。
+    if (value <= UNIX_SECONDS_MAX) return Math.floor(value)
+    if (value <= UNIX_MILLIS_MAX) return Math.floor(value / 1000)
+    return undefined
   }
   const m = text.replace(/[./]/g, '-').match(/^(\d{4})-(\d{1,2})-(\d{1,2})/)
   if (!m) return undefined

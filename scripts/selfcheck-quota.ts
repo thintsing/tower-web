@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url'
 import { renderToStaticMarkup } from 'react-dom/server'
 
 import { mergeUsage, parse, parseUserinfoHeader } from '../src/parser'
-import { QUOTA_PROBE_MISS_TTL_MS, quotaProbeMissFresh, quotaProbeURLs, rememberQuotaProbeMiss } from '../src/store'
+import { QUOTA_PROBE_MISS_TTL_MS, quotaProbeMissFresh, quotaProbeURLs, rememberQuotaProbeMiss, usageIsUsable } from '../src/store'
 import { subscriptionUsageSummary, usageFieldsFrom } from '../src/models/types'
 import { formatBytes, SourceUsage, shouldShowSourceUsage } from '../src/components/SourceUsage'
 
@@ -232,7 +232,8 @@ async function main(): Promise<void> {
       assert.equal(state.usedBytes, 1048576 + 10737418240)
       assert.equal(state.expireAt, 1798761600000)
       const html = render(state.usage, usageFieldsFrom(state.usage))
-      assert.ok(html.includes('剩余'), '有数据时应显示剩余流量')
+      assert.ok(html.includes('已用'), '有数据时应显示已用流量')
+      assert.ok(html.includes('共'), '有总量时应显示套餐总量')
       assert.ok(html.includes('到期'), '有数据时应显示到期时间')
       assert.ok(html.includes('data-usage="known"'))
     })
@@ -342,28 +343,26 @@ async function main(): Promise<void> {
         quotaProbeURLs('https://a.example/link/token?sub=1'),
         [
           'https://a.example/link/token?clash=1',
-          'https://a.example/link/token?sub=1&flag=clash',
-          'https://a.example/link/token?sub=1&clash=1',
+          'https://a.example/link/token?flag=clash',
         ],
-        '带 sub 的通用链接应先去掉 sub 再试 clash=1',
+        '带 sub 的通用链接应去掉 sub 后分别探测 clash=1 与 flag=clash',
       )
       assert.deepEqual(
         quotaProbeURLs('https://a.example/link/token?sub=1&clash=1'),
         [
           'https://a.example/link/token?clash=1',
-          'https://a.example/link/token?sub=1&clash=1&flag=clash',
-          'https://a.example/link/token?sub=1&clash=1',
+          'https://a.example/link/token?clash=1&flag=clash',
         ],
-        '带 sub 时即使已有 clash=1 也必须先探测去掉 sub 的链接',
+        '带 sub 时必须先探测去掉 sub 的链接，且候选不再带 sub',
       )
       assert.deepEqual(
         quotaProbeURLs('https://a.example/link/token?sub=1&flag=clash'),
         [
           'https://a.example/link/token?flag=clash&clash=1',
-          'https://a.example/link/token?sub=1&flag=clash',
-          'https://a.example/link/token?sub=1&clash=1',
+          'https://a.example/link/token?flag=clash',
+          'https://a.example/link/token?clash=1',
         ],
-        '带 sub 时 flag=clash 同样会被通用链接压制，不能跳过探测',
+        '带 sub 时 flag=clash 会被通用链接压制，所有候选都要去掉 sub',
       )
       assert.deepEqual(
         quotaProbeURLs('https://a.example/sub/clash?token=t&flag=clash'),
@@ -415,6 +414,72 @@ async function main(): Promise<void> {
       assert.ok(html.includes('总量未知'), `应说明总量未知：${html}`)
       assert.ok(!html.includes('机场未返回用量信息'), '已有 upload/download 时不能误判为缺失')
       assert.ok(html.includes('data-usage="known"'))
+    })
+
+    await check('流量三态：缺省 / total=0（不限量）/ 有上限', async () => {
+      // 缺省：三无，按未知展示。
+      const unknown = usageFieldsFrom(parseUserinfoHeader(undefined))
+      assert.deepEqual(unknown, {})
+      const unknownHtml = render(undefined, unknown)
+      assert.ok(unknownHtml.includes('流量 —'))
+      assert.ok(unknownHtml.includes('data-usage="unknown"'))
+
+      // total=0 + 已用 = 不限量；不能显示“请换 UA”，也不能当成缺失继续探测。
+      const unlimitedUsage = parseUserinfoHeader('total=0; upload=1GB; download=2GB')
+      const unlimitedFields = usageFieldsFrom(unlimitedUsage)
+      assert.equal(unlimitedFields.unlimited, true)
+      assert.equal(unlimitedFields.totalBytes, undefined, '不限量不应伪造 totalBytes=0')
+      assert.equal(unlimitedFields.usedBytes, 3 * GB)
+      assert.equal(usageIsUsable(unlimitedUsage), true, 'total=0 的不限量声明是真实用量')
+      const unlimitedHtml = render(unlimitedUsage, unlimitedFields)
+      assert.ok(unlimitedHtml.includes('不限量'), `应显示不限量：${unlimitedHtml}`)
+      assert.ok(!unlimitedHtml.includes('机场未返回用量信息'), '不限量不能提示机场没返回用量')
+      assert.ok(!unlimitedHtml.includes('改用 Clash 系 UA'), '不限量不能把用户推去换 UA')
+      assert.ok(unlimitedHtml.includes('data-usage="known"'))
+
+      // 只有 total=0、没有任何已用信息：仍按未知处理，避免把空头误判成不限量。
+      const zeroOnly = usageFieldsFrom(parseUserinfoHeader('total=0'))
+      assert.equal(zeroOnly.unlimited, undefined)
+      assert.equal(usageIsUsable(parseUserinfoHeader('total=0')), false)
+
+      // 有上限：total>0 时按已用 / 共展示。
+      const capped = usageFieldsFrom(parseUserinfoHeader('total=100GB; upload=3GB; download=2GB'))
+      assert.equal(capped.totalBytes, 100 * GB)
+      assert.equal(capped.unlimited, undefined)
+      const cappedHtml = render(parseUserinfoHeader('total=100GB; upload=3GB; download=2GB'), capped)
+      assert.ok(cappedHtml.includes('已用 5.0 GB / 共 100 GB'), `应有上限文案：${cappedHtml}`)
+
+      // 有上限但没有已用：不要出现“剩余 —”。
+      const totalOnly = usageFieldsFrom(parseUserinfoHeader('total=1GB'))
+      const totalOnlyHtml = render(parseUserinfoHeader('total=1GB'), totalOnly)
+      assert.ok(totalOnlyHtml.includes('共 1.0 GB · 未提供已用'), `总量已知但未用未知应有可读文案：${totalOnlyHtml}`)
+      assert.ok(!totalOnlyHtml.includes('剩余 —'))
+    })
+
+    await check('负缓存不被 total=0 的不限量声明污染', async () => {
+      const usage = parseUserinfoHeader('total=0; upload=1GB')
+      assert.equal(usageIsUsable(usage), true, 'usable → 不应写负缓存')
+      // 模拟 refreshSource 的分支：usable 时删除历史 miss，未 usable 才记录。
+      const misses = new Map<string, number>()
+      rememberQuotaProbeMiss(misses, 'src-unlimited', 1_800_000_000_000)
+      if (usageIsUsable(usage)) misses.delete('src-unlimited')
+      assert.equal(misses.has('src-unlimited'), false)
+      assert.equal(usageIsUsable(parseUserinfoHeader('total=0')), false, '空 total=0 仍应继续探测')
+    })
+
+    await check('expire 秒/毫秒按合理年份区间判定（含 1970–2001 的毫秒值）', async () => {
+      // 946684800 秒 = 2000-01-01；946684800000 毫秒也必须解析成同一天，
+      // 不能被“大于 1e12 才算毫秒”的单点阈值当成公元 31970 年。
+      const sec = parseUserinfoHeader('expire=946684800')
+      assert.equal(sec?.expire, 946684800)
+      const millis = parseUserinfoHeader('expire=946684800000')
+      assert.equal(millis?.expire, 946684800)
+      // 1970-01-01 的毫秒值 0 与秒值 0 都表示长期有效，保持原语义。
+      assert.equal(parseUserinfoHeader('expire=0')?.expire, 0)
+      // 常规毫秒时间戳不受影响。
+      assert.equal(parseUserinfoHeader('expire=1798761600000')?.expire, 1798761600)
+      // 超出 2100 年的数字不再瞎猜单位。
+      assert.equal(parseUserinfoHeader('expire=9999999999999999')?.expire, undefined)
     })
 
     await check('流量格式化不出现「1024 KB」式进位', async () => {

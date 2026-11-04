@@ -172,6 +172,8 @@ export interface SubscriptionSource {
   expireAt?: number
   /** 套餐总量（字节）；0 或 undefined 表示未知。 */
   totalBytes?: number
+  /** 机场明确表示不限量（total=0 且给出了已用流量）。 */
+  unlimited?: boolean
   /** 已用流量（字节）；undefined 表示未知。 */
   usedBytes?: number
   /** Airport announcements parsed from metadata pseudo nodes. */
@@ -187,21 +189,32 @@ export interface SubscriptionSource {
 
 export interface SubscriptionUsageFields {
   expireAt?: number
+  /** 套餐总量（字节）。undefined 表示未知；0 不会出现在这里（0 走 unlimited）。 */
   totalBytes?: number
   usedBytes?: number
+  /**
+   * 机场明确表示不限量：`total=0` 且同时给出了 upload/download。
+   * 单独一个 total=0 无法区分“不限量”和“没填”，仍按未知处理。
+   */
+  unlimited?: boolean
 }
 
 /**
  * 把响应头 / 正文解析出的 usage 转成订阅卡直接使用的字段。
- * total<=0 视为未知（部分面板用它表示“不限量”），expire=0 表示长期有效。
+ * 流量是三态的：未知（没有任何总量/已用信息）/ 不限量（total=0 且有已用）/
+ * 有上限（total>0）。expire=0 表示长期有效。
  */
 export function usageFieldsFrom(usage?: SubscriptionUsage): SubscriptionUsageFields {
   const fields: SubscriptionUsageFields = {}
   if (!usage) return fields
+  const hasUsed = typeof usage.upload === 'number' || typeof usage.download === 'number'
   if (typeof usage.total === 'number' && usage.total > 0) {
     fields.totalBytes = Math.floor(usage.total)
+  } else if (usage.total === 0 && hasUsed) {
+    // 常见面板用 total=0 表示不限量；没有已用数据时保持未知，避免误报。
+    fields.unlimited = true
   }
-  if (typeof usage.upload === 'number' || typeof usage.download === 'number') {
+  if (hasUsed) {
     const used = (usage.upload ?? 0) + (usage.download ?? 0)
     if (Number.isFinite(used) && used >= 0) fields.usedBytes = Math.floor(used)
   }
@@ -224,7 +237,7 @@ export interface SubscriptionUsageSummary extends SubscriptionUsageFields {
 
 /** 兼容旧快照：新字段缺失时回退到 usage 推导。 */
 export function subscriptionUsageSummary(
-  source: Pick<SubscriptionSource, 'usage' | 'expireAt' | 'totalBytes' | 'usedBytes'>,
+  source: Pick<SubscriptionSource, 'usage' | 'expireAt' | 'totalBytes' | 'usedBytes' | 'unlimited'>,
   now = Date.now(),
 ): SubscriptionUsageSummary {
   const derived = usageFieldsFrom(source.usage)
@@ -243,6 +256,8 @@ export function subscriptionUsageSummary(
     : typeof source.expireAt === 'undefined'
       ? derived.expireAt
       : undefined
+  // 有 totalBytes 时以总量为准；旧快照可能没写 unlimited，从 usage 再推一次。
+  const unlimited = totalBytes === undefined && (source.unlimited === true || derived.unlimited === true)
   const remainingBytes = totalBytes !== undefined && usedBytes !== undefined
     ? Math.max(0, totalBytes - usedBytes)
     : undefined
@@ -260,6 +275,7 @@ export function subscriptionUsageSummary(
   return {
     totalBytes,
     usedBytes,
+    unlimited,
     expireAt,
     remainingBytes,
     remainingRatio,

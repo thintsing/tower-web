@@ -62,7 +62,7 @@ import { READONLY_NOTE, writeGuard } from './util/readOnlyUi'
 import { buildFlow, explainNodePool, type FlowStepKey } from './flow/flow'
 import { markExported, readExportedAt } from './flow/prefs'
 import { applyFixAction, type FixAction } from './rules/diagnosis'
-import { applyDuplicateCleanup, type DuplicateCleanupPlan } from './rules/duplicateCleanup'
+import { applyDuplicateCleanup, restoreRemovedRules, type DuplicateCleanupPlan, type RemovedRuleRecord } from './rules/duplicateCleanup'
 import { clearRuleSetHistory, digestRules, recordRuleSetSnapshot } from './rules/ruleSetHistory'
 import { lintScheme, lintSummary, type SchemeLintIssue } from './rules/schemeLint'
 
@@ -6571,8 +6571,9 @@ function RulesTab({
 // 规则诊断页的「撤销本次清理」只在本机这次会话内有效。
 // 放在模块级而不是组件 state：诊断结果刷新会让子组件重渲染，
 // 组件内快照容易被重置，撤销按钮就会无声消失。
-// 快照绑定方案 id：撤销时能把用户带回被清理的那个方案，而不是只改一个看不见的方案。
-let cleanupUndoSnapshot: { scheme: RuleScheme; schemeID: string } | null = null
+// 只记录“被删掉的条目 + 原始位置”，撤销时精确回插；不再保存整份方案快照，
+// 否则清理之后用户在同一方案里做的其它编辑会被一起回滚。
+let cleanupUndoRecord: { schemeID: string; records: RemovedRuleRecord[] } | null = null
 
 function CheckTab({
   onGo,
@@ -6615,7 +6616,7 @@ function CheckTab({
     sourceErrors,
   })
 
-  const canUndoCleanup = cleanupUndoSnapshot !== null
+  const canUndoCleanup = cleanupUndoRecord !== null
 
   /** 选中内置方案时，先把当前内容复制成可编辑方案。保留已有 customRules，避免索引错位。 */
   const ensureEditable = (): RuleScheme | null => {
@@ -6649,8 +6650,8 @@ function CheckTab({
     const next = applyFixAction(editable, action)
     if (!next) return { ok: false, message: '没有找到这条规则，可能已被修改。' }
     useStore.getState().addCustomScheme({ ...next.scheme, updatedAt: Date.now() })
-    // 清理快照之后又做了别的修改，旧快照已过期，撤销会静默回滚这次修改。
-    cleanupUndoSnapshot = null
+    // 这次单条删除不影响撤销记录的语义：撤销只回插清理时删掉的条目，
+    // 不会覆盖这次编辑。保留记录，用户仍然可以撤销上一次批量清理。
     const where = next.removedFrom === 'custom' ? '自定义规则' : next.removedFrom === 'ruleset' ? '规则集' : '方案规则'
     return { ok: true, message: `已从${where}删除「${next.removedText}」，方案已保存。` }
   }
@@ -6666,21 +6667,40 @@ function CheckTab({
     if (!editable) return { ok: false, message: '规则方案还没加载完成。' }
     const result = applyDuplicateCleanup(editable, plan)
     if (!result.removed) return { ok: false, message: '规则已经变化，请重新运行诊断后再清理。' }
-    cleanupUndoSnapshot = { scheme: editable, schemeID: editable.id }
+    cleanupUndoRecord = {
+      schemeID: editable.id,
+      records: result.applied.map((item) => ({ place: item.place, rule: { ...item.rule } })),
+    }
     useStore.getState().addCustomScheme({ ...result.scheme, updatedAt: Date.now() })
     return {
       ok: true,
-      message: `已删除 ${result.removed} 条同组重复规则，方案已保存；可撤销本次清理。`,
+      message: `已删除 ${result.removed} 条同组重复规则，方案已保存；可撤销本次清理（只恢复这几条，不影响其它修改）。`,
     }
   }
 
   const undoCleanup = (): FixOutcome => {
-    if (!cleanupUndoSnapshot) return { ok: false, message: '没有可撤销的清理。' }
-    const { scheme: snapshot, schemeID } = cleanupUndoSnapshot
-    cleanupUndoSnapshot = null
-    useStore.getState().addCustomScheme({ ...snapshot, updatedAt: Date.now() })
-    useStore.getState().setScheme(schemeID)
-    return { ok: true, message: '已撤销上一次重复规则清理，并切回被清理的方案。' }
+    const record = cleanupUndoRecord
+    if (!record) return { ok: false, message: '没有可撤销的清理。' }
+    const state = useStore.getState()
+    const target = state.customSchemes.find((item) => item.id === record.schemeID)
+    if (!target) {
+      cleanupUndoRecord = null
+      return { ok: false, message: '被清理的方案已经被删除，无法撤销这次清理。' }
+    }
+    const result = restoreRemovedRules(target, record.records)
+    cleanupUndoRecord = null
+    if (!result.restored) {
+      return { ok: false, message: '没有可恢复的条目：规则集可能已被删除或替换。' }
+    }
+    state.addCustomScheme({ ...result.scheme, updatedAt: Date.now() })
+    state.setScheme(record.schemeID)
+    const skippedNote = result.skipped
+      ? `；${result.skipped} 条因原位置已有同条规则或规则集已被替换而跳过`
+      : ''
+    return {
+      ok: true,
+      message: `已恢复 ${result.restored} 条被清理的规则，清理之后的其它修改保持不变${skippedNote}。`,
+    }
   }
 
   return (
@@ -6866,6 +6886,8 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   })
   const [checking, setChecking] = useState(false)
   const [checkResult, setCheckResult] = useState<{ ok: boolean; text: string } | null>(null)
+  /** 撤销链接失败时保留 token 与地址，显示原因并提供重试。 */
+  const [revokeError, setRevokeError] = useState('')
   const [copiedField, setCopiedField] = useState<'sub' | 'import' | 'lan' | null>(null)
   const [importNotice, setImportNotice] = useState('')
   const [net, setNet] = useState<{ host: string; lan: string[] } | null>(null)
@@ -7360,6 +7382,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       }
       const json = await res.json()
       setSubToken(json.token)
+      setRevokeError('')
       localPrefs.setItem('tower-sub-token', json.token)
       const abs = new URL(json.url, window.location.origin).href
       setSubURL(abs)
@@ -7446,7 +7469,23 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
 
   const revokeSubscription = async () => {
     if (!subToken) return
-    try { await apiFetch(`/api/sub/${encodeURIComponent(subToken)}`, { method: 'DELETE' }) } catch {}
+    setRevokeError('')
+    try {
+      const response = await apiFetch(`/api/sub/${encodeURIComponent(subToken)}`, { method: 'DELETE' })
+      // 404 说明服务端已经没有这个 token，本地清掉即可；其它失败必须如实报错，
+      // 否则界面显示“已撤销”，但服务端 token 仍然有效、旧链接还能继续更新。
+      if (!response.ok && response.status !== 404) {
+        let detail = `HTTP ${response.status}`
+        try {
+          const body = await response.json() as { error?: unknown }
+          if (typeof body.error === 'string' && body.error.trim()) detail = body.error.trim()
+        } catch { /* 非 JSON 错误体，保留状态码 */ }
+        throw new Error(detail)
+      }
+    } catch (err) {
+      setRevokeError(`撤销失败：${err instanceof Error ? err.message : String(err)}。链接仍然有效，请重试。`)
+      return
+    }
     setSubToken(''); setSubURL(''); setSubUpdatedAt(null)
     localPrefs.removeItem('tower-sub-token')
     localPrefs.removeItem('tower-sub-url')
@@ -8167,6 +8206,19 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                 <button className="btn ghost" onClick={() => setQrOpen(true)}>二维码</button>
                 <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => setPendingRevoke(true)}>撤销</button>
               </div>
+              {revokeError && (
+                <div className="error" style={{ marginTop: 8 }}>
+                  {revokeError}
+                  <button
+                    className="btn ghost"
+                    style={{ marginLeft: 8 }}
+                    {...writeGuard(readOnly)}
+                    onClick={() => void revokeSubscription()}
+                  >
+                    重试撤销
+                  </button>
+                </div>
+              )}
               {checkResult && (
                 <div className={checkResult.ok ? 'hint' : 'error'} style={{ marginTop: 8 }}>
                   {checkResult.ok ? '可用 · ' : '异常 · '}

@@ -1,7 +1,7 @@
 {
   "name": "tower-web",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.3.2",
   "license": "MIT",
   "description": "本地优先的代理订阅管理、测速与多客户端配置导出工具",
   "repository": {

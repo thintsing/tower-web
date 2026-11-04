@@ -208,6 +208,8 @@ export function analyzeDuplicateCleanup(scheme: RuleScheme): DuplicateCleanupPla
 export interface DuplicateApplyResult {
   scheme: RuleScheme
   removed: number
+  /** 实际通过签名核对、真正被删除的条目；撤销按这些条目精确回插。 */
+  applied: DuplicateDeletion[]
 }
 
 /** 按原地索引删除；应用到前会核对签名，避免方案已变时误删别的规则。 */
@@ -218,6 +220,7 @@ export function applyDuplicateCleanup(
   const custom = new Set<number>()
   const base = new Set<number>()
   const bySet = new Map<string, Set<number>>()
+  const applied: DuplicateDeletion[] = []
 
   for (const deletion of plan.deletions) {
     const place = deletion.place
@@ -227,6 +230,7 @@ export function applyDuplicateCleanup(
         ? scheme.rules[place.index]
         : scheme.ruleSets?.find((set) => set.id === place.ruleSetId)?.rules[place.index]
     if (!current || ruleSignature(current) !== ruleSignature(deletion.rule)) continue
+    applied.push(deletion)
     if (place.kind === 'custom') custom.add(place.index)
     else if (place.kind === 'scheme') base.add(place.index)
     else if (place.ruleSetId) {
@@ -236,8 +240,8 @@ export function applyDuplicateCleanup(
     }
   }
 
-  const removed = custom.size + base.size + [...bySet.values()].reduce((sum, item) => sum + item.size, 0)
-  if (!removed) return { scheme, removed: 0 }
+  const removed = applied.length
+  if (!removed) return { scheme, removed: 0, applied: [] }
 
   const next: RuleScheme = {
     ...scheme,
@@ -250,5 +254,98 @@ export function applyDuplicateCleanup(
         : set
     }),
   }
-  return { scheme: next, removed }
+  return { scheme: next, removed, applied }
+}
+
+export interface RemovedRuleRecord {
+  place: RulePlace
+  rule: RoutingRule
+}
+
+export interface RestoreResult {
+  scheme: RuleScheme
+  restored: number
+  /** 规则集已被删除/替换成只读来源，或原位已经有同签名规则时跳过。 */
+  skipped: number
+}
+
+function sameSignature(left: RoutingRule, right: RoutingRule): boolean {
+  return ruleSignature(left) === ruleSignature(right)
+}
+
+/** 按记录的原始索引升序回插；只动被清理的那几条，不覆盖其它编辑。 */
+function insertBack(rules: RoutingRule[], records: RemovedRuleRecord[]): { next: RoutingRule[]; restored: number; skipped: number } {
+  const next = [...rules]
+  let restored = 0
+  let skipped = 0
+  for (const record of [...records].sort((a, b) => a.place.index - b.place.index)) {
+    const at = Math.min(Math.max(0, record.place.index), next.length)
+    // 用户可能已经手工把同一条规则加回原位；此时不再重复插入，避免凭空多一条。
+    if (next[at] && sameSignature(next[at], record.rule)) {
+      skipped += 1
+      continue
+    }
+    next.splice(at, 0, { ...record.rule })
+    restored += 1
+  }
+  return { next, restored, skipped }
+}
+
+/**
+ * 撤销重复规则清理：精确回插被删的条目，其它编辑原样保留。
+ * 边界：同一条值被用户重新加回原位 → 跳过；规则集被删除或被替换成
+ * 在线 / 内置只读来源 → 跳过并在 skipped 里计数；用户在别处又加了同签名
+ * 规则 → 照原样回插，不按签名去重（撤销是“恢复原状”，不是再次清理）。
+ */
+export function restoreRemovedRules(
+  scheme: RuleScheme,
+  records: RemovedRuleRecord[],
+): RestoreResult {
+  const custom: RemovedRuleRecord[] = []
+  const base: RemovedRuleRecord[] = []
+  const bySet = new Map<string, RemovedRuleRecord[]>()
+  let skipped = 0
+
+  for (const record of records) {
+    const place = record.place
+    if (place.kind === 'custom') {
+      custom.push(record)
+      continue
+    }
+    if (place.kind === 'scheme') {
+      base.push(record)
+      continue
+    }
+    const set = place.ruleSetId ? scheme.ruleSets?.find((item) => item.id === place.ruleSetId) : undefined
+    if (!set || set.sourceKind === 'url' || set.sourceKind === 'library') {
+      skipped += 1
+      continue
+    }
+    bySet.set(set.id, [...(bySet.get(set.id) ?? []), record])
+  }
+
+  const customResult = insertBack(scheme.customRules ?? [], custom)
+  const baseResult = insertBack(scheme.rules, base)
+  let restored = customResult.restored + baseResult.restored
+  let skippedCount = skipped + customResult.skipped + baseResult.skipped
+
+  const ruleSets = scheme.ruleSets?.map((set) => {
+    const records = bySet.get(set.id)
+    if (!records?.length) return set
+    const result = insertBack(set.rules, records)
+    restored += result.restored
+    skippedCount += result.skipped
+    return { ...set, rules: result.next }
+  })
+
+  return {
+    scheme: {
+      ...scheme,
+      customRules: scheme.customRules?.length ? customResult.next : scheme.customRules,
+      rules: baseResult.next,
+      ruleSets,
+    },
+    restored,
+    skipped: skippedCount,
+  }
 }

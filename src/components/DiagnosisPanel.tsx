@@ -481,7 +481,7 @@ export function DiagnosisPanel({
               <div className="diag-cleanup">
                 <div className="diag-cleanup-copy">
                   <strong>最近一次清理</strong>
-                  <span className="diag-cleanup-count">重复规则已删除并保存，可撤销回到清理前的方案。</span>
+                  <span className="diag-cleanup-count">重复规则已删除并保存；撤销只恢复被清理的条目，不会回退清理之后的其它修改。</span>
                 </div>
                 <div className="diag-cleanup-actions">
                   <button className="btn ghost" disabled={readOnly} onClick={undoCleanup}>撤销本次清理</button>
@@ -646,7 +646,7 @@ export function DiagnosisPanel({
           )}
           <p className="diag-hint">
             只删除「类型与归一化值相同、选项相同、同组、且前一条确实可达」的后一条规则。
-            删除后可在风险区撤销本次清理。
+            撤销会把它们按原位插回，不会影响你之后做的其它编辑。
           </p>
           <div className="actions">
             <button className="btn primary" disabled={readOnly} onClick={confirmCleanup}>

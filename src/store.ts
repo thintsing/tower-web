@@ -308,28 +308,46 @@ export function quotaProbeURLs(raw: string): string[] {
   const push = (next: URL) => {
     if (!probes.includes(next.href)) probes.push(next.href)
   }
-  if (hasSub) {
-    const bare = new URL(url.href)
-    for (const key of [...bare.searchParams.keys()]) {
-      if (key.toLowerCase() === 'sub') bare.searchParams.delete(key)
+  // 所有候选都去掉 `sub`：它会压过 clash / flag=clash，让面板返回空响应。
+  const withoutSub = (source: URL) => {
+    const next = new URL(source.href)
+    for (const key of [...next.searchParams.keys()]) {
+      if (key.toLowerCase() === 'sub') next.searchParams.delete(key)
     }
+    return next
+  }
+  if (hasSub) {
+    const bare = withoutSub(url)
     bare.searchParams.set('clash', '1')
     push(bare)
   }
-  const flag = new URL(url.href)
-  const flagKey = keys.find((key) => key.toLowerCase() === 'flag')
+  const flag = withoutSub(url)
+  const flagKey = [...flag.searchParams.keys()].find((key) => key.toLowerCase() === 'flag')
   // 通用链接常带 flag=ss / flag=v2ray，这里替换成 clash 再探测一次，
   // 否则会直接跳过探测、永远拿不到只在 Clash 方言下发的用量头。
   if (flagKey) flag.searchParams.delete(flagKey)
   flag.searchParams.set('flag', 'clash')
   push(flag)
-  const clash = new URL(url.href)
+  const clash = withoutSub(url)
   // 已有 flag 时用 clash=1 替代，避免两个方言参数同时出现让面板返回空响应。
-  const clashFlagKey = keys.find((key) => key.toLowerCase() === 'flag')
+  const clashFlagKey = [...clash.searchParams.keys()].find((key) => key.toLowerCase() === 'flag')
   if (clashFlagKey) clash.searchParams.delete(clashFlagKey)
   clash.searchParams.set('clash', '1')
   push(clash)
   return probes
+}
+
+/**
+ * 探测链是否还需要继续：只要拿到任意一项真实用量（总量 / 已用 / 到期），
+ * 或者机场明确表示不限量（total=0 + upload/download），就不算“缺失”。
+ * 单独的 total=0 无法区分“不限量”与“没填”，仍按缺失处理。
+ */
+export function usageIsUsable(usage?: SubscriptionUsage): boolean {
+  if (!usage) return false
+  if (typeof usage.total === 'number' && usage.total > 0) return true
+  if (typeof usage.expire === 'number') return true
+  if (typeof usage.upload === 'number' || typeof usage.download === 'number') return true
+  return false
 }
 
 /**
@@ -704,15 +722,9 @@ export const useStore = create<Store>()(
           if (!isCurrent() || !get().sources.some((s) => s.id === id)) return
           let usage = mergeUsage(parsed.status, fetched.usage)
           const quotaKey = `${source.id}\n${source.url}\n${source.userAgent ?? ''}`
-          // Some panels only send quota on a Clash-dialect request. Use only
-          // its response headers; its node body may silently drop protocols.
-          // 只有 upload/download（没有 total）也算「已知但不完整」：这已经是真实用量，
-          // 不能当成什么都没返回，否则会误判成缺失并反复跑探测链。
-          const missingQuota = () => !usage
-            || ((usage.total === undefined || usage.total <= 0)
-              && usage.expire === undefined
-              && usage.upload === undefined
-              && usage.download === undefined)
+          // 只有 upload/download（没有 total）、以及 total=0 的不限量声明，
+          // 都已经是真实用量，不能当成什么都没返回，否则会误判成缺失并反复探测。
+          const missingQuota = () => !usageIsUsable(usage)
           if (!missingQuota()) {
             // 已经拿到用量，清掉历史空结果，未来再缺失时重新探测。
             quotaProbeMisses.delete(quotaKey)
@@ -720,12 +732,15 @@ export const useStore = create<Store>()(
             const probes = quotaProbeURLs(source.url)
             if (probes.length > 0) {
               const doh = source.dnsOverHTTPSURL?.trim()
-              // 先按当前 UA 逐个尝试 Clash 方言链接，再补试机场常用的转换器 UA。
-              // 这些请求只取响应头，节点正文仍来自上面已成功解析的那次请求。
+              // 先按当前 UA 逐个尝试 Clash 方言链接；只有用户没固定 UA 时才补试
+              // 机场常用的转换器 UA。固定 UA 的语义是“这条订阅只以这个身份请求”，
+              // 探测也不能偷偷换身份去打同一个地址。
               const plan: { url: string; ua?: string }[] = probes.map((url) => ({ url, ua: fetched.userAgent }))
-              const compatibilityUAs = [COMPATIBILITY_USER_AGENT, 'ClashforWindows/0.20.39']
-              for (const ua of compatibilityUAs) {
-                for (const probe of probes.slice(0, 2)) plan.push({ url: probe, ua })
+              if (!fetched.userAgent) {
+                const compatibilityUAs = [COMPATIBILITY_USER_AGENT, 'ClashforWindows/0.20.39']
+                for (const ua of compatibilityUAs) {
+                  for (const probe of probes.slice(0, 2)) plan.push({ url: probe, ua })
+                }
               }
               // 上一次命中的变体排到最前，失败时仍回退到完整链。
               const cached = quotaProbeHits.get(quotaKey)
@@ -788,6 +803,9 @@ export const useStore = create<Store>()(
                   usage: nextUsage,
                   expireAt: fields.expireAt ?? src.expireAt,
                   totalBytes: fields.totalBytes ?? src.totalBytes,
+                  // unlimited 跟随本次合并结果：拿到上限后必须清掉旧的不限量标记，
+                  // 否则机场改套餐后界面会一直显示“不限量”。
+                  unlimited: fields.unlimited,
                   usedBytes: fields.usedBytes ?? src.usedBytes,
                   notices: parsed.notices,
                   excludedNodeKeys: carried,

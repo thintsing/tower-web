@@ -2,7 +2,7 @@
 // 用法：npm run selfcheck:duplicates
 import assert from 'node:assert/strict'
 import type { RoutingRule, RuleScheme, SchemeRuleSet } from '../src/models/types'
-import { analyzeDuplicateCleanup, applyDuplicateCleanup } from '../src/rules/duplicateCleanup'
+import { analyzeDuplicateCleanup, applyDuplicateCleanup, restoreRemovedRules } from '../src/rules/duplicateCleanup'
 
 let failures = 0
 function check(label: string, run: () => void): void {
@@ -147,6 +147,124 @@ function main(): void {
     const result = applyDuplicateCleanup(input, plan)
     assert.equal(result.removed, 0)
     assert.equal(result.scheme.ruleSets?.[0].rules.length, 2)
+  })
+
+  check('撤销精确回插：只恢复被删条目，清理之后的编辑不动', () => {
+    const set: SchemeRuleSet = {
+      id: 'set-local',
+      name: '本地规则集',
+      group: 'A',
+      sourceKind: 'local',
+      rules: [
+        rule('DOMAIN', 'set-a.example', 'A'),
+        rule('DOMAIN', 'SET-A.EXAMPLE', 'A'),
+        rule('DOMAIN', 'set-b.example', 'A'),
+      ],
+    }
+    const input = scheme([
+      rule('DOMAIN', 'keep.example', 'A'),
+      rule('DOMAIN', 'KEEP.EXAMPLE', 'A'),
+      rule('FINAL', '', 'DIRECT'),
+    ], {
+      customRules: [
+        rule('DOMAIN', 'c1.example', 'A'),
+        rule('DOMAIN', 'C1.EXAMPLE', 'A'),
+        rule('DOMAIN', 'c2.example', 'A'),
+      ],
+      ruleSets: [set],
+    })
+    const plan = analyzeDuplicateCleanup(input)
+    const applied = applyDuplicateCleanup(input, plan)
+    assert.equal(applied.removed, 3, 'scheme / custom / ruleSet 各删一条')
+    assert.deepEqual(
+      applied.applied.map((item) => item.place.kind).sort(),
+      ['custom', 'ruleSet', 'scheme'],
+    )
+
+    // 模拟用户清理后继续编辑：三处各追加一条规则。
+    const edited: RuleScheme = {
+      ...applied.scheme,
+      customRules: [...(applied.scheme.customRules ?? []), rule('DOMAIN', 'later-custom.example', 'A')],
+      rules: [...applied.scheme.rules.slice(0, -1), rule('DOMAIN', 'later-scheme.example', 'A'), applied.scheme.rules.at(-1)!],
+      ruleSets: applied.scheme.ruleSets?.map((item) => item.id === set.id
+        ? { ...item, rules: [...item.rules, rule('DOMAIN', 'later-set.example', 'A')] }
+        : item),
+    }
+
+    const restored = restoreRemovedRules(edited, applied.applied)
+    assert.equal(restored.restored, 3)
+    assert.equal(restored.skipped, 0)
+    assert.deepEqual(restored.scheme.rules.map((item) => item.value), [
+      'keep.example', 'KEEP.EXAMPLE', 'later-scheme.example', '',
+    ])
+    assert.deepEqual(restored.scheme.customRules?.map((item) => item.value), [
+      'c1.example', 'C1.EXAMPLE', 'c2.example', 'later-custom.example',
+    ])
+    assert.deepEqual(restored.scheme.ruleSets?.[0].rules.map((item) => item.value), [
+      'set-a.example', 'SET-A.EXAMPLE', 'set-b.example', 'later-set.example',
+    ])
+  })
+
+  check('撤销边界：原位已有同条规则时跳过，不重复插入', () => {
+    const input = scheme([
+      rule('DOMAIN', 'keep.example', 'A'),
+      rule('DOMAIN', 'KEEP.EXAMPLE', 'A'),
+    ])
+    const plan = analyzeDuplicateCleanup(input)
+    const applied = applyDuplicateCleanup(input, plan)
+    // 用户清理后又手工把同一条加回原位。
+    const edited = scheme([
+      input.rules[0],
+      { ...input.rules[1] },
+    ])
+    const restored = restoreRemovedRules(edited, applied.applied)
+    assert.equal(restored.restored, 0)
+    assert.equal(restored.skipped, 1)
+    assert.equal(restored.scheme.rules.length, 2)
+  })
+
+  check('撤销边界：规则集被替换成只读来源时跳过并计数', () => {
+    const set: SchemeRuleSet = {
+      id: 'set-local',
+      name: '本地规则集',
+      group: 'A',
+      sourceKind: 'local',
+      rules: [
+        rule('DOMAIN', 'a.example', 'A'),
+        rule('DOMAIN', 'A.EXAMPLE', 'A'),
+      ],
+    }
+    const input = scheme([rule('FINAL', '', 'DIRECT')], { ruleSets: [set] })
+    const plan = analyzeDuplicateCleanup(input)
+    const applied = applyDuplicateCleanup(input, plan)
+    const replaced: RuleScheme = {
+      ...applied.scheme,
+      ruleSets: applied.scheme.ruleSets?.map((item) => ({ ...item, sourceKind: 'url' as const })),
+    }
+    const restored = restoreRemovedRules(replaced, applied.applied)
+    assert.equal(restored.restored, 0)
+    assert.equal(restored.skipped, 1)
+    assert.equal(restored.scheme.ruleSets?.[0].rules.length, 1)
+  })
+
+  check('撤销边界：规则集已被删除时跳过', () => {
+    const set: SchemeRuleSet = {
+      id: 'set-local',
+      name: '本地规则集',
+      group: 'A',
+      sourceKind: 'local',
+      rules: [
+        rule('DOMAIN', 'a.example', 'A'),
+        rule('DOMAIN', 'A.EXAMPLE', 'A'),
+      ],
+    }
+    const input = scheme([rule('FINAL', '', 'DIRECT')], { ruleSets: [set] })
+    const plan = analyzeDuplicateCleanup(input)
+    const applied = applyDuplicateCleanup(input, plan)
+    const removed: RuleScheme = { ...applied.scheme, ruleSets: [] }
+    const restored = restoreRemovedRules(removed, applied.applied)
+    assert.equal(restored.restored, 0)
+    assert.equal(restored.skipped, 1)
   })
 
   check('摘要计数覆盖四类结果', () => {

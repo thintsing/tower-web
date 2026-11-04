@@ -36,14 +36,37 @@ export function shouldShowSourceUsage(source: { url?: string }): boolean {
 export function SourceUsage({ summary }: { summary: SubscriptionUsageSummary }) {
   const total = summary.totalBytes
   const used = summary.usedBytes
+  const unlimited = summary.unlimited === true
   const expireAt = summary.expireAt
-  const trafficUnknown = total === undefined && used === undefined
+  const trafficUnknown = !unlimited && total === undefined && used === undefined
   const expiryUnknown = expireAt === undefined
   const allUnknown = trafficUnknown && expiryUnknown
 
+  // 三种状态都要读得通：未知（—）/ 不限量 / 有上限（已用 + 共）。
+  const trafficLabel = (() => {
+    if (unlimited) {
+      return used !== undefined ? `已用 ${formatBytes(used)} · 不限量` : '不限量'
+    }
+    if (total !== undefined) {
+      return used !== undefined
+        ? `已用 ${formatBytes(used)} / 共 ${formatBytes(total)}`
+        : `共 ${formatBytes(total)} · 未提供已用`
+    }
+    if (used !== undefined) {
+      return `已用 ${formatBytes(used)} · 总量未知`
+    }
+    return '流量 —'
+  })()
+
   return (
     <div className="usage" data-usage={allUnknown ? 'unknown' : 'known'}>
-      {trafficUnknown ? (
+      {/* 不限量与有上限都属于“已知”，只有真正三无时才提示机场没返回。 */}
+      {unlimited ? (
+        <span
+          className="usage-item"
+          title="机场把流量标记为不限量（total=0），已用流量仍会累计"
+        >{trafficLabel}</span>
+      ) : trafficUnknown ? (
         <span
           className="usage-item unknown"
           title="该订阅没有返回流量信息（响应头 subscription-userinfo）"
@@ -55,8 +78,8 @@ export function SourceUsage({ summary }: { summary: SubscriptionUsageSummary }) 
             ? `已用 ${formatBytes(used)}${summary.remainingRatio !== undefined
               ? ` · 剩余 ${Math.round(Math.max(0, summary.remainingRatio) * 100)}%`
               : ''}`
-            : '已用流量未知'}
-        >剩余 {formatBytes(summary.remainingBytes)} / 共 {formatBytes(total)}</span>
+            : '机场只返回了套餐总量，没有提供已用流量'}
+        >{trafficLabel}</span>
       ) : (
         <span className="usage-item" title="该订阅只返回了已用流量">已用 {formatBytes(used)}（总量未知）</span>
       )}
@@ -83,7 +106,7 @@ export function SourceUsage({ summary }: { summary: SubscriptionUsageSummary }) 
       )}
       {allUnknown && (
         <span className="usage-item note">
-          机场未返回用量信息 · 请在订阅卡「⋯ → 编辑订阅 → 高级请求设置」里改用 Clash 系 UA，并确认地址是 Clash 版链接（常见 ?flag=clash 或 ?clash=1）后刷新
+          机场未返回用量信息 · 可在订阅卡「⋯ → 编辑订阅 → 高级请求设置」里改用 Clash 系 UA，并确认地址是 Clash 版链接（常见 ?flag=clash 或 ?clash=1）后刷新
         </span>
       )}
     </div>

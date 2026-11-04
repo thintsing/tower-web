@@ -151,6 +151,9 @@ function normalizedUsage(value: unknown): SubscriptionUsage | undefined {
 export function normalizeSource(value: SubscriptionSource): SubscriptionSource {
   const usage = normalizedUsage(value.usage)
   const derived = usageFieldsFrom(usage)
+  const totalBytes = typeof value.totalBytes === 'number' && Number.isFinite(value.totalBytes) && value.totalBytes > 0
+    ? value.totalBytes
+    : derived.totalBytes
   return {
     ...value,
     usage,
@@ -162,9 +165,11 @@ export function normalizeSource(value: SubscriptionSource): SubscriptionSource {
     expireAt: typeof value.expireAt === 'number' && Number.isFinite(value.expireAt) && value.expireAt >= 0
       ? value.expireAt
       : derived.expireAt,
-    totalBytes: typeof value.totalBytes === 'number' && Number.isFinite(value.totalBytes) && value.totalBytes > 0
-      ? value.totalBytes
-      : derived.totalBytes,
+    totalBytes,
+    // 有限总量优先；只有确实没有上限时才认不限量，避免旧字段互相矛盾。
+    unlimited: totalBytes === undefined
+      ? (value.unlimited === true || derived.unlimited === true ? true : undefined)
+      : undefined,
     usedBytes: typeof value.usedBytes === 'number' && Number.isFinite(value.usedBytes) && value.usedBytes >= 0
       ? value.usedBytes
       : derived.usedBytes,

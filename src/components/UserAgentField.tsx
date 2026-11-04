@@ -56,6 +56,7 @@ export function UserAgentField({
       <div className="hint">
         留空跟随后端默认；改用 Clash 系 UA 常能让机场返回流量与到期信息。
         有些机场只在 Clash 版链接（如带 <code>?flag=clash</code>、<code>?clash=1</code> 或 <code>/clash</code> 路径）上下发用量。
+        填了自定义 UA 后，塔台只会用这个 UA 请求该订阅（包括补探用量），不会再自动换用其它 UA。
       </div>
     </>
   )
