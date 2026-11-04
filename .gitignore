@@ -11,6 +11,10 @@ server/subscriptions.json.tmp
 server/subscriptions.json.corrupt-*
 server/settings.json
 server/settings.json.tmp
+server/workspace.json
+server/workspace.json.tmp
+server/workspace.json.bak
+server/workspace.json.broken-*
 .env
 .env.*
 !.env.example

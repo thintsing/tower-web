@@ -14,6 +14,7 @@ import { apiFetch } from './util/apiAuth'
 import { nodeTransportCapability } from './generator/nodeCapabilities'
 import { newID } from './util/browser'
 import { browserStorage, createSafeStorage } from './util/localStore'
+import { isWorkspaceReadOnly } from './util/workspaceLock'
 
 export interface Store extends AppState {
   loadingSourceIDs: string[]
@@ -335,9 +336,36 @@ export function persistedSnapshot(s: Store): PersistedData {
   }
 }
 
+/** 服务器版工作区里会落盘的字段；只读时只拦这些，设备偏好不受影响。 */
+const WORKSPACE_STATE_KEYS = new Set<string>([
+  'sources', 'nodes', 'customSchemes', 'localRuleSets', 'selectedSchemeID',
+  'policySelections', 'exportConfigName', 'tailnets', 'tailnetAuthKeys',
+])
+
 export const useStore = create<Store>()(
   persist(
-    (set, get) => ({
+    (set, get): Store => {
+      // 服务器版只读时只拦「会写服务端」的字段；设备偏好与测速等运行时状态
+      // 仍要能用。服务端 hydrate 走 useStore.setState，不经过这里。
+      const rawSet = set as (partial: unknown, replace?: unknown) => void
+      const guardedSet = ((partial: unknown, replace?: unknown) => {
+        if (!isWorkspaceReadOnly()) {
+          rawSet(partial, replace)
+          return
+        }
+        const resolved = typeof partial === 'function'
+          ? (partial as (state: Store) => unknown)(get())
+          : partial
+        if (!resolved || typeof resolved !== 'object') return
+        const allowed = Object.fromEntries(
+          Object.entries(resolved as Record<string, unknown>)
+            .filter(([key]) => !WORKSPACE_STATE_KEYS.has(key)),
+        )
+        if (Object.keys(allowed).length === 0) return
+        rawSet(allowed, false)
+      }) as typeof set
+      set = guardedSet
+      return {
       sources: [],
       nodes: [],
       selectedSchemeID: 'acl4ssr-online',
@@ -904,7 +932,8 @@ export const useStore = create<Store>()(
         // 备份不含 Tailscale Auth Key；只保留仍然存在的内网连接对应的本机 Key。
         get().pruneTailnetKeys()
       },
-    }),
+      }
+    },
     {
       name: 'tower-web-state',
       // 配额满时只标记状态、不抛出：否则每个 set() 都会让界面操作失败。

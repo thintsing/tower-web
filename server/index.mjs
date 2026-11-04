@@ -12,7 +12,7 @@ import { execFile } from 'node:child_process'
 import { lookup } from 'node:dns/promises'
 import { networkInterfaces } from 'node:os'
 import { readFile, rename, writeFile } from 'node:fs/promises'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join, dirname, extname, normalize, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
@@ -183,6 +183,13 @@ const DATA_DIR = process.env.TOWER_DATA_DIR || dirname(fileURLToPath(import.meta
 const SUBS_FILE = join(DATA_DIR, 'subscriptions.json')
 const SETTINGS_FILE = join(DATA_DIR, 'settings.json')
 
+// 服务器版：订阅源、节点、规则方案等整个工作区存在服务端 workspace.json，
+// 任何设备打开都是同一份数据。默认 local，保持原有 localStorage 行为。
+const SERVER_MODE = String(process.env.TOWER_MODE ?? '').trim().toLowerCase() === 'server'
+const WORKSPACE_FILE = join(DATA_DIR, 'workspace.json')
+// 工作区含节点与规则，但远小于已发布配置；16MB 足够且能挡住误传大文件。
+const WORKSPACE_MAX_BYTES = 16 * 1024 * 1024
+
 const DEFAULT_SERVER_SETTINGS = Object.freeze({
   /** 关闭后，非本机请求不能使用塔台 API / 订阅 / 规则集。 */
   lanSharing: true,
@@ -194,6 +201,11 @@ let serverSettings = { ...DEFAULT_SERVER_SETTINGS }
 
 function normalizeAPIToken(value) {
   const token = String(value ?? '').trim()
+  if (SERVER_MODE) {
+    // 服务器版允许任意长度的短密钥（1 字符也可），但必须是非空、不含空白 /
+    // 换行 / 控制字符。短密钥的风险见 SECURITY.md。
+    return /^[^\s\x00-\x1f\x7f]{1,128}$/.test(token) ? token : ''
+  }
   return /^[A-Za-z0-9_-]{16,128}$/.test(token) ? token : ''
 }
 
@@ -215,7 +227,7 @@ function loadServerSettings() {
   if (envTokenRaw) {
     const envToken = normalizeAPIToken(envTokenRaw)
     if (envToken) serverSettings.apiToken = envToken
-    else console.warn('[tower] TOWER_API_TOKEN 格式无效（需 16–128 位 A-Z/a-z/0-9/_/-），已忽略')
+    else console.warn(`[tower] TOWER_API_TOKEN 格式无效（${SERVER_MODE ? '需 1–128 个不含空白 / 控制字符的字符' : '需 16–128 位 A-Z/a-z/0-9/_/-'}），已忽略`)
   }
 }
 
@@ -346,12 +358,57 @@ function authStatus(req, url) {
   // 密钥）时才把 local 报给页面，避免局域网伪造 Host 后绕过访问门。
   const local = isLoopbackRequest(req)
     || (isContainerHostLocalRequest(req) && apiTokenMatches(presentedAPIToken(req, url)))
+  const tokenMatches = apiTokenMatches(presentedAPIToken(req, url))
   return {
+    mode: SERVER_MODE ? 'server' : 'local',
     lanSharing: serverSettings.lanSharing,
     requiresAuth: !!serverSettings.apiToken,
     local,
-    valid: local || apiTokenMatches(presentedAPIToken(req, url)),
+    // 服务器模式没有本机豁免：回环地址也必须带对密钥才算 valid。
+    valid: SERVER_MODE ? (!!serverSettings.apiToken && tokenMatches) : (local || tokenMatches),
   }
+}
+
+// 认证失败节流：同一 IP 连续 10 次失败后冷却 60 秒。计数只在内存里，
+// 服务端重启即清空；只防暴力猜密钥，不做持久封禁。
+const AUTH_FAILURE_LIMIT = 10
+const AUTH_COOLDOWN_MS = 60 * 1000
+const authFailures = new Map()
+
+function requestIP(req) {
+  return normalizedRemoteAddress(req) || 'unknown'
+}
+
+function authCooldownRemaining(req) {
+  const record = authFailures.get(requestIP(req))
+  if (!record?.blockedUntil) return 0
+  return Math.max(0, record.blockedUntil - Date.now())
+}
+
+function recordAuthFailure(req) {
+  const ip = requestIP(req)
+  const record = authFailures.get(ip) ?? { count: 0, blockedUntil: 0 }
+  if (record.blockedUntil && record.blockedUntil <= Date.now()) {
+    record.count = 0
+    record.blockedUntil = 0
+  }
+  record.count += 1
+  if (record.count >= AUTH_FAILURE_LIMIT) {
+    record.count = 0
+    record.blockedUntil = Date.now() + AUTH_COOLDOWN_MS
+    console.warn(`[tower] ${ip} 连续认证失败，冷却 60 秒`)
+  }
+  authFailures.set(ip, record)
+  // 简单上限，避免长期运行后 Map 无限增长。
+  if (authFailures.size > 1024) {
+    for (const [key, value] of authFailures) {
+      if (!value.blockedUntil || value.blockedUntil <= Date.now()) authFailures.delete(key)
+    }
+  }
+}
+
+function resetAuthFailures(req) {
+  authFailures.delete(requestIP(req))
 }
 
 function settingsPayload() {
@@ -459,6 +516,183 @@ for (const signal of ['SIGTERM', 'SIGINT']) {
   })
 }
 
+// ---------- 服务器版工作区 ----------
+// 单用户、单进程：整个工作区（订阅源、节点、规则方案 / 规则集、当前选择、
+// Tailscale 连接与 Auth Key）保存在一个 JSON 文件里。写入走串行队列，
+// 先落临时文件再原子替换；版本号用于检测多设备并发修改。
+
+let workspace = { version: 0, updatedAt: 0, data: {} }
+/** 非空表示启动时文件已损坏并改名保留，所有工作区接口返回明确错误。 */
+let workspaceCorrupt = ''
+let workspaceQueue = Promise.resolve()
+
+function workspaceHasData() {
+  return workspace.version > 0
+}
+
+async function writeWorkspaceFile(next) {
+  mkdirSync(DATA_DIR, { recursive: true })
+  const temp = `${WORKSPACE_FILE}.tmp`
+  await writeFile(temp, JSON.stringify(next), 'utf8')
+  // 覆盖前留一份上一版，误覆盖或恢复备份后还能找回。
+  if (existsSync(WORKSPACE_FILE)) {
+    try {
+      copyFileSync(WORKSPACE_FILE, `${WORKSPACE_FILE}.bak`)
+    } catch (error) {
+      console.warn('[tower] 工作区 .bak 写入失败:', error?.message ?? error)
+    }
+  }
+  await replaceFile(temp, WORKSPACE_FILE)
+}
+
+function commitWorkspace(payload) {
+  // 版本比较、落盘和内存更新都排在同一条 Promise 链上，避免并发写同一文件。
+  const run = workspaceQueue.then(async () => {
+    if (workspaceCorrupt) return { corrupt: true }
+    if (payload.version !== workspace.version) return { conflict: true }
+    // version=0 只用于「服务端还没有任何工作区」时的首次创建；
+    // 已有数据时客户端必须显式按当前版本覆盖，不能静默回到 0。
+    if (payload.version === 0 && workspaceHasData()) return { conflict: true }
+    const next = {
+      version: workspace.version + 1,
+      updatedAt: Date.now(),
+      data: payload.data,
+    }
+    try {
+      await writeWorkspaceFile(next)
+    } catch (error) {
+      return { failure: String(error?.message ?? error) }
+    }
+    workspace = next
+    return { version: next.version, updatedAt: next.updatedAt }
+  })
+  workspaceQueue = run.then(() => undefined, () => undefined)
+  return run
+}
+
+function loadWorkspace() {
+  if (!SERVER_MODE) return
+  try {
+    const raw = JSON.parse(readFileSync(WORKSPACE_FILE, 'utf8'))
+    if (!raw || typeof raw !== 'object'
+      || !Number.isInteger(raw.version) || raw.version < 0
+      || !raw.data || typeof raw.data !== 'object' || Array.isArray(raw.data)) {
+      throw new Error('结构无效：需要 { version: 非负整数, updatedAt: 数字, data: 对象 }')
+    }
+    workspace = {
+      version: raw.version,
+      updatedAt: Number(raw.updatedAt) || 0,
+      data: raw.data,
+    }
+    try {
+      copyFileSync(WORKSPACE_FILE, `${WORKSPACE_FILE}.bak`)
+    } catch (error) {
+      console.warn('[tower] 工作区 .bak 写入失败:', error?.message ?? error)
+    }
+    console.log(`[tower] 已载入服务器工作区 v${workspace.version}`)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return
+    // 坏文件绝不能当成空工作区继续跑，否则下一次写入会覆盖现场。
+    const broken = `${WORKSPACE_FILE}.broken-${Date.now()}`
+    try {
+      renameSync(WORKSPACE_FILE, broken)
+    } catch {
+      // 改名失败也保留原文件，不覆盖。
+    }
+    workspaceCorrupt = `服务器工作区文件损坏，已保留现场为 ${broken}`
+    console.error('[tower]', workspaceCorrupt, ':', error?.message ?? error)
+  }
+}
+
+function workspaceETag() {
+  return `"v${workspace.version}"`
+}
+
+function etagMatches(header, etag) {
+  if (!header) return false
+  return String(header)
+    .split(',')
+    .map((value) => value.trim())
+    .some((value) => value === '*' || value === etag || value === `W/${etag}`)
+}
+
+function workspaceJSON(res, status, value, headers = {}) {
+  return send(res, status, JSON.stringify(value), {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    ...headers,
+  })
+}
+
+async function handleWorkspace(url, req, res) {
+  if (workspaceCorrupt) {
+    return workspaceJSON(res, 500, { error: workspaceCorrupt, code: 'workspace_corrupt' })
+  }
+  const etag = workspaceETag()
+  if (url.pathname === '/api/workspace/version') {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      return workspaceJSON(res, 405, { error: '只支持 GET' }, { allow: 'GET' })
+    }
+    return workspaceJSON(res, 200, { version: workspace.version }, { etag })
+  }
+  if (req.method === 'GET') {
+    const requested = url.searchParams.get('version')
+    if (etagMatches(req.headers['if-none-match'], etag)
+      || (requested !== null && Number(requested) === workspace.version)) {
+      res.writeHead(304, { etag, 'cache-control': 'no-store' })
+      res.end()
+      return
+    }
+    return workspaceJSON(res, 200, {
+      version: workspace.version,
+      updatedAt: workspace.updatedAt,
+      data: workspace.data,
+    }, { etag })
+  }
+  if (req.method === 'PUT') {
+    // 超过上限时 readBody 会抛 413，外层统一转成 JSON 错误。
+    const raw = await readBody(req, WORKSPACE_MAX_BYTES)
+    let payload
+    try {
+      payload = JSON.parse(raw.toString('utf8'))
+    } catch {
+      return workspaceJSON(res, 400, { error: '请求内容不是 JSON', code: 'bad_json' })
+    }
+    if (!payload || typeof payload !== 'object'
+      || !Number.isInteger(payload.version) || payload.version < 0
+      || !payload.data || typeof payload.data !== 'object' || Array.isArray(payload.data)) {
+      return workspaceJSON(res, 400, {
+        error: 'PUT 需要 { version: 非负整数, data: 对象 }',
+        code: 'bad_payload',
+      })
+    }
+    const result = await commitWorkspace(payload)
+    if (result.corrupt) {
+      return workspaceJSON(res, 500, { error: workspaceCorrupt, code: 'workspace_corrupt' })
+    }
+    if (result.conflict) {
+      return workspaceJSON(res, 409, {
+        error: '工作区已被其他设备修改，请先拉取最新版本',
+        code: 'version_conflict',
+        version: workspace.version,
+      })
+    }
+    if (result.failure) {
+      return workspaceJSON(res, 500, {
+        error: `工作区写入失败：${result.failure}`,
+        code: 'workspace_write_failed',
+        version: workspace.version,
+      })
+    }
+    return workspaceJSON(res, 200, {
+      version: result.version,
+      updatedAt: result.updatedAt,
+    }, { etag: `"v${result.version}"` })
+  }
+  return workspaceJSON(res, 405, { error: '只支持 GET / PUT' }, { allow: 'GET, PUT' })
+}
+
+loadWorkspace()
 loadSubscriptions()
 
 setInterval(() => {
@@ -1150,6 +1384,24 @@ const server = createServer(async (req, res) => {
       rememberAPIToken(res)
     }
     if (url.pathname.startsWith('/api/')) {
+      // 工作区接口永远需要密钥：服务器模式下 127.0.0.1 也不例外，
+      // 否则局域网客户端伪造 Host 就能读写整份工作区。
+      const workspacePath = url.pathname === '/api/workspace'
+        || url.pathname === '/api/workspace/version'
+      const authExempt = apiAuthExempt(url, req.method)
+      // 同一 IP 连续认证失败后先冷却，连正确密钥也会短暂被拒。
+      const cooldown = authExempt ? 0 : authCooldownRemaining(req)
+      if (cooldown > 0) {
+        const retryAfter = Math.ceil(cooldown / 1000)
+        return send(res, 429, JSON.stringify({
+          error: `认证失败次数过多，请 ${retryAfter} 秒后再试`,
+          code: 'too_many_attempts',
+        }), {
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store',
+          'retry-after': String(retryAfter),
+        })
+      }
       // 容器宿主机与局域网客户端都可能表现为「私有地址 + Host: localhost」。
       // 关闭共享时只给它保留恢复设置所需的端点；订阅、规则集、代理等数据/代理
       // 端点不能因为伪造 Host 继续可用。
@@ -1163,14 +1415,37 @@ const server = createServer(async (req, res) => {
         && !(containerHostRequest && containerHostRecoveryPath)) {
         return json(res, 403, { error: '局域网共享已关闭', code: 'lan_disabled' })
       }
-      // 容器内 Host: localhost 只能用来识别宿主机页面，不能代替管理密钥；
-      // 否则局域网客户端伪造 Host 就能读取 settings.json 里的密钥。
-      if (serverSettings.apiToken
-        && !apiAuthExempt(url, req.method)
+      if (workspacePath) {
+        if (!SERVER_MODE) {
+          return json(res, 404, {
+            error: '服务器版未启用（TOWER_MODE=server）',
+            code: 'workspace_disabled',
+          })
+        }
+        if (!serverSettings.apiToken) {
+          return json(res, 401, {
+            error: '服务器模式必须设置访问密钥（TOWER_API_TOKEN）',
+            code: 'workspace_key_required',
+          })
+        }
+        if (!apiTokenMatches(presentedAPIToken(req, url))) {
+          recordAuthFailure(req)
+          return json(res, 401, { error: '访问密钥无效', code: 'auth_required' })
+        }
+        resetAuthFailures(req)
+      } else if (serverSettings.apiToken
+        && !authExempt
         && !loopbackRequest
         && !apiTokenMatches(presentedAPIToken(req, url))) {
+        // 容器内 Host: localhost 只能用来识别宿主机页面，不能代替管理密钥；
+        // 否则局域网客户端伪造 Host 就能读取 settings.json 里的密钥。
+        recordAuthFailure(req)
         return json(res, 401, { error: '需要访问密钥', code: 'auth_required' })
       }
+    }
+
+    if (url.pathname === '/api/workspace' || url.pathname === '/api/workspace/version') {
+      return await handleWorkspace(url, req, res)
     }
 
     if (url.pathname === '/api/auth-status') {
@@ -1482,6 +1757,12 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`[tower-web] companion server on http://127.0.0.1:${PORT}`)
+  if (SERVER_MODE) {
+    console.log(`[tower-web] 服务器模式：工作区保存在 ${WORKSPACE_FILE}`)
+    if (!serverSettings.apiToken) {
+      console.warn('[tower-web] 服务器模式必须设置访问密钥（TOWER_API_TOKEN），否则 /api/workspace 会拒绝所有请求')
+    }
+  }
   if (HOST === '0.0.0.0') {
     for (const u of lanUrls(PORT)) console.log(`[tower-web] 局域网可访问: ${u}`)
     console.log(`[tower-web] 局域网共享：${serverSettings.lanSharing ? '开启' : '关闭'} · API 密钥：${serverSettings.apiToken ? '已启用' : '未启用'}`)

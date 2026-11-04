@@ -52,6 +52,7 @@
     "selfcheck:regressions": "tsx scripts/selfcheck-regressions.ts",
     "selfcheck:remote": "tsx scripts/selfcheck-remote.ts",
     "selfcheck:rulesets": "tsx scripts/selfcheck-rulesets.ts",
+    "selfcheck:workspace": "tsx scripts/selfcheck-workspace.ts",
     "selfcheck:yaml": "tsx scripts/selfcheck-yaml.ts"
   },
   "dependencies": {
