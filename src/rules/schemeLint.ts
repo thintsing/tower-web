@@ -5,6 +5,8 @@ import { prepareSchemeForExport, resolveGroups, uniqueDisplayNames } from '../ge
 import { analyzeRuleCompatibility } from '../generator/compatibility'
 import { validateSchemePolicy } from './policyValidation'
 import { DOMAIN_TYPES } from './ruleMatcher'
+import { ruleSignature } from './ruleDiff'
+import { isTerminalRule } from './ruleKeys'
 
 export type LintLevel = 'error' | 'warn' | 'info'
 
@@ -30,6 +32,8 @@ export interface SchemeLintIssue {
   location: LintLocation
   /** 进一步的修正建议。 */
   hint?: string
+  /** 是否允许一键删除；跨组遮蔽或前置规则已失效时为 false。 */
+  deletable?: boolean
 }
 
 export interface SchemeLintOptions {
@@ -55,12 +59,13 @@ function ruleText(rule: RoutingRule): string {
   return `${rule.type}${rule.value ? `,${rule.value}` : ''}`
 }
 
-function ruleKey(rule: RoutingRule): string {
-  return `${rule.type}|${rule.value ?? ''}|${(rule.options ?? []).join(',')}|${rule.noResolve ? 'no-resolve' : ''}|${rule.raw ?? ''}`
-}
-
 function normalizeDomain(value: string | undefined): string {
   return (value ?? '').trim().toLowerCase().replace(/^\.+/, '').replace(/\.+$/, '')
+}
+
+/** 与 ruleDiff 的签名一致：忽略域名大小写 / 首尾点、选项顺序与空白。 */
+function ruleKey(rule: RoutingRule): string {
+  return ruleSignature(rule)
 }
 
 function locationForRule(rule: RoutingRule, index: number): LintLocation {
@@ -139,6 +144,7 @@ function findShadowedDomainRules(rules: RoutingRule[]): SchemeLintIssue[] {
         code: 'shadowedRule',
         message: `规则 ${ruleText(rule)} 永远不会命中：${reason}`,
         hint: '前序规则已经覆盖同样的请求，可删除这一条或调整顺序',
+        deletable: true,
         location: locationForRule(rule, index),
       })
     }
@@ -150,25 +156,30 @@ function findShadowedDomainRules(rules: RoutingRule[]): SchemeLintIssue[] {
   return issues
 }
 
-function findDuplicateRules(rules: RoutingRule[]): SchemeLintIssue[] {
+function findDuplicateRules(rules: RoutingRule[], dead: Set<number> = new Set()): SchemeLintIssue[] {
   const issues: SchemeLintIssue[] = []
   const seen = new Map<string, { index: number; rule: RoutingRule }>()
   rules.forEach((rule, index) => {
-    const type = (rule.type ?? '').toUpperCase()
-    if (type === 'FINAL' || type === 'MATCH') return
+    if (isTerminalRule(rule)) return
     const key = ruleKey(rule)
     const existing = seen.get(key)
     if (!existing) {
       seen.set(key, { index, rule })
       return
     }
+    const firstDead = dead.has(existing.index)
     if (existing.rule.group === rule.group) {
       issues.push({
         id: `dup:${index}`,
         level: 'info',
         code: 'duplicateRuleSameGroup',
-        message: `规则 ${ruleText(rule)} 与第 ${existing.index + 1} 条完全重复（同一个策略组）`,
-        hint: '重复规则不会改变结果，可以删除一条保持整洁',
+        message: firstDead
+          ? `规则 ${ruleText(rule)} 与第 ${existing.index + 1} 条重复（同一个策略组）；但第 ${existing.index + 1} 条本身已被更前面的规则遮蔽，不能据此判断后一条是否命中`
+          : `规则 ${ruleText(rule)} 与第 ${existing.index + 1} 条完全重复（同一个策略组）`,
+        hint: firstDead
+          ? '两条规则都已被更前面的规则遮蔽；清理前需要先确认前置规则的顺序'
+          : '重复规则不会改变结果，可以删除一条保持整洁',
+        deletable: !firstDead,
         location: locationForRule(rule, index),
       })
     } else {
@@ -176,13 +187,34 @@ function findDuplicateRules(rules: RoutingRule[]): SchemeLintIssue[] {
         id: `dup:${index}`,
         level: 'info',
         code: 'duplicateRule',
-        message: `规则 ${ruleText(rule)} 与第 ${existing.index + 1} 条完全重复，后一条永远不会命中（策略组 ${rule.group} 被前一条 ${existing.rule.group} 遮蔽）`,
-        hint: '删除后一条，或调整前一条的策略组',
+        message: firstDead
+          ? `规则 ${ruleText(rule)} 与第 ${existing.index + 1} 条等价，但第 ${existing.index + 1} 条本身已被更前面的规则遮蔽，不能据此判断后一条是否命中（策略组 ${rule.group} / ${existing.rule.group}）`
+          : `规则 ${ruleText(rule)} 与第 ${existing.index + 1} 条完全重复，后一条永远不会命中（策略组 ${rule.group} 被前一条 ${existing.rule.group} 遮蔽）`,
+        hint: firstDead
+          ? '前一条已失效，先处理遮蔽它的规则；不要直接删除后一条'
+          : '删除后一条，或调整前一条的策略组',
+        deletable: false,
         location: locationForRule(rule, index),
       })
     }
   })
   return issues
+}
+
+/**
+ * 本身不可达的规则下标：被更宽的域名/关键词规则遮蔽，或排在 FINAL/MATCH 之后。
+ * 清理重复前必须先排除这些「前一条」，否则会把假阳性当成安全删除。
+ */
+export function shadowedRuleIndexes(rules: RoutingRule[]): Set<number> {
+  const dead = new Set<number>()
+  for (const issue of findShadowedDomainRules(rules)) {
+    if (issue.location.ruleIndex !== undefined) dead.add(issue.location.ruleIndex)
+  }
+  const terminal = rules.findIndex((rule) => isTerminalRule(rule))
+  if (terminal >= 0) {
+    for (let index = terminal + 1; index < rules.length; index += 1) dead.add(index)
+  }
+  return dead
 }
 
 function groupNodeCount(group: PolicyGroup, nodes: ProxyNode[]): number {
@@ -392,8 +424,9 @@ export function lintScheme(options: SchemeLintOptions): SchemeLintIssue[] {
     preferRuleSets: false,
   })
   const rules = prepared.rules
+  const dead = shadowedRuleIndexes(rules)
   const issues = [
-    ...findDuplicateRules(rules),
+    ...findDuplicateRules(rules, dead),
     ...findShadowedDomainRules(rules),
     ...findGroupIssues(options, prepared),
     ...findRuleSetIssues(options, prepared),

@@ -136,8 +136,8 @@ docker run -d --name tower-web \
 推送 `v*.*.*` tag 后，GitHub Actions 会自动构建双架构镜像、推送 GHCR 并创建 Release：
 
 ```bash
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.3.1
+git push origin v0.3.1
 ```
 
 > 镜像默认允许局域网访问，可以在「订阅设置 → 局域网与访问密钥」关闭共享或生成 API 密钥；Docker 下生成首个密钥建议用 `TOWER_API_TOKEN`。`-p 8787:8787` 仍会暴露到局域网，只建议在可信网络使用。
@@ -225,7 +225,7 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 | `npm run selfcheck:workspace` | 校验服务器版工作区接口、版本号、密钥与并发写 |
 
 <details>
-<summary>全部 21 项自检</summary>
+<summary>全部 23 项自检</summary>
 
 ```text
 selfcheck:asn         离线 IP / ASN 查询
@@ -235,6 +235,7 @@ selfcheck:batch       批量订阅导入
 selfcheck:catalog     在线规则目录
 selfcheck:clients     客户端配置结构
 selfcheck:dns         DNS 投影 / 纯节点组 / ECS
+selfcheck:duplicates  重复规则清理：同组 / 跨组 / 前置失效 / 只读来源
 selfcheck:flow        四步状态推导与诊断
 selfcheck:importers   Clash / Surge / Egern / sing-box / INI 导入
 selfcheck:icons       策略组图标与能力矩阵
@@ -252,7 +253,7 @@ selfcheck:workspace   服务器版工作区：版本 / 304 / 409 / 密钥 / 坏�
 selfcheck:yaml        Clash YAML 结构
 ```
 
-自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 21 项自检。
+自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 23 项自检。
 
 </details>
 

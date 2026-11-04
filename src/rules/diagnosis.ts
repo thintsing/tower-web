@@ -19,7 +19,8 @@ export interface RankedIssue {
   reasons: string[]
 }
 
-const SAFE_DELETE_CODES = new Set(['duplicateRule', 'duplicateRuleSameGroup', 'shadowedRule'])
+// 跨组重复（duplicateRule）删除后会改变流量去向，不属于「安全删除」。
+const SAFE_DELETE_CODES = new Set(['duplicateRuleSameGroup', 'shadowedRule'])
 
 const LEVEL_WEIGHT: Record<string, number> = { error: 0, warn: 1, info: 2 }
 
@@ -218,14 +219,15 @@ export function buildFixActions(issue: SchemeLintIssue): FixAction[] {
     : undefined
   const goExport: FixAction = { kind: 'go-export', label: '去导出页调整客户端', detail: '在导出页选择支持这些规则的客户端，或关闭该客户端的导出。' }
 
-  if (SAFE_DELETE_CODES.has(issue.code)) {
+  if (SAFE_DELETE_CODES.has(issue.code) && issue.deletable !== false) {
+    const readOnlySetNote = '若这条规则来自在线 / 订阅规则集，删除只对当前方案快照生效，刷新规则集后会恢复。'
     return [
       {
         kind: 'delete-rule',
         label: issue.code === 'shadowedRule' ? '删除这条永远不命中的规则' : '删除重复的后一条规则',
         detail: issue.code === 'shadowedRule'
-          ? '它被前面的规则完全覆盖，删除不会改变任何匹配结果。'
-          : '保留前面那条即可，删除不会改变匹配结果。',
+          ? `它被前面的规则完全覆盖，删除不会改变任何匹配结果。${readOnlySetNote}`
+          : `保留前面那条即可，删除不会改变匹配结果。${readOnlySetNote}`,
         safe: true,
         ruleText: loc.rule,
         group: loc.group,
@@ -238,6 +240,26 @@ export function buildFixActions(issue: SchemeLintIssue): FixAction[] {
 
   const actions: FixAction[] = []
   switch (issue.code) {
+    case 'duplicateRule':
+      actions.push({
+        kind: 'manual',
+        label: '需你决定：删除后一条或调整前一条策略组',
+        detail: '两条规则等价但策略组不同，删除后一条会改变这些流量的去向。请确认意图后手动处理，或把它们移到前面并重排顺序。',
+        group: loc.group,
+        ruleText: loc.rule,
+        ruleIndex: loc.ruleIndex,
+      })
+      break
+    case 'duplicateRuleSameGroup':
+      actions.push({
+        kind: 'manual',
+        label: '先处理遮蔽前一条的规则',
+        detail: '前一条重复规则本身已被更前面的规则遮蔽，直接删后一条会让诊断结论失真；请先调整前置规则顺序。',
+        group: loc.group,
+        ruleText: loc.rule,
+        ruleIndex: loc.ruleIndex,
+      })
+      break
     case 'missingRuleTarget':
       actions.push({
         kind: 'manual',

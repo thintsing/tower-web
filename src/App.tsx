@@ -62,11 +62,15 @@ import { READONLY_NOTE, writeGuard } from './util/readOnlyUi'
 import { buildFlow, explainNodePool, type FlowStepKey } from './flow/flow'
 import { markExported, readExportedAt } from './flow/prefs'
 import { applyFixAction, type FixAction } from './rules/diagnosis'
+import { applyDuplicateCleanup, type DuplicateCleanupPlan } from './rules/duplicateCleanup'
 import { clearRuleSetHistory, digestRules, recordRuleSetSnapshot } from './rules/ruleSetHistory'
 import { lintScheme, lintSummary, type SchemeLintIssue } from './rules/schemeLint'
 
 const SELF_CONFIGURATION_NAME = 'Self-Configuration'
 const SELF_CONFIGURATION_URL = 'https://raw.githubusercontent.com/ClashConnectRules/Self-Configuration/main/Clash.yaml'
+
+/** 发布 token / 地址是设备偏好；隐私模式或配额满时不能把导出页一起拖崩。 */
+const localPrefs = createSafeStorage(browserStorage)
 
 // 地图与扫码只在对应面板出现时才加载，避免把 d3/map 和 jsQR 塞进首屏。
 const WorldMapSVG = lazy(() => import('./worldmap/WorldMapSVG').then((mod) => ({ default: mod.WorldMapSVG })))
@@ -6564,6 +6568,12 @@ function RulesTab({
 
 // ---------------- 规则诊断 Tab ----------------
 
+// 规则诊断页的「撤销本次清理」只在本机这次会话内有效。
+// 放在模块级而不是组件 state：诊断结果刷新会让子组件重渲染，
+// 组件内快照容易被重置，撤销按钮就会无声消失。
+// 快照绑定方案 id：撤销时能把用户带回被清理的那个方案，而不是只改一个看不见的方案。
+let cleanupUndoSnapshot: { scheme: RuleScheme; schemeID: string } | null = null
+
 function CheckTab({
   onGo,
   onLocate,
@@ -6605,32 +6615,72 @@ function CheckTab({
     sourceErrors,
   })
 
-  const applyFix = (action: FixAction): FixOutcome => {
-    if (!scheme) return { ok: false, message: '规则方案还没加载完成。' }
+  const canUndoCleanup = cleanupUndoSnapshot !== null
+
+  /** 选中内置方案时，先把当前内容复制成可编辑方案。保留已有 customRules，避免索引错位。 */
+  const ensureEditable = (): RuleScheme | null => {
+    if (!scheme) return null
     const state = useStore.getState()
     const existing = state.customSchemes.find((item) => item.id === scheme.id)
-    let editable = existing
-    if (!editable) {
-      const previousSelections = { ...state.policySelections }
-      editable = {
-        ...scheme,
-        id: `custom-${Date.now()}`,
-        name: `${stripSchemeCustomSuffix(scheme.name)} · 自定义`,
-        sourceKind: 'copy',
-        updatedAt: Date.now(),
-        customRules: [],
-      }
-      state.addCustomScheme(editable)
-      state.setScheme(editable.id)
-      for (const [group, selection] of Object.entries(previousSelections)) {
-        useStore.getState().setPolicy(group, selection)
-      }
+    if (existing) return existing
+    const previousSelections = { ...state.policySelections }
+    const editable: RuleScheme = {
+      ...scheme,
+      id: `custom-${Date.now()}`,
+      name: `${stripSchemeCustomSuffix(scheme.name)} · 自定义`,
+      sourceKind: 'copy',
+      updatedAt: Date.now(),
+      customRules: scheme.customRules ?? [],
     }
+    state.addCustomScheme(editable)
+    state.setScheme(editable.id)
+    for (const [group, selection] of Object.entries(previousSelections)) {
+      useStore.getState().setPolicy(group, selection)
+    }
+    return editable
+  }
+
+  const applyFix = (action: FixAction): FixOutcome => {
+    if (!scheme) return { ok: false, message: '规则方案还没加载完成。' }
+    // 先在当前方案上试算：规则不在了就不要复制出一个多余的「自定义」方案。
+    if (!applyFixAction(scheme, action)) return { ok: false, message: '没有找到这条规则，可能已被修改。' }
+    const editable = ensureEditable()
+    if (!editable) return { ok: false, message: '规则方案还没加载完成。' }
     const next = applyFixAction(editable, action)
     if (!next) return { ok: false, message: '没有找到这条规则，可能已被修改。' }
     useStore.getState().addCustomScheme({ ...next.scheme, updatedAt: Date.now() })
+    // 清理快照之后又做了别的修改，旧快照已过期，撤销会静默回滚这次修改。
+    cleanupUndoSnapshot = null
     const where = next.removedFrom === 'custom' ? '自定义规则' : next.removedFrom === 'ruleset' ? '规则集' : '方案规则'
     return { ok: true, message: `已从${where}删除「${next.removedText}」，方案已保存。` }
+  }
+
+  const cleanDuplicates = (plan: DuplicateCleanupPlan): FixOutcome => {
+    if (!plan.deletions.length) return { ok: false, message: '没有可安全删除的重复规则。' }
+    if (!scheme) return { ok: false, message: '规则方案还没加载完成。' }
+    // 同上：先确认计划在当前方案上仍然成立，再决定要不要复制方案。
+    if (!applyDuplicateCleanup(scheme, plan).removed) {
+      return { ok: false, message: '规则已经变化，请重新运行诊断后再清理。' }
+    }
+    const editable = ensureEditable()
+    if (!editable) return { ok: false, message: '规则方案还没加载完成。' }
+    const result = applyDuplicateCleanup(editable, plan)
+    if (!result.removed) return { ok: false, message: '规则已经变化，请重新运行诊断后再清理。' }
+    cleanupUndoSnapshot = { scheme: editable, schemeID: editable.id }
+    useStore.getState().addCustomScheme({ ...result.scheme, updatedAt: Date.now() })
+    return {
+      ok: true,
+      message: `已删除 ${result.removed} 条同组重复规则，方案已保存；可撤销本次清理。`,
+    }
+  }
+
+  const undoCleanup = (): FixOutcome => {
+    if (!cleanupUndoSnapshot) return { ok: false, message: '没有可撤销的清理。' }
+    const { scheme: snapshot, schemeID } = cleanupUndoSnapshot
+    cleanupUndoSnapshot = null
+    useStore.getState().addCustomScheme({ ...snapshot, updatedAt: Date.now() })
+    useStore.getState().setScheme(schemeID)
+    return { ok: true, message: '已撤销上一次重复规则清理，并切回被清理的方案。' }
   }
 
   return (
@@ -6671,6 +6721,9 @@ function CheckTab({
           historyRevision={ruleSetVersionHistory ? 1 : 0}
           onLocate={(issue) => onLocate?.(issue)}
           onApplyFix={applyFix}
+          onCleanDuplicates={cleanDuplicates}
+          onUndoCleanup={undoCleanup}
+          canUndoCleanup={canUndoCleanup}
           onGo={(key) => onGo?.(key)}
         />
       )}

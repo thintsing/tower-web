@@ -1,5 +1,5 @@
 // 规则诊断：围绕「这条流量为什么走这里 · 有什么变化 · 导出会不会丢语义」的一条链路。
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { LocalRuleSet, ProxyNode, RuleScheme } from '../models/types'
 import { compileScheme, explainWith, type ExplainedStep, type ExplainResult } from '../rules/ruleExplain'
 import { lintScheme, lintSummary, type LintLevel, type SchemeLintIssue } from '../rules/schemeLint'
@@ -13,11 +13,14 @@ import {
   type RankedIssue,
 } from '../rules/diagnosis'
 import { readRuleSetHistory, type RuleSetHistory } from '../rules/ruleSetHistory'
+import { analyzeDuplicateCleanup, type DuplicateCleanupPlan } from '../rules/duplicateCleanup'
 import { useWorkspaceStatus } from '../workspaceSync'
 import { READONLY_NOTE } from '../util/readOnlyUi'
 import { groupDisplayName } from './GroupIcon'
 
 const LEVEL_TITLES: Record<LintLevel, string> = { error: '错误', warn: '警告', info: '提示' }
+/** 数量可能上千的重复/遮蔽提示单独折叠，避免埋掉 3 条 error。 */
+const NOISE_CODES = new Set(['duplicateRule', 'duplicateRuleSameGroup', 'shadowedRule'])
 
 const STATUS_TITLES: Record<ExplainedStep['evaluation']['status'], string> = {
   match: '命中',
@@ -71,6 +74,12 @@ interface DiagnosisPanelProps {
   onLocate: (issue: SchemeLintIssue) => void
   /** 由 App 负责把修改落到自定义方案；返回是否成功。 */
   onApplyFix: (action: FixAction) => FixOutcome
+  /** 批量删除可安全清理的重复规则。 */
+  onCleanDuplicates: (plan: DuplicateCleanupPlan) => FixOutcome
+  /** 撤销上一次批量清理。 */
+  onUndoCleanup: () => FixOutcome
+  /** 当前会话是否存在可撤销的清理快照。 */
+  canUndoCleanup: boolean
   onGo: (key: 'sub' | 'rules' | 'export') => void
 }
 
@@ -86,6 +95,9 @@ export function DiagnosisPanel({
   historyRevision = 0,
   onLocate,
   onApplyFix,
+  onCleanDuplicates,
+  onUndoCleanup,
+  canUndoCleanup,
   onGo,
 }: DiagnosisPanelProps) {
   const [input, setInput] = useState('www.google.com')
@@ -95,7 +107,12 @@ export function DiagnosisPanel({
   const [showAllChain, setShowAllChain] = useState(false)
   const [fixNote, setFixNote] = useState('')
   const [lastFix, setLastFix] = useState<{ code: string; ruleText?: string } | null>(null)
+  const [cleanupOpen, setCleanupOpen] = useState(false)
+  const [cleanupNote, setCleanupNote] = useState('')
+  const cleanupBusy = useRef(false)
   const [error, setError] = useState('')
+  const cleanupDialog = useRef<HTMLDialogElement>(null)
+  const readOnly = useWorkspaceStatus().readOnly
 
   const compiled = useMemo(
     () => (scheme
@@ -133,10 +150,23 @@ export function DiagnosisPanel({
     ? rankLintIssues(lintState.issues, result, scheme)
     : []
   const { relevant, others } = splitRanked(ranked)
+  const cleanup = useMemo(
+    () => (scheme && result ? analyzeDuplicateCleanup(scheme) : null),
+    [scheme, result],
+  )
+  const noiseItems = ranked.filter((item) => NOISE_CODES.has(item.issue.code))
+  // error / warn 以及其它可操作提示优先展示；重复/遮蔽单独折叠。
+  const signalRelevant = relevant.filter((item) => !NOISE_CODES.has(item.issue.code))
+  const signalOthers = others.filter((item) => !NOISE_CODES.has(item.issue.code))
 
   useEffect(() => {
     setError('')
   }, [submitted])
+
+  useEffect(() => {
+    if (cleanupOpen) cleanupDialog.current?.showModal()
+    else cleanupDialog.current?.close()
+  }, [cleanupOpen])
 
   const run = () => {
     const value = input.trim()
@@ -175,6 +205,29 @@ export function DiagnosisPanel({
     setBaselineQuery(submitted)
     setLastFix({ code: issue.code, ruleText: issue.location.rule })
     setFixNote(outcome.message)
+  }
+
+  const confirmCleanup = () => {
+    if (!cleanup || !result || cleanupBusy.current) return
+    cleanupBusy.current = true
+    try {
+      const outcome = onCleanDuplicates(cleanup)
+      setCleanupNote(outcome.message)
+      if (outcome.ok) {
+        setBaseline(result)
+        setBaselineQuery(submitted)
+        setLastFix(null)
+        setFixNote('')
+      }
+      setCleanupOpen(false)
+    } finally {
+      cleanupBusy.current = false
+    }
+  }
+
+  const undoCleanup = () => {
+    const outcome = onUndoCleanup()
+    setCleanupNote(outcome.message)
   }
 
   const stillPresent = lastFix
@@ -386,14 +439,66 @@ export function DiagnosisPanel({
                 {lintState.summary.error} error · {lintState.summary.warn} warn · {lintState.summary.info} info
               </span>
             </div>
-            {relevant.length === 0 ? (
+            {cleanup && cleanup.total > 0 && (
+              <div className="diag-cleanup">
+                <div className="diag-cleanup-copy">
+                  <strong>重复 / 遮蔽规则</strong>
+                  <span className="diag-cleanup-count">
+                    {cleanup.total} 条 · 可安全删除 {cleanup.deletions.length} 条
+                    {cleanup.deletions.length > 0 && ` · 涉及 ${cleanup.groups} 个策略组`}
+                  </span>
+                  <div className="diag-cleanup-skip">
+                    {cleanup.skipped.readOnly.length > 0 && (
+                      <span>只读来源 {cleanup.skipped.readOnly.length} 条（无法删除）</span>
+                    )}
+                    {cleanup.skipped.crossGroup.length > 0 && (
+                      <span>跨组遮蔽 {cleanup.skipped.crossGroup.length} 条（需你决定）</span>
+                    )}
+                    {cleanup.skipped.deadPredecessor.length > 0 && (
+                      <span>前置规则已失效 {cleanup.skipped.deadPredecessor.length} 条</span>
+                    )}
+                  </div>
+                  {cleanupNote && <div className="diag-hint">{cleanupNote}</div>}
+                </div>
+                <div className="diag-cleanup-actions">
+                  <button
+                    className="btn primary"
+                    disabled={readOnly || cleanup.deletions.length === 0}
+                    title={readOnly ? READONLY_NOTE : '确认后一次性删除同组纯冗余规则'}
+                    onClick={() => setCleanupOpen(true)}
+                  >
+                    一键清理重复规则
+                  </button>
+                  {canUndoCleanup && (
+                    <button className="btn ghost" disabled={readOnly} onClick={undoCleanup}>撤销本次清理</button>
+                  )}
+                </div>
+              </div>
+            )}
+            {canUndoCleanup && (!cleanup || cleanup.total === 0) && (
+              // 清理干净后 total 变为 0，上面的卡片会整体隐藏；撤销入口必须独立保留，
+              // 否则「删完才发现删错」时用户根本点不到撤销。
+              <div className="diag-cleanup">
+                <div className="diag-cleanup-copy">
+                  <strong>最近一次清理</strong>
+                  <span className="diag-cleanup-count">重复规则已删除并保存，可撤销回到清理前的方案。</span>
+                </div>
+                <div className="diag-cleanup-actions">
+                  <button className="btn ghost" disabled={readOnly} onClick={undoCleanup}>撤销本次清理</button>
+                </div>
+              </div>
+            )}
+            {signalRelevant.length === 0 ? (
               <div className="diag-context-empty">
-                <strong>没有和这条流量直接相关的发现</strong>
-                <span>方案整体还有 {others.length} 条检查项，它们在这次判定链路之外。需要时可以展开查看。</span>
+                <strong>没有和这条流量直接相关的 error / warn</strong>
+                <span>
+                  方案整体还有 {signalOthers.length} 条其它检查项
+                  {noiseItems.length > 0 && `，另有 ${noiseItems.length} 条重复/遮蔽提示已折叠在下方`}。
+                </span>
               </div>
             ) : (
               <ul className="diag-issues">
-                {relevant.slice(0, 8).map((item) => (
+                {signalRelevant.slice(0, 8).map((item) => (
                   <IssueCard
                     key={item.issue.id}
                     item={item}
@@ -404,14 +509,14 @@ export function DiagnosisPanel({
                 ))}
               </ul>
             )}
-            {relevant.length > 8 && (
-              <div className="diag-meta">还有 {relevant.length - 8} 条相关内容，建议先修完上面的高相关项。</div>
+            {signalRelevant.length > 8 && (
+              <div className="diag-meta">还有 {signalRelevant.length - 8} 条相关内容，建议先修完上面的高相关项。</div>
             )}
-            {others.length > 0 && (
-              <details className="diag-others">
-                <summary>其他 {others.length} 条与这次查询无关的检查项</summary>
+            {noiseItems.length > 0 && (
+              <details className="diag-noise">
+                <summary>重复 / 遮蔽提示 {noiseItems.length} 条（默认折叠）</summary>
                 <ul className="diag-issues">
-                  {others.slice(0, 30).map((item) => (
+                  {noiseItems.slice(0, 20).map((item) => (
                     <IssueCard
                       key={item.issue.id}
                       item={item}
@@ -421,7 +526,26 @@ export function DiagnosisPanel({
                     />
                   ))}
                 </ul>
-                {others.length > 30 && <div className="diag-meta">仅显示前 30 条。</div>}
+                {noiseItems.length > 20 && (
+                  <div className="diag-meta">仅显示前 20 条；用上方「一键清理」可先处理同组纯冗余。</div>
+                )}
+              </details>
+            )}
+            {signalOthers.length > 0 && (
+              <details className="diag-others">
+                <summary>其他 {signalOthers.length} 条与这次查询无关的检查项</summary>
+                <ul className="diag-issues">
+                  {signalOthers.slice(0, 30).map((item) => (
+                    <IssueCard
+                      key={item.issue.id}
+                      item={item}
+                      onApplyFix={performFix}
+                      onLocate={onLocate}
+                      onGo={onGo}
+                    />
+                  ))}
+                </ul>
+                {signalOthers.length > 30 && <div className="diag-meta">仅显示前 30 条。</div>}
               </details>
             )}
           </section>
@@ -478,6 +602,59 @@ export function DiagnosisPanel({
           <strong>还没有诊断结果</strong>
           <span>输入一条域名或 IP 并运行，就能同时看到命中链路、规则集变更、相关风险和修复动作。</span>
         </div>
+      )}
+
+      {cleanup && (
+        <dialog
+          ref={cleanupDialog}
+          className="diag-cleanup-dialog"
+          onClose={() => setCleanupOpen(false)}
+          aria-labelledby="diag-cleanup-title"
+        >
+          <h3 id="diag-cleanup-title">清理重复规则</h3>
+          <p>
+            将删除 <strong>{cleanup.deletions.length}</strong> 条规则，涉及{' '}
+            <strong>{cleanup.groups}</strong> 个策略组。
+          </p>
+          <div className="diag-cleanup-skip is-dialog">
+            {cleanup.skipped.readOnly.length > 0 && (
+              <span>只读来源 {cleanup.skipped.readOnly.length} 条：位于在线 / 内置规则集，无法删除</span>
+            )}
+            {cleanup.skipped.crossGroup.length > 0 && (
+              <span>跨组遮蔽 {cleanup.skipped.crossGroup.length} 条：删除会改变路由，未自动删除</span>
+            )}
+            {cleanup.skipped.deadPredecessor.length > 0 && (
+              <span>前置规则已失效 {cleanup.skipped.deadPredecessor.length} 条：前一条本身不会命中，不据此删除</span>
+            )}
+          </div>
+          {cleanup.skipped.crossGroup.length > 0 && (
+            <div className="diag-cleanup-cross">
+              <strong>需你决定：跨组遮蔽 {cleanup.skipped.crossGroup.length} 条</strong>
+              <p>下面这些后一条规则与前面的规则等价，但策略组不同；自动删除会静默丢掉后一条的分流意图。</p>
+              <ul>
+                {cleanup.skipped.crossGroup.slice(0, 6).map((item) => (
+                  <li key={`${item.index}-${item.ruleText}`}>
+                    第 {item.index} 条 <span className="mono">{item.ruleText}</span>
+                    <span className="diag-meta">「{item.firstGroup}」→「{item.group}」</span>
+                  </li>
+                ))}
+              </ul>
+              {cleanup.skipped.crossGroup.length > 6 && (
+                <div className="diag-meta">还有 {cleanup.skipped.crossGroup.length - 6} 条，请到规则页单独处理。</div>
+              )}
+            </div>
+          )}
+          <p className="diag-hint">
+            只删除「类型与归一化值相同、选项相同、同组、且前一条确实可达」的后一条规则。
+            删除后可在风险区撤销本次清理。
+          </p>
+          <div className="actions">
+            <button className="btn primary" disabled={readOnly} onClick={confirmCleanup}>
+              确认删除 {cleanup.deletions.length} 条
+            </button>
+            <button className="btn ghost" autoFocus onClick={() => setCleanupOpen(false)}>取消</button>
+          </div>
+        </dialog>
       )}
     </div>
   )
