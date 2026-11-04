@@ -11,7 +11,7 @@ import { connect, isIP } from 'node:net'
 import { execFile } from 'node:child_process'
 import { lookup } from 'node:dns/promises'
 import { networkInterfaces } from 'node:os'
-import { readFile } from 'node:fs/promises'
+import { readFile, rename, writeFile } from 'node:fs/promises'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join, dirname, extname, normalize, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -32,6 +32,10 @@ const PUBLIC_URL = (() => {
 const distDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist')
 const publicRulesetsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'public', 'rulesets')
 const distRulesetsDir = join(distDir, 'rulesets')
+
+// 单次订阅响应的上限（解压后）。没有上限时一个超大响应就能把进程内存吃光。
+const MAX_FETCH_BYTES = 32 * 1024 * 1024
+const MAX_FETCH_LABEL = '32MB'
 
 /** 虚拟网卡（VMware / VirtualBox / Hyper-V / Tailscale …）排在真实网卡之后。 */
 const VIRTUAL_IFACE = /(vmware|virtualbox|vethernet|hyper-v|wsl|docker|tailscale|zerotier|loopback)/i
@@ -87,6 +91,27 @@ function ruleSetCacheKey(query) {
   return `${format}|${behavior}|${file ? `file:${file}` : `url:${remote}`}`
 }
 
+/**
+ * 云元数据 / 链路本地地址不可能是合法规则集来源。
+ * `/api/ruleset?url=` 是免密钥的公开端点（客户端要直接拉取），因此在这里
+ * 挡掉最常见的 SSRF 探测目标；局域网 NAS 等私有地址仍然允许。
+ */
+const BLOCKED_RULESET_HOSTS = new Set([
+  '169.254.169.254',
+  '100.100.100.200',
+  'fd00:ec2::254',
+  'metadata',
+  'metadata.google.internal',
+  'metadata.tencentyun.com',
+])
+
+function isBlockedRuleSetTarget(target) {
+  const host = target.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  return BLOCKED_RULESET_HOSTS.has(host)
+    || host.startsWith('169.254.')
+    || host.endsWith('.metadata.google.internal')
+}
+
 /** 读取内置规则文件或抓取远程列表，再转换成目标客户端方言。 */
 async function buildRuleSetArtifact(query) {
   const format = String(query.get('format') ?? '').toLowerCase()
@@ -125,6 +150,9 @@ async function buildRuleSetArtifact(query) {
     }
     if (target.protocol !== 'http:' && target.protocol !== 'https:') {
       throw new RuleSetConversionError('只支持 http/https 规则集地址', 400)
+    }
+    if (isBlockedRuleSetTarget(target)) {
+      throw new RuleSetConversionError('规则集地址不能指向链路本地或云元数据服务', 400)
     }
     let response
     try {
@@ -364,16 +392,52 @@ function loadSubscriptions() {
   }
 }
 
-function persistSubscriptions() {
+let persistRunning = false
+let persistAgain = false
+
+async function persistSubscriptions() {
+  // 10MB 级的 subscriptions.json 同步 stringify + writeFileSync 会阻塞事件
+  // 循环约 40ms；改成串行异步落盘，发布请求立即返回，合并并发写入。
+  if (persistRunning) {
+    persistAgain = true
+    return
+  }
+  persistRunning = true
+  try {
+    do {
+      persistAgain = false
+      try {
+        mkdirSync(DATA_DIR, { recursive: true })
+        // 先写临时文件再替换，避免进程在写入中途退出时留下半截 JSON。
+        const temp = `${SUBS_FILE}.tmp`
+        await writeFile(temp, JSON.stringify(Object.fromEntries(subscriptions)), 'utf8')
+        await rename(temp, SUBS_FILE)
+      } catch (err) {
+        console.error('[tower] 订阅落盘失败:', err.message)
+      }
+    } while (persistAgain)
+  } finally {
+    persistRunning = false
+  }
+}
+
+/** 退出前把待写内容同步落盘，避免刚发布就丢。 */
+function flushSubscriptionsSync() {
   try {
     mkdirSync(DATA_DIR, { recursive: true })
-    // 先写临时文件再替换，避免进程在写入中途退出时留下半截 JSON。
     const temp = `${SUBS_FILE}.tmp`
     writeFileSync(temp, JSON.stringify(Object.fromEntries(subscriptions)), 'utf8')
     renameSync(temp, SUBS_FILE)
   } catch (err) {
     console.error('[tower] 订阅落盘失败:', err.message)
   }
+}
+
+for (const signal of ['SIGTERM', 'SIGINT']) {
+  process.once(signal, () => {
+    flushSubscriptionsSync()
+    process.exit(0)
+  })
 }
 
 loadSubscriptions()
@@ -782,16 +846,30 @@ function requestOnce(target, userAgent, dohEndpoint) {
         'accept-encoding': 'gzip, deflate, br',
       },
     }, (upstream) => {
+      const declared = Number(headerValue(upstream.headers, 'content-length') ?? 0)
+      if (Number.isFinite(declared) && declared > MAX_FETCH_BYTES) {
+        upstream.destroy(new Error(`订阅内容超过 ${MAX_FETCH_LABEL} 上限`))
+        return
+      }
       const chunks = []
-      upstream.on('data', (chunk) => chunks.push(chunk))
+      let size = 0
+      upstream.on('data', (chunk) => {
+        size += chunk.length
+        // 不设上限时一个恶意/异常订阅就能把进程内存吃光。
+        if (size > MAX_FETCH_BYTES) {
+          upstream.destroy(new Error(`订阅内容超过 ${MAX_FETCH_LABEL} 上限`))
+          return
+        }
+        chunks.push(chunk)
+      })
       upstream.on('error', reject)
       upstream.on('end', () => {
         let body = Buffer.concat(chunks)
         try {
           const encoding = String(headerValue(upstream.headers, 'content-encoding') ?? '').toLowerCase()
-          if (encoding.includes('br')) body = brotliDecompressSync(body)
-          else if (encoding.includes('gzip')) body = gunzipSync(body)
-          else if (encoding.includes('deflate')) body = inflateSync(body)
+          if (encoding.includes('br')) body = brotliDecompressSync(body, { maxOutputLength: MAX_FETCH_BYTES })
+          else if (encoding.includes('gzip')) body = gunzipSync(body, { maxOutputLength: MAX_FETCH_BYTES })
+          else if (encoding.includes('deflate')) body = inflateSync(body, { maxOutputLength: MAX_FETCH_BYTES })
         } catch (error) {
           reject(new Error(`订阅响应解压失败：${error.message}`))
           return
@@ -803,6 +881,33 @@ function requestOnce(target, userAgent, dohEndpoint) {
     req.on('error', reject)
     req.end()
   })
+}
+
+/** 流式读取并限制体积；fetch 会在读取时解压，因此上限作用于解压后的内容。 */
+async function readLimitedBody(response) {
+  const declared = Number(headerValue(response.headers, 'content-length') ?? 0)
+  if (Number.isFinite(declared) && declared > MAX_FETCH_BYTES) {
+    throw new Error(`订阅内容超过 ${MAX_FETCH_LABEL} 上限`)
+  }
+  if (!response.body) return Buffer.alloc(0)
+  const reader = response.body.getReader()
+  const chunks = []
+  let size = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      size += value.byteLength
+      if (size > MAX_FETCH_BYTES) {
+        await reader.cancel().catch(() => {})
+        throw new Error(`订阅内容超过 ${MAX_FETCH_LABEL} 上限`)
+      }
+      chunks.push(Buffer.from(value))
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  return Buffer.concat(chunks, size)
 }
 
 async function fetchWithDoH(target, userAgent, dohEndpoint) {
@@ -860,10 +965,16 @@ async function handleFetch(url, options, res) {
     if ('error' in response) {
       return json(res, 502, { error: `订阅服务器无法访问：${response.error?.message ?? '网络错误'}` })
     }
+    let body
+    try {
+      body = await readLimitedBody(response)
+    } catch (error) {
+      return json(res, 502, { error: `订阅内容读取失败：${error?.message ?? '网络错误'}` })
+    }
     upstream = {
       status: response.status,
       headers: response.headers,
-      body: Buffer.from(await response.arrayBuffer()),
+      body,
     }
   }
 
