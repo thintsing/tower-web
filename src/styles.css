@@ -2906,6 +2906,38 @@ dialog h3 { font-family: var(--font-display); font-size: 20px; font-weight: 600;
   font-size: 12px;
   animation: rise-in 420ms var(--ease-out) both;
 }
+.storage-alert {
+  position: fixed;
+  z-index: 60;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(680px, calc(100vw - 32px));
+  padding: 10px 12px;
+  border-left: 2px solid var(--negative, #c0392b);
+  border-radius: 0 6px 6px 0;
+  background: var(--pill-negative-bg, #fdf1ef);
+  color: var(--pill-negative-ink, #8c2f1f);
+  font-size: 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+}
+.storage-alert span {
+  flex: 1;
+  line-height: 1.5;
+}
+.storage-alert-close {
+  flex: none;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: underline;
+}
 .health-bar {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

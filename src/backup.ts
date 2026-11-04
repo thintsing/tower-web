@@ -148,12 +148,16 @@ function normalizedUsage(value: unknown): SubscriptionUsage | undefined {
   return matched ? usage : undefined
 }
 
-function normalizeSource(value: SubscriptionSource): SubscriptionSource {
+export function normalizeSource(value: SubscriptionSource): SubscriptionSource {
   const usage = normalizedUsage(value.usage)
   const derived = usageFieldsFrom(usage)
   return {
     ...value,
     usage,
+    // 旧快照/旧备份可能没有这两个字段；补成默认值，否则界面读取
+    // excludedNodeKeys.length 会直接抛错，订阅也永远刷新失败。
+    isEnabled: value.isEnabled === false ? false : true,
+    excludedNodeKeys: Array.isArray(value.excludedNodeKeys) ? value.excludedNodeKeys : [],
     // 旧备份只有 usage；恢复时补出新字段，损坏字段则回退到 usage 推导。
     expireAt: typeof value.expireAt === 'number' && Number.isFinite(value.expireAt) && value.expireAt >= 0
       ? value.expireAt

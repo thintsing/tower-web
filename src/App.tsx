@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode, type SyntheticEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, lazy, Suspense, type ReactNode, type SyntheticEvent } from 'react'
 import { renderSVG } from 'uqr'
 import { CLIENTS, PROXY_KIND_TITLES, clientSupportsImport, subFormatFor, subscriptionUsageSummary, type ClientInfo, type ClientTarget, type ExportContentMode, type LatencyTestMode, type LocalRuleSet, type NodeNameFilterSettings, type PolicyGroup, type ProxyKind, type ProxyNode, type RemoteSubscriptionEntry, type RoutingRule, type RuleScheme, type RuleSetFormat, type SchemeRuleSet, type SubFormat, type SubscriptionSource, type TailnetConnection, type TailnetExport } from './models/types'
 import { allRegions, filterNodesByRegionCodes, regionForName, regionForNode } from './models/region'
@@ -33,7 +33,6 @@ import { buildNodeFilterGroup, nextGroupName, previewNodeMatches, removePolicyGr
 import { ONLINE_RULE_CATALOG } from './rules/ruleCatalog'
 import type { ManualNodeImportResult } from './manualNodes'
 import { MAX_BATCH_SUBSCRIPTIONS, splitSubscriptionURLs, subscriptionLabel } from './batchSubscriptions'
-import { WorldMapSVG } from './worldmap/WorldMapSVG'
 import { generateConfig, generateSubscriptionFormats } from './generator'
 import { nodeShareText } from './generator/shareLink'
 import { nodeTransportCapability } from './generator/nodeCapabilities'
@@ -42,6 +41,7 @@ import { formatSupportsProxyCollections, prepareSchemeForExport } from './genera
 import { autoFillGroupEmojis } from './generator/groupIcons'
 import { maskTailnetAuthKeys, tailnetSupports } from './generator/tailnet'
 import { copyToClipboard, newID } from './util/browser'
+import { clearTowerStorage, isStorageFull, onStorageFullChange } from './util/localStore'
 import { placeDetailsPanel, placeOpenDetailsPanels } from './util/menuPlacement'
 import { apiFetch, clearAPIKey, getAPIKey, setAPIKey } from './util/apiAuth'
 import { normalizeRemoteTextURL } from './util/remoteURL'
@@ -50,7 +50,6 @@ import { RouteIllustration } from './components/RouteIllustration'
 import { GroupIcon, groupDisplayName } from './components/GroupIcon'
 import { TailnetIllustration } from './components/TailnetIllustration'
 import { ManualNodeEditorDialog } from './components/ManualNodeEditorDialog'
-import { QrScanner } from './components/QrScanner'
 import { RulesToolsCard } from './components/RulesToolsCard'
 import { DiagnosisPanel, type FixOutcome } from './components/DiagnosisPanel'
 import { FlowRail } from './components/FlowRail'
@@ -63,6 +62,10 @@ import { lintScheme, lintSummary, type SchemeLintIssue } from './rules/schemeLin
 
 const SELF_CONFIGURATION_NAME = 'Self-Configuration'
 const SELF_CONFIGURATION_URL = 'https://raw.githubusercontent.com/ClashConnectRules/Self-Configuration/main/Clash.yaml'
+
+// 地图与扫码只在对应面板出现时才加载，避免把 d3/map 和 jsQR 塞进首屏。
+const WorldMapSVG = lazy(() => import('./worldmap/WorldMapSVG').then((mod) => ({ default: mod.WorldMapSVG })))
+const QrScanner = lazy(() => import('./components/QrScanner').then((mod) => ({ default: mod.QrScanner })))
 
 /** 顶部工作区。跨页面跳转（上手流程 / 导出补救）需要它。 */
 type TabKey = 'sub' | 'rules' | 'check' | 'tailnet' | 'export'
@@ -843,7 +846,9 @@ function AddSourceDialog({
             </details>
           </>
         ) : mode === 'scan' ? (
-          <QrScanner onDecoded={handleScan} />
+          <Suspense fallback={<div className="hint">扫码组件加载中…</div>}>
+            <QrScanner onDecoded={handleScan} />
+          </Suspense>
         ) : mode === 'uri' ? (
           <>
             <div className="field">
@@ -1790,7 +1795,7 @@ function SubscriptionSettingsDialog({
                 type="button"
                 className="btn danger"
                 onClick={() => {
-                  localStorage.clear()
+                  clearTowerStorage()
                   window.location.reload()
                 }}
               >确认重置</button>
@@ -3659,17 +3664,19 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
               {selectedCode ? `选中：${selectedCode} · 点击空白取消` : '缩放 / 拖动 / 点击地区查看节点'}
             </div>
           </div>
-          <WorldMapSVG
-            nodes={enabled}
-            latencyByNodeId={latencyMap}
-            selectedCode={selectedCode}
-            onSelect={setSelectedCode}
-            testing={testingAny}
-            onTest={() => {
-              if (testingAny) stopTesting()
-              else startTesting(enabledIds)
-            }}
-          />
+          <Suspense fallback={<div className="hint">地图加载中…</div>}>
+            <WorldMapSVG
+              nodes={enabled}
+              latencyByNodeId={latencyMap}
+              selectedCode={selectedCode}
+              onSelect={setSelectedCode}
+              testing={testingAny}
+              onTest={() => {
+                if (testingAny) stopTesting()
+                else startTesting(enabledIds)
+              }}
+            />
+          </Suspense>
         </div>
       )}
 
@@ -6557,7 +6564,7 @@ function CheckTab({
     [sources, errors],
   )
   const manualCount = useMemo(
-    () => nodes.filter((node) => node.isManual && node.isEnabled !== false).length,
+    () => nodes.filter((node) => node.isManual).length,
     [nodes],
   )
   const excludedCount = useMemo(() => {
@@ -8201,6 +8208,9 @@ export function App() {
   const autoRefreshStarted = useRef(false)
   const ruleSetAutoRefreshStarted = useRef(false)
   const keysPruned = useRef(false)
+  const [storageFull, setStorageFull] = useState(isStorageFull)
+
+  useEffect(() => onStorageFullChange(setStorageFull), [])
 
   // 四步主线需要跨页读取同一份数据；方案本身仍然走缓存加载。
   const scheme = useScheme()
@@ -8228,7 +8238,7 @@ export function App() {
     [sources, errors],
   )
   const manualNodeCount = useMemo(
-    () => nodes.filter((node) => node.isManual && node.isEnabled !== false).length,
+    () => nodes.filter((node) => node.isManual).length,
     [nodes],
   )
   const excludedNodeCount = useMemo(() => {
@@ -8399,6 +8409,15 @@ export function App() {
   return (
     <div className="app-shell">
       <LANAccessGate />
+      {storageFull && (
+        <div className="storage-alert" role="alert">
+          <strong>浏览器存储已满</strong>
+          <span>当前修改只保留在内存中，刷新后会丢失。请到「导出」页保存备份，再清理不需要的订阅或规则方案。</span>
+          <button className="storage-alert-close" type="button" onClick={() => setStorageFull(false)}>
+            知道了
+          </button>
+        </div>
+      )}
       <aside
         className={`sidebar${sidebarOpen ? ' open' : ''}`}
       >

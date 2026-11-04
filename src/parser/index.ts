@@ -208,12 +208,24 @@ function containsNodeScheme(text: string): boolean {
   return NODE_SCHEMES.some((s) => lower.includes(s))
 }
 
+/** Clash / mihomo YAML 的顶层键，用来识别被 base64 包裹的配置。 */
+const CLASH_TOP_LEVEL_KEY = /^\s*(proxies|proxy-groups|proxy-providers|mixed-port|port|socks-port|allow-lan|mode|dns)\s*:/m
+
+function looksLikeSubscriptionContent(text: string): boolean {
+  return containsNodeScheme(text)
+    || text.startsWith('{')
+    || text.startsWith('[')
+    || text.includes('proxies:')
+    || containsClientProxySection(text)
+    || CLASH_TOP_LEVEL_KEY.test(text)
+}
+
 export function parse(data: string, sourceID?: string): ParsedContent {
   let text = data.trim()
 
   if (!containsNodeScheme(text)) {
     const decoded = decodeBase64String(text)?.trim()
-    if (decoded && (containsNodeScheme(decoded) || decoded.startsWith('{') || decoded.startsWith('['))) {
+    if (decoded && looksLikeSubscriptionContent(decoded)) {
       text = decoded
     }
   }

@@ -2,16 +2,18 @@
 // Persisted to localStorage; nothing leaves the machine except the
 // subscription fetches the user explicitly triggers (via /api/fetch).
 import { create } from 'zustand'
-import { persist } from 'zustand/middleware'
+import { createJSONStorage, persist } from 'zustand/middleware'
 import type { AppState, ClientTarget, ExportContentMode, LatencyTestMethod, LatencyTestMode, LocalRuleSet, NodeNameFilterSettings, ProxyKind, ProxyNode, RuleScheme, SubscriptionRequestOptions, SubscriptionSource, SubscriptionUsage, TailnetConnection } from './models/types'
 import { usageFieldsFrom } from './models/types'
 import { loadTailnetAuthKeys, persistTailnetAuthKeys, pruneTailnetAuthKeys } from './models/tailnetAuthKeys'
 import type { PersistedData } from './backup'
+import { normalizeSource } from './backup'
 import { prepareManualNodes, type ManualNodeImportResult } from './manualNodes'
 import { mergeUsage, parse, parseUserinfoHeader } from './parser'
 import { apiFetch } from './util/apiAuth'
 import { nodeTransportCapability } from './generator/nodeCapabilities'
 import { newID } from './util/browser'
+import { browserStorage, createSafeStorage } from './util/localStore'
 
 export interface Store extends AppState {
   loadingSourceIDs: string[]
@@ -264,7 +266,7 @@ function looseKey(node: ProxyNode): string {
 function carriedOverExclusions(
   oldNodes: ProxyNode[],
   newNodes: ProxyNode[],
-  excludedKeys: string[],
+  excludedKeys: string[] = [],
 ): string[] {
   if (!excludedKeys.length) return []
   const excludedSet = new Set(excludedKeys)
@@ -904,7 +906,21 @@ export const useStore = create<Store>()(
     }),
     {
       name: 'tower-web-state',
+      // 配额满时只标记状态、不抛出：否则每个 set() 都会让界面操作失败。
+      storage: createJSONStorage(() => createSafeStorage(browserStorage)),
       partialize: persistedSnapshot,
+      // 旧版本快照可能缺少 excludedNodeKeys / isEnabled，必须在这里补齐，
+      // 否则渲染和刷新会读到 undefined 直接抛错。
+      merge: (persisted, current) => {
+        const data = persisted as Partial<PersistedData> | undefined
+        return {
+          ...current,
+          ...(data ?? {}),
+          sources: Array.isArray(data?.sources)
+            ? data.sources.map(normalizeSource)
+            : current.sources,
+        }
+      },
     },
   ),
 )

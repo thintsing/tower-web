@@ -48,13 +48,20 @@ export function uniqueDisplayNames(
   escape: (s: string) => string,
   nameFor?: (node: ProxyNode) => string,
 ): Map<string, string> {
-  const taken = new Map<string, number>()
   const out = new Map<string, string>()
+  const used = new Set<string>()
   for (const node of nodes) {
     const base = escape(nameFor?.(node) ?? node.name)
-    const count = taken.get(base) ?? 0
-    taken.set(base, count + 1)
-    out.set(node.id, count === 0 ? base : `${base} ${count + 1}`)
+    // 不能只按 base 计数：已有节点本来就叫 "A 2" 时，第三个 "A" 会被
+    // 补成 "A 2" 并与之重名，客户端会因此拒绝整份配置。
+    let name = base
+    let suffix = 2
+    while (used.has(name)) {
+      name = `${base} ${suffix}`
+      suffix += 1
+    }
+    used.add(name)
+    out.set(node.id, name)
   }
   return out
 }
