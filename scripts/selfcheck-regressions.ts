@@ -618,6 +618,115 @@ await checkAsync('只读模式只拦工作区字段，设备偏好保持可写',
   }
 })
 
+// ---------- 11b. 只读模式：逐类调用写入口，工作区与 Auth Key 缓存都不变 ----------
+await checkAsync('只读模式下所有工作区写入口都无效，设备偏好仍可写', async () => {
+  const { useStore } = await import('../src/store')
+  const KEY_STORAGE = 'tower-web-tailnet-auth-keys'
+  // 本文件前面的缓存测试已经装好了内存 localStorage；这里直接检查它的写入。
+  const storage = (globalThis as unknown as { localStorage: Storage }).localStorage
+  const source = {
+    id: 'ro-a', name: '只读源', url: 'https://ro.example/sub',
+    isEnabled: true, excludedNodeKeys: [], userAgent: '',
+  }
+  const node = {
+    id: 'ro-n', sourceID: 'ro-a', kind: 'ss' as const, name: '只读节点',
+    server: '1.2.3.4', port: 8388, cipher: 'aes-128-gcm', password: 'pw',
+    tls: false, skipCertificateVerification: false, rawURI: '',
+  }
+  const scheme = {
+    id: 'ro-scheme', name: '只读方案', description: '',
+    groups: [{ name: '代理', type: 'select' as const, options: ['DIRECT'] }],
+    rules: [{ type: 'FINAL' as const, group: '代理' }],
+  }
+  const localSet = { id: 'ro-set', name: '只读规则集', rules: [], updatedAt: 0 }
+  const tailnet = { id: 'ro-t', name: '只读内网', subnets: [], isEnabled: true }
+  useStore.setState({
+    sources: [source],
+    nodes: [node],
+    customSchemes: [scheme],
+    localRuleSets: [localSet],
+    selectedSchemeID: 'ro-scheme',
+    policySelections: { 代理: 'DIRECT' },
+    exportConfigName: 'tower',
+    tailnets: [tailnet],
+    tailnetAuthKeys: { 'ro-t': 'tskey-original' },
+    showGroupEmoji: false,
+    latencyTestMode: 'tcp',
+  })
+  const workspaceKeys = [
+    'sources', 'nodes', 'customSchemes', 'localRuleSets', 'selectedSchemeID',
+    'policySelections', 'exportConfigName', 'tailnets', 'tailnetAuthKeys',
+  ] as const
+  const snapshot = () => {
+    const state = useStore.getState() as unknown as Record<string, unknown>
+    return JSON.parse(JSON.stringify(Object.fromEntries(workspaceKeys.map((key) => [key, state[key]]))))
+  }
+  const before = snapshot()
+  const authKeysBefore = storage.getItem(KEY_STORAGE)
+  const act = (label: string, run: () => unknown) => {
+    const prior = snapshot()
+    try { run() } catch (error) {
+      throw new Error(`${label} 抛出异常：${error instanceof Error ? error.message : String(error)}`)
+    }
+    const now = snapshot()
+    for (const key of workspaceKeys) {
+      assert.deepEqual(now[key], prior[key], `只读时 ${label} 不应改动 ${key}`)
+    }
+  }
+  setWorkspaceReadOnly(true)
+  try {
+    const store = useStore.getState()
+    act('addSourceFromText', () => store.addSourceFromText('新源', 'ss://YWVzLTEyOC1nY206cGFzc3dvcmQ@1.2.3.4:8388#audit'))
+    act('updateSource', () => store.updateSource('ro-a', { name: '改名' }))
+    act('setSourceEnabled', () => store.setSourceEnabled('ro-a', false))
+    act('setSourcesEnabled', () => store.setSourcesEnabled(['ro-a'], false))
+    act('setSourceExclusions', () => store.setSourceExclusions('ro-a', ['node|1']))
+    act('toggleNodeExcluded', () => store.toggleNodeExcluded(node))
+    act('removeSource', () => store.removeSource('ro-a'))
+    act('setScheme', () => store.setScheme('ro-scheme'))
+    act('setPolicy', () => store.setPolicy('代理', 'REJECT'))
+    act('removePolicy', () => store.removePolicy('代理'))
+    act('renamePolicySelection', () => store.renamePolicySelection('代理', '直连'))
+    act('addCustomScheme', () => store.addCustomScheme({ ...scheme, id: 'ro-scheme-2' }))
+    act('removeCustomScheme', () => store.removeCustomScheme('ro-scheme'))
+    act('addLocalRuleSet', () => store.addLocalRuleSet({ ...localSet, id: 'ro-set-2' }))
+    act('removeLocalRuleSet', () => store.removeLocalRuleSet('ro-set'))
+    act('addManualNodes', () => store.addManualNodes('ss://YWVzLTEyOC1nY206cGFzc3dvcmQ@1.2.3.4:8388#audit'))
+    act('updateManualNode', () => store.updateManualNode('ro-n', { name: '改名' }))
+    act('saveManualNode', () => store.saveManualNode({ ...node, name: '改名' }))
+    act('removeManualNode', () => store.removeManualNode('ro-n'))
+    act('setNodeCountryOverride', () => store.setNodeCountryOverride('ro-n', 'US'))
+    act('setNodeDetectedCountries', () => store.setNodeDetectedCountries({ '1.2.3.4': 'JP' }))
+    act('setExportConfigName', () => store.setExportConfigName('changed'))
+    act('addTailnet', () => store.addTailnet({ ...tailnet, id: 'ro-t2' }))
+    act('updateTailnet', () => store.updateTailnet({ ...tailnet, name: '改名' }))
+    act('deleteTailnet', () => store.deleteTailnet('ro-t'))
+    act('setTailnetEnabled', () => store.setTailnetEnabled('ro-t', false))
+    act('setTailnetAuthKey', () => store.setTailnetAuthKey('ro-t', 'tskey-new'))
+    act('pruneTailnetKeys', () => store.pruneTailnetKeys())
+    act('restoreBackup', () => store.restoreBackup({
+      ...before,
+      sources: [...before.sources, { ...source, id: 'ro-new' }],
+      nodes: [...before.nodes, { ...node, id: 'ro-new-node' }],
+      exportConfigName: 'restored',
+      autoRefreshOnOpen: true,
+    }))
+    assert.deepEqual(snapshot(), before, '只读批量调用后工作区应保持原样')
+    assert.equal(storage.getItem(KEY_STORAGE), authKeysBefore, '只读时不应改写 Auth Key 的本地缓存')
+    // 设备偏好不是服务端工作区数据，只读时仍要能切换。
+    const state = useStore.getState()
+    state.setShowGroupEmoji(true)
+    state.setLatencyTestMode('icmp')
+    state.setAutoRefreshOnOpen(true)
+    const after = useStore.getState()
+    assert.equal(after.showGroupEmoji, true)
+    assert.equal(after.latencyTestMode, 'icmp')
+    assert.equal(after.autoRefreshOnOpen, true)
+  } finally {
+    setWorkspaceReadOnly(false)
+  }
+})
+
 // ---------- 12. 只读禁用态 helper ----------
 await checkAsync('禁用态 helper 返回 disabled / aria-disabled 与统一提示', async () => {
   const on = writeGuard(true)

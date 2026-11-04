@@ -337,6 +337,82 @@ async function main(): Promise<void> {
     await throttle.stop()
   }
 
+  // auth-status 也返回 valid，必须同样计入失败次数，否则就是无限试错 oracle。
+  const oracle = await startServer({ TOWER_MODE: 'server', TOWER_API_TOKEN: 'oracle-key' })
+  try {
+    await check('auth-status 带错误密钥也计入节流，不能无限试错', async () => {
+      for (let index = 0; index < 10; index += 1) {
+        const response = await fetch(`${oracle.base}/api/auth-status?key=guess-${index}`)
+        assert.equal(response.status, 200)
+        assert.equal(((await response.json()) as { valid?: boolean }).valid, false)
+      }
+      const blocked = await fetch(workspaceURL(oracle.base, 'oracle-key'))
+      assert.equal(blocked.status, 429)
+      // 状态接口本身仍可用：合法客户端还能判断模式，且带对密钥会清零计数。
+      const status = await (await fetch(`${oracle.base}/api/auth-status?key=oracle-key`)).json() as { valid?: boolean }
+      assert.equal(status.valid, true)
+      const recovered = await fetch(workspaceURL(oracle.base, 'oracle-key'))
+      assert.equal(recovered.status, 200)
+    })
+  } finally {
+    await oracle.stop()
+  }
+
+  // 主文件损坏但有 .bak：自动从备份恢复，并保留坏文件现场。
+  const backup = await startServer(
+    { TOWER_MODE: 'server', TOWER_API_TOKEN: 'backup-key' },
+    (dir) => {
+      writeFileSync(join(dir, 'workspace.json'), '{"version":3,"data":{', 'utf8')
+      writeFileSync(
+        join(dir, 'workspace.json.bak'),
+        JSON.stringify({ version: 2, updatedAt: 1, data: { marker: 'from-bak' } }),
+        'utf8',
+      )
+    },
+  )
+  try {
+    await check('workspace.json 损坏时自动回退到 .bak 并可继续写入', async () => {
+      const response = await fetch(workspaceURL(backup.base, 'backup-key'))
+      assert.equal(response.status, 200)
+      const body = await response.json() as { version: number; data: { marker?: string } }
+      assert.equal(body.version, 2)
+      assert.equal(body.data.marker, 'from-bak')
+      assert.equal(readdirSync(backup.dir).filter((name) => name.startsWith('workspace.json.broken-')).length, 1)
+      const write = await put(backup.base, 'backup-key', { version: 2, data: { marker: 'after' } })
+      assert.equal(write.status, 200)
+      assert.equal(readWorkspaceFile(backup.dir).version, 3)
+    })
+  } finally {
+    await backup.stop()
+  }
+
+  // version=0 且已有数据（只会由手工编辑产生）：按 v1 继续，不被 version=0 覆盖。
+  const zero = await startServer(
+    { TOWER_MODE: 'server', TOWER_API_TOKEN: 'zero-key' },
+    (dir) => writeFileSync(
+      join(dir, 'workspace.json'),
+      JSON.stringify({ version: 0, updatedAt: 1, data: { marker: 'sneaky' } }),
+      'utf8',
+    ),
+  )
+  try {
+    await check('version=0 但已有数据按 v1 处理，拒绝再次以 version=0 覆盖', async () => {
+      const body = await (await fetch(workspaceURL(zero.base, 'zero-key'))).json() as {
+        version: number
+        data: { marker?: string }
+      }
+      assert.equal(body.version, 1)
+      assert.equal(body.data.marker, 'sneaky')
+      const conflict = await put(zero.base, 'zero-key', { version: 0, data: { marker: 'overwrite' } })
+      assert.equal(conflict.status, 409)
+      const normal = await put(zero.base, 'zero-key', { version: 1, data: { marker: 'normal' } })
+      assert.equal(normal.status, 200)
+      assert.equal(readWorkspaceFile(zero.dir).version, 2)
+    })
+  } finally {
+    await zero.stop()
+  }
+
   // 本地模式保持原样：工作区接口关闭，短密钥仍按原来的 16 位下限忽略。
   const local = await startServer({ TOWER_API_TOKEN: 'short-key' })
   try {
