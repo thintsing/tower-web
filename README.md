@@ -179,13 +179,14 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 - 工作区保存在 `TOWER_DATA_DIR/workspace.json`（默认 `server/workspace.json`，Docker 下 `/app/data/workspace.json`），结构为 `{ version, updatedAt, data }`。服务端已有数据时不要在运行中手工编辑这个文件。
 - 服务器模式下 `/api/workspace` 的所有请求都必须带访问密钥，`127.0.0.1` 也不例外；密钥来源沿用现有机制（`?key=`、`x-tower-key`、`Authorization: Bearer`、`tower_key` cookie）。
 - 服务器模式密钥放宽为 1–128 个不含空白 / 换行 / 控制字符的字符，首尾空白会 trim；本地模式仍要求 16–128 位 `A-Z/a-z/0-9/_/-`。短密钥能被穷举，强度请自行决定并配合可信网络使用。
-- 同一 IP 连续 10 次认证失败，服务端冷却 60 秒。
+- 同一 IP 连续 10 次认证失败，服务端冷却 60 秒；认证成功会清零计数。`/api/auth-status` 带错误密钥的试探也计入失败，不能当成无限次试错的 oracle。
 - 首次使用：服务端还没有 `workspace.json` 时，打开页面的客户端会把本机现有工作区上传创建，并提示「已上传本机工作区」。服务端已有数据后客户端只读取；要覆盖必须按当前版本号正常写入（例如覆盖恢复），不能静默清空。
 - 同步：页面可见时每 8 秒探测一次版本，窗口 `focus` / 标签页切换立即探测；本地改动 500ms 防抖后推送，内容没变不发送。
 - 并发写：版本不匹配返回 409，客户端提示「另一台设备刚改过」，随后自动拉取并替换为最新版本，不做自动合并。
 - 服务端离线、密钥错误或 `workspace.json` 损坏时页面进入只读，横幅提示「仅本地缓存，改动不会保存」；恢复连接后自动重连。
-- 每次写入前服务端保留上一版 `workspace.json.bak`；启动时文件解析失败会改名为 `workspace.json.broken-<时间戳>` 并返回明确错误，不会当成空工作区。
+- 每次写入前服务端保留上一版 `workspace.json.bak`；启动时主文件解析失败会改名为 `workspace.json.broken-<时间戳>`，优先用可解析的 `.bak` 恢复（版本可能回退一版，客户端轮询会自己拉到最新）；`.bak` 也不可用时才返回明确的 `workspace_corrupt`，不会当成空工作区。
 - 设备偏好（导出目标、隐藏客户端、排序、Emoji、测速模式、地图状态、高级区展开等）仍留在本机 localStorage，不跨设备同步；Tailscale Auth Key 属于工作区，会保存在服务端。
+- 同一个 `TOWER_DATA_DIR` 只支持一个服务进程。两个进程同时写会各自按内存里的版本号覆盖同一个 `workspace.json`，实测会静默丢失更新；需要多副本时请为每个实例使用独立数据目录。
 
 ## 数据存在哪里（服务端 vs 浏览器）
 
