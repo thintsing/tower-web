@@ -3,6 +3,8 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import type { ProxyKind, ProxyNode } from '../models/types'
 import { PROXY_KIND_TITLES } from '../models/types'
 import { useStore } from '../store'
+import { READONLY_NOTE, writeGuard } from '../util/readOnlyUi'
+import { useWorkspaceStatus } from '../workspaceSync'
 import {
   applyManualKind,
   buildManualNode,
@@ -33,6 +35,7 @@ export function ManualNodeEditorDialog({
 }) {
   const ref = useRef<HTMLDialogElement>(null)
   const saveManualNode = useStore((s) => s.saveManualNode)
+  const readOnly = useWorkspaceStatus().readOnly
   const [draft, setDraft] = useState<ManualNodeDraft>(() =>
     node ? manualDraftFromNode(node) : emptyManualDraft())
   const [error, setError] = useState('')
@@ -59,6 +62,10 @@ export function ManualNodeEditorDialog({
     : kind === 'snell' ? 'PSK' : '密码'
 
   const submit = () => {
+    if (readOnly) {
+      setError(READONLY_NOTE)
+      return
+    }
     setError('')
     try {
       const next = buildManualNode(draft, node)
@@ -504,7 +511,7 @@ export function ManualNodeEditorDialog({
         </div>
         {error && <div className="form-error" role="alert"><strong>无法保存</strong><span>{error}</span></div>}
         <div className="actions">
-          <button type="submit" className="btn primary">{node ? '保存修改' : '创建节点'}</button>
+          <button type="submit" className="btn primary" {...writeGuard(readOnly)}>{node ? '保存修改' : '创建节点'}</button>
           <button type="button" className="btn ghost" onClick={onClose}>取消</button>
         </div>
       </form>

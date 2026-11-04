@@ -32,6 +32,10 @@
   --pill-warning-bg: #f5ead8; --pill-warning-ink: #5f3d0f;
   --pill-neutral-bg: #eef0ea; --pill-neutral-ink: #3a3f39;
 
+  /* 只读模式（服务器版离线）统一禁用态 */
+  --disabled-opacity: 0.46;
+  --disabled-cursor: not-allowed;
+
   --font-display: "Archivo", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
   --font-body: "IBM Plex Sans", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", monospace;
@@ -2928,6 +2932,32 @@ dialog h3 { font-family: var(--font-display); font-size: 20px; font-weight: 600;
   flex: 1;
   line-height: 1.5;
 }
+/* 服务器版工作区状态横幅：固定底部，不挤压主布局。 */
+.workspace-alert {
+  position: fixed;
+  z-index: 61;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(760px, calc(100vw - 32px));
+  padding: 10px 14px;
+  border-left: 2px solid var(--negative, #c0392b);
+  border-radius: 0 6px 6px 0;
+  background: var(--pill-negative-bg, #fdf1ef);
+  color: var(--pill-negative-ink, #8c2f1f);
+  font-size: 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+}
+.workspace-alert strong { flex: none; }
+.workspace-alert span { flex: 1; line-height: 1.5; }
+.workspace-alert.info {
+  border-left-color: var(--positive);
+  background: var(--pill-positive-bg);
+  color: var(--pill-positive-ink);
+}
 .storage-alert-close {
   flex: none;
   border: 0;
@@ -3733,6 +3763,9 @@ body.no-scroll { overflow: hidden; }
     --pill-warning-ink: #fbe3b9;
     --pill-neutral-bg: #232a25;
     --pill-neutral-ink: #d5dcd1;
+
+    /* 深色模式下降低透明度会让灰字更难看清，略抬高一点 */
+    --disabled-opacity: 0.5;
   }
   .btn.danger:hover { background: rgba(255, 133, 120, 0.12); }
   .node-row.is-testing { background: color-mix(in srgb, var(--accent) 12%, var(--surface)); }
@@ -4220,4 +4253,27 @@ body.no-scroll { overflow: hidden; }
   .mobile-tab { padding: 0 6px; }
   .mobile-tab span,
   .mobile-tab.active::after { display: none; }
+}
+
+/* ---------- 只读模式：写操作入口统一禁用态 ----------
+   服务器版离线时，所有会 PUT 的入口都进入禁用态。原生控件用 disabled，
+   summary / 自定义 div / 菜单项等无法 disabled 的用 aria-disabled。 */
+button:disabled,
+input:disabled,
+select:disabled,
+textarea:disabled {
+  opacity: var(--disabled-opacity);
+  cursor: var(--disabled-cursor);
+}
+
+button:disabled:hover,
+.btn:disabled:hover {
+  filter: saturate(0.7);
+}
+
+[aria-disabled="true"] {
+  opacity: var(--disabled-opacity);
+  cursor: var(--disabled-cursor);
+  pointer-events: none;
+  user-select: none;
 }

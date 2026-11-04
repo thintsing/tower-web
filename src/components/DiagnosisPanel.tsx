@@ -13,6 +13,8 @@ import {
   type RankedIssue,
 } from '../rules/diagnosis'
 import { readRuleSetHistory, type RuleSetHistory } from '../rules/ruleSetHistory'
+import { useWorkspaceStatus } from '../workspaceSync'
+import { READONLY_NOTE } from '../util/readOnlyUi'
 import { groupDisplayName } from './GroupIcon'
 
 const LEVEL_TITLES: Record<LintLevel, string> = { error: '错误', warn: '警告', info: '提示' }
@@ -493,6 +495,7 @@ function IssueCard({
   onGo: (key: 'sub' | 'rules' | 'export') => void
 }) {
   const { issue } = item
+  const readOnly = useWorkspaceStatus().readOnly
   const actions = buildFixActions(issue)
   const reasons = [...new Set(item.reasons)]
   return (
@@ -521,8 +524,9 @@ function IssueCard({
               <button
                 key={`${action.kind}-${action.label}`}
                 className="btn primary"
+                disabled={readOnly}
                 onClick={() => onApplyFix(issue, action)}
-                title={action.detail}
+                title={readOnly ? READONLY_NOTE : action.detail}
               >
                 {action.label}
               </button>

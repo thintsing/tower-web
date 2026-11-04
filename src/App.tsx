@@ -54,6 +54,9 @@ import { RulesToolsCard } from './components/RulesToolsCard'
 import { DiagnosisPanel, type FixOutcome } from './components/DiagnosisPanel'
 import { FlowRail } from './components/FlowRail'
 import { AdvancedSection } from './components/AdvancedSection'
+import { WorkspaceStatusBanner } from './components/WorkspaceStatusBanner'
+import { flushWorkspaceNow, useWorkspaceStatus } from './workspaceSync'
+import { READONLY_NOTE, writeGuard } from './util/readOnlyUi'
 import { buildFlow, explainNodePool, type FlowStepKey } from './flow/flow'
 import { markExported, readExportedAt } from './flow/prefs'
 import { applyFixAction, type FixAction } from './rules/diagnosis'
@@ -159,6 +162,7 @@ function ConfirmDialog({
   body,
   confirmLabel = '确认',
   danger = false,
+  confirmDisabled = false,
   onConfirm,
   onCancel,
 }: {
@@ -167,6 +171,8 @@ function ConfirmDialog({
   body: ReactNode
   confirmLabel?: string
   danger?: boolean
+  /** 只读模式下由调用方传入，写操作的确认按钮不可点。 */
+  confirmDisabled?: boolean
   onConfirm: () => void
   onCancel: () => void
 }) {
@@ -180,7 +186,12 @@ function ConfirmDialog({
       <h3>{title}</h3>
       <p className="confirm-body">{body}</p>
       <div className="actions">
-        <button className={`btn ${danger ? 'danger' : 'primary'}`} onClick={onConfirm}>{confirmLabel}</button>
+        <button
+          className={`btn ${danger ? 'danger' : 'primary'}`}
+          disabled={confirmDisabled}
+          title={confirmDisabled ? READONLY_NOTE : undefined}
+          onClick={onConfirm}
+        >{confirmLabel}</button>
         <button className="btn ghost" autoFocus onClick={onCancel}>取消</button>
       </div>
     </dialog>
@@ -260,6 +271,7 @@ function QRCodeDialog({
  */
 function LANAccessGate() {
   const [status, setStatus] = useState<{
+    mode?: 'local' | 'server'
     lanSharing: boolean
     requiresAuth: boolean
     local: boolean
@@ -282,7 +294,10 @@ function LANAccessGate() {
     return () => { cancelled = true }
   }, [])
 
-  if (!status || status.local) return null
+  if (!status) return null
+  const serverMode = status.mode === 'server'
+  // 服务器模式连本机也要密钥，因此不再按 local 放行；其它行为保持原样。
+  if (!serverMode && status.local) return null
   if (status.lanSharing && (!status.requiresAuth || status.valid)) return null
   const needsKey = status.lanSharing && status.requiresAuth && !status.valid
 
@@ -319,7 +334,11 @@ function LANAccessGate() {
           </form>
         )}
         {error && <div className="form-error" role="alert"><span>{error}</span></div>}
-        <div className="hint">本机打开塔台无需密钥；关闭共享或轮换密钥请在服务端本机操作。</div>
+        <div className="hint">
+          {serverMode
+            ? '服务器模式下所有设备（包括本机）都需要访问密钥；密钥由 TOWER_API_TOKEN 决定。'
+            : '本机打开塔台无需密钥；关闭共享或轮换密钥请在服务端本机操作。'}
+        </div>
       </div>
     </div>
   )
@@ -335,6 +354,7 @@ function NodeCountryDialog({
 }) {
   const ref = useRef<HTMLDialogElement>(null)
   const setNodeCountryOverride = useStore((s) => s.setNodeCountryOverride)
+  const readOnly = useWorkspaceStatus().readOnly
   const [search, setSearch] = useState('')
   useEffect(() => {
     if (node) {
@@ -388,6 +408,7 @@ function NodeCountryDialog({
         <button
           type="button"
           className={`country-option${node?.countryOverride ? '' : ' active'}`}
+          {...writeGuard(readOnly)}
           onClick={() => {
             if (node) setNodeCountryOverride(node.id, undefined)
             onClose()
@@ -401,6 +422,7 @@ function NodeCountryDialog({
             type="button"
             key={region.code}
             className={`country-option${node?.countryOverride === region.code ? ' active' : ''}`}
+            {...writeGuard(readOnly)}
             onClick={() => {
               if (node) setNodeCountryOverride(node.id, region.code)
               onClose()
@@ -587,6 +609,7 @@ function AddSourceDialog({
   const ref = useRef<HTMLDialogElement>(null)
   const addSourceFromURL = useStore((s) => s.addSourceFromURL)
   const addSourceFromText = useStore((s) => s.addSourceFromText)
+  const readOnly = useWorkspaceStatus().readOnly
   const urlBatch = useMemo(() => splitSubscriptionURLs(url), [url])
 
   useEffect(() => {
@@ -900,7 +923,7 @@ function AddSourceDialog({
         )}
         <div className="actions">
           {mode !== 'scan' && (
-            <button type="submit" className="btn primary" disabled={busy}>
+            <button type="submit" className="btn primary" disabled={busy || readOnly} title={readOnly ? READONLY_NOTE : undefined}>
               {busy
                 ? '处理中…'
                 : mode === 'url' && urlBatch.urls.length > 1
@@ -932,6 +955,7 @@ function AddManualNodesDialog({
   const ref = useRef<HTMLDialogElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const addManualNodes = useStore((s) => s.addManualNodes)
+  const readOnly = useWorkspaceStatus().readOnly
   const [name, setName] = useState('')
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
@@ -1047,12 +1071,12 @@ function AddManualNodesDialog({
           </div>
         )}
         <div className="actions">
-          <button type="submit" className="btn primary" disabled={busy}>添加节点</button>
+          <button type="submit" className="btn primary" disabled={busy || readOnly} title={readOnly ? READONLY_NOTE : undefined}>添加节点</button>
           {onManualCreate && (
             <button
               type="button"
               className="btn ghost"
-              disabled={busy}
+              disabled={busy || readOnly}
               onClick={() => {
                 onClose()
                 onManualCreate()
@@ -1078,6 +1102,7 @@ function RenameManualNodeDialog({
 }) {
   const ref = useRef<HTMLDialogElement>(null)
   const updateManualNode = useStore((s) => s.updateManualNode)
+  const readOnly = useWorkspaceStatus().readOnly
   const [name, setName] = useState(node.name)
   const [error, setError] = useState('')
 
@@ -1118,7 +1143,7 @@ function RenameManualNodeDialog({
         </div>
         {error && <div className="form-error" role="alert"><span>{error}</span></div>}
         <div className="actions">
-          <button type="submit" className="btn primary">保存名称</button>
+          <button type="submit" className="btn primary" {...writeGuard(readOnly)}>保存名称</button>
           <button type="button" className="btn ghost" onClick={onClose}>取消</button>
         </div>
       </form>
@@ -1140,6 +1165,7 @@ function EditSourceDialog({
   const ref = useRef<HTMLDialogElement>(null)
   const updateSource = useStore((s) => s.updateSource)
   const refreshSource = useStore((s) => s.refreshSource)
+  const readOnly = useWorkspaceStatus().readOnly
   const [name, setName] = useState(source.name)
   const [url, setURL] = useState(source.url)
   const [userAgent, setUserAgent] = useState(source.userAgent ?? '')
@@ -1278,7 +1304,7 @@ function EditSourceDialog({
         </div>
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="actions">
-          <button type="submit" className="btn primary">保存</button>
+          <button type="submit" className="btn primary" {...writeGuard(readOnly)}>保存</button>
           <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
         </div>
       </form>
@@ -1312,6 +1338,7 @@ function SubscriptionSettingsDialog({
   const latencyTestMode = useStore((s) => s.latencyTestMode)
   const setLatencyTestMode = useStore((s) => s.setLatencyTestMode)
   const restoreBackup = useStore((s) => s.restoreBackup)
+  const readOnly = useWorkspaceStatus().readOnly
   const [pendingBackup, setPendingBackup] = useState<BackupFile | null>(null)
   const [backupBusy, setBackupBusy] = useState(false)
   const [backupError, setBackupError] = useState('')
@@ -1502,6 +1529,8 @@ function SubscriptionSettingsDialog({
       // 空间不足时仍然允许恢复，历史只是额外保障。
     }
     restoreBackup(pendingBackup.data)
+    // 服务器模式下恢复 = 推送并递增版本；服务端会在覆盖前自动留一份 .bak。
+    void flushWorkspaceNow()
     // 备份不含规则集历史；恢复后旧快照的 setID 可能已不存在，直接清空避免错配。
     clearRuleSetHistory()
     setPendingBackup(null)
@@ -1704,7 +1733,7 @@ function SubscriptionSettingsDialog({
             <button type="button" className="btn ghost" disabled={backupBusy} onClick={exportBackup}>
               导出备份
             </button>
-            <button type="button" className="btn ghost" disabled={backupBusy} onClick={() => backupRef.current?.click()}>
+            <button type="button" className="btn ghost" disabled={backupBusy || readOnly} title={readOnly ? READONLY_NOTE : undefined} onClick={() => backupRef.current?.click()}>
               {backupBusy ? '读取中…' : '恢复备份'}
             </button>
           </div>
@@ -1745,6 +1774,7 @@ function SubscriptionSettingsDialog({
                   <button
                     type="button"
                     className="btn ghost"
+                    {...writeGuard(readOnly)}
                     onClick={() => {
                       const entry = readBackupHistory().find((value) => value.id === item.id)
                       if (entry) setPendingBackup(entry.file)
@@ -1782,7 +1812,7 @@ function SubscriptionSettingsDialog({
             <strong className="danger-text">重置所有配置</strong>
             <small>删除本机的订阅、节点、方案、规则集、导出设置、版本历史和 Tailscale Auth Key，然后重新加载页面。</small>
           </div>
-          <button type="button" className="btn danger" onClick={() => setResetConfirm(true)}>重置所有配置</button>
+          <button type="button" className="btn danger" {...writeGuard(readOnly)} onClick={() => setResetConfirm(true)}>重置所有配置</button>
         </div>
         {resetConfirm && (
           <div className="restore-confirm" role="alert">
@@ -1794,6 +1824,7 @@ function SubscriptionSettingsDialog({
               <button
                 type="button"
                 className="btn danger"
+                {...writeGuard(readOnly)}
                 onClick={() => {
                   clearTowerStorage()
                   window.location.reload()
@@ -1816,7 +1847,7 @@ function SubscriptionSettingsDialog({
               </small>
             </div>
             <div className="row" style={{ gap: 8 }}>
-              <button type="button" className="btn danger" onClick={applyBackup}>覆盖恢复</button>
+              <button type="button" className="btn danger" {...writeGuard(readOnly)} onClick={applyBackup}>覆盖恢复</button>
               <button type="button" className="btn ghost" onClick={() => setPendingBackup(null)}>取消</button>
             </div>
           </div>
@@ -1838,6 +1869,7 @@ function TailnetRow({
 }) {
   const tailnetAuthKeys = useStore((s) => s.tailnetAuthKeys)
   const setTailnetEnabled = useStore((s) => s.setTailnetEnabled)
+  const readOnly = useWorkspaceStatus().readOnly
   const detail = [
     connection.magicDNSSuffix ?? (connection.controlURLString ? '自建控制服务器' : '官方 Tailscale'),
     connection.subnets.length > 0 ? `${connection.subnets.length} 个子网` : '',
@@ -1851,11 +1883,12 @@ function TailnetRow({
         <div className="tailnet-name">{tailnetPolicyName(connection)}</div>
         <div className="tailnet-detail">{detail}</div>
       </div>
-      <button type="button" className="btn ghost" onClick={onEdit}>编辑</button>
+      <button type="button" className="btn ghost" {...writeGuard(readOnly)} onClick={onEdit}>编辑</button>
       <label className="tailnet-switch">
         <input
           type="checkbox"
           checked={connection.isEnabled}
+          {...writeGuard(readOnly)}
           onChange={(e) => setTailnetEnabled(connection.id, e.target.checked)}
           aria-label={`启用 ${tailnetPolicyName(connection)}`}
         />
@@ -1879,6 +1912,7 @@ function TailnetEditorDialog({
   const updateTailnet = useStore((s) => s.updateTailnet)
   const deleteTailnet = useStore((s) => s.deleteTailnet)
   const setTailnetAuthKey = useStore((s) => s.setTailnetAuthKey)
+  const readOnly = useWorkspaceStatus().readOnly
   const savedAuthKey = tailnetAuthKeys[item.connection.id] ?? ''
   const [name, setName] = useState(item.connection.name)
   const [controlURL, setControlURL] = useState(item.connection.controlURLString ?? '')
@@ -2046,6 +2080,7 @@ function TailnetEditorDialog({
                 <button
                   type="button"
                   className="btn danger"
+                  {...writeGuard(readOnly)}
                   onClick={() => {
                     deleteTailnet(item.connection.id)
                     onClose()
@@ -2056,13 +2091,13 @@ function TailnetEditorDialog({
                 <button type="button" className="btn ghost" onClick={() => setConfirmDelete(false)}>取消删除</button>
               </>
             ) : (
-              <button type="button" className="btn ghost" onClick={() => setConfirmDelete(true)}>删除这个内网</button>
+              <button type="button" className="btn ghost" {...writeGuard(readOnly)} onClick={() => setConfirmDelete(true)}>删除这个内网</button>
             )}
           </div>
         )}
       </div>
       <div className="actions">
-        <button type="button" className="btn primary" onClick={save}>保存</button>
+        <button type="button" className="btn primary" {...writeGuard(readOnly)} onClick={save}>保存</button>
         <button type="button" className="btn ghost" onClick={onClose}>取消</button>
       </div>
     </dialog>
@@ -2072,6 +2107,7 @@ function TailnetEditorDialog({
 function TailnetTab() {
   const tailnets = useStore((s) => s.tailnets)
   const tailnetAuthKeys = useStore((s) => s.tailnetAuthKeys)
+  const readOnly = useWorkspaceStatus().readOnly
   const [editing, setEditing] = useState<{ connection: TailnetConnection; isNew: boolean } | null>(null)
   const enabledCount = tailnets.filter((connection) => connection.isEnabled).length
   const keyCount = tailnets.filter((connection) => tailnetAuthKeys[connection.id]).length
@@ -2085,7 +2121,7 @@ function TailnetTab() {
           <div className="sub">开着代理时，也能按规则访问家里设备和子网。</div>
         </div>
         <div className="row page-actions" style={{ gap: 8 }}>
-          <button className="btn primary" onClick={() => setEditing({ connection: defaultTailnetConnection(), isNew: true })}>
+          <button className="btn primary" {...writeGuard(readOnly)} onClick={() => setEditing({ connection: defaultTailnetConnection(), isNew: true })}>
             + 添加内网
           </button>
         </div>
@@ -2243,6 +2279,7 @@ function NodeRow({
   const latencyMethodMap = useStore((s) => s.latencyMethodByNodeId)
   const probeErrors = useStore((s) => s.probeErrorByNodeId)
   const testingIds = useStore((s) => s.testingNodeIds)
+  const readOnly = useWorkspaceStatus().readOnly
 
   const excluded = useMemo(() => {
     if (node.isManual) return node.isEnabled === false
@@ -2374,8 +2411,9 @@ function NodeRow({
             toggle(node)
           }
         }}
-        title="包含在生成的配置中"
+        title={readOnly ? READONLY_NOTE : '包含在生成的配置中'}
         aria-label={`包含在生成的配置中：${node.name}`}
+        {...writeGuard(readOnly)}
       />
       {onEditCountry ? (
         <button
@@ -2386,7 +2424,8 @@ function NodeRow({
             onEditCountry(node)
           }}
           aria-label={`设置地区：${node.name}`}
-          title={region ? `${region.name} · 点击修改地区` : '点击设置地区'}
+          title={readOnly ? READONLY_NOTE : region ? `${region.name} · 点击修改地区` : '点击设置地区'}
+          {...writeGuard(readOnly)}
         >
           {region?.flag ?? '·'}
         </button>
@@ -2420,25 +2459,25 @@ function NodeRow({
           <summary className="icon-btn" aria-label={`自有节点操作：${node.name}`} title="自有节点操作">⋯</summary>
           <div className="menu-panel">
             {onEditManual && (
-              <button onClick={(event) => {
+              <button {...writeGuard(readOnly)} onClick={(event) => {
                 event.currentTarget.closest('details')?.removeAttribute('open')
                 onEditManual(node)
               }}>编辑节点</button>
             )}
             {onRenameManual && (
-              <button onClick={(event) => {
+              <button {...writeGuard(readOnly)} onClick={(event) => {
                 event.currentTarget.closest('details')?.removeAttribute('open')
                 onRenameManual(node)
               }}>重命名</button>
             )}
-            <button onClick={(event) => {
+            <button {...writeGuard(readOnly)} onClick={(event) => {
               event.currentTarget.closest('details')?.removeAttribute('open')
               updateManualNode(node.id, { isEnabled: node.isEnabled === false })
             }}>
               {node.isEnabled === false ? '启用节点' : '停用节点'}
             </button>
             {onDeleteManual && (
-              <button className="danger" onClick={(event) => {
+              <button className="danger" {...writeGuard(readOnly)} onClick={(event) => {
                 event.currentTarget.closest('details')?.removeAttribute('open')
                 onDeleteManual(node)
               }}>删除节点</button>
@@ -2600,6 +2639,7 @@ function ManualNodesCard({
   onRequestDelete: (node: ProxyNode) => void
 }) {
   const needle = keyword.trim().toLowerCase()
+  const readOnly = useWorkspaceStatus().readOnly
   const visible = useMemo(
     () => needle ? nodes.filter((node) => nodeMatchesKeyword(node, needle)) : nodes,
     [nodes, needle],
@@ -2623,8 +2663,8 @@ function ManualNodesCard({
           </div>
         </div>
         <div className="row card-actions">
-          <button className="btn ghost" onClick={onAdd}>+ 添加节点</button>
-          <button className="btn ghost" onClick={onCreate}>+ 新建节点</button>
+          <button className="btn ghost" {...writeGuard(readOnly)} onClick={onAdd}>+ 添加节点</button>
+          <button className="btn ghost" {...writeGuard(readOnly)} onClick={onCreate}>+ 新建节点</button>
         </div>
       </div>
       <div className="hint manual-node-hint">
@@ -2685,6 +2725,7 @@ function SourceCard({
   const startTesting = useStore((s) => s.startTesting)
   const stopTesting = useStore((s) => s.stopTesting)
   const filterInfoNodes = useStore((s) => s.filterSubscriptionInfoNodes)
+  const readOnly = useWorkspaceStatus().readOnly
   // 订阅卡片默认收起；搜索时自动展开，方便直接看到命中的节点行。
   const [expanded, setExpanded] = useState(false)
   const [sortByLatency, setSortByLatency] = useState(false)
@@ -2833,6 +2874,7 @@ function SourceCard({
               aria-label={sourceEnabled ? `停用订阅「${source.name}」` : `启用订阅「${source.name}」`}
               title={sourceEnabled ? '停用后，节点不会进入生成的配置' : '启用后，节点会重新进入生成的配置'}
               className={`source-switch${sourceEnabled ? ' is-on' : ''}`}
+              {...writeGuard(readOnly)}
               onClick={() => setSourceEnabled(id, !sourceEnabled)}
             >
               <span className="switch-track" aria-hidden="true"><span className="switch-thumb" /></span>
@@ -2845,7 +2887,7 @@ function SourceCard({
             )}
             {sourceEnabled && testingThisSource && <button className="btn ghost" onClick={() => stopTesting()}>取消</button>}
             {source.url && (
-              <button className="btn ghost" disabled={loading} onClick={() => refresh(id)}>
+              <button className="btn ghost" disabled={loading || readOnly} title={readOnly ? READONLY_NOTE : undefined} onClick={() => refresh(id)}>
                 {loading ? '刷新中…' : '刷新'}
               </button>
             )}
@@ -2855,15 +2897,15 @@ function SourceCard({
             <details className="menu" ref={menuRef} onToggle={updateDetailsPlacement}>
               <summary className="icon-btn" aria-label="更多操作" title="更多操作">⋯</summary>
               <div className="menu-panel">
-                <button onClick={() => { closeMenu(); onEdit?.() }}>编辑订阅</button>
-                <button onClick={() => { setSourceEnabled(id, !sourceEnabled); closeMenu() }}>
+                <button {...writeGuard(readOnly)} onClick={() => { closeMenu(); onEdit?.() }}>编辑订阅</button>
+                <button {...writeGuard(readOnly)} onClick={() => { setSourceEnabled(id, !sourceEnabled); closeMenu() }}>
                   {sourceEnabled ? '停用订阅' : '启用订阅'}
                 </button>
                 <button onClick={() => { setSortByLatency((v) => !v); closeMenu() }}>
                   延迟排序{sortByLatency ? '（已开启）' : ''}
                 </button>
-                <button onClick={() => { setExclusions(id, []); closeMenu() }}>恢复默认（全部启用）</button>
-                <button className="danger" onClick={() => { closeMenu(); onRequestDelete?.(id, source.name) }}>删除订阅</button>
+                <button {...writeGuard(readOnly)} onClick={() => { setExclusions(id, []); closeMenu() }}>恢复默认（全部启用）</button>
+                <button className="danger" {...writeGuard(readOnly)} onClick={() => { closeMenu(); onRequestDelete?.(id, source.name) }}>删除订阅</button>
               </div>
             </details>
           </div>
@@ -2902,7 +2944,7 @@ function SourceCard({
         <div className="source-error" role="alert">
           <span>{error}</span>
           {source.url && (
-            <button className="btn ghost" disabled={loading} onClick={() => void refresh(id)}>重试</button>
+            <button className="btn ghost" disabled={loading || readOnly} title={readOnly ? READONLY_NOTE : undefined} onClick={() => void refresh(id)}>重试</button>
           )}
         </div>
       )}
@@ -2917,6 +2959,8 @@ function SourceCard({
                   checked={allIncluded}
                   onChange={toggleAllNodes}
                   aria-label="全选或全不选：节点是否包含在生成的配置中"
+                  title={readOnly ? READONLY_NOTE : undefined}
+                  {...writeGuard(readOnly)}
                 />
                 <span>
                   包含在配置 <span className="num">{includedAll.length}</span>/<span className="num">{real.length}</span>
@@ -2991,6 +3035,7 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const stopTesting = useStore((s) => s.stopTesting)
   const renewalRemindersEnabled = useStore((s) => s.renewalRemindersEnabled)
   const setNodeDetectedCountries = useStore((s) => s.setNodeDetectedCountries)
+  const readOnly = useWorkspaceStatus().readOnly
   const [adding, setAdding] = useState(false)
   const [selectedCode, setSelectedCode] = useState<string | null>(null)
   const [searchText, setSearchText] = useState('')
@@ -3278,7 +3323,8 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
               {checkedSources.size > 0 && (
                 <button
                   className="btn"
-                  disabled={selectedAllEnabled}
+                  disabled={selectedAllEnabled || readOnly}
+                  title={readOnly ? READONLY_NOTE : undefined}
                   onClick={() => {
                     setSourcesEnabled([...checkedSources], true)
                     setFlash(`已启用 ${checkedSources.size} 个订阅。`)
@@ -3288,7 +3334,8 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
               {checkedSources.size > 0 && (
                 <button
                   className="btn"
-                  disabled={selectedAllDisabled}
+                  disabled={selectedAllDisabled || readOnly}
+                  title={readOnly ? READONLY_NOTE : undefined}
                   onClick={() => {
                     setSourcesEnabled([...checkedSources], false)
                     setFlash(`已停用 ${checkedSources.size} 个订阅，节点不会再进入配置。`)
@@ -3298,6 +3345,7 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
               {checkedSources.size > 0 && (
                 <button
                   className="btn danger"
+                  {...writeGuard(readOnly)}
                   onClick={() => setPendingDelete({ ids: [...checkedSources], label: `${checkedSources.size} 个订阅` })}
                 >删除选中</button>
               )}
@@ -3305,10 +3353,10 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
             </>
           )}
           {!manageMode && (
-            <button className="btn ghost" onClick={() => setAddingManual(true)}>+ 自有节点</button>
+            <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => setAddingManual(true)}>+ 自有节点</button>
           )}
           {!manageMode && hasContent && (
-            <button className="btn primary" onClick={() => setAdding(true)}>+ 添加订阅</button>
+            <button className="btn primary" {...writeGuard(readOnly)} onClick={() => setAdding(true)}>+ 添加订阅</button>
           )}
         </div>
       </div>
@@ -3341,6 +3389,7 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
               {poolReason.action === 'retry-source' && (
                 <button
                   className="btn"
+                  {...writeGuard(readOnly)}
                   onClick={() => {
                     const ids = sources.filter((source) => isSourceEnabled(source)).map((source) => source.id)
                     if (ids.length) void Promise.all(ids.map((id) => refreshSource(id)))
@@ -3351,9 +3400,9 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                 <button className="btn" onClick={() => setManageMode(true)}>管理订阅与节点</button>
               )}
               {poolReason.action === 'add-source' && (
-                <button className="btn" onClick={() => setAdding(true)}>+ 添加订阅</button>
+                <button className="btn" {...writeGuard(readOnly)} onClick={() => setAdding(true)}>+ 添加订阅</button>
               )}
-              <button className="btn ghost" onClick={() => setAddingManual(true)}>+ 自有节点</button>
+              <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => setAddingManual(true)}>+ 自有节点</button>
             </div>
           </div>
         </div>
@@ -3513,7 +3562,8 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
             <button
               className="btn ghost refresh-all"
               onClick={() => void refreshAll()}
-              disabled={refreshing || !!refreshProgress}
+              disabled={refreshing || !!refreshProgress || readOnly}
+              title={readOnly ? READONLY_NOTE : undefined}
             >
               {refreshProgress
                 ? `刷新中… ${refreshProgress.done}/${refreshProgress.total}`
@@ -3533,7 +3583,7 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
               塔台在本机完成拉取、解析、测速与配置生成。
             </p>
             <div className="first-run-action">
-              <button className="btn primary first-run-cta" onClick={() => setAdding(true)}>
+              <button className="btn primary first-run-cta" {...writeGuard(readOnly)} onClick={() => setAdding(true)}>
                 + 添加订阅
               </button>
               <span className="first-run-hint">只需要这一步</span>
@@ -3686,6 +3736,7 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         body={<>将删除 <b>{pendingDelete?.label}</b> 及其全部节点，生成的配置会立即少掉这些节点。该操作不可撤销。</>}
         confirmLabel="删除"
         danger
+        confirmDisabled={readOnly}
         onCancel={() => setPendingDelete(null)}
         onConfirm={() => {
           const ids = pendingDelete?.ids ?? []
@@ -3701,6 +3752,7 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         body={<>将从导出配置中移除 <b>{pendingManualDelete?.name}</b>。订阅里的同名节点不受影响，该操作不可撤销。</>}
         confirmLabel="删除"
         danger
+        confirmDisabled={readOnly}
         onCancel={() => setPendingManualDelete(null)}
         onConfirm={() => {
           const node = pendingManualDelete
@@ -3847,6 +3899,7 @@ function SchemeEditDialog({
   onSave: (next: RuleScheme) => void
 }) {
   const ref = useRef<HTMLDialogElement>(null)
+  const readOnly = useWorkspaceStatus().readOnly
   const [name, setName] = useState(scheme.name)
   const [description, setDescription] = useState(scheme.description)
   const [error, setError] = useState('')
@@ -3879,7 +3932,7 @@ function SchemeEditDialog({
         )}
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="actions">
-          <button type="submit" className="btn primary">保存</button>
+          <button type="submit" className="btn primary" {...writeGuard(readOnly)}>保存</button>
           <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
         </div>
       </form>
@@ -3897,6 +3950,7 @@ function SchemeTextDialog({
   onSave: (text: string) => Promise<string | undefined>
 }) {
   const ref = useRef<HTMLDialogElement>(null)
+  const readOnly = useWorkspaceStatus().readOnly
   const [text, setText] = useState(scheme.rawConfigurationText ?? '')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
@@ -3929,7 +3983,7 @@ function SchemeTextDialog({
         />
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="actions">
-          <button type="submit" className="btn primary" disabled={busy || !text.trim()}>
+          <button type="submit" className="btn primary" disabled={busy || !text.trim() || readOnly} title={readOnly ? READONLY_NOTE : undefined}>
             {busy ? '解析中…' : '保存全文'}
           </button>
           <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
@@ -3957,6 +4011,7 @@ function AddCustomRuleDialog({
   const [value, setValue] = useState('')
   const [noResolve, setNoResolve] = useState(false)
   const [error, setError] = useState('')
+  const readOnly = useWorkspaceStatus().readOnly
   const typeInfo = RULE_TYPE_OPTIONS.find((t) => t.value === type) ?? RULE_TYPE_OPTIONS[0]
 
   useEffect(() => { ref.current?.showModal() }, [])
@@ -4055,7 +4110,7 @@ function AddCustomRuleDialog({
         </div>
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="actions">
-          <button type="submit" className="btn primary">添加规则</button>
+          <button type="submit" className="btn primary" {...writeGuard(readOnly)}>添加规则</button>
           <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
         </div>
       </form>
@@ -4087,6 +4142,7 @@ function GroupEditorDialog({
   onAddRule: (rule: RoutingRule) => void
 }) {
   const ref = useRef<HTMLDialogElement>(null)
+  const readOnly = useWorkspaceStatus().readOnly
   const [name, setName] = useState(group.name)
   const [type, setType] = useState<PolicyGroup['type']>(group.type)
   const [options, setOptions] = useState<string[]>(group.options)
@@ -4292,6 +4348,7 @@ function GroupEditorDialog({
                 <button
                   type="button"
                   aria-label={`移除候选 ${option}`}
+                  {...writeGuard(readOnly)}
                   onClick={() => setOptions(options.filter((o) => o !== option))}
                 >×</button>
               </span>
@@ -4311,9 +4368,9 @@ function GroupEditorDialog({
                 }
               }}
             />
-            <button type="button" className="btn" onClick={() => addOption(newOption)}>添加</button>
-            {!options.includes('DIRECT') && <button type="button" className="btn ghost" onClick={() => addOption('DIRECT')}>+ DIRECT</button>}
-            {!options.includes('REJECT') && <button type="button" className="btn ghost" onClick={() => addOption('REJECT')}>+ REJECT</button>}
+            <button type="button" className="btn" {...writeGuard(readOnly)} onClick={() => addOption(newOption)}>添加</button>
+            {!options.includes('DIRECT') && <button type="button" className="btn ghost" {...writeGuard(readOnly)} onClick={() => addOption('DIRECT')}>+ DIRECT</button>}
+            {!options.includes('REJECT') && <button type="button" className="btn ghost" {...writeGuard(readOnly)} onClick={() => addOption('REJECT')}>+ REJECT</button>}
           </div>
         </div>
         <div className="field">
@@ -4375,7 +4432,7 @@ function GroupEditorDialog({
                   }
                 }}
               />
-              <button type="button" className="btn" onClick={addDomainRule}>添加网站</button>
+              <button type="button" className="btn" {...writeGuard(readOnly)} onClick={addDomainRule}>添加网站</button>
             </div>
             {ruleNotice && <div className="hint" role="status">{ruleNotice}</div>}
             {visibleGroupRules.length > 0 ? (
@@ -4404,7 +4461,7 @@ function GroupEditorDialog({
         <div className="actions">
           {tab === 'settings' ? (
             <>
-              <button type="submit" className="btn primary">保存</button>
+              <button type="submit" className="btn primary" {...writeGuard(readOnly)}>保存</button>
               <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
             </>
           ) : (
@@ -4432,6 +4489,7 @@ function GroupCreateDialog({
   const [type, setType] = useState<NodeGroupDraft['type']>('select')
   const [pattern, setPattern] = useState('')
   const [error, setError] = useState('')
+  const readOnly = useWorkspaceStatus().readOnly
 
   useEffect(() => { ref.current?.showModal() }, [])
 
@@ -4493,7 +4551,7 @@ function GroupCreateDialog({
         </div>
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="actions">
-          <button type="submit" className="btn primary">创建策略组</button>
+          <button type="submit" className="btn primary" {...writeGuard(readOnly)}>创建策略组</button>
           <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
         </div>
       </form>
@@ -4511,6 +4569,7 @@ function NetworkSettingsDialog({
   onSave: (next: RuleScheme) => void
 }) {
   const ref = useRef<HTMLDialogElement>(null)
+  const readOnly = useWorkspaceStatus().readOnly
   const [draft, setDraft] = useState<NetworkSettingsDraft>(() => networkSettingsDraft(scheme.networkSettings))
   const [error, setError] = useState('')
   useEffect(() => { ref.current?.showModal() }, [])
@@ -4614,7 +4673,7 @@ function NetworkSettingsDialog({
 
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="actions dns-actions">
-          <button type="submit" className="btn primary">保存</button>
+          <button type="submit" className="btn primary" {...writeGuard(readOnly)}>保存</button>
           <button type="button" className="btn" onClick={() => setDraft(networkSettingsDraft(undefined))}>
             填入默认值
           </button>
@@ -4653,6 +4712,7 @@ function RuleLibraryDialog({
   const [remoteURL, setRemoteURL] = useState('')
   const [remoteName, setRemoteName] = useState('')
   const [remoteBusy, setRemoteBusy] = useState(false)
+  const readOnly = useWorkspaceStatus().readOnly
 
   useEffect(() => {
     ref.current?.showModal()
@@ -4795,7 +4855,7 @@ function RuleLibraryDialog({
               </div>
               <button
                 className="btn ghost"
-                disabled={!!busyFile || remoteBusy}
+                disabled={!!busyFile || remoteBusy || readOnly}
                 onClick={() => void addEntry(entry)}
               >{busyFile === entry.id ? '添加中…' : '添加'}</button>
             </li>
@@ -4812,7 +4872,7 @@ function RuleLibraryDialog({
           <div className="row candidate-add">
             <input className="input" type="url" placeholder="https://…/rules.list" value={remoteURL} onChange={(e) => setRemoteURL(e.target.value)} />
             <input className="input" type="text" placeholder="名称（可选）" value={remoteName} onChange={(e) => setRemoteName(e.target.value)} />
-            <button className="btn" disabled={remoteBusy || !!busyFile} onClick={() => void addRemote()}>
+            <button className="btn" disabled={remoteBusy || !!busyFile || readOnly} onClick={() => void addRemote()}>
               {remoteBusy ? '读取中…' : '读取并添加'}
             </button>
           </div>
@@ -4842,6 +4902,7 @@ function RuleSetEditorDialog({
   const [text, setText] = useState(ruleSet ? ruleSet.rules.map(ruleSetLine).join('\n') : '')
   const [format, setFormat] = useState<RuleSetFormat | undefined>(ruleSet?.format)
   const [error, setError] = useState('')
+  const readOnly = useWorkspaceStatus().readOnly
 
   useEffect(() => { ref.current?.showModal() }, [])
   const parsed = parseRuleList(text)
@@ -4907,7 +4968,7 @@ function RuleSetEditorDialog({
         </div>
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="actions">
-          <button type="submit" className="btn primary">保存</button>
+          <button type="submit" className="btn primary" {...writeGuard(readOnly)}>保存</button>
           <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
         </div>
       </form>
@@ -4931,6 +4992,7 @@ function RemoteRuleSetDialog({
   const [join, setJoin] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const readOnly = useWorkspaceStatus().readOnly
 
   useEffect(() => { ref.current?.showModal() }, [])
 
@@ -5000,7 +5062,7 @@ function RemoteRuleSetDialog({
         )}
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="actions">
-          <button type="submit" className="btn primary" disabled={busy}>
+          <button type="submit" className="btn primary" disabled={busy || readOnly} title={readOnly ? READONLY_NOTE : undefined}>
             {busy ? '读取中…' : '添加'}
           </button>
           <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
@@ -5022,6 +5084,7 @@ function RenameRuleSetDialog({
   const ref = useRef<HTMLDialogElement>(null)
   const [name, setName] = useState(set.name)
   const [error, setError] = useState('')
+  const readOnly = useWorkspaceStatus().readOnly
 
   useEffect(() => { ref.current?.showModal() }, [])
 
@@ -5048,7 +5111,7 @@ function RenameRuleSetDialog({
         </div>
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="actions">
-          <button type="button" className="btn primary" onClick={save}>保存</button>
+          <button type="button" className="btn primary" {...writeGuard(readOnly)} onClick={save}>保存</button>
           <button type="button" className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
         </div>
       </div>
@@ -5069,6 +5132,7 @@ function AddRuleSetToSchemeDialog({
 }) {
   const ref = useRef<HTMLDialogElement>(null)
   const [group, setGroup] = useState(scheme.groups[0]?.name ?? '')
+  const readOnly = useWorkspaceStatus().readOnly
   useEffect(() => { ref.current?.showModal() }, [])
 
   return (
@@ -5083,7 +5147,7 @@ function AddRuleSetToSchemeDialog({
       </div>
       <div className="hint">加入的是当前规则内容的快照；之后编辑本地规则集不会自动改动已加入的方案。</div>
       <div className="actions">
-        <button className="btn primary" disabled={!group} onClick={() => { onAdd(group); ref.current?.close() }}>加入</button>
+        <button className="btn primary" disabled={!group || readOnly} title={readOnly ? READONLY_NOTE : undefined} onClick={() => { onAdd(group); ref.current?.close() }}>加入</button>
         <button className="btn ghost" onClick={() => ref.current?.close()}>取消</button>
       </div>
     </dialog>
@@ -5101,6 +5165,7 @@ function RulesTab({
   onLocateConsumed?: () => void
 }) {
   const selectedSchemeID = useStore((s) => s.selectedSchemeID)
+  const readOnly = useWorkspaceStatus().readOnly
   const setScheme = useStore((s) => s.setScheme)
   const policySelections = useStore((s) => s.policySelections)
   const setPolicy = useStore((s) => s.setPolicy)
@@ -5895,28 +5960,28 @@ function RulesTab({
               </button>
             )}
             {builtinForCustom && (
-              <button className="btn ghost" onClick={() => setRestoreInitialConfirm(true)}>恢复初始规则</button>
+              <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => setRestoreInitialConfirm(true)}>恢复初始规则</button>
             )}
             {scheme && (
-              <button className="btn ghost" onClick={autoFillGroupEmoji}>补全 Emoji</button>
+              <button className="btn ghost" {...writeGuard(readOnly)} onClick={autoFillGroupEmoji}>补全 Emoji</button>
             )}
             {customScheme?.rawConfigurationText && (
               <button className="btn ghost" onClick={() => setTextEditorScheme(customScheme)}>编辑全文</button>
             )}
             {customScheme?.sourceURL && (
-              <button className="btn ghost" disabled={refreshingScheme} onClick={() => void refreshImportedScheme()}>
+              <button className="btn ghost" disabled={refreshingScheme || readOnly} title={readOnly ? READONLY_NOTE : undefined} onClick={() => void refreshImportedScheme()}>
                 {refreshingScheme ? '刷新中…' : '刷新方案'}
               </button>
             )}
             {scheme && (
               <button className="btn ghost" onClick={beginEditNetwork}>DNS 与网络</button>
             )}
-            <button className="btn ghost" onClick={() => setImportingScheme(true)}>+ 导入方案</button>
+            <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => setImportingScheme(true)}>+ 导入方案</button>
           </div>
         </div>
         <div className="scheme-select-row">
           <span className="scheme-select-label">切换方案</span>
-          <select className="input" value={selectedSchemeID} onChange={(e) => setScheme(e.target.value)}>
+          <select className="input" value={selectedSchemeID} disabled={readOnly} title={readOnly ? READONLY_NOTE : undefined} onChange={(e) => setScheme(e.target.value)}>
             {allMetas.map((m) => <option key={m.id} value={m.id}>{schemeDisplayName(m.name, 'custom' in m)}</option>)}
           </select>
         </div>
@@ -5958,6 +6023,7 @@ function RulesTab({
                 key={s.id}
                 type="button"
                 className="btn ghost"
+                {...writeGuard(readOnly)}
                 onClick={() => setPendingSchemeDelete(s)}
               >× {stripSchemeCustomSuffix(s.name)}</button>
             ))}
@@ -6006,13 +6072,13 @@ function RulesTab({
           </div>
           {schemeError && <div className="error">{schemeError}</div>}
           <div className="row" style={{ gap: 8, marginTop: 8 }}>
-            <button className="btn primary" disabled={schemeLoading || !schemeURL.trim()} onClick={importSchemeFromURL}>
+            <button className="btn primary" disabled={schemeLoading || !schemeURL.trim() || readOnly} title={readOnly ? READONLY_NOTE : undefined} onClick={importSchemeFromURL}>
               {schemeLoading ? '处理中…' : '从 URL 导入'}
             </button>
-            <button className="btn" disabled={schemeLoading || !schemeText.trim()} onClick={importSchemeFromText}>
+            <button className="btn" disabled={schemeLoading || !schemeText.trim() || readOnly} title={readOnly ? READONLY_NOTE : undefined} onClick={importSchemeFromText}>
               {schemeLoading ? '处理中…' : schemeFileName ? '导入文件内容' : '粘贴导入'}
             </button>
-            <button className="btn ghost" disabled={schemeLoading} onClick={() => void importSelfConfiguration()}>
+            <button className="btn ghost" disabled={schemeLoading || readOnly} title={readOnly ? READONLY_NOTE : undefined} onClick={() => void importSelfConfiguration()}>
               Self-Configuration 预设
             </button>
             <button className="btn ghost" onClick={() => { setImportingScheme(false); setSchemeError(null); }}>取消</button>
@@ -6026,7 +6092,7 @@ function RulesTab({
             <h3>策略组</h3>
             <div className="row wrap" style={{ gap: 8, alignItems: 'center' }}>
               <span className="meta">{groupCardMeta}</span>
-              <button className="btn ghost" onClick={() => setCreatingGroup(scheme)}>+ 新建策略组</button>
+              <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => setCreatingGroup(scheme)}>+ 新建策略组</button>
             </div>
           </div>
           <div className="group-list" tabIndex={0} aria-label="策略组列表">
@@ -6042,7 +6108,7 @@ function RulesTab({
                 className={`group-row${dragFromIndex === index ? ' dragging' : ''}${dragOverIndex === index ? ' drop-target' : ''}`}
                 key={g.name}
                 onDragOver={(e) => {
-                  if (dragFromIndex === null) return
+                  if (readOnly || dragFromIndex === null) return
                   e.preventDefault()
                   e.dataTransfer.dropEffect = 'move'
                   if (dragOverIndex !== index) setDragOverIndex(index)
@@ -6052,6 +6118,7 @@ function RulesTab({
                 }}
                 onDrop={(e) => {
                   e.preventDefault()
+                  if (readOnly) return
                   const from = dragFromIndex ?? Number(e.dataTransfer.getData('text/plain'))
                   setDragFromIndex(null)
                   setDragOverIndex(null)
@@ -6064,10 +6131,11 @@ function RulesTab({
                   <div className="group-title">
                     <span
                       className="drag-handle"
-                      draggable
+                      draggable={!readOnly}
                       aria-hidden="true"
-                      title="拖动调整策略组顺序和匹配优先级"
+                      title={readOnly ? READONLY_NOTE : '拖动调整策略组顺序和匹配优先级'}
                       onDragStart={(e) => {
+                        if (readOnly) { e.preventDefault(); return }
                         setDragFromIndex(index)
                         e.dataTransfer.effectAllowed = 'move'
                         e.dataTransfer.setData('text/plain', String(index))
@@ -6092,6 +6160,8 @@ function RulesTab({
                       className="input"
                       aria-label={`${g.name} 的首选策略`}
                       value={current}
+                      disabled={readOnly}
+                      title={readOnly ? READONLY_NOTE : undefined}
                       onChange={(e) => setPolicy(g.name, e.target.value)}
                     >
                       {g.options.length > 0 && (
@@ -6119,23 +6189,23 @@ function RulesTab({
                   >✎</button>
                   <button
                     className="icon-btn"
-                    disabled={index === 0}
+                    disabled={index === 0 || readOnly}
                     aria-label={`上移策略组「${g.name}」`}
-                    title="上移"
+                    title={readOnly ? READONLY_NOTE : '上移'}
                     onClick={() => moveGroup(scheme, index, -1)}
                   >↑</button>
                   <button
                     className="icon-btn"
-                    disabled={index === scheme.groups.length - 1}
+                    disabled={index === scheme.groups.length - 1 || readOnly}
                     aria-label={`下移策略组「${g.name}」`}
-                    title="下移"
+                    title={readOnly ? READONLY_NOTE : '下移'}
                     onClick={() => moveGroup(scheme, index, 1)}
                   >↓</button>
                   <button
                     className="icon-btn"
-                    disabled={scheme.groups.length <= 1}
+                    disabled={scheme.groups.length <= 1 || readOnly}
                     aria-label={`删除策略组「${g.name}」`}
-                    title={scheme.groups.length <= 1 ? '至少保留一个策略组' : '删除策略组'}
+                    title={readOnly ? READONLY_NOTE : scheme.groups.length <= 1 ? '至少保留一个策略组' : '删除策略组'}
                     onClick={() => setPendingGroupDelete(g)}
                   >×</button>
                 </div>
@@ -6160,7 +6230,7 @@ function RulesTab({
                   </>
                 ) : '已调整策略组顺序和匹配优先级。'}
               </div>
-              <button type="button" className="btn ghost" onClick={undoGroupReorder}>撤销</button>
+              <button type="button" className="btn ghost" {...writeGuard(readOnly)} onClick={undoGroupReorder}>撤销</button>
             </div>
           )}
           <div className="hint group-order-hint">
@@ -6173,7 +6243,7 @@ function RulesTab({
         <div className="card">
           <div className="card-head">
             <h3>自定义规则</h3>
-            <button className="btn ghost" onClick={() => beginAddCustomRule(scheme)}>+ 添加规则</button>
+            <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => beginAddCustomRule(scheme)}>+ 添加规则</button>
           </div>
           {(scheme.customRules?.length ?? 0) > 0 ? (
             <ul className="custom-rule-list">
@@ -6186,7 +6256,8 @@ function RulesTab({
                   <button
                     className="icon-btn"
                     aria-label={`删除规则 ${rule.type} ${rule.value ?? ''}`}
-                    title="删除这条自定义规则"
+                    title={readOnly ? READONLY_NOTE : '删除这条自定义规则'}
+                    {...writeGuard(readOnly)}
                     onClick={() => removeCustomRule(scheme, rule)}
                   >×</button>
                 </li>
@@ -6204,9 +6275,9 @@ function RulesTab({
             <h3>规则库与规则集</h3>
             <div className="row wrap" style={{ gap: 6 }}>
               <button className="btn ghost" onClick={() => setLibraryOpen(true)}>浏览规则库</button>
-              <button className="btn ghost" onClick={() => setRemoteSetOpen(true)}>+ 在线规则集</button>
-              <button className="btn ghost" onClick={() => setLocalSetEditor({})}>+ 新建规则集</button>
-              <button className="btn ghost" onClick={() => localSetImportRef.current?.click()}>导入文件</button>
+              <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => setRemoteSetOpen(true)}>+ 在线规则集</button>
+              <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => setLocalSetEditor({})}>+ 新建规则集</button>
+              <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => localSetImportRef.current?.click()}>导入文件</button>
               <input
                 ref={localSetImportRef}
                 type="file"
@@ -6315,22 +6386,23 @@ function RulesTab({
                         <>
                           <button
                             className="btn ghost"
-                            disabled={refreshingRuleSetID !== null}
+                            disabled={refreshingRuleSetID !== null || readOnly}
+                            title={readOnly ? READONLY_NOTE : undefined}
                             onClick={() => void refreshLocalRuleSet(set)}
                           >
                             {refreshingRuleSetID === set.id ? '刷新中…' : '刷新'}
                           </button>
-                          <button className="btn ghost" onClick={() => toggleLocalRuleSetPaused(set)}>
+                          <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => toggleLocalRuleSetPaused(set)}>
                             {set.paused ? '恢复刷新' : '暂停刷新'}
                           </button>
-                          <button className="btn ghost" onClick={() => setRenamingLocalSet(set)}>重命名</button>
+                          <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => setRenamingLocalSet(set)}>重命名</button>
                         </>
                       )}
-                      <button className="btn ghost" onClick={() => setLocalSetAddTarget(set)}>加入方案</button>
+                      <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => setLocalSetAddTarget(set)}>加入方案</button>
                       {!set.sourceURL && (
-                        <button className="btn ghost" onClick={() => setLocalSetEditor({ set })}>编辑</button>
+                        <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => setLocalSetEditor({ set })}>编辑</button>
                       )}
-                      <button className="btn ghost danger-text" onClick={() => setPendingLocalSetDelete(set)}>删除</button>
+                      <button className="btn ghost danger-text" {...writeGuard(readOnly)} onClick={() => setPendingLocalSetDelete(set)}>删除</button>
                     </div>
                   </li>
                 ))}
@@ -6372,6 +6444,7 @@ function RulesTab({
         body={<>将删除规则方案 <b>「{pendingSchemeDelete?.name}」</b>。如果它正被使用，会切回内置 ACL4SSR 方案。</>}
         confirmLabel="删除"
         danger
+        confirmDisabled={readOnly}
         onCancel={() => setPendingSchemeDelete(null)}
         onConfirm={() => {
           const target = pendingSchemeDelete
@@ -6498,6 +6571,7 @@ function RulesTab({
           )}
           confirmLabel="恢复初始规则"
           danger
+          confirmDisabled={readOnly}
           onCancel={() => setRestoreInitialConfirm(false)}
           onConfirm={() => void restoreInitialRules()}
         />
@@ -6514,6 +6588,7 @@ function RulesTab({
           )}
           confirmLabel="删除策略组"
           danger
+          confirmDisabled={readOnly}
           onCancel={() => setPendingGroupDelete(null)}
           onConfirm={() => deleteNodeGroup(scheme, pendingGroupDelete)}
         />
@@ -6524,6 +6599,7 @@ function RulesTab({
         body={<>将删除 <b>「{pendingLocalSetDelete?.name}」</b>。已加入方案的规则集快照不会被移除。</>}
         confirmLabel="删除"
         danger
+        confirmDisabled={readOnly}
         onCancel={() => setPendingLocalSetDelete(null)}
         onConfirm={() => {
           const target = pendingLocalSetDelete
@@ -6705,6 +6781,7 @@ const TAILNET_TARGET_VARIANTS: ClientTarget[] = [
 ]
 
 function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
+  const readOnly = useWorkspaceStatus().readOnly
   const scheme = useScheme()
   const policySelections = useStore((s) => s.policySelections)
   const preferRuleSets = useStore((s) => s.preferRuleSets)
@@ -7618,6 +7695,8 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
               value={exportConfigName}
               maxLength={48}
               placeholder="tower"
+              disabled={readOnly}
+              title={readOnly ? READONLY_NOTE : undefined}
               onChange={(e) => setExportConfigName(e.target.value)}
             />
             <div className="hint">
@@ -7947,7 +8026,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           <button className="btn" disabled={!scheme || !hasExportable} onClick={download}>{downloaded ? '已下载' : '下载文件'}</button>
           <button className="btn ghost" disabled={!hasExportable || !generated} onClick={copy}>{copied ? '已复制' : '复制'}</button>
           {canImport && (
-            <button className="btn ghost" disabled={importing || !hasExportable} onClick={importIntoClient}>
+            <button className="btn ghost" disabled={importing || !hasExportable || readOnly} title={readOnly ? READONLY_NOTE : undefined} onClick={importIntoClient}>
               {importing ? '生成链接…' : `导入到 ${target.name}`}
             </button>
           )}
@@ -8066,7 +8145,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                 </div>
               )}
               <div className="row sub-actions" style={{ gap: 8, marginTop: 10 }}>
-                <button className="btn primary" disabled={subRefreshing || !hasExportable} onClick={publishSubscription}>
+                <button className="btn primary" disabled={subRefreshing || !hasExportable || readOnly} title={readOnly ? READONLY_NOTE : undefined} onClick={publishSubscription}>
                   {subRefreshing ? '同步中…' : '同步节点到链接'}
                 </button>
                 <button className="btn ghost" disabled={checking || !hasExportable} onClick={checkSubscription}>
@@ -8086,14 +8165,14 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                   </button>
                 )}
                 <button className="btn ghost" onClick={() => setQrOpen(true)}>二维码</button>
-                <button className="btn ghost" onClick={() => setPendingRevoke(true)}>撤销</button>
+                <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => setPendingRevoke(true)}>撤销</button>
               </div>
               {checkResult && (
                 <div className={checkResult.ok ? 'hint' : 'error'} style={{ marginTop: 8 }}>
                   {checkResult.ok ? '可用 · ' : '异常 · '}
                   {checkResult.text}
                   {!checkResult.ok && hasExportable && (
-                    <button className="btn ghost" style={{ marginLeft: 8 }} onClick={publishSubscription}>
+                    <button className="btn ghost" style={{ marginLeft: 8 }} {...writeGuard(readOnly)} onClick={publishSubscription}>
                       重新生成链接
                     </button>
                   )}
@@ -8119,7 +8198,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
             </>
           ) : (
             <>
-              <button className="btn primary sub-publish-start" disabled={subRefreshing || !hasExportable} onClick={publishSubscription}>
+              <button className="btn primary sub-publish-start" disabled={subRefreshing || !hasExportable || readOnly} title={readOnly ? READONLY_NOTE : undefined} onClick={publishSubscription}>
                 {subRefreshing ? '生成中…' : '生成订阅链接'}
               </button>
               {!hasExportable && <div className="error" style={{ marginTop: 8 }}>{emptyReason}</div>}
@@ -8172,6 +8251,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         body={<>撤销后 <b>已经导入该链接的客户端</b> 将无法再更新订阅，需要重新生成。节点本身不会删除。</>}
         confirmLabel="撤销链接"
         danger
+        confirmDisabled={readOnly}
         onCancel={() => setPendingRevoke(false)}
         onConfirm={() => { setPendingRevoke(false); void revokeSubscription() }}
       />
@@ -8409,6 +8489,7 @@ export function App() {
   return (
     <div className="app-shell">
       <LANAccessGate />
+      <WorkspaceStatusBanner />
       {storageFull && (
         <div className="storage-alert" role="alert">
           <strong>浏览器存储已满</strong>

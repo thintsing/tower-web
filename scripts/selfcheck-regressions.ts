@@ -25,6 +25,8 @@ import { parseRuleSetText } from '../src/rules/ruleSets'
 import { countryNumericCode } from '../src/worldmap/countryCodes'
 import { iso3ForRegionCode, regionForName } from '../src/models/region'
 import { CLIENTS, type ProxyNode, type RuleScheme } from '../src/models/types'
+import { setWorkspaceReadOnly } from '../src/util/workspaceLock'
+import { READONLY_NOTE, writeGuard } from '../src/util/readOnlyUi'
 
 const base = { tls: false, skipCertificateVerification: false, rawURI: '' } as const
 const SCHEME: RuleScheme = {
@@ -581,7 +583,53 @@ await checkAsync('订阅刷新后清理旧节点的测速 / 错误状态', async
   assert.equal('old-node' in state.probeErrorByNodeId, false)
 })
 
-// ---------- 11. 畸形 Host / 容器管理密钥 ----------
+// ---------- 11. 只读模式：工作区写被拦，设备偏好仍可改 ----------
+await checkAsync('只读模式只拦工作区字段，设备偏好保持可写', async () => {
+  const { useStore } = await import('../src/store')
+  useStore.setState({
+    sources: [{
+      id: 'ro-source',
+      name: '只读源',
+      url: 'https://ro.example/sub',
+      isEnabled: true,
+      excludedNodeKeys: [],
+    }],
+    nodes: [],
+    selectedSchemeID: 'acl4ssr-online',
+    policySelections: {},
+    showGroupEmoji: false,
+  })
+  setWorkspaceReadOnly(true)
+  try {
+    const store = useStore.getState()
+    store.setSourceEnabled('ro-source', false)
+    store.setSourceExclusions('ro-source', ['node|1'])
+    store.setScheme('custom-scheme')
+    store.setPolicy('节点选择', 'REJECT')
+    store.setShowGroupEmoji(true)
+    const state = useStore.getState()
+    assert.equal(state.sources[0].isEnabled, true, '只读时订阅启停不应改变')
+    assert.deepEqual(state.sources[0].excludedNodeKeys, [], '只读时节点排除项不应改变')
+    assert.equal(state.selectedSchemeID, 'acl4ssr-online', '只读时方案选择不应改变')
+    assert.equal('节点选择' in state.policySelections, false, '只读时策略选择不应写入')
+    assert.equal(state.showGroupEmoji, true, '设备偏好不受只读闸门影响')
+  } finally {
+    setWorkspaceReadOnly(false)
+  }
+})
+
+// ---------- 12. 只读禁用态 helper ----------
+await checkAsync('禁用态 helper 返回 disabled / aria-disabled 与统一提示', async () => {
+  const on = writeGuard(true)
+  assert.equal(on.disabled, true)
+  assert.equal(on['aria-disabled'], true)
+  assert.equal(on.title, READONLY_NOTE)
+  const off = writeGuard(false)
+  assert.equal(off.disabled, undefined)
+  assert.equal(off.title, undefined)
+})
+
+// ---------- 13. 畸形 Host / 容器管理密钥 ----------
 await checkAsync('畸形 Host 不崩溃；容器内伪造 Host 不能绕过管理密钥', async () => {
   const port = 20000 + Math.floor(Math.random() * 20000)
   const dataDir = mkdtempSync(join(tmpdir(), 'tower-regression-'))
