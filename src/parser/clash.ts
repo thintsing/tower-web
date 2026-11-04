@@ -185,9 +185,12 @@ function clashProxy(entry: unknown, sourceID?: string): ProxyNode | undefined {
     plugin: sip003Plugin,
     pluginMux,
     shadowTLS,
-    // TLS is part of Trojan / TrustTunnel / key-MASQUE themselves.
+    // TLS is part of Trojan / TrustTunnel / key-MASQUE / Hysteria / TUIC /
+    // AnyTLS themselves; mihomo 不会写 tls: true，导入时必须补回来，
+    // 否则再导出会变成明文协议。
     tls: kind === 'trojan' || kind === 'trusttunnel' || kind === 'masque'
-      || pluginTLS || boolString(str(d['tls'])),
+      || kind === 'hysteria' || kind === 'hysteria2' || kind === 'tuic'
+      || kind === 'anytls' || pluginTLS || boolString(str(d['tls'])),
     sni: str(d['servername']) ?? str(d['sni']),
     hostHeader:
       sip003Plugin === 'v2ray-plugin'

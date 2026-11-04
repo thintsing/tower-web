@@ -162,6 +162,40 @@ async function main(): Promise<void> {
       assert.equal(removed.status, 200)
     })
 
+    await check('并发发布与删除不丢更新，落盘文件始终可解析', async () => {
+      const prefix = `conc-${Math.random().toString(36).slice(2, 8)}-`
+      const tokens = Array.from({ length: 40 }, (_, index) => `${prefix}${index}`.padEnd(24, 'x'))
+      const publishes = await Promise.all(tokens.map((item) => fetch(`${LOCAL}/api/subscribe?token=${item}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ title: item, formats: { yaml: 'proxies: []\n' } }),
+      })))
+      assert.equal(publishes.filter((res) => res.status === 200).length, tokens.length)
+      const deletes = await Promise.all(tokens.slice(20).map((item) =>
+        fetch(`${LOCAL}/api/sub/${item}`, { method: 'DELETE' })))
+      assert.equal(deletes.filter((res) => res.status === 200).length, 20)
+
+      const file = join(dataDir, 'subscriptions.json')
+      const deadline = Date.now() + 3000
+      let data: Record<string, unknown> = {}
+      let readable = true
+      while (Date.now() < deadline) {
+        try {
+          data = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
+          readable = true
+        } catch {
+          readable = false
+        }
+        if (readable && Object.keys(data).length === 20) break
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      assert.ok(readable, '落盘文件出现无法解析的中间状态')
+      assert.equal(Object.keys(data).length, 20, '并发删除后仍残留旧记录')
+      for (const item of tokens.slice(0, 20)) {
+        await fetch(`${LOCAL}/api/sub/${item}`, { method: 'DELETE' })
+      }
+    })
+
     if (!lanBase) {
       console.log('… 当前环境没有可用的非本机地址，跳过局域网请求检查')
       return

@@ -395,6 +395,25 @@ function loadSubscriptions() {
 let persistRunning = false
 let persistAgain = false
 
+/**
+ * Windows 上杀毒/备份工具会短暂占用 subscriptions.json，此时 rename 会抛
+ * EPERM/EBUSY/EACCES。重试几次比直接放弃更安全，否则磁盘上会停留在旧版本。
+ */
+async function replaceFile(temp, target) {
+  let lastError
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await rename(temp, target)
+      return
+    } catch (err) {
+      lastError = err
+      if (!['EPERM', 'EBUSY', 'EACCES'].includes(err.code)) break
+      await new Promise((resolve) => setTimeout(resolve, 30 * (attempt + 1)))
+    }
+  }
+  throw lastError
+}
+
 async function persistSubscriptions() {
   // 10MB 级的 subscriptions.json 同步 stringify + writeFileSync 会阻塞事件
   // 循环约 40ms；改成串行异步落盘，发布请求立即返回，合并并发写入。
@@ -411,7 +430,7 @@ async function persistSubscriptions() {
         // 先写临时文件再替换，避免进程在写入中途退出时留下半截 JSON。
         const temp = `${SUBS_FILE}.tmp`
         await writeFile(temp, JSON.stringify(Object.fromEntries(subscriptions)), 'utf8')
-        await rename(temp, SUBS_FILE)
+        await replaceFile(temp, SUBS_FILE)
       } catch (err) {
         console.error('[tower] 订阅落盘失败:', err.message)
       }

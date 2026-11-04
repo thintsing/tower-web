@@ -193,16 +193,17 @@ $env:HOST='127.0.0.1'; npm start
 | `npm run selfcheck:protocols` | 校验协议解析与降级 |
 
 <details>
-<summary>全部 19 项自检</summary>
+<summary>全部 20 项自检</summary>
 
 ```text
 selfcheck:asn         离线 IP / ASN 查询
-selfcheck:auth        局域网共享 / API 访问密钥
+selfcheck:auth        局域网共享 / API 访问密钥 / 并发落盘
 selfcheck:backup      备份与版本历史
 selfcheck:batch       批量订阅导入
 selfcheck:catalog     在线规则目录
 selfcheck:clients     客户端配置结构
 selfcheck:dns         DNS 投影 / 纯节点组 / ECS
+selfcheck:flow        四步状态推导与诊断
 selfcheck:importers   Clash / Surge / Egern / sing-box / INI 导入
 selfcheck:icons       策略组图标与能力矩阵
 selfcheck:manual      自有节点导入与去重
@@ -211,13 +212,13 @@ selfcheck:map         地图地区聚合
 selfcheck:matching    策略组拖动后的规则顺序
 selfcheck:protocols   协议解析与客户端降级
 selfcheck:qr          二维码生成与解码
-selfcheck:regressions 审计回归：凭据编码 / Clash 嵌套字段 / 客户端配置导入 / sing-box 顺序 / 地图国家码
+selfcheck:regressions 审计回归：解析 / 命名 / 备份兼容 / 存储配额 / 隐式 TLS
 selfcheck:remote      代理集合与远程规则集
 selfcheck:rulesets    规则集方言转换
 selfcheck:yaml        Clash YAML 结构
 ```
 
-自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 19 项自检。
+自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 20 项自检。
 
 </details>
 

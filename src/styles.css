@@ -4212,3 +4212,12 @@ body.no-scroll { overflow: hidden; }
   .advanced-body { padding: 4px 14px 16px; }
   .pool-reason { flex-direction: column; padding: 14px 15px; }
 }
+
+/* 320px 级别再收一档：顶栏四个工作区标签改成纯图标，否则最右标签会被裁掉。
+   按钮本身有 aria-label，隐藏文字不影响读屏。 */
+@media (max-width: 380px) {
+  .topbar { padding: 0 8px; gap: 6px; }
+  .mobile-tab { padding: 0 6px; }
+  .mobile-tab span,
+  .mobile-tab.active::after { display: none; }
+}

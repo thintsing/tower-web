@@ -38,11 +38,13 @@ export function networkSettingsDraft(
   const defaults = DEFAULT_NETWORK_SETTINGS
   return {
     ipv6Enabled: settings?.ipv6Enabled,
-    dnsServers: settings?.dnsServers.length ? [...settings.dnsServers] : [...defaults.dnsServers],
-    encryptedDNSServers: settings?.encryptedDNSServers.length
+    dnsServers: Array.isArray(settings?.dnsServers) && settings.dnsServers.length
+      ? [...settings.dnsServers]
+      : [...defaults.dnsServers],
+    encryptedDNSServers: Array.isArray(settings?.encryptedDNSServers) && settings.encryptedDNSServers.length
       ? [...settings.encryptedDNSServers]
       : [...defaults.encryptedDNSServers],
-    remoteDNSServers: settings?.remoteDNSServers.length
+    remoteDNSServers: Array.isArray(settings?.remoteDNSServers) && settings.remoteDNSServers.length
       ? [...settings.remoteDNSServers]
       : [...defaults.remoteDNSServers],
     proxyTestURLString: settings?.proxyTestURLString ?? defaults.proxyTestURLString ?? DEFAULT_TEST_URL,

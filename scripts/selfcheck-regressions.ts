@@ -19,6 +19,7 @@ import { generateSurge } from '../src/generator/surge'
 import { generateConfig } from '../src/generator'
 import { uniqueDisplayNames } from '../src/generator/groups'
 import { clearTowerStorage, createSafeStorage, isStorageFull, onStorageFullChange } from '../src/util/localStore'
+import { effectiveNetworkSettings } from '../src/models/networkSettings'
 import { loadScheme, parseSchemeINI, BUILTIN_SCHEMES } from '../src/rules/scheme'
 import { parseRuleSetText } from '../src/rules/ruleSets'
 import { countryNumericCode } from '../src/worldmap/countryCodes'
@@ -1009,6 +1010,26 @@ check('重置只清理塔台的 localStorage 键，保留同源其它应用数�
   ])
   assert.equal(memory.get('other-app-prefs'), 'keep-me')
   assert.equal(memory.get('unrelated'), 'keep-too')
+})
+
+check('旧快照只有部分 networkSettings 时生成器不崩，缺失项回落到默认值', () => {
+  const partial = { encryptedDNSServers: ['https://dns.alidns.com/dns-query'] } as Parameters<typeof effectiveNetworkSettings>[0]
+  const settings = effectiveNetworkSettings(partial)
+  assert.ok(settings.dnsServers.length > 0, '缺少 dnsServers 时应回落到默认值')
+  assert.deepEqual(settings.encryptedDNSServers, ['https://dns.alidns.com/dns-query'])
+  assert.ok(settings.remoteDNSServers.length > 0)
+})
+
+check('Clash 导入 hysteria2 / tuic / anytls 时补回隐式 TLS', () => {
+  const text = [
+    'proxies:',
+    '  - {name: h2, type: hysteria2, server: h2.example.com, port: 443, password: pw}',
+    '  - {name: tu, type: tuic, server: tu.example.com, port: 443, uuid: 11111111-2222-3333-4444-555555555555, password: pw}',
+    '  - {name: any, type: anytls, server: any.example.com, port: 443, password: pw}',
+  ].join('\n')
+  const nodes = parseClashYAML(text).nodes
+  assert.equal(nodes.length, 3)
+  for (const node of nodes) assert.equal(node.tls, true, `${node.name} 应识别为 TLS`)
 })
 
 if (failures) {
