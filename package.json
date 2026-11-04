@@ -48,6 +48,7 @@
     "selfcheck:map": "tsx scripts/selfcheck-map.ts",
     "selfcheck:matching": "tsx scripts/selfcheck-matching.ts",
     "selfcheck:protocols": "tsx scripts/selfcheck-protocols.ts",
+    "selfcheck:quota": "tsx scripts/selfcheck-quota.ts",
     "selfcheck:qr": "tsx scripts/selfcheck-qr.ts",
     "selfcheck:regressions": "tsx scripts/selfcheck-regressions.ts",
     "selfcheck:remote": "tsx scripts/selfcheck-remote.ts",

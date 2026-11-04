@@ -1157,6 +1157,15 @@ dialog.confirm { width: min(420px, 92vw); }
   border-radius: 3px;
   font-weight: 500;
 }
+/* 机场没返回套餐信息时仍占位，避免整行消失让用户以为功能没做。 */
+.usage-item.unknown {
+  color: var(--muted);
+}
+.usage-item.note {
+  flex-basis: 100%;
+  font-size: 11px;
+  opacity: 0.9;
+}
 .source-notices {
   margin-top: 7px;
   padding-left: 9px;

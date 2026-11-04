@@ -142,6 +142,46 @@ export interface ManualNodePatch {
 const refreshGenerations = new Map<string, number>()
 const inFlightFetches = new Map<string, Promise<SubscriptionFetch>>()
 const hostQueues = new Map<string, Promise<void>>()
+/** 已命中的配额探测变体；同一订阅后续刷新先试它，避免每次从链头开始。 */
+const quotaProbeHits = new Map<string, { url: string; ua?: string }>()
+/**
+ * 配额探测负缓存：同一订阅 6 小时内不再重复空探测。
+ * 机场没下发用量时，一次刷新会多打 6 个只取响应头的请求；没有负缓存的话，
+ * 每次刷新（包括每天自动刷新）都要再打一遍，纯属浪费且容易触发限流。
+ */
+export const QUOTA_PROBE_MISS_TTL_MS = 6 * 60 * 60 * 1000
+const QUOTA_PROBE_CACHE_LIMIT = 64
+const quotaProbeMisses = new Map<string, number>()
+
+/** 负缓存仍然有效时返回 true；过期条目顺手清掉，让下一次刷新真正重试。 */
+export function quotaProbeMissFresh(
+  misses: Map<string, number>,
+  key: string,
+  now = Date.now(),
+  ttl = QUOTA_PROBE_MISS_TTL_MS,
+): boolean {
+  const at = misses.get(key)
+  if (at === undefined) return false
+  if (now - at < ttl) return true
+  misses.delete(key)
+  return false
+}
+
+/** 记录一次「探测链跑完仍没有用量」，按写入顺序淘汰，上限与命中缓存一致。 */
+export function rememberQuotaProbeMiss(
+  misses: Map<string, number>,
+  key: string,
+  now = Date.now(),
+  limit = QUOTA_PROBE_CACHE_LIMIT,
+): void {
+  misses.delete(key)
+  misses.set(key, now)
+  while (misses.size > limit) {
+    const oldest = misses.keys().next().value
+    if (oldest === undefined) break
+    misses.delete(oldest)
+  }
+}
 
 async function withHostQueue<T>(url: string, task: () => Promise<T>): Promise<T> {
   let host = ''
@@ -168,11 +208,12 @@ function fetchSubscriptionShared(
   url: string,
   userAgent?: string,
   dnsOverHTTPSURL?: string,
+  headersOnly = false,
 ): Promise<SubscriptionFetch> {
-  const key = `${url}\n${userAgent ?? ''}\n${dnsOverHTTPSURL ?? ''}`
+  const key = `${url}\n${userAgent ?? ''}\n${dnsOverHTTPSURL ?? ''}\n${headersOnly ? 'headers' : 'body'}`
   const existing = inFlightFetches.get(key)
   if (existing) return existing
-  const promise = withHostQueue(url, () => fetchSubscription(url, userAgent, dnsOverHTTPSURL))
+  const promise = withHostQueue(url, () => fetchSubscription(url, userAgent, dnsOverHTTPSURL, headersOnly))
     .finally(() => {
       if (inFlightFetches.get(key) === promise) inFlightFetches.delete(key)
     })
@@ -212,34 +253,83 @@ async function fetchSubscription(
   url: string,
   userAgent?: string,
   dnsOverHTTPSURL?: string,
+  headersOnly = false,
 ): Promise<SubscriptionFetch> {
   const params = new URLSearchParams({ url })
   if (userAgent) params.set('ua', userAgent)
   if (dnsOverHTTPSURL) params.set('doh', dnsOverHTTPSURL)
+  if (headersOnly) params.set('headers', '1')
   const res = await apiFetch(`/api/fetch?${params.toString()}`)
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
     throw new Error(body.error ?? `HTTP ${res.status}`)
   }
+  const usage = parseUserinfoHeader(res.headers.get('x-subscription-userinfo'))
+  if (headersOnly) {
+    // 探测只需要响应头；服务端会提前断开上游正文，这里也不读 body。
+    await res.body?.cancel().catch(() => {})
+    return { text: '', usage, userAgent }
+  }
   return {
     text: await res.text(),
-    usage: parseUserinfoHeader(res.headers.get('x-subscription-userinfo')),
+    usage,
     userAgent,
   }
 }
 
-/** Append `flag=clash` once to read quota headers without replacing node data. */
-function quotaProbeURL(raw: string): string | undefined {
+/**
+ * Candidate URLs for reading quota headers in the panel's Clash dialect.
+ * Panels disagree: most use `flag=clash`, but some `/link/<token>` links only
+ * return `subscription-userinfo` for `?clash=1`; combining it with the generic
+ * `?sub=1` makes such panels answer with an empty JSON body, so drop `sub`.
+ */
+export function quotaProbeURLs(raw: string): string[] {
+  let url: URL
   try {
-    const url = new URL(raw)
-    if ([...url.searchParams.keys()].some((key) => key.toLowerCase() === 'flag')) {
-      return undefined
-    }
-    url.searchParams.set('flag', 'clash')
-    return url.href
+    url = new URL(raw)
   } catch {
-    return undefined
+    return []
   }
+  const keys = [...url.searchParams.keys()]
+  // 通用链接上的 `sub=1` 会压过 clash / flag=clash：真实机场在这种组合下
+  // 返回空正文且不带用量头，所以只要还有 sub 就必须继续探测（去掉 sub）。
+  const hasSub = keys.some((key) => key.toLowerCase() === 'sub')
+  const alreadyClash = !hasSub && keys.some((key) => {
+    const lower = key.toLowerCase()
+    if (lower === 'clash') {
+      const value = (url.searchParams.get(key) ?? '').trim().toLowerCase()
+      return value !== '' && value !== '0' && value !== 'false'
+    }
+    return lower === 'flag' && (url.searchParams.get(key) ?? '').trim().toLowerCase() === 'clash'
+  })
+  if (alreadyClash) return []
+
+  const probes: string[] = []
+  const push = (next: URL) => {
+    if (!probes.includes(next.href)) probes.push(next.href)
+  }
+  if (hasSub) {
+    const bare = new URL(url.href)
+    for (const key of [...bare.searchParams.keys()]) {
+      if (key.toLowerCase() === 'sub') bare.searchParams.delete(key)
+    }
+    bare.searchParams.set('clash', '1')
+    push(bare)
+  }
+  const flag = new URL(url.href)
+  const flagKey = keys.find((key) => key.toLowerCase() === 'flag')
+  // 通用链接常带 flag=ss / flag=v2ray，这里替换成 clash 再探测一次，
+  // 否则会直接跳过探测、永远拿不到只在 Clash 方言下发的用量头。
+  if (flagKey) flag.searchParams.delete(flagKey)
+  flag.searchParams.set('flag', 'clash')
+  push(flag)
+  const clash = new URL(url.href)
+  // 已有 flag 时用 clash=1 替代，避免两个方言参数同时出现让面板返回空响应。
+  const clashFlagKey = keys.find((key) => key.toLowerCase() === 'flag')
+  if (clashFlagKey) clash.searchParams.delete(clashFlagKey)
+  clash.searchParams.set('clash', '1')
+  push(clash)
+  return probes
 }
 
 /**
@@ -613,21 +703,60 @@ export const useStore = create<Store>()(
           if (!fetched || !parsed) throw lastError
           if (!isCurrent() || !get().sources.some((s) => s.id === id)) return
           let usage = mergeUsage(parsed.status, fetched.usage)
+          const quotaKey = `${source.id}\n${source.url}\n${source.userAgent ?? ''}`
           // Some panels only send quota on a Clash-dialect request. Use only
           // its response headers; its node body may silently drop protocols.
-          if ((usage?.total === undefined || usage.total <= 0) && usage?.expire === undefined) {
-            const probe = quotaProbeURL(source.url)
-            if (probe) {
-              try {
-                const probeResult = await fetchSubscriptionShared(
-                  probe,
-                  fetched.userAgent,
-                  source.dnsOverHTTPSURL?.trim(),
-                )
-                usage = mergeUsage(usage, probeResult.usage)
-              } catch {
-                // Quota is optional; keep the successfully parsed node list.
+          // 只有 upload/download（没有 total）也算「已知但不完整」：这已经是真实用量，
+          // 不能当成什么都没返回，否则会误判成缺失并反复跑探测链。
+          const missingQuota = () => !usage
+            || ((usage.total === undefined || usage.total <= 0)
+              && usage.expire === undefined
+              && usage.upload === undefined
+              && usage.download === undefined)
+          if (!missingQuota()) {
+            // 已经拿到用量，清掉历史空结果，未来再缺失时重新探测。
+            quotaProbeMisses.delete(quotaKey)
+          } else if (!quotaProbeMissFresh(quotaProbeMisses, quotaKey)) {
+            const probes = quotaProbeURLs(source.url)
+            if (probes.length > 0) {
+              const doh = source.dnsOverHTTPSURL?.trim()
+              // 先按当前 UA 逐个尝试 Clash 方言链接，再补试机场常用的转换器 UA。
+              // 这些请求只取响应头，节点正文仍来自上面已成功解析的那次请求。
+              const plan: { url: string; ua?: string }[] = probes.map((url) => ({ url, ua: fetched.userAgent }))
+              const compatibilityUAs = [COMPATIBILITY_USER_AGENT, 'ClashforWindows/0.20.39']
+              for (const ua of compatibilityUAs) {
+                for (const probe of probes.slice(0, 2)) plan.push({ url: probe, ua })
               }
+              // 上一次命中的变体排到最前，失败时仍回退到完整链。
+              const cached = quotaProbeHits.get(quotaKey)
+              if (cached) plan.unshift(cached)
+              const seen = new Set<string>()
+              const attempts = plan.filter((attempt) => {
+                const key = `${attempt.url}\n${attempt.ua ?? ''}`
+                if (seen.has(key)) return false
+                seen.add(key)
+                return true
+              }).slice(0, 6)
+              for (const attempt of attempts) {
+                try {
+                  const probeResult = await fetchSubscriptionShared(attempt.url, attempt.ua, doh, true)
+                  const before = usage
+                  usage = mergeUsage(usage, probeResult.usage)
+                  if (usage !== before && !missingQuota()) {
+                    // 命中后移到队尾（Map.set 不会改变已有键的顺序），保持活跃条目不被淘汰。
+                    quotaProbeHits.delete(quotaKey)
+                    if (quotaProbeHits.size >= QUOTA_PROBE_CACHE_LIMIT) {
+                      const oldest = quotaProbeHits.keys().next().value
+                      if (oldest !== undefined) quotaProbeHits.delete(oldest)
+                    }
+                    quotaProbeHits.set(quotaKey, attempt)
+                  }
+                } catch {
+                  // Quota is optional; keep the successfully parsed node list.
+                }
+                if (!missingQuota()) break
+              }
+              if (missingQuota()) rememberQuotaProbeMiss(quotaProbeMisses, quotaKey)
             }
           }
           if (!isCurrent() || !get().sources.some((s) => s.id === id)) return

@@ -41,7 +41,7 @@ import { formatSupportsProxyCollections, prepareSchemeForExport } from './genera
 import { autoFillGroupEmojis } from './generator/groupIcons'
 import { maskTailnetAuthKeys, tailnetSupports } from './generator/tailnet'
 import { copyToClipboard, newID } from './util/browser'
-import { clearTowerStorage, isStorageFull, onStorageFullChange } from './util/localStore'
+import { browserStorage, clearTowerStorage, createSafeStorage, isStorageFull, onStorageFullChange } from './util/localStore'
 import { placeDetailsPanel, placeOpenDetailsPanels } from './util/menuPlacement'
 import { apiFetch, clearAPIKey, getAPIKey, setAPIKey } from './util/apiAuth'
 import { normalizeRemoteTextURL } from './util/remoteURL'
@@ -50,6 +50,8 @@ import { RouteIllustration } from './components/RouteIllustration'
 import { GroupIcon, groupDisplayName } from './components/GroupIcon'
 import { TailnetIllustration } from './components/TailnetIllustration'
 import { ManualNodeEditorDialog } from './components/ManualNodeEditorDialog'
+import { SourceUsage, shouldShowSourceUsage } from './components/SourceUsage'
+import { UserAgentField } from './components/UserAgentField'
 import { RulesToolsCard } from './components/RulesToolsCard'
 import { DiagnosisPanel, type FixOutcome } from './components/DiagnosisPanel'
 import { FlowRail } from './components/FlowRail'
@@ -79,24 +81,9 @@ function updateDetailsPlacement(event: SyntheticEvent<HTMLDetailsElement>): void
   requestAnimationFrame(() => placeDetailsPanel(details))
 }
 
-/** 流量未知时显示「—」，不要用 0 冒充真实值。 */
-function formatBytes(bytes?: number): string {
-  if (bytes === undefined || !Number.isFinite(bytes)) return '—'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  let v = Math.max(0, bytes)
-  let i = 0
-  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++ }
-  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`
-}
-
 function formatDate(ts?: number): string {
   if (!ts) return ''
   return new Date(ts).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
-}
-
-/** 到期日期按浏览器本地时区展示。 */
-function formatExpiryDate(ts: number): string {
-  return new Date(ts).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' })
 }
 
 /** 高级请求设置：只影响这一条订阅的抓取请求。 */
@@ -840,20 +827,15 @@ function AddSourceDialog({
                 {urlBatch.proxyCount > 0 ? ` · ${urlBatch.proxyCount} 行像 HTTP 代理节点` : ''}
                 {urlBatch.truncated > 0 ? ` · 超过 ${MAX_BATCH_SUBSCRIPTIONS} 个上限` : ''}
               </div>
+              <div className="hint">
+                机场通常同时提供通用链接和 Clash 链接；流量与到期响应头多只在 Clash 版（形如
+                <code>?flag=clash</code>、<code>?clash=1</code> 或含 <code>/clash</code>）下发。塔台会自动尝试
+                几种 Clash 方言链接，直接粘贴 Clash 链接最稳。
+              </div>
             </div>
             <details className="advanced-request">
               <summary>高级请求设置（可选）</summary>
-              <div className="field">
-                <label>自定义 User-Agent</label>
-                <input
-                  type="text"
-                  className="field"
-                  disabled={busy}
-                  placeholder="clash-verge/v2.4.2"
-                  value={userAgent}
-                  onChange={(e) => setUserAgent(e.target.value)}
-                />
-              </div>
+              <UserAgentField value={userAgent} onChange={setUserAgent} disabled={busy} />
               <div className="field">
                 <label>DNS-over-HTTPS 地址</label>
                 <input
@@ -1229,7 +1211,7 @@ function EditSourceDialog({
       void refreshSource(source.id)
       onSaved?.(`「${trimmedName}」已保存，正在按新设置重新拉取订阅…`)
     } else {
-      onSaved?.(`「${trimmedName}」的订阅设置已保存。`)
+      onSaved?.(`订阅「${trimmedName}」的修改已保存。`)
     }
     ref.current?.close()
   }
@@ -1265,22 +1247,17 @@ function EditSourceDialog({
                 value={url}
                 onChange={(e) => setURL(e.target.value)}
               />
+              <div className="hint">
+                如果机场给了多个地址，优先用 Clash 版（形如 <code>?flag=clash</code>、<code>?clash=1</code>
+                或含 <code>/clash</code>）；通用链接通常不带流量与到期响应头。
+              </div>
             </div>
             <div className="advanced-request is-open">
               <div className="advanced-request-title">
                 高级请求设置
                 <span>只对这一条订阅生效</span>
               </div>
-              <div className="field">
-                <label>自定义 User-Agent</label>
-                <input
-                  type="text"
-                  className="field"
-                  placeholder="clash-verge/v2.4.2"
-                  value={userAgent}
-                  onChange={(e) => setUserAgent(e.target.value)}
-                />
-              </div>
+              <UserAgentField value={userAgent} onChange={setUserAgent} />
               <div className="field">
                 <label>DNS-over-HTTPS 地址</label>
                 <input
@@ -2823,40 +2800,7 @@ function SourceCard({
               {source.dnsOverHTTPSURL ? ' · DoH' : ''}
               {needle && !sourceNameMatches ? ` · 匹配 ${visibleRealCount}/${real.length}` : ''}
             </div>
-            {(usage.totalBytes !== undefined
-              || usage.usedBytes !== undefined
-              || usage.expireAt !== undefined) && (
-              <div className="usage">
-                {(usage.totalBytes !== undefined || usage.usedBytes !== undefined) && (
-                  <span
-                    className={`usage-item${usage.lowTraffic ? ' warn' : ''}`}
-                    title={usage.usedBytes !== undefined
-                      ? `已用 ${formatBytes(usage.usedBytes)}${usage.remainingRatio !== undefined
-                        ? ` · 剩余 ${Math.round(Math.max(0, usage.remainingRatio) * 100)}%`
-                        : ''}`
-                      : '已用流量未知'}
-                  >
-                    剩余 {formatBytes(usage.remainingBytes)} / 共 {formatBytes(usage.totalBytes)}
-                  </span>
-                )}
-                {usage.expireAt !== undefined && (
-                  <span
-                    className={`usage-item${usage.expired
-                      ? ' expired'
-                      : usage.daysUntilExpiry !== undefined && usage.daysUntilExpiry <= 7 ? ' warn' : ''}`}
-                    title={usage.longTerm
-                      ? '订阅未设置到期时间'
-                      : `到期日期 ${formatExpiryDate(usage.expireAt)}（按本地时区）`}
-                  >
-                    {usage.longTerm
-                      ? '长期有效'
-                      : usage.expired
-                        ? `已过期 · ${formatExpiryDate(usage.expireAt)}`
-                        : `还有 ${usage.daysUntilExpiry} 天到期 · ${formatExpiryDate(usage.expireAt)}`}
-                  </span>
-                )}
-              </div>
-            )}
+            {shouldShowSourceUsage(source) && <SourceUsage summary={usage} />}
             {(source.notices?.length ?? 0) > 0 && (
               <details className="source-notices">
                 <summary>订阅公告 · {source.notices!.length}</summary>
@@ -3270,13 +3214,14 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   useEffect(() => {
     if (renewalAlerts.length === 0) return
     if (!('Notification' in window) || Notification.permission !== 'granted') return
-    const day = new Date().toISOString().slice(0, 10)
+    // 用本地日期而不是 UTC：UTC 跨日会让同一条提醒在本地同一天内重复两次。
+    const day = new Date().toLocaleDateString('en-CA')
     for (const alert of renewalAlerts) {
       const key = `tower-renewal-notified:${alert.id}:${day}`
-      if (localStorage.getItem(key)) continue
+      if (localPrefs.getItem(key)) continue
       try {
         new Notification(`塔台 · ${alert.name}`, { body: alert.text, tag: alert.id })
-        localStorage.setItem(key, '1')
+        localPrefs.setItem(key, '1')
       } catch {
         // 浏览器不允许构造通知时保留应用内提示即可。
       }
@@ -6850,9 +6795,9 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const [downloaded, setDownloaded] = useState(false)
   const [pendingRevoke, setPendingRevoke] = useState(false)
   const [importing, setImporting] = useState(false)
-  const [subToken, setSubToken] = useState<string>(() => localStorage.getItem('tower-sub-token') ?? '')
+  const [subToken, setSubToken] = useState<string>(() => localPrefs.getItem('tower-sub-token') ?? '')
   const [subURL, setSubURL] = useState(() => {
-    const raw = localStorage.getItem('tower-sub-url') ?? ''
+    const raw = localPrefs.getItem('tower-sub-url') ?? ''
     if (!raw) return ''
     // 旧版本 / 手工改坏的地址：不要让它带着整个导出页一起崩。
     try {
@@ -6863,7 +6808,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   })
   const [subRefreshing, setSubRefreshing] = useState(false)
   const [subUpdatedAt, setSubUpdatedAt] = useState<number | null>(() => {
-    const v = Number(localStorage.getItem('tower-sub-updated-at'))
+    const v = Number(localPrefs.getItem('tower-sub-updated-at'))
     return Number.isFinite(v) && v > 0 ? v : null
   })
   const [checking, setChecking] = useState(false)
@@ -7362,13 +7307,13 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       }
       const json = await res.json()
       setSubToken(json.token)
-      localStorage.setItem('tower-sub-token', json.token)
+      localPrefs.setItem('tower-sub-token', json.token)
       const abs = new URL(json.url, window.location.origin).href
       setSubURL(abs)
-      localStorage.setItem('tower-sub-url', abs)
+      localPrefs.setItem('tower-sub-url', abs)
       const now = Date.now()
       setSubUpdatedAt(now)
-      localStorage.setItem('tower-sub-updated-at', String(now))
+      localPrefs.setItem('tower-sub-updated-at', String(now))
       markExported()
       return abs
     } catch (e: unknown) {
@@ -7450,9 +7395,9 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     if (!subToken) return
     try { await apiFetch(`/api/sub/${encodeURIComponent(subToken)}`, { method: 'DELETE' }) } catch {}
     setSubToken(''); setSubURL(''); setSubUpdatedAt(null)
-    localStorage.removeItem('tower-sub-token')
-    localStorage.removeItem('tower-sub-url')
-    localStorage.removeItem('tower-sub-updated-at')
+    localPrefs.removeItem('tower-sub-token')
+    localPrefs.removeItem('tower-sub-url')
+    localPrefs.removeItem('tower-sub-updated-at')
   }
 
   const toggleProtocol = (kind: ProxyKind) => {

@@ -160,7 +160,11 @@ function bytesAfter(marker: string, text: string): number | undefined {
   return m ? toBytes(m[1], m[2]) : undefined
 }
 
-/** Unix 秒 / Unix 毫秒 / YYYY-MM-DD（按 UTC 午夜，和旧解析保持一致）。 */
+/**
+ * Unix 秒 / Unix 毫秒 / YYYY-MM-DD。
+ * 纯日期按**本地日历日**解析（当天 0 点到期），不再用 UTC 午夜，
+ * 否则东八区用户会看到「日期当天 08:00 才到期」，西半球则会提前一天。
+ */
 function parseExpiryValue(raw: string): number | undefined {
   const text = raw.trim()
   if (/^\d+(?:\.\d+)?$/.test(text)) {
@@ -170,8 +174,9 @@ function parseExpiryValue(raw: string): number | undefined {
   }
   const m = text.replace(/[./]/g, '-').match(/^(\d{4})-(\d{1,2})-(\d{1,2})/)
   if (!m) return undefined
-  const date = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
-  return Number.isFinite(date) ? Math.floor(date / 1000) : undefined
+  const date = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+  const millis = date.getTime()
+  return Number.isFinite(millis) ? Math.floor(millis / 1000) : undefined
 }
 
 function timeAfter(marker: string, text: string): number | undefined {
@@ -180,21 +185,32 @@ function timeAfter(marker: string, text: string): number | undefined {
   return parseExpiryValue(text.slice(index + marker.length))
 }
 
-/** `subscription-userinfo: upload=…; download=…; total=…; expire=…` header. */
+/**
+ * `subscription-userinfo: upload=…; download=…; total=…; expire=…` header.
+ * 面板实现差异很大：expire 可能是秒、毫秒或 `YYYY-MM-DD`，字节数也可能带单位，
+ * 所以复用正文解析的同一套归一化，避免“头里有值但被 Number() 判成 NaN 后丢掉”。
+ */
 export function parseUserinfoHeader(header: string | undefined | null): SubscriptionUsage | undefined {
   if (!header) return undefined
   const usage: SubscriptionUsage = {}
   let matched = false
-  for (const part of header.split(';')) {
+  for (const part of header.split(/[;,]/)) {
     const eq = part.indexOf('=')
     if (eq < 0) continue
     const key = part.slice(0, eq).trim().toLowerCase()
-    const value = Number(part.slice(eq + 1).trim().replace(/^["']|["']$/g, ''))
-    if (!Number.isFinite(value) || value < 0) continue
-    if (key === 'upload') { usage.upload = Math.floor(value); matched = true }
-    else if (key === 'download') { usage.download = Math.floor(value); matched = true }
-    else if (key === 'total') { usage.total = Math.floor(value); matched = true }
-    else if (key === 'expire') { usage.expire = Math.floor(value); matched = true }
+    const raw = part.slice(eq + 1).trim().replace(/^["']|["']$/g, '')
+    if (!raw) continue
+    if (key === 'expire' || key === 'expires') {
+      const expire = parseExpiryValue(raw)
+      if (expire !== undefined) { usage.expire = expire; matched = true }
+      continue
+    }
+    if (key !== 'upload' && key !== 'download' && key !== 'total') continue
+    const numeric = Number(raw)
+    const bytes = Number.isFinite(numeric) && numeric >= 0 ? Math.floor(numeric) : parseBytesValue(raw)
+    if (bytes === undefined) continue
+    usage[key] = bytes
+    matched = true
   }
   return matched ? usage : undefined
 }

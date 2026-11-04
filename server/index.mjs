@@ -20,7 +20,13 @@ import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib'
 import { convertRuleSet, RuleSetConversionError } from './ruleset-convert.mjs'
 import { loadIPASNData, organizationForAddress } from './ip-asn.mjs'
 
-const PORT = Number(process.env.PORT || 8787)
+const rawPort = String(process.env.PORT ?? '').trim()
+const parsedPort = rawPort ? Number(rawPort) : 8787
+// 非法 PORT 直接传给 listen 会抛 ERR_SOCKET_BAD_PORT（没有可读提示），这里回退默认值。
+const PORT = Number.isInteger(parsedPort) && parsedPort >= 0 && parsedPort <= 65535 ? parsedPort : 8787
+if (rawPort && PORT !== parsedPort) {
+  console.warn(`[tower] PORT=${rawPort} 无效（应为 0–65535 的整数），已改用 ${PORT}`)
+}
 // 默认监听所有网卡，手机 / 局域网其它机器才能打开订阅页与订阅链接。
 // 只想本机使用时启动加 `HOST=127.0.0.1`。
 const HOST = process.env.HOST || '0.0.0.0'
@@ -1131,7 +1137,7 @@ function headerValue(headers, name) {
   return Array.isArray(value) ? value[0] : (value ?? null)
 }
 
-function requestOnce(target, userAgent, dohEndpoint) {
+function requestOnce(target, userAgent, dohEndpoint, headersOnly = false) {
   return new Promise((resolve, reject) => {
     const transport = target.protocol === 'https:' ? httpsRequest : httpRequest
     const req = transport({
@@ -1149,6 +1155,13 @@ function requestOnce(target, userAgent, dohEndpoint) {
         'accept-encoding': 'gzip, deflate, br',
       },
     }, (upstream) => {
+      if (headersOnly) {
+        // 只读响应头时立刻断开，避免把几 MB 的订阅正文完整下载下来。
+        upstream.on('error', () => {})
+        upstream.destroy()
+        resolve({ status: upstream.statusCode ?? 0, headers: upstream.headers, body: Buffer.alloc(0) })
+        return
+      }
       const declared = Number(headerValue(upstream.headers, 'content-length') ?? 0)
       if (Number.isFinite(declared) && declared > MAX_FETCH_BYTES) {
         upstream.destroy(new Error(`订阅内容超过 ${MAX_FETCH_LABEL} 上限`))
@@ -1213,10 +1226,10 @@ async function readLimitedBody(response) {
   return Buffer.concat(chunks, size)
 }
 
-async function fetchWithDoH(target, userAgent, dohEndpoint) {
+async function fetchWithDoH(target, userAgent, dohEndpoint, headersOnly = false) {
   let current = target
   for (let hop = 0; hop < 6; hop++) {
-    const result = await requestOnce(current, userAgent, dohEndpoint)
+    const result = await requestOnce(current, userAgent, dohEndpoint, headersOnly)
     const location = headerValue(result.headers, 'location')
     if ([301, 302, 303, 307, 308].includes(result.status) && location) {
       const next = new URL(location, current)
@@ -1243,6 +1256,8 @@ async function handleFetch(url, options, res) {
   }
 
   const userAgent = sanitizeUserAgent(options?.userAgent) || 'clash-verge/v2.4.2'
+  // 配额探测只需要响应头；提前断开上游正文，避免每次刷新都下载整份订阅。
+  const headersOnly = options?.headersOnly === true
   let dohEndpoint
   try {
     dohEndpoint = validatedDoHURL(options?.doh)
@@ -1255,7 +1270,7 @@ async function handleFetch(url, options, res) {
     // Node 的 fetch 不暴露自定义 DNS，使用 http(s).request + lookup 才能
     // 真正按 DoH 返回的地址连接，同时保留原域名的 TLS 校验。
     try {
-      upstream = await fetchWithDoH(target, userAgent, dohEndpoint)
+      upstream = await fetchWithDoH(target, userAgent, dohEndpoint, headersOnly)
     } catch (error) {
       return json(res, 502, { error: `订阅服务器无法访问：${error?.message ?? '网络错误'}` })
     }
@@ -1268,16 +1283,21 @@ async function handleFetch(url, options, res) {
     if ('error' in response) {
       return json(res, 502, { error: `订阅服务器无法访问：${response.error?.message ?? '网络错误'}` })
     }
-    let body
-    try {
-      body = await readLimitedBody(response)
-    } catch (error) {
-      return json(res, 502, { error: `订阅内容读取失败：${error?.message ?? '网络错误'}` })
-    }
-    upstream = {
-      status: response.status,
-      headers: response.headers,
-      body,
+    if (headersOnly) {
+      await response.body?.cancel().catch(() => {})
+      upstream = { status: response.status, headers: response.headers, body: Buffer.alloc(0) }
+    } else {
+      let body
+      try {
+        body = await readLimitedBody(response)
+      } catch (error) {
+        return json(res, 502, { error: `订阅内容读取失败：${error?.message ?? '网络错误'}` })
+      }
+      upstream = {
+        status: response.status,
+        headers: response.headers,
+        body,
+      }
     }
   }
 
@@ -1543,6 +1563,7 @@ const server = createServer(async (req, res) => {
       return await handleFetch(target, {
         userAgent: url.searchParams.get('ua') ?? '',
         doh: url.searchParams.get('doh') ?? '',
+        headersOnly: url.searchParams.get('headers') === '1',
       }, res)
     }
 
@@ -1806,7 +1827,10 @@ const server = createServer(async (req, res) => {
 })
 
 server.listen(PORT, HOST, () => {
-  console.log(`[tower-web] companion server on http://127.0.0.1:${PORT}`)
+  // PORT=0 时由系统分配端口，日志必须用实际监听端口。
+  const bound = server.address()
+  const actualPort = bound && typeof bound === 'object' ? bound.port : PORT
+  console.log(`[tower-web] companion server on http://127.0.0.1:${actualPort}`)
   if (SERVER_MODE) {
     console.log(`[tower-web] 服务器模式：工作区保存在 ${WORKSPACE_FILE}`)
     if (!serverSettings.apiToken) {
@@ -1814,7 +1838,7 @@ server.listen(PORT, HOST, () => {
     }
   }
   if (HOST === '0.0.0.0') {
-    for (const u of lanUrls(PORT)) console.log(`[tower-web] 局域网可访问: ${u}`)
+    for (const u of lanUrls(actualPort)) console.log(`[tower-web] 局域网可访问: ${u}`)
     console.log(`[tower-web] 局域网共享：${serverSettings.lanSharing ? '开启' : '关闭'} · API 密钥：${serverSettings.apiToken ? '已启用' : '未启用'}`)
     if (!serverSettings.apiToken) {
       console.log('[tower-web] 可在「订阅设置 → 局域网与访问密钥」生成密钥；不需要局域网时也可用 HOST=127.0.0.1 启动')

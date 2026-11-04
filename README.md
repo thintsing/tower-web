@@ -70,7 +70,7 @@
 - mihomo 的 ECS 需要较新内核并支持 `#代理组` DNS 后缀；sing-box 的 ECS 需要官方 1.14+，Hiddify 1.13 会跳过 ECS 提示。
 - Surge 的仅节点输出是纯 `policy-path` 列表；Quantumult X 的仅节点作为 `server_remote` 资源导入；sing-box MT 完整配置提供「规则判定 / 全局代理 / 直接连接」三种模式。
 - 经典规则列表会按目标客户端自动转换为二进制规则集：mihomo / Stash 用 MRS（domain + ipcidr 两份引用），sing-box / Hiddify 用 SRS；无法表达的规则类型继续内联。Karing、Shadowrocket 不读 MRS，仍引用经典列表。
-- 订阅默认请求没有解析到节点时，会自动用 `clash.meta` 兼容 UA 重试；流量或到期信息缺失时会补请求一次配额响应头。
+- 订阅默认请求没有解析到节点时，会自动用 `clash.meta` 兼容 UA 重试；流量或到期信息缺失时，会按 Clash 方言补探测响应头（最多 6 次、只取响应头不下载正文，命中过的变体会记住）。
 - 闭源客户端按规则白名单和引用完整性自检，仍建议在目标客户端实际导入确认。
 
 ## 快速开始
@@ -244,6 +244,7 @@ selfcheck:map         地图地区聚合
 selfcheck:matching    策略组拖动后的规则顺序
 selfcheck:protocols   协议解析与客户端降级
 selfcheck:qr          二维码生成与解码
+selfcheck:quota       订阅用量响应头 / Clash 方言探测 / 只取头
 selfcheck:regressions 审计回归：解析 / 命名 / 备份兼容 / 存储配额 / 隐式 TLS
 selfcheck:remote      代理集合与远程规则集
 selfcheck:rulesets    规则集方言转换

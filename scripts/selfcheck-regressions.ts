@@ -476,6 +476,10 @@ let fetchCalls = 0
 let allFetchCalls = 0
 let activeFetches = 0
 let maxActiveFetches = 0
+// 配额探测回归：记录探测命中的目标地址，并模拟上游整站失败。
+let quotaFailNext = false
+const quotaTargets: string[] = []
+const QUOTA_HEADER = 'upload=1048576; download=10737418240; total=107374182400; expire=1798761600'
 
 function localRuleset(pathname: string): Response {
   try {
@@ -500,6 +504,21 @@ globalThis.fetch = (async (input: RequestInfo | URL) => {
     if (/^https:\/\/latency\.example\//.test(target)) {
       const auth = Buffer.from('aes-256-gcm:pass').toString('base64').replace(/=+$/, '')
       return new Response(`ss://${auth}@1.2.3.4:8388#刷新后的节点`, { status: 200 })
+    }
+    if (target.includes('quota-retain.example')) {
+      quotaTargets.push(target)
+      if (quotaFailNext) {
+        return new Response(JSON.stringify({ error: 'upstream down' }), {
+          status: 502,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      const auth = Buffer.from('aes-256-gcm:pass').toString('base64').replace(/=+$/, '')
+      // 通用链接不带用量头；只有 clash=1 变体返回用量，且正文固定为一个节点。
+      const headers = new URL(target).searchParams.get('clash') === '1'
+        ? { 'x-subscription-userinfo': QUOTA_HEADER }
+        : {}
+      return new Response(`ss://${auth}@1.2.3.4:8388#配额节点`, { status: 200, headers })
     }
     return new Response(`DOMAIN-SUFFIX,${target.split('/').pop()?.replace('.list', '')}.example`, {
       status: 200,
@@ -583,7 +602,60 @@ await checkAsync('订阅刷新后清理旧节点的测速 / 错误状态', async
   assert.equal('old-node' in state.probeErrorByNodeId, false)
 })
 
-// ---------- 11. 只读模式：工作区写被拦，设备偏好仍可改 ----------
+// ---------- 11. 配额探测：命中变体复用 + 失败保留旧用量 ----------
+await checkAsync('配额探测命中后复用变体，上游失败时保留旧用量', async () => {
+  const { useStore } = await import('../src/store')
+  useStore.setState({
+    sources: [{
+      id: 'quota-retain',
+      name: '配额保留测试',
+      url: 'https://quota-retain.example/link/token?sub=1',
+      isEnabled: true,
+      excludedNodeKeys: [],
+    }],
+    nodes: [],
+    loadingSourceIDs: [],
+    errors: {},
+  })
+  quotaFailNext = false
+  quotaTargets.length = 0
+  await useStore.getState().refreshSource('quota-retain')
+  let source = useStore.getState().sources.find((item) => item.id === 'quota-retain')!
+  assert.equal(source.totalBytes, 107374182400, 'clash=1 探测应写回总量')
+  assert.equal(source.usedBytes, 1048576 + 10737418240, '应写回已用流量')
+  assert.equal(source.expireAt, 1798761600000, '应写回到期时间')
+  assert.equal(
+    quotaTargets.filter((target) => target.includes('clash=1')).length,
+    1,
+    '首次刷新应只命中一次 clash=1 探测，不应跑完整条链',
+  )
+
+  // 第二次刷新：上次命中的变体应排在最前，不再尝试 flag=clash。
+  quotaTargets.length = 0
+  await useStore.getState().refreshSource('quota-retain')
+  assert.equal(
+    quotaTargets.filter((target) => target.includes('clash=1')).length,
+    1,
+    '复用缓存变体时仍只发一次探测',
+  )
+  assert.equal(
+    quotaTargets.filter((target) => target.includes('flag=clash')).length,
+    0,
+    '缓存命中后不应再试 flag=clash',
+  )
+
+  // 上游失败：旧的用量字段必须原样保留，不能变成空。
+  quotaFailNext = true
+  const before = useStore.getState().sources.find((item) => item.id === 'quota-retain')!
+  await useStore.getState().refreshSource('quota-retain')
+  const after = useStore.getState().sources.find((item) => item.id === 'quota-retain')!
+  assert.equal(after.totalBytes, before.totalBytes, '失败时总量应保留')
+  assert.equal(after.usedBytes, before.usedBytes, '失败时已用流量应保留')
+  assert.equal(after.expireAt, before.expireAt, '失败时到期时间应保留')
+  assert.ok(useStore.getState().errors['quota-retain'], '失败应写入错误提示')
+})
+
+// ---------- 12. 只读模式：工作区写被拦，设备偏好仍可改 ----------
 await checkAsync('只读模式只拦工作区字段，设备偏好保持可写', async () => {
   const { useStore } = await import('../src/store')
   useStore.setState({
@@ -918,17 +990,30 @@ check('订阅配额：响应头 / STATUS / TRAFFIC / 正文 key=value 都能解�
   assert.equal(header.total, 107374182400)
   assert.equal(header.upload, 1048576)
 
+  // 面板实现差异：expire 可能是毫秒或 ISO 日期，字节数可能带单位。
+  const millis = parseUserinfoHeader(
+    'upload=1048576; download=10737418240; total=107374182400; expire=1798761600000',
+  )
+  assert.ok(millis)
+  assert.equal(millis.expire, 1798761600, '毫秒应归一到秒')
+  assert.equal(usageFieldsFrom(millis).expireAt, 1798761600000)
+
+  const iso = parseUserinfoHeader('total=1GB; expire=2027-01-01')
+  assert.ok(iso)
+  assert.equal(iso.total, GB)
+  assert.equal(iso.expire, new Date(2027, 0, 1).getTime() / 1000)
+
   const status = parseStatusLine('STATUS=↑:1.2GB ↓:34GB TOT:500GB EXPIRES:2027-01-01')
   assert.ok(status)
   assert.equal(status.upload, Math.floor(1.2 * GB))
   assert.equal(status.download, 34 * GB)
   assert.equal(status.total, 500 * GB)
-  assert.equal(status.expire, Date.UTC(2027, 0, 1) / 1000)
+  assert.equal(status.expire, new Date(2027, 0, 1).getTime() / 1000)
 
   const traffic = parseStatusLine('TRAFFIC=upload=1.2GB; download=34GB; total=500GB; expire=2027-01-01')
   assert.ok(traffic)
   assert.equal(traffic.total, 500 * GB)
-  assert.equal(traffic.expire, Date.UTC(2027, 0, 1) / 1000)
+  assert.equal(traffic.expire, new Date(2027, 0, 1).getTime() / 1000)
 
   const declared = parseUsageDeclaration('upload=1GB\n download=2GB\n total=100GB\nexpire=0')
   assert.ok(declared)
