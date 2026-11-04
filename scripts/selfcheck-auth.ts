@@ -4,8 +4,10 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { createServer } from 'node:http'
 import { networkInterfaces, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { AddressInfo } from 'node:net'
 import { fileURLToPath } from 'node:url'
 
 const PORT = 20000 + Math.floor(Math.random() * 20000)
@@ -94,6 +96,70 @@ async function main(): Promise<void> {
       assert.match(token, /^[A-Za-z0-9_-]{32}$/)
       const saved = JSON.parse(readFileSync(join(dataDir, 'settings.json'), 'utf8'))
       assert.equal(saved.apiToken, token)
+    })
+
+    await check('/api/fetch 超过 32MB 上限时拒绝且不拖垮服务', async () => {
+      const upstream = createServer((_req, res) => {
+        res.writeHead(200, { 'content-type': 'text/plain' })
+        const chunk = Buffer.alloc(1024 * 1024, 97)
+        const timer = setInterval(() => {
+          if (!res.write(chunk)) {
+            // 忽略背压即可：被测服务到达上限后会主动断开。
+          }
+        }, 4)
+        res.on('close', () => clearInterval(timer))
+      })
+      await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+      const upstreamPort = (upstream.address() as AddressInfo).port
+      const started = Date.now()
+      try {
+        const response = await fetch(
+          `${LOCAL}/api/fetch?key=${encodeURIComponent(token)}&url=${encodeURIComponent(`http://127.0.0.1:${upstreamPort}/`)}`,
+        )
+        const body = await response.json() as { error?: string }
+        assert.equal(response.status, 502)
+        assert.match(body.error ?? '', /32MB/)
+        assert.ok(Date.now() - started < 5000, '超限响应应立即中止而不是读完整个响应体')
+      } finally {
+        upstream.close()
+      }
+      const health = await fetch(`${LOCAL}/api/health`)
+      assert.equal(health.status, 200)
+    })
+
+    await check('/api/ruleset 拒绝链路本地 / 云元数据地址，内置 file 仍可用', async () => {
+      const blocked = await fetch(
+        `${LOCAL}/api/ruleset?format=quanx&url=${encodeURIComponent('http://169.254.169.254/latest/meta-data/')}`,
+      )
+      assert.equal(blocked.status, 400)
+      assert.match(await blocked.text(), /元数据|链路本地/)
+      const builtin = await fetch(`${LOCAL}/api/ruleset?format=mrs&behavior=domain&file=ACL4SSR_Apple.list`)
+      assert.equal(builtin.status, 200)
+    })
+
+    await check('发布订阅后 subscriptions.json 异步落盘', async () => {
+      const publishToken = `audit-${Math.random().toString(36).slice(2, 10)}`.padEnd(32, 'x')
+      const published = await fetch(`${LOCAL}/api/subscribe?token=${publishToken}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-tower-key': token },
+        body: JSON.stringify({ title: 'audit', formats: { yaml: 'proxies: []\n' } }),
+      })
+      assert.equal(published.status, 200)
+      const file = join(dataDir, 'subscriptions.json')
+      const deadline = Date.now() + 3000
+      let onDisk = false
+      while (Date.now() < deadline) {
+        try {
+          const data = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
+          if (data[publishToken]) { onDisk = true; break }
+        } catch {
+          // 文件尚未生成或正在原子替换
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      assert.ok(onDisk, '发布后 3s 内未落盘')
+      const removed = await fetch(`${LOCAL}/api/sub/${publishToken}?key=${encodeURIComponent(token)}`, { method: 'DELETE' })
+      assert.equal(removed.status, 200)
     })
 
     if (!lanBase) {

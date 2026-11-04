@@ -17,6 +17,8 @@ import { canonicalNodeURI } from '../src/generator/base64Sub'
 import { generateSingBox } from '../src/generator/singbox'
 import { generateSurge } from '../src/generator/surge'
 import { generateConfig } from '../src/generator'
+import { uniqueDisplayNames } from '../src/generator/groups'
+import { clearTowerStorage, createSafeStorage, isStorageFull, onStorageFullChange } from '../src/util/localStore'
 import { loadScheme, parseSchemeINI, BUILTIN_SCHEMES } from '../src/rules/scheme'
 import { parseRuleSetText } from '../src/rules/ruleSets'
 import { countryNumericCode } from '../src/worldmap/countryCodes'
@@ -914,6 +916,99 @@ check('协议传输层与 UDP 转发能力映射', () => {
     kind: 'hysteria2',
     udpRelayEnabled: false,
   })).udpForwarding, 'unsupported')
+})
+
+// ---------- 8. base64 包裹的配置与节点重名 ----------
+check('base64 包裹的 Clash YAML 会被解码后解析', () => {
+  const yaml = [
+    'mixed-port: 7890',
+    'proxies:',
+    '  - name: HK',
+    '    type: ss',
+    '    server: hk.example.com',
+    '    port: 8388',
+    '    cipher: aes-128-gcm',
+    '    password: pw',
+    '',
+  ].join('\n')
+  const parsed = parse(Buffer.from(yaml, 'utf8').toString('base64'))
+  assert.equal(parsed.nodes.length, 1)
+  assert.equal(parsed.nodes[0].kind, 'ss')
+})
+
+check('base64 包裹的 Surge 配置（首行是注释）会被解码后解析', () => {
+  const surge = [
+    '#!MANAGED-CONFIG',
+    '[General]',
+    'loglevel = notify',
+    '[Proxy]',
+    'HK = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=pw',
+    '',
+  ].join('\n')
+  const parsed = parse(Buffer.from(surge, 'utf8').toString('base64'))
+  assert.equal(parsed.nodes.length, 1)
+  assert.equal(parsed.nodes[0].name, 'HK')
+})
+
+check('重名补丁不会让本身带后缀的节点与其他节点重名', () => {
+  const nodes = [
+    { ...base, id: 'n1', kind: 'ss', name: 'A', server: 'a.example.com', port: 1, password: 'p' },
+    { ...base, id: 'n2', kind: 'ss', name: 'A 2', server: 'b.example.com', port: 1, password: 'p' },
+    { ...base, id: 'n3', kind: 'ss', name: 'A', server: 'c.example.com', port: 1, password: 'p' },
+  ] as ProxyNode[]
+  const names = uniqueDisplayNames(nodes, (value) => value, (node) => node.name)
+  const values = nodes.map((node) => names.get(node.id))
+  assert.deepEqual(values, ['A', 'A 2', 'A 3'])
+  assert.equal(new Set(values).size, values.length)
+})
+
+check('localStorage 配额满时写入不抛异常，并通知界面一次', () => {
+  const changes: boolean[] = []
+  const off = onStorageFullChange((value) => changes.push(value))
+  const storage = {
+    getItem: () => null,
+    setItem: (_name: string, value: string) => {
+      if (value.length > 200) {
+        const error = new Error('quota exceeded')
+        error.name = 'QuotaExceededError'
+        throw error
+      }
+    },
+    removeItem: () => {},
+  }
+  const safe = createSafeStorage(() => storage)
+  assert.doesNotThrow(() => safe.setItem('tower-web-state', 'x'.repeat(1000)))
+  assert.equal(isStorageFull(), true)
+  assert.doesNotThrow(() => safe.setItem('tower-web-state', 'small'))
+  assert.equal(isStorageFull(), false)
+  assert.deepEqual(changes, [true, false])
+  off()
+})
+
+check('重置只清理塔台的 localStorage 键，保留同源其它应用数据', () => {
+  const memory = new Map<string, string>([
+    ['tower-web-state', '{"sources":[]}'],
+    ['tower-sub-token', 'abc'],
+    ['tower-renewal-notified:1:2026-11-04', '1'],
+    ['other-app-prefs', 'keep-me'],
+    ['unrelated', 'keep-too'],
+  ])
+  const snapshot = () => {
+    const keys = [...memory.keys()]
+    return {
+      length: keys.length,
+      key: (index: number) => keys[index] ?? null,
+      removeItem: (name: string) => { memory.delete(name) },
+    }
+  }
+  const removed = clearTowerStorage(snapshot())
+  assert.deepEqual(removed.sort(), [
+    'tower-renewal-notified:1:2026-11-04',
+    'tower-sub-token',
+    'tower-web-state',
+  ])
+  assert.equal(memory.get('other-app-prefs'), 'keep-me')
+  assert.equal(memory.get('unrelated'), 'keep-too')
 })
 
 if (failures) {

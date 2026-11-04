@@ -85,6 +85,26 @@ check('空节点池：有订阅但 0 节点时区分解析失败与全被排除'
   assert.equal(excluded.action, 'enable-nodes')
 })
 
+check('空节点池：只有被停用的自有节点时不再提示添加订阅', () => {
+  const reason = explainNodePool({
+    sourceCount: 0, manualNodeCount: 1, nodeCount: 1, enabledNodeCount: 0, excludedNodeCount: 1, sourceErrors: [],
+  })
+  assert.equal(reason.code, 'all-excluded')
+  assert.equal(reason.action, 'enable-nodes')
+  assert.match(reason.title, /没有启用/)
+})
+
+check('四步主线：只有被停用的自有节点时第 1 步阻断并提示恢复', () => {
+  const steps = buildFlow({
+    sourceCount: 0, manualNodeCount: 1, nodeCount: 1, enabledNodeCount: 0, excludedNodeCount: 1, sourceErrors: [],
+    hasExportable: false, schemeReady: true, schemeName: '默认方案', schemeCustomized: false,
+    lintErrors: 0, lintWarnings: 0, published: false,
+  })
+  assert.equal(steps[0].status, 'blocked')
+  assert.equal(steps[0].detail, '没有启用的节点')
+  assert.equal(steps[0].actionLabel, '恢复节点')
+})
+
 check('四步主线：没有订阅时第 1 步待开始，检查与导出被阻断', () => {
   const steps = buildFlow({
     sourceCount: 0, manualNodeCount: 0, nodeCount: 0, enabledNodeCount: 0, excludedNodeCount: 0, sourceErrors: [],

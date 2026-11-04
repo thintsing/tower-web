@@ -266,6 +266,23 @@ function main(): void {
     assert.equal(readBackupHistory(storage).length, 0)
   })
 
+  check('旧备份缺少 excludedNodeKeys 时补成空数组并保持启用', () => {
+    const legacy = JSON.stringify({
+      app: BACKUP_APP,
+      version: BACKUP_VERSION,
+      exportedAt: '2025-01-01T00:00:00.000Z',
+      data: {
+        ...DATA,
+        sources: [{ id: 'old-source', name: '旧订阅', url: 'https://sub.example.com/old' }],
+      },
+    })
+    const restored = parseBackup(legacy)
+    assert.deepEqual(restored.data.sources[0].excludedNodeKeys, [])
+    assert.equal(restored.data.sources[0].isEnabled, true)
+    // 界面会直接读 .length；恢复后的对象必须能安全访问。
+    assert.equal(restored.data.sources[0].excludedNodeKeys.length, 0)
+  })
+
   if (failures) {
     console.error(`\n${failures} 项检查失败`)
     process.exit(1)
