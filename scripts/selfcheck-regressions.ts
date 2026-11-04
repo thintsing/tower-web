@@ -1032,6 +1032,348 @@ check('Clash 导入 hysteria2 / tuic / anytls 时补回隐式 TLS', () => {
   for (const node of nodes) assert.equal(node.tls, true, `${node.name} 应识别为 TLS`)
 })
 
+// ---------- 15. sing-box / Hiddify JSON 全协议导入往返 ----------
+const jsonNode = (patch: Partial<ProxyNode>): ProxyNode => ({
+  ...base,
+  id: `json-${patch.name ?? 'node'}`,
+  kind: 'ss',
+  name: 'node',
+  server: 'node.example.com',
+  port: 443,
+  ...patch,
+})
+
+const JSON_NODES: ProxyNode[] = [
+  jsonNode({ name: 'SS', kind: 'ss', server: 'ss.example.com', port: 8388, cipher: 'aes-256-gcm', password: 'ss-pass' }),
+  jsonNode({
+    name: 'SS-V2', kind: 'ss', server: 'ssv2.example.com', port: 443, cipher: 'aes-128-gcm', password: 'v2-pass',
+    plugin: 'v2ray-plugin', transport: 'ws', pluginMux: true, tls: true, path: '/ssws', hostHeader: 'ss.host',
+  }),
+  jsonNode({
+    name: 'SS-OBFS', kind: 'ss', server: 'obfs.example.com', port: 8388, cipher: 'aes-128-gcm', password: 'obfs-pass',
+    obfs: 'http', obfsParam: 'obfs.host',
+  }),
+  jsonNode({
+    name: 'SS-STLS', kind: 'ss', server: 'stls.example.com', port: 443, cipher: 'aes-256-gcm', password: 'outer-pass',
+    plugin: 'shadow-tls', shadowTLS: { version: 3, host: 'shadow.host', password: 'inner-pass', skipCertificateVerification: true },
+    fingerprint: 'chrome',
+  }),
+  jsonNode({
+    name: 'VM', kind: 'vmess', server: 'vm.example.com', cipher: 'aes-128-gcm',
+    uuid: '11111111-2222-3333-4444-555555555555', alterID: 0, tls: true, sni: 'vm.example.com',
+    skipCertificateVerification: true, alpn: 'h2,http/1.1', transport: 'ws', path: '/vm', hostHeader: 'vm.host',
+  }),
+  jsonNode({
+    name: 'VM-HTTP', kind: 'vmess', server: 'vmh.example.com', cipher: 'auto',
+    uuid: '44444444-5555-6666-7777-888888888888', transport: 'http', path: '/h2', hostHeader: 'h2.host',
+  }),
+  jsonNode({
+    name: 'VM-HU', kind: 'vmess', server: 'vmhu.example.com', cipher: 'auto',
+    uuid: '55555555-6666-7777-8888-999999999999', transport: 'httpupgrade', path: '/hu', hostHeader: 'hu.host',
+  }),
+  jsonNode({
+    name: 'VM-QUIC', kind: 'vmess', server: 'vmq.example.com', cipher: 'auto',
+    uuid: '66666666-7777-8888-9999-aaaaaaaaaaaa', transport: 'quic',
+  }),
+  jsonNode({
+    name: 'VL', kind: 'vless', server: 'vl.example.com',
+    uuid: '22222222-3333-4444-5555-666666666666', flow: 'xtls-rprx-vision', tls: true, sni: 'vl.example.com',
+    realityPublicKey: 'reality-pub', realityShortID: 'abcd', fingerprint: 'chrome', transport: 'grpc', path: 'vl-grpc',
+  }),
+  jsonNode({
+    name: 'TR', kind: 'trojan', server: 'tr.example.com', password: 'tr-pass', tls: true, sni: 'tr.example.com',
+    transport: 'ws', path: '/tr', hostHeader: 'tr.host',
+  }),
+  jsonNode({
+    name: 'HY2', kind: 'hysteria2', server: 'hy2.example.com', password: 'hy2-pass', tls: true, sni: 'hy2.example.com',
+    skipCertificateVerification: true, obfs: 'salamander', obfsParam: 'obfs-pass', upMbps: 50, downMbps: 200,
+    portHopping: '443,5000-6000',
+  }),
+  jsonNode({
+    name: 'HY1', kind: 'hysteria', server: 'hy1.example.com', password: 'hy1-pass', tls: true, sni: 'hy1.example.com',
+    obfs: 'http', upMbps: 30, downMbps: 100,
+  }),
+  jsonNode({
+    name: 'TU', kind: 'tuic', server: 'tu.example.com', uuid: '33333333-4444-5555-6666-777777777777',
+    password: 'tu-pass', congestionControl: 'bbr', udpRelayMode: 'native', tls: true, sni: 'tu.example.com', alpn: 'h3',
+  }),
+  jsonNode({
+    name: 'ANY', kind: 'anytls', server: 'any.example.com', password: 'any-pass', tls: true, sni: 'any.example.com',
+    idleSessionCheckInterval: 30, idleSessionTimeout: 60, minIdleSession: 5,
+  }),
+  jsonNode({
+    name: 'SSH', kind: 'ssh', server: 'ssh.example.com', port: 22, username: 'root', password: 'ssh-pass',
+    ssh: { privateKey: 'ssh-private-key', hostKeys: ['ssh-ed25519 AAAA'], hostKeyAlgorithms: ['ssh-ed25519'] },
+  }),
+  jsonNode({
+    name: 'SNELL', kind: 'snell', server: 'snell.example.com', password: 'snell-psk', version: 4,
+    obfs: 'http', obfsParam: 'snell.host',
+  }),
+  jsonNode({ name: 'SOCKS', kind: 'socks5', server: 'socks.example.com', port: 1080, username: 'u', password: 'p' }),
+  jsonNode({ name: 'HTTPP', kind: 'http', server: 'http.example.com', port: 8080, username: 'u', password: 'p', tls: true, sni: 'http.example.com' }),
+  jsonNode({
+    name: 'WG', kind: 'wireguard', server: 'wg.example.com', port: 51820,
+    wireGuardPrivateKey: 'wg-private', wireGuardPublicKey: 'wg-public', wireGuardPreSharedKey: 'wg-psk',
+    wireGuardIPv4: '10.0.0.2', wireGuardIPv6: 'fd00::2', wireGuardAllowedIPs: '0.0.0.0/0,::/0',
+    wireGuardReserved: '1,2,3', wireGuardMTU: 1420, wireGuardPersistentKeepalive: 30,
+  }),
+  jsonNode({
+    name: 'MASQUE', kind: 'masque', server: 'masque.example.com', port: 443, tls: true, sni: 'masque.example.com',
+    alpn: 'h3', username: 'u', password: 'p', path: '/masque',
+    masque: {
+      mode: 'basicConnectIP', httpVersion: 3, mtu: 1400, headers: { 'X-Test': '1' },
+      certificate: ['-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----'],
+    },
+  }),
+]
+
+check('sing-box JSON 全协议导出后能读回，关键字段不丢', () => {
+  const generated = generateSingBox(JSON_NODES, SCHEME, { target: 'sing-box', contentMode: 'nodes' })
+  assert.equal(generated.skipped, 0)
+  const imported = parse(generated.text)
+  assert.equal(imported.nodes.length, JSON_NODES.length)
+  assert.equal(imported.rejectedLineCount, 0)
+
+  const ss = byName(imported.nodes, 'SS')
+  assert.equal(ss.cipher, 'aes-256-gcm')
+  assert.equal(ss.password, 'ss-pass')
+  const v2 = byName(imported.nodes, 'SS-V2')
+  assert.equal(v2.plugin, 'v2ray-plugin')
+  assert.equal(v2.transport, 'ws')
+  assert.equal(v2.path, '/ssws')
+  assert.equal(v2.hostHeader, 'ss.host')
+  assert.equal(v2.pluginMux, true)
+  assert.equal(v2.tls, true)
+  const obfs = byName(imported.nodes, 'SS-OBFS')
+  assert.equal(obfs.plugin, 'obfs-local')
+  assert.equal(obfs.obfs, 'http')
+  assert.equal(obfs.obfsParam, 'obfs.host')
+  const stls = byName(imported.nodes, 'SS-STLS')
+  assert.equal(stls.plugin, 'shadow-tls')
+  assert.deepEqual(stls.shadowTLS, {
+    version: 3, host: 'shadow.host', password: 'inner-pass', skipCertificateVerification: true,
+  })
+  assert.equal(stls.fingerprint, 'chrome')
+  // ShadowTLS 辅助出站不能被当成独立节点。
+  assert.equal(imported.nodes.some((node) => node.name.startsWith('tower-shadowtls')), false)
+
+  const vm = byName(imported.nodes, 'VM')
+  assert.equal(vm.uuid, '11111111-2222-3333-4444-555555555555')
+  assert.equal(vm.cipher, 'aes-128-gcm')
+  assert.equal(vm.alterID, 0)
+  assert.equal(vm.tls, true)
+  assert.equal(vm.sni, 'vm.example.com')
+  assert.equal(vm.skipCertificateVerification, true)
+  assert.equal(vm.alpn, 'h2,http/1.1')
+  assert.equal(vm.transport, 'ws')
+  assert.equal(vm.path, '/vm')
+  assert.equal(vm.hostHeader, 'vm.host')
+
+  const http2 = byName(imported.nodes, 'VM-HTTP')
+  assert.equal(http2.transport, 'http')
+  assert.equal(http2.path, '/h2')
+  assert.equal(http2.hostHeader, 'h2.host')
+  const upgrade = byName(imported.nodes, 'VM-HU')
+  assert.equal(upgrade.transport, 'httpupgrade')
+  assert.equal(upgrade.path, '/hu')
+  assert.equal(upgrade.hostHeader, 'hu.host')
+  const quic = byName(imported.nodes, 'VM-QUIC')
+  assert.equal(quic.transport, 'quic')
+
+  const vl = byName(imported.nodes, 'VL')
+  assert.equal(vl.uuid, '22222222-3333-4444-5555-666666666666')
+  assert.equal(vl.flow, 'xtls-rprx-vision')
+  assert.equal(vl.realityPublicKey, 'reality-pub')
+  assert.equal(vl.realityShortID, 'abcd')
+  assert.equal(vl.fingerprint, 'chrome')
+  assert.equal(vl.transport, 'grpc')
+  assert.equal(vl.path, 'vl-grpc')
+
+  const tr = byName(imported.nodes, 'TR')
+  assert.equal(tr.password, 'tr-pass')
+  assert.equal(tr.tls, true)
+  assert.equal(tr.sni, 'tr.example.com')
+  assert.equal(tr.transport, 'ws')
+  assert.equal(tr.path, '/tr')
+  assert.equal(tr.hostHeader, 'tr.host')
+
+  const hy2 = byName(imported.nodes, 'HY2')
+  assert.equal(hy2.password, 'hy2-pass')
+  assert.equal(hy2.tls, true)
+  assert.equal(hy2.obfs, 'salamander')
+  assert.equal(hy2.obfsParam, 'obfs-pass')
+  assert.equal(hy2.upMbps, 50)
+  assert.equal(hy2.downMbps, 200)
+  assert.equal(hy2.portHopping, '443,5000-6000')
+
+  const hy1 = byName(imported.nodes, 'HY1')
+  assert.equal(hy1.password, 'hy1-pass')
+  assert.equal(hy1.obfs, 'http')
+  assert.equal(hy1.upMbps, 30)
+  assert.equal(hy1.downMbps, 100)
+
+  const tu = byName(imported.nodes, 'TU')
+  assert.equal(tu.uuid, '33333333-4444-5555-6666-777777777777')
+  assert.equal(tu.password, 'tu-pass')
+  assert.equal(tu.congestionControl, 'bbr')
+  assert.equal(tu.udpRelayMode, 'native')
+  assert.equal(tu.alpn, 'h3')
+
+  const any = byName(imported.nodes, 'ANY')
+  assert.equal(any.password, 'any-pass')
+  assert.equal(any.idleSessionCheckInterval, 30)
+  assert.equal(any.idleSessionTimeout, 60)
+  assert.equal(any.minIdleSession, 5)
+
+  const ssh = byName(imported.nodes, 'SSH')
+  assert.equal(ssh.username, 'root')
+  assert.equal(ssh.password, 'ssh-pass')
+  assert.equal(ssh.ssh?.privateKey, 'ssh-private-key')
+  assert.deepEqual(ssh.ssh?.hostKeys, ['ssh-ed25519 AAAA'])
+  assert.deepEqual(ssh.ssh?.hostKeyAlgorithms, ['ssh-ed25519'])
+
+  const snell = byName(imported.nodes, 'SNELL')
+  assert.equal(snell.password, 'snell-psk')
+  assert.equal(snell.version, 4)
+  assert.equal(snell.obfs, 'http')
+  assert.equal(snell.obfsParam, 'snell.host')
+
+  const socks = byName(imported.nodes, 'SOCKS')
+  assert.equal(socks.username, 'u')
+  assert.equal(socks.password, 'p')
+  const http = byName(imported.nodes, 'HTTPP')
+  assert.equal(http.tls, true)
+  assert.equal(http.sni, 'http.example.com')
+
+  const wg = byName(imported.nodes, 'WG')
+  assert.equal(wg.wireGuardPrivateKey, 'wg-private')
+  assert.equal(wg.wireGuardPublicKey, 'wg-public')
+  assert.equal(wg.wireGuardPreSharedKey, 'wg-psk')
+  assert.equal(wg.wireGuardIPv4, '10.0.0.2')
+  assert.equal(wg.wireGuardIPv6, 'fd00::2')
+  assert.equal(wg.wireGuardAllowedIPs, '0.0.0.0/0,::/0')
+  assert.equal(wg.wireGuardReserved, '1,2,3')
+  assert.equal(wg.wireGuardMTU, 1420)
+  assert.equal(wg.wireGuardPersistentKeepalive, 30)
+
+  const masque = byName(imported.nodes, 'MASQUE')
+  assert.equal(masque.tls, true)
+  assert.equal(masque.sni, 'masque.example.com')
+  assert.equal(masque.alpn, 'h3')
+  assert.equal(masque.username, 'u')
+  assert.equal(masque.path, '/masque')
+  assert.equal(masque.masque?.httpVersion, 3)
+  assert.equal(masque.masque?.mtu, 1400)
+  assert.deepEqual(masque.masque?.headers, { 'X-Test': '1' })
+  assert.deepEqual(masque.masque?.certificate, JSON_NODES.at(-1)!.masque!.certificate)
+})
+
+check('Hiddify JSON 往返：legacy WireGuard、隐藏 ShadowTLS 辅助出站', () => {
+  const hiddifyNodes = JSON_NODES.filter((node) => node.kind !== 'masque' && node.kind !== 'snell')
+  const generated = generateSingBox(hiddifyNodes, SCHEME, { target: 'hiddify', contentMode: 'nodes' })
+  assert.equal(generated.skipped, 0)
+  const imported = parse(generated.text)
+  assert.equal(imported.nodes.length, hiddifyNodes.length)
+  assert.equal(imported.rejectedLineCount, 0)
+  assert.equal(imported.nodes.some((node) => node.name.startsWith('§hide§')), false)
+  assert.equal(imported.nodes.some((node) => node.name.startsWith('tower-shadowtls')), false)
+
+  const wg = byName(imported.nodes, 'WG')
+  assert.equal(wg.server, 'wg.example.com')
+  assert.equal(wg.port, 51820)
+  assert.equal(wg.wireGuardPrivateKey, 'wg-private')
+  assert.equal(wg.wireGuardPublicKey, 'wg-public')
+  assert.equal(wg.wireGuardIPv4, '10.0.0.2')
+  assert.equal(wg.wireGuardReserved, '1,2,3')
+  const stls = byName(imported.nodes, 'SS-STLS')
+  assert.equal(stls.shadowTLS?.host, 'shadow.host')
+  assert.equal(stls.shadowTLS?.password, 'inner-pass')
+  const hy2 = byName(imported.nodes, 'HY2')
+  assert.equal(hy2.portHopping, '443,5000-6000')
+  assert.equal(hy2.obfsParam, 'obfs-pass')
+})
+
+check('sing-box JSON 异常输入给出可读原因，不静默返回 0 节点', () => {
+  const array = parse('[1,2,3]')
+  assert.equal(array.nodes.length, 0)
+  assert.match(array.reason ?? '', /JSON 数组/)
+
+  const empty = parse('{"outbounds":[]}')
+  assert.equal(empty.nodes.length, 0)
+  assert.match(empty.reason ?? '', /为空/)
+
+  const noOutbounds = parse('{"inbounds":[],"route":{}}')
+  assert.match(noOutbounds.reason ?? '', /缺少有效的 outbounds/)
+
+  const unsupported = parse(JSON.stringify({
+    outbounds: [
+      { type: 'selector', tag: 'group', outbounds: ['a'] },
+      { type: 'naive', tag: 'NAIVE', server: 'naive.example.com', server_port: 443 },
+    ],
+  }))
+  assert.equal(unsupported.nodes.length, 0)
+  assert.match(unsupported.reason ?? '', /不支持的出站类型：naive/)
+  assert.equal(unsupported.rejectedLineCount, 1)
+
+  const missing = parse(JSON.stringify({
+    outbounds: [{ type: 'vmess', tag: 'VM', server: 'vm.example.com', server_port: 443 }],
+  }))
+  assert.match(missing.reason ?? '', /vmess 缺少 uuid/)
+
+  // 完整配置对象 + Hiddify 的 `/` 结尾 tag：组和内置出站跳过，不计数为失败。
+  const full = parse(JSON.stringify({
+    log: { level: 'info' },
+    inbounds: [],
+    route: {},
+    outbounds: [
+      { type: 'selector', tag: 'group', outbounds: ['HK', 'direct'] },
+      { type: 'shadowsocks', tag: 'US/JP 02/', server: 'hk.example.com', server_port: 8388, method: 'aes-128-gcm', password: 'pw' },
+      { type: 'direct', tag: 'direct' },
+    ],
+  }))
+  assert.equal(full.nodes.length, 1)
+  assert.equal(full.nodes[0].name, 'US/JP 02')
+  assert.equal(full.rejectedLineCount, 0)
+
+  // 同服务器不同凭据不能被误判为重复。
+  const multiUser = parse(JSON.stringify({
+    outbounds: [
+      { type: 'shadowsocks', tag: 'A', server: 'same.example.com', server_port: 8388, method: 'aes-128-gcm', password: 'one' },
+      { type: 'shadowsocks', tag: 'B', server: 'same.example.com', server_port: 8388, method: 'aes-128-gcm', password: 'two' },
+    ],
+  }))
+  assert.equal(multiUser.nodes.length, 2)
+
+  // 第三方配置的多余字段（max_early_data、utls）不应导致整条出站被拒。
+  const thirdParty = parse(JSON.stringify({
+    outbounds: [{
+      type: 'vless', tag: 'VLESS-X', server: 'x.example.com', server_port: 443,
+      uuid: '77777777-8888-9999-aaaa-bbbbbbbbbbbb',
+      tls: {
+        enabled: true, server_name: 'x.example.com',
+        utls: { enabled: true, fingerprint: 'chrome' },
+        reality: { enabled: true, public_key: 'pk', short_id: 'sid' },
+      },
+      transport: { type: 'ws', path: '/ws', headers: { Host: 'cdn.example.com' }, max_early_data: 2048 },
+    }],
+  }))
+  assert.equal(thirdParty.nodes.length, 1)
+  assert.equal(thirdParty.nodes[0].sni, 'x.example.com')
+  assert.equal(thirdParty.nodes[0].realityPublicKey, 'pk')
+  assert.equal(thirdParty.nodes[0].realityShortID, 'sid')
+  assert.equal(thirdParty.nodes[0].fingerprint, 'chrome')
+  assert.equal(thirdParty.nodes[0].transport, 'ws')
+  assert.equal(thirdParty.nodes[0].path, '/ws')
+  assert.equal(thirdParty.nodes[0].hostHeader, 'cdn.example.com')
+
+  // 顶层是出站数组时也能导入。
+  const list = parse(JSON.stringify([
+    { type: 'trojan', tag: 'TR', server: 'tr.example.com', server_port: 443, password: 'pw' },
+  ]))
+  assert.equal(list.nodes.length, 1)
+  assert.equal(list.nodes[0].kind, 'trojan')
+})
+
 if (failures) {
   console.error(`\n${failures} 项回归检查失败`)
   process.exit(1)

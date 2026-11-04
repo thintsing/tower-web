@@ -443,6 +443,14 @@ function singboxOutbound(node: ProxyNode, name: string, target?: ClientTarget): 
       case 'http':
       case 'h2':
         return { type: 'http', path: node.path || '/', host: node.hostHeader ? [node.hostHeader] : [] }
+      case 'httpupgrade':
+        return {
+          type: 'httpupgrade',
+          path: node.path || '/',
+          ...(node.hostHeader ? { headers: { Host: node.hostHeader } } : {}),
+        }
+      case 'quic':
+        return { type: 'quic' }
       default:
         return undefined
     }
@@ -503,6 +511,11 @@ function singboxOutbound(node: ProxyNode, name: string, target?: ClientTarget): 
         ...base,
         type: 'hysteria2',
         password: node.password ?? '',
+        ...(node.upMbps !== undefined ? { up_mbps: node.upMbps } : {}),
+        ...(node.downMbps !== undefined ? { down_mbps: node.downMbps } : {}),
+        ...(node.portHopping
+          ? { server_ports: node.portHopping.split(',').map((item) => item.trim().replace(/-/g, ':')).filter(Boolean) }
+          : {}),
         tls: tls(true),
         ...(node.obfs ? { obfs: { type: node.obfs, password: node.obfsParam ?? '' } } : {}),
       }
@@ -535,6 +548,7 @@ function singboxOutbound(node: ProxyNode, name: string, target?: ClientTarget): 
         uuid: node.uuid ?? '',
         password: node.password ?? '',
         congestion_control: node.congestionControl ?? 'cubic',
+        ...(node.udpRelayMode ? { udp_relay_mode: node.udpRelayMode } : {}),
         tls: tls(true),
       }
     case 'anytls':

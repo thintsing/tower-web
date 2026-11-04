@@ -975,7 +975,7 @@ function AddManualNodesDialog({
     if (result.nodes.length === 0) {
       setError(result.duplicates > 0
         ? '这些节点已经在「自有节点」里了'
-        : '没有解析到可用节点，请检查链接或配置内容')
+        : result.reason ?? '没有解析到可用节点，请检查链接或配置内容')
       return
     }
     onAdded?.(result)

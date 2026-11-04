@@ -564,9 +564,10 @@ export const useStore = create<Store>()(
               const candidate = parse(result.text, id)
               if (!candidate.nodes.some((n) => !n.isSubscriptionMetadata)) {
                 lastError = new Error(
-                  candidate.rejectedLineCount
-                    ? `没有解析到可用节点（${candidate.rejectedLineCount} 行无法识别），请检查订阅内容或地址`
-                    : '没有解析到可用节点，请检查订阅内容或地址',
+                  candidate.reason
+                    ?? (candidate.rejectedLineCount
+                      ? `没有解析到可用节点（${candidate.rejectedLineCount} 行无法识别），请检查订阅内容或地址`
+                      : '没有解析到可用节点，请检查订阅内容或地址'),
                 )
                 continue
               }

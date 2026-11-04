@@ -5,7 +5,7 @@
 import type { ProxyNode, SubscriptionUsage } from '../models/types'
 import { regionForNode } from '../models/region'
 import { parseClashYAML } from './clash'
-import { parseSingBoxEndpoints } from './singbox'
+import { parseSingBoxConfig } from './singbox'
 import { parseURI } from './uri'
 import { decodeBase64String } from './util'
 import { containsClientProxySection, parseClientProxyConfiguration } from './clientConfigs'
@@ -17,6 +17,8 @@ export interface ParsedContent {
   notices: string[]
   /** Quota read from a `STATUS=` line or a notice remark. */
   status?: SubscriptionUsage
+  /** Why a recognized config imported no nodes, shown instead of a generic message. */
+  reason?: string
 }
 
 const NOTICE_KEYWORDS = [
@@ -233,8 +235,8 @@ export function parse(data: string, sourceID?: string): ParsedContent {
   const declaredStatus = parseUsageDeclaration(text)
 
   if (text.startsWith('{') || text.startsWith('[')) {
-    const endpoints = parseSingBoxEndpoints(text, sourceID)
-    if (endpoints) return finish(endpoints.nodes, endpoints.rejected, declaredStatus)
+    const singbox = parseSingBoxConfig(text, sourceID)
+    if (singbox) return finish(singbox.nodes, singbox.rejected, declaredStatus, singbox.error)
   }
 
   if (containsClientProxySection(text)) {
@@ -292,6 +294,7 @@ function finish(
   rawNodes: ProxyNode[],
   rejected: number,
   status?: SubscriptionUsage,
+  reason?: string,
 ): ParsedContent {
   const marked = deduplicated(rawNodes.map(markingSubscriptionMetadata))
   const notices = marked.filter((n) => n.isSubscriptionMetadata).map((n) => n.name)
@@ -301,6 +304,7 @@ function finish(
     rejectedLineCount: rejected,
     notices,
     status: mergeUsage(noticeStatus, status),
+    reason,
   }
 }
 

@@ -9,6 +9,8 @@ export interface ManualNodeImportResult {
   rejected: number
   /** 已经在「自有节点」里存在的重复节点数。 */
   duplicates: number
+  /** 识别成功但 0 节点时的可读原因（如 sing-box 配置里全是策略组）。 */
+  reason?: string
 }
 
 /** 与解析器内部的去重键保持一致；名称不参与比较，改名后仍能识别重复。 */
@@ -73,5 +75,5 @@ export function prepareManualNodes(
     nodes[0] = { ...nodes[0], name: cleanName }
   }
 
-  return { nodes, rejected: parsed.rejectedLineCount, duplicates }
+  return { nodes, rejected: parsed.rejectedLineCount, duplicates, reason: parsed.reason }
 }
