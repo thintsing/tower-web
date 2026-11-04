@@ -170,11 +170,34 @@ let initialized: Promise<void> | null = null
 let writing = false
 let pendingWrite = false
 let failureCount = 0
+// 版本探针连续失败两次才判定离线：一次网络抖动不打断正在编辑的页面，
+// 又能在服务端停掉后约 16 秒内进入只读，而不是等到用户真的改东西才发现。
+let pollFailures = 0
 let debounceTimer: number | undefined
 let retryTimer: number | undefined
 let pollTimer: number | undefined
 let windowListenersBound = false
 const POLL_INTERVAL_MS = 8000
+// 上次确认过的服务端模式。服务器版偶尔先于服务端启动时，不能再把缓存当成
+// 可写工作区：否则离线期间的改动会在下次连接时被服务端数据静默覆盖。
+const MODE_CACHE_KEY = 'tower-web-workspace-mode'
+
+function cachedMode(): 'server' | 'local' | '' {
+  try {
+    const value = localStorage.getItem(MODE_CACHE_KEY)
+    return value === 'server' || value === 'local' ? value : ''
+  } catch {
+    return ''
+  }
+}
+
+function rememberMode(mode: 'server' | 'local'): void {
+  try {
+    localStorage.setItem(MODE_CACHE_KEY, mode)
+  } catch {
+    // 存储不可用时只影响重启后的离线判定，不影响本次会话。
+  }
+}
 
 /** 启动同步；重复调用返回同一个 Promise。 */
 export function initWorkspaceSync(): Promise<void> {
@@ -195,17 +218,26 @@ async function detectMode(): Promise<void> {
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     auth = await res.json() as { mode?: unknown }
   } catch {
-    // 无法判断模式时按本地模式处理，稍后再探测。
+    if (cachedMode() === 'server') {
+      // 上次确认是服务器版、这次连不上：按离线只读处理，避免用户以为改动
+      // 已保存，等 reconnect 成功后再拉取服务端数据。
+      serverMode = true
+      bindStore()
+      bindWindowListeners()
+      setupPolling()
+      goOffline('暂时无法连接服务端')
+      return
+    }
+    // 从未确认过模式时仍保持原来的本地可用行为，稍后再探测。
     updateStatus({ mode: 'unknown', state: 'checking', readOnly: false, message: '' })
     scheduleRetry()
     return
   }
   if (auth.mode !== 'server') {
-    serverMode = false
-    updateStatus({ mode: 'local', state: 'local', readOnly: false, version: 0, message: '' })
-    setWorkspaceReadOnly(false)
+    goLocal()
     return
   }
+  rememberMode('server')
   serverMode = true
   updateStatus({ mode: 'server', state: 'connecting', readOnly: false, message: '' })
   bindStore()
@@ -309,16 +341,34 @@ async function pollVersion(): Promise<void> {
       goReadOnly('unauthorized', '访问密钥无效，无法读取服务端工作区')
       return
     }
-    if (!res.ok) return
+    if (res.status === 404 && await workspaceDisabled(res)) {
+      goLocal()
+      return
+    }
+    if (!res.ok) {
+      notePollFailure()
+      return
+    }
     const body = await res.json() as { version?: unknown }
-    if (typeof body.version !== 'number' || !Number.isInteger(body.version)) return
+    if (typeof body.version !== 'number' || !Number.isInteger(body.version)) {
+      notePollFailure()
+      return
+    }
     version = body.version
   } catch {
+    notePollFailure()
     return
   }
+  pollFailures = 0
   if (version !== serverVersion) {
     await fetchFull({ notice: '已同步其他设备的改动。' })
   }
+}
+
+function notePollFailure(): void {
+  if (isWorkspaceReadOnly()) return
+  pollFailures += 1
+  if (pollFailures >= 2) goOffline('无法连接服务端')
 }
 
 async function fetchFull(options: { notice?: string } = {}): Promise<boolean> {
@@ -337,6 +387,10 @@ async function fetchFull(options: { notice?: string } = {}): Promise<boolean> {
   if (res.status === 500) {
     const body = await res.json().catch(() => ({})) as { error?: string }
     goReadOnly('corrupt', body.error ?? '服务端工作区文件不可用')
+    return false
+  }
+  if (res.status === 404 && await workspaceDisabled(res)) {
+    goLocal()
     return false
   }
   if (!res.ok) {
@@ -397,6 +451,7 @@ async function fetchFull(options: { notice?: string } = {}): Promise<boolean> {
 function markOnline(version: number, message: string): void {
   ready = true
   failureCount = 0
+  pollFailures = 0
   setWorkspaceReadOnly(false)
   updateStatus({ mode: 'server', state: 'online', readOnly: false, version, message })
 }
@@ -443,6 +498,10 @@ async function putWorkspace(version: number, data: WorkspaceData): Promise<PutRe
     const body = await res.json().catch(() => ({})) as { error?: string }
     goReadOnly('unauthorized', body.error ?? '访问密钥无效')
     return 'unauthorized'
+  }
+  if (res.status === 404 && await workspaceDisabled(res)) {
+    goLocal()
+    return 'failed'
   }
   if (res.status === 409) return 'conflict'
   if (res.status === 413) {
@@ -508,6 +567,40 @@ async function flushWrite(): Promise<boolean> {
       if (!isWorkspaceReadOnly()) void flushWrite()
     }
   }
+}
+
+/** 服务端明确回答「服务器版未启用」时，退回本地模式。 */
+async function workspaceDisabled(res: Response): Promise<boolean> {
+  const body = await res.json().catch(() => ({})) as { code?: string }
+  return body.code === 'workspace_disabled'
+}
+
+/** 停掉服务器同步，退回原有本地模式；只可能发生在服务端被改回 local 时。 */
+function goLocal(): void {
+  serverMode = false
+  stopServerSync()
+  rememberMode('local')
+  setWorkspaceReadOnly(false)
+  updateStatus({ mode: 'local', state: 'local', readOnly: false, version: 0, message: '' })
+}
+
+function stopServerSync(): void {
+  unsubscribeStore?.()
+  unsubscribeStore = undefined
+  watchedState = null
+  if (pollTimer !== undefined) {
+    window.clearInterval(pollTimer)
+    pollTimer = undefined
+  }
+  if (retryTimer !== undefined) {
+    window.clearTimeout(retryTimer)
+    retryTimer = undefined
+  }
+  if (debounceTimer !== undefined) {
+    window.clearTimeout(debounceTimer)
+    debounceTimer = undefined
+  }
+  ready = false
 }
 
 function goOffline(detail?: string): void {

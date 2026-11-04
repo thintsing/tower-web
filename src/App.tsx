@@ -4177,6 +4177,7 @@ function GroupEditorDialog({
   }
 
   const addOption = (value: string) => {
+    if (readOnly) return
     const trimmed = value.trim()
     if (!trimmed) return
     if (trimmed === name.trim()) {
@@ -4213,6 +4214,7 @@ function GroupEditorDialog({
     .slice(0, 200)
 
   const addDomainRule = () => {
+    if (readOnly) return
     let value = newDomain.trim()
     if (!value) { setRuleNotice('请填写要加入这个组的域名'); return }
     if (/^https?:\/\//i.test(value)) {

@@ -356,9 +356,14 @@ function apiAuthExempt(url, method) {
 function authStatus(req, url) {
   // 容器宿主机通过 Host: localhost 识别；但只有没有管理密钥（或已经带对
   // 密钥）时才把 local 报给页面，避免局域网伪造 Host 后绕过访问门。
+  const presented = presentedAPIToken(req, url)
+  const tokenMatches = apiTokenMatches(presented)
+  // 状态接口本身免节流（页面无密钥时也要能判断模式），但它会返回 valid，
+  // 不能让这里变成不限次数的密钥试错 oracle：带了错误密钥就计入失败。
+  if (presented && !tokenMatches) recordAuthFailure(req)
+  else if (tokenMatches && presented) resetAuthFailures(req)
   const local = isLoopbackRequest(req)
-    || (isContainerHostLocalRequest(req) && apiTokenMatches(presentedAPIToken(req, url)))
-  const tokenMatches = apiTokenMatches(presentedAPIToken(req, url))
+    || (isContainerHostLocalRequest(req) && tokenMatches)
   return {
     mode: SERVER_MODE ? 'server' : 'local',
     lanSharing: serverSettings.lanSharing,
@@ -570,28 +575,35 @@ function commitWorkspace(payload) {
   return run
 }
 
+function parseWorkspaceFile(text) {
+  const raw = JSON.parse(text)
+  if (!raw || typeof raw !== 'object'
+    || !Number.isInteger(raw.version) || raw.version < 0
+    || !raw.data || typeof raw.data !== 'object' || Array.isArray(raw.data)) {
+    throw new Error('结构无效：需要 { version: 非负整数, updatedAt: 数字, data: 对象 }')
+  }
+  // 服务端不会写出 version=0 且带数据的文件；手工编辑可能制造这种状态。
+  // 把它当成 v1 继续用，否则 version=0 的写入会被当作首次创建而互相覆盖。
+  const version = raw.version === 0 && Object.keys(raw.data).length > 0 ? 1 : raw.version
+  return {
+    version,
+    updatedAt: Number(raw.updatedAt) || 0,
+    data: raw.data,
+    normalized: version !== raw.version,
+  }
+}
+
 function loadWorkspace() {
   if (!SERVER_MODE) return
+  let loaded
+  let error
   try {
-    const raw = JSON.parse(readFileSync(WORKSPACE_FILE, 'utf8'))
-    if (!raw || typeof raw !== 'object'
-      || !Number.isInteger(raw.version) || raw.version < 0
-      || !raw.data || typeof raw.data !== 'object' || Array.isArray(raw.data)) {
-      throw new Error('结构无效：需要 { version: 非负整数, updatedAt: 数字, data: 对象 }')
-    }
-    workspace = {
-      version: raw.version,
-      updatedAt: Number(raw.updatedAt) || 0,
-      data: raw.data,
-    }
-    try {
-      copyFileSync(WORKSPACE_FILE, `${WORKSPACE_FILE}.bak`)
-    } catch (error) {
-      console.warn('[tower] 工作区 .bak 写入失败:', error?.message ?? error)
-    }
-    console.log(`[tower] 已载入服务器工作区 v${workspace.version}`)
-  } catch (error) {
-    if (error?.code === 'ENOENT') return
+    loaded = parseWorkspaceFile(readFileSync(WORKSPACE_FILE, 'utf8'))
+  } catch (err) {
+    error = err
+    if (err?.code === 'ENOENT') return
+  }
+  if (!loaded) {
     // 坏文件绝不能当成空工作区继续跑，否则下一次写入会覆盖现场。
     const broken = `${WORKSPACE_FILE}.broken-${Date.now()}`
     try {
@@ -599,9 +611,47 @@ function loadWorkspace() {
     } catch {
       // 改名失败也保留原文件，不覆盖。
     }
-    workspaceCorrupt = `服务器工作区文件损坏，已保留现场为 ${broken}`
-    console.error('[tower]', workspaceCorrupt, ':', error?.message ?? error)
+    // 每次成功写入前都会把上一版复制成 .bak，因此主文件损坏时还有一份
+    // 可用的备份。恢复后版本可能回退一版，客户端轮询会自己拉回最新。
+    try {
+      const backup = parseWorkspaceFile(readFileSync(`${WORKSPACE_FILE}.bak`, 'utf8'))
+      writeFileSync(WORKSPACE_FILE, JSON.stringify({
+        version: backup.version,
+        updatedAt: backup.updatedAt,
+        data: backup.data,
+      }), 'utf8')
+      workspace = { version: backup.version, updatedAt: backup.updatedAt, data: backup.data }
+      console.warn(`[tower] 主工作区损坏（已保留 ${broken}），已从 .bak 恢复 v${backup.version}`)
+      return
+    } catch (backupError) {
+      workspaceCorrupt = `服务器工作区文件损坏，已保留现场为 ${broken}`
+      console.error('[tower]', workspaceCorrupt, ':', error?.message ?? error, '；.bak 也不可用:', backupError?.message ?? backupError)
+      return
+    }
   }
+  workspace = {
+    version: loaded.version,
+    updatedAt: loaded.updatedAt,
+    data: loaded.data,
+  }
+  if (loaded.normalized) {
+    try {
+      writeFileSync(WORKSPACE_FILE, JSON.stringify({
+        version: loaded.version,
+        updatedAt: loaded.updatedAt,
+        data: loaded.data,
+      }), 'utf8')
+      console.warn(`[tower] workspace.json 的 version=0 但已有数据，已按 v${loaded.version} 继续`)
+    } catch (err) {
+      console.warn('[tower] 修正 version=0 的 workspace.json 失败:', err?.message ?? err)
+    }
+  }
+  try {
+    copyFileSync(WORKSPACE_FILE, `${WORKSPACE_FILE}.bak`)
+  } catch (err) {
+    console.warn('[tower] 工作区 .bak 写入失败:', err?.message ?? err)
+  }
+  console.log(`[tower] 已载入服务器工作区 v${workspace.version}`)
 }
 
 function workspaceETag() {

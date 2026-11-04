@@ -505,6 +505,9 @@ export const useStore = create<Store>()(
           tailnets: s.tailnets.map((item) => item.id === id ? { ...item, isEnabled: enabled } : item),
         })),
       setTailnetAuthKey: (id, key) => {
+        // Auth Key 另存 localStorage，不走 store 闸门；只读时必须在这里拦住，
+        // 否则界面虽然灰了，本机缓存仍会被改写。
+        if (isWorkspaceReadOnly()) return
         const authKeys = { ...get().tailnetAuthKeys }
         const normalized = key?.trim()
         if (normalized) authKeys[id] = normalized
@@ -513,6 +516,7 @@ export const useStore = create<Store>()(
         set({ tailnetAuthKeys: authKeys })
       },
       pruneTailnetKeys: () => {
+        if (isWorkspaceReadOnly()) return
         const state = get()
         const validIds = new Set(state.tailnets.map((item) => item.id))
         const authKeys = pruneTailnetAuthKeys(state.tailnetAuthKeys, validIds)
@@ -918,6 +922,8 @@ export const useStore = create<Store>()(
         }),
 
       restoreBackup: (data) => {
+        // 备份覆盖包含导出设置等设备偏好；只读时整笔拒绝，避免只恢复一半。
+        if (isWorkspaceReadOnly()) return
         set((s) => ({
           ...data,
           // 备份不含测速结果与瞬时错误；恢复后从头开始，避免旧 ID 的结果串到新节点。
