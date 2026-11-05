@@ -12,7 +12,7 @@ import { execFile } from 'node:child_process'
 import { lookup } from 'node:dns/promises'
 import { networkInterfaces } from 'node:os'
 import { readFile, rename, writeFile } from 'node:fs/promises'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join, dirname, extname, normalize, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
@@ -196,6 +196,37 @@ const WORKSPACE_FILE = join(DATA_DIR, 'workspace.json')
 // 工作区含节点与规则，但远小于已发布配置；16MB 足够且能挡住误传大文件。
 const WORKSPACE_MAX_BYTES = 16 * 1024 * 1024
 
+/**
+ * 数据目录是否可写。Docker 里 bind mount 的宿主机目录常由 root 创建，
+ * 容器内的 node 用户（UID 1000）写不进去，工作区就会永远停在 v0。
+ * 页面需要这个信号，否则用户只会看到一份空白工作区。
+ * 真正写一个小文件再删掉，而不是只看权限位：root、ACL、只读挂载都更可靠。
+ */
+function probeDataDirWritable() {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true })
+    const marker = join(DATA_DIR, `.tower-write-probe-${process.pid}`)
+    writeFileSync(marker, 'ok')
+    unlinkSync(marker)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// 健康检查每 30 秒一次，不必每次都落盘；10 秒内的结果直接复用。
+// 修复权限后最多 10 秒恢复 healthy，不需要重启容器。
+const DATA_PROBE_TTL_MS = 10_000
+let dataProbe = { at: Number.NEGATIVE_INFINITY, value: true }
+
+function dataDirWritable() {
+  const now = Date.now()
+  if (now - dataProbe.at < DATA_PROBE_TTL_MS) return dataProbe.value
+  const value = probeDataDirWritable()
+  dataProbe = { at: now, value }
+  return value
+}
+
 const DEFAULT_SERVER_SETTINGS = Object.freeze({
   /** 关闭后，非本机请求不能使用塔台 API / 订阅 / 规则集。 */
   lanSharing: true,
@@ -377,6 +408,8 @@ function authStatus(req, url) {
     local,
     // 服务器模式没有本机豁免：回环地址也必须带对密钥才算 valid。
     valid: SERVER_MODE ? (!!serverSettings.apiToken && tokenMatches) : (local || tokenMatches),
+    // 服务器模式下数据目录不可写 = 任何设备都存不了工作区，页面据此给出明确提示。
+    dataWritable: SERVER_MODE ? dataDirWritable() : true,
   }
 }
 
@@ -1634,8 +1667,12 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname === '/api/health') {
-      return json(res, 200, {
-        ok: true,
+      // 进程活着但数据目录不可写时返回 503：Docker 会显示 unhealthy，
+      // 让「healthy 但工作区永远为空」这类部署事故在 docker ps 就看得见。
+      const dataWritable = dataDirWritable()
+      return json(res, dataWritable ? 200 : 503, {
+        ok: dataWritable,
+        dataWritable,
         formats: SUB_FORMATS,
         subscriptions: subscriptions.size,
         uptimeSec: Math.round(process.uptime()),
@@ -1833,6 +1870,12 @@ server.listen(PORT, HOST, () => {
   console.log(`[tower-web] companion server on http://127.0.0.1:${actualPort}`)
   if (SERVER_MODE) {
     console.log(`[tower-web] 服务器模式：工作区保存在 ${WORKSPACE_FILE}`)
+    if (!dataDirWritable()) {
+      console.warn(
+        `[tower-web] 数据目录不可写（${DATA_DIR}）：工作区改动会全部失败。`
+        + ' Docker 中请确认挂载目录对容器内 node 用户可写，例如宿主机执行 chown -R 1000:1000 <挂载目录>。',
+      )
+    }
     if (!serverSettings.apiToken) {
       console.warn('[tower-web] 服务器模式必须设置访问密钥（TOWER_API_TOKEN），否则 /api/workspace 会拒绝所有请求')
     }

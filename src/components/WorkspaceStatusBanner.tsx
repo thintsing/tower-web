@@ -6,6 +6,7 @@ import { getWorkspaceStatus, subscribeWorkspaceStatus } from '../workspaceSync'
 function titleFor(state: string): string {
   if (state === 'offline') return '服务端离线，当前只读'
   if (state === 'unauthorized') return '访问密钥无效'
+  if (state === 'blocked') return '服务端拒绝请求'
   return '服务端工作区不可用'
 }
 
@@ -15,12 +16,13 @@ export function WorkspaceStatusBanner() {
 
   useEffect(() => subscribeWorkspaceStatus(() => setStatus(getWorkspaceStatus())), [])
 
-  if (status.mode !== 'server') return null
+  // local 模式不提示；unknown（首次探测失败）必须提示，否则空白页面看起来像数据丢了。
+  if (status.mode === 'local') return null
   if (!status.readOnly) {
     if (!status.message || status.message === dismissed) return null
     return (
       <div className="workspace-alert info" role="status">
-        <strong>服务器工作区</strong>
+        <strong>{status.mode === 'server' ? '服务器工作区' : '塔台服务端'}</strong>
         <span>{status.message}</span>
         <button
           className="storage-alert-close"

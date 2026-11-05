@@ -31,6 +31,8 @@ export type WorkspaceState =
   | 'offline'
   | 'unauthorized'
   | 'corrupt'
+  /** 服务端明确拒绝（403 局域网共享关闭 / 429 认证冷却），与网络离线分开。 */
+  | 'blocked'
 
 export interface WorkspaceStatus {
   mode: 'unknown' | 'local' | 'server'
@@ -228,8 +230,14 @@ async function detectMode(): Promise<void> {
       goOffline('暂时无法连接服务端')
       return
     }
-    // 从未确认过模式时仍保持原来的本地可用行为，稍后再探测。
-    updateStatus({ mode: 'unknown', state: 'checking', readOnly: false, message: '' })
+    // 从未确认过模式时仍保持原来的本地可用行为，但必须让用户知道
+    // 「这是一份本机缓存、还没连上服务端」，否则空白页面看起来像数据丢了。
+    updateStatus({
+      mode: 'unknown',
+      state: 'checking',
+      readOnly: false,
+      message: '无法连接塔台服务端，正在重试…（当前显示本机缓存，可能不是最新的）',
+    })
     scheduleRetry()
     return
   }
@@ -310,9 +318,11 @@ function scheduleRetry(): void {
   if (status.state === 'unauthorized') return
   const delay = status.mode === 'unknown'
     ? 8_000
-    : status.state === 'corrupt'
-      ? 60_000
-      : Math.min(30_000, 500 * 2 ** Math.min(failureCount, 6))
+    : status.state === 'blocked'
+      ? 30_000
+      : status.state === 'corrupt'
+        ? 60_000
+        : Math.min(30_000, 500 * 2 ** Math.min(failureCount, 6))
   retryTimer = window.setTimeout(() => {
     retryTimer = undefined
     void reconnect()
@@ -339,6 +349,11 @@ async function pollVersion(): Promise<void> {
     const res = await apiFetch('/api/workspace/version', { cache: 'no-store' })
     if (res.status === 401) {
       goReadOnly('unauthorized', '访问密钥无效，无法读取服务端工作区')
+      return
+    }
+    if (res.status === 403 || res.status === 429) {
+      const body = await res.json().catch(() => ({})) as { error?: string }
+      goReadOnly('blocked', body.error ?? `服务端拒绝请求（HTTP ${res.status}）`)
       return
     }
     if (res.status === 404 && await workspaceDisabled(res)) {
@@ -384,6 +399,11 @@ async function fetchFull(options: { notice?: string } = {}): Promise<boolean> {
     goReadOnly('unauthorized', body.error ?? '访问密钥无效')
     return false
   }
+  if (res.status === 403 || res.status === 429) {
+    const body = await res.json().catch(() => ({})) as { error?: string }
+    goReadOnly('blocked', body.error ?? `服务端拒绝请求（HTTP ${res.status}）`)
+    return false
+  }
   if (res.status === 500) {
     const body = await res.json().catch(() => ({})) as { error?: string }
     goReadOnly('corrupt', body.error ?? '服务端工作区文件不可用')
@@ -423,7 +443,8 @@ async function fetchFull(options: { notice?: string } = {}): Promise<boolean> {
     if (!hasContent(snapshot)) {
       serverVersion = 0
       lastSignature = signature(snapshot)
-      markOnline(0, '')
+      // 两边都空：不能再「静默成功」，否则用户会以为配置丢了却没有任何线索。
+      markOnline(0, '已连接服务端，但服务端工作区为空。若你在另一台设备配置过，请在那台设备用同一访问密钥打开一次，让它把数据上传到服务器。')
       return true
     }
     const created = await putWorkspace(0, snapshot)
@@ -441,10 +462,14 @@ async function fetchFull(options: { notice?: string } = {}): Promise<boolean> {
     return false
   }
 
+  // 本地完全没有数据、服务端有数据：多半是新设备 / 新访问地址，
+  // 明确说明这是从服务端载入，避免用户把正常同步误认为数据丢失。
+  const localWasEmpty = !hasContent(workspaceSnapshot(useStore.getState()))
   applyServerData(data)
   serverVersion = payload.version
   lastSignature = signature(workspaceSnapshot(useStore.getState()))
-  markOnline(payload.version, options.notice ?? '')
+  markOnline(payload.version, options.notice
+    ?? (localWasEmpty ? '这是新设备或新地址：已从服务端载入工作区。' : ''))
   return true
 }
 
@@ -498,6 +523,11 @@ async function putWorkspace(version: number, data: WorkspaceData): Promise<PutRe
     const body = await res.json().catch(() => ({})) as { error?: string }
     goReadOnly('unauthorized', body.error ?? '访问密钥无效')
     return 'unauthorized'
+  }
+  if (res.status === 403 || res.status === 429) {
+    const body = await res.json().catch(() => ({})) as { error?: string }
+    goReadOnly('blocked', body.error ?? `服务端拒绝请求（HTTP ${res.status}）`)
+    return 'failed'
   }
   if (res.status === 404 && await workspaceDisabled(res)) {
     goLocal()
@@ -616,7 +646,7 @@ function goOffline(detail?: string): void {
   scheduleRetry()
 }
 
-function goReadOnly(kind: 'unauthorized' | 'corrupt', message: string): void {
+function goReadOnly(kind: 'unauthorized' | 'corrupt' | 'blocked', message: string): void {
   ready = false
   setWorkspaceReadOnly(true)
   updateStatus({

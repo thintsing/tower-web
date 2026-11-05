@@ -267,6 +267,7 @@ function LANAccessGate() {
     requiresAuth: boolean
     local: boolean
     valid: boolean
+    dataWritable?: boolean
   } | null>(null)
   const [key, setKey] = useState(() => getAPIKey())
   const [error, setError] = useState('')
@@ -287,6 +288,27 @@ function LANAccessGate() {
 
   if (!status) return null
   const serverMode = status.mode === 'server'
+  // 服务器模式的数据目录不可写时，所有设备都存不了工作区；这比密钥问题更根本，
+  // 先挡住并给出宿主机修复命令，避免用户只看到一份空白工作区。
+  if (serverMode && status.dataWritable === false) {
+    return (
+      <div className="lan-gate" role="dialog" aria-modal="true" aria-labelledby="lan-gate-title">
+        <div className="lan-gate-card">
+          <strong id="lan-gate-title">服务端数据目录不可写</strong>
+          <p>
+            容器内的 node 用户（UID 1000）无法写入挂载目录，工作区改动会全部失败，页面会一直是空的。
+            在 VPS 上执行下面的命令后重启容器：
+          </p>
+          <pre className="mono" style={{ whiteSpace: 'pre-wrap' }}>
+            sudo chown -R 1000:1000 /opt/tower/app/data{'\n'}docker compose restart tower-web
+          </pre>
+          <div className="hint">
+            若挂载路径不是 /opt/tower/app/data，请换成实际路径（docker-compose 里的 volumes 那一行）。
+          </div>
+        </div>
+      </div>
+    )
+  }
   // 服务器模式连本机也要密钥，因此不再按 local 放行；其它行为保持原样。
   if (!serverMode && status.local) return null
   if (status.lanSharing && (!status.requiresAuth || status.valid)) return null
