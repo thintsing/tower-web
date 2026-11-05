@@ -7066,15 +7066,40 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       return sourceName ? `${node.name} · ${sourceName}` : node.name
     }
   }, [appendSourceName, sourceNameByID])
+  // ------- 客户端专属订阅链接（跟随 target 实时变化）-------
+  // 同一 token 下按客户端 format 取对应载体：
+  //   yaml → Clash Verge / Mihomo / Stash …  ini → Surge / Loon / QuanX
+  //   json → sing-box MT / Hiddify           base64 → V2Box / Anywhere
+  //   yaml → Shadowrocket 也使用 Clash YAML；egern 使用独立 Egern 载体。
+  const clientSubURL = useMemo(() => {
+    if (!subURL) return ''
+    try {
+      // 用当前页面的 origin 重建：从 127.0.0.1 发布、之后用局域网地址打开时，
+      // 链接也会自动变成局域网地址，不会把 127.0.0.1 发给手机。
+      const u = new URL(new URL(subURL, window.location.origin).pathname, window.location.origin)
+      u.searchParams.set('format', subFormatFor(target))
+      // target 让服务端在存在客户端专属变体（如 Stash / Surge Mac）时选对写法。
+      u.searchParams.set('target', target.target)
+      return u.href
+    } catch {
+      // localStorage 里的旧地址被改坏时，别让整个导出页白屏。
+      return ''
+    }
+  }, [target, subURL])
+
   const outputOptions = useMemo(
     () => ({
       contentMode,
       nameForNode,
       remoteSubscriptions: previewRemoteSubscriptions,
       tailnets: contentMode === 'full' ? activeTailnets : [],
+      // Surge 自更新首行只指向已发布的链接；尚未发布（subURL 为空）时不写，
+      // 避免生成一个指向不存在地址的 #!MANAGED-CONFIG。
+      managedConfigURL: targetFormat === 'surge' && contentMode === 'full' ? clientSubURL : '',
     }),
-    [contentMode, nameForNode, previewRemoteSubscriptions, activeTailnets],
+    [contentMode, nameForNode, previewRemoteSubscriptions, activeTailnets, targetFormat, clientSubURL],
   )
+
   const configName = exportConfigName.trim() || 'tower'
   const fileStem = configFileStem(configName)
 
@@ -7113,27 +7138,6 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     setRemoteSourceCount(out.remoteSourceCount)
     setTailnetNotes(out.notes)
   }, [target, usable, exportScheme, outputOptions])
-
-  // ------- 客户端专属订阅链接（跟随 target 实时变化）-------
-  // 同一 token 下按客户端 format 取对应载体：
-  //   yaml → Clash Verge / Mihomo / Stash …  ini → Surge / Loon / QuanX
-  //   json → sing-box MT / Hiddify           base64 → V2Box / Anywhere
-  //   yaml → Shadowrocket 也使用 Clash YAML；egern 使用独立 Egern 载体。
-  const clientSubURL = useMemo(() => {
-    if (!subURL) return ''
-    try {
-      // 用当前页面的 origin 重建：从 127.0.0.1 发布、之后用局域网地址打开时，
-      // 链接也会自动变成局域网地址，不会把 127.0.0.1 发给手机。
-      const u = new URL(new URL(subURL, window.location.origin).pathname, window.location.origin)
-      u.searchParams.set('format', subFormatFor(target))
-      // target 让服务端在存在客户端专属变体（如 Stash / Surge Mac）时选对写法。
-      u.searchParams.set('target', target.target)
-      return u.href
-    } catch {
-      // localStorage 里的旧地址被改坏时，别让整个导出页白屏。
-      return ''
-    }
-  }, [target, subURL])
 
   // importScheme 可用时包装成客户端 deep link，否则直接给订阅地址。
   const clientImportURL = useMemo(() => {

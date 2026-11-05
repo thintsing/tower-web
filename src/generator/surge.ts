@@ -233,6 +233,28 @@ function surgeNode(node: ProxyNode, name: string, target?: ClientTarget): string
   }
 }
 
+/** 配置自动更新的默认间隔：与 policy-path 的 update-interval 共用，避免两处不一致。 */
+export const SURGE_UPDATE_INTERVAL = 86400
+
+/**
+ * Surge 只认文件首行的 `#!MANAGED-CONFIG <url> interval=<秒>`。
+ * 地址必须能原样写进一行：带空白 / 控制字符或不是 http(s) 时宁可不写，
+ * 也不要生成一行无法解析、甚至把后续配置挤坏的头部。
+ */
+export function surgeManagedConfigHeader(url: string | undefined): string | undefined {
+  const value = (url ?? '').trim()
+  if (!value || /[\s\x00-\x1f\x7f]/.test(value)) return undefined
+  try {
+    const parsed = new URL(value)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined
+    // 只允许完整绝对地址；URL 自身会编码空格等字符，这里用规范化结果。
+    if (!/^https?:\/\/[^\s]+$/i.test(parsed.href)) return undefined
+    return `#!MANAGED-CONFIG ${parsed.href} interval=${SURGE_UPDATE_INTERVAL}`
+  } catch {
+    return undefined
+  }
+}
+
 export function generateSurge(
   nodes: ProxyNode[],
   scheme: RuleScheme,
@@ -299,8 +321,11 @@ export function generateSurge(
     sourceGroupNames.set(source.id, candidate)
   }
   const quote = (value: string) => `"${value.replace(/"/g, '\\"')}"`
+  // 只有完整配置才有自更新意义；节点列表 / 无可发布地址时不写首行。
+  const managedHeader = surgeManagedConfigHeader(options.managedConfigURL)
 
   const out: string[] = [
+    ...(managedHeader ? [managedHeader] : []),
     '[General]',
     'loglevel = notify',
     'skip-proxy = 127.0.0.1, 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, localhost, *.local',
@@ -315,7 +340,7 @@ export function generateSurge(
     out.push('', '[Proxy Group]')
     for (const source of remoteSources) {
       const name = sourceGroupNames.get(source.id)!
-      out.push(`${name} = select, policy-path=${quote(source.url)}, update-interval=86400, hidden=true`)
+      out.push(`${name} = select, policy-path=${quote(source.url)}, update-interval=${SURGE_UPDATE_INTERVAL}, hidden=true`)
     }
     for (const { group, members } of resolved) {
       const inlineMembers = members.filter(

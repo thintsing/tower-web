@@ -31,6 +31,8 @@ export interface OutputOptions {
   remoteSubscriptions?: RemoteSubscriptionEntry[]
   /** Tailscale 内网；只在完整配置里写入。 */
   tailnets?: TailnetExport[]
+  /** Surge 自更新首行 `#!MANAGED-CONFIG` 的目标地址；留空则不写。 */
+  managedConfigURL?: string
 }
 
 export interface ResolvedGroup {

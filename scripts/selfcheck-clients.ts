@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { parse } from 'yaml'
 import { generateBase64Subscription } from '../src/generator/base64Sub'
 import { generateConfig, generateSubscriptionFormats } from '../src/generator'
+import { SURGE_UPDATE_INTERVAL } from '../src/generator/surge'
 import { compileRuleLine, prepareSchemeForExport } from '../src/generator/groups'
 import { CLIENTS, clientSupportsImport, type ClientTarget, type ProxyNode, type RuleScheme } from '../src/models/types'
 
@@ -344,6 +345,31 @@ if (!(clashConditionalGroup?.proxies as string[] | undefined)?.includes('节点�
 
 console.log(`egern: 节点 ${egernProxies} · 分组 ${egernGroups} · 规则 ${egernRules}`)
 console.log(`shadowrocket: 节点 ${shadowProxies} · 分组 ${shadowGroups} · 规则 ${shadowRules}`)
+
+// ---------- Surge 自更新首行 #!MANAGED-CONFIG ----------
+const managedURL = 'https://tower.example.com/api/sub/abc123?format=surge&target=surge'
+const surgeManaged = generateConfig(client('surge'), SAMPLE, scheme, {
+  contentMode: 'full',
+  managedConfigURL: managedURL,
+  remoteSubscriptions: [{ id: 'sub1', name: '机场 A', url: 'https://sub.example.com/clash' }],
+})
+const managedFirstLine = surgeManaged.text.split('\n')[0]
+if (managedFirstLine !== `#!MANAGED-CONFIG ${managedURL} interval=${SURGE_UPDATE_INTERVAL}`) {
+  problems.push(`surge: 自更新首行不正确 → ${managedFirstLine}`)
+}
+// interval 必须与 policy-path 的 update-interval 完全一致，不允许两处不同。
+const policyIntervals = [...surgeManaged.text.matchAll(/update-interval=(\d+)/g)].map((m) => Number(m[1]))
+if (policyIntervals.length === 0) problems.push('surge: 缺少 policy-path 的 update-interval 样例')
+for (const value of policyIntervals) {
+  if (value !== SURGE_UPDATE_INTERVAL) problems.push(`surge: update-interval=${value} 与首行 ${SURGE_UPDATE_INTERVAL} 不一致`)
+}
+// 没有可发布地址 / 仅节点 / 非法地址时都不能写首行，避免制造假地址或破坏首行。
+if (surge.text.startsWith('#!MANAGED-CONFIG')) problems.push('surge: 没有可发布地址时不应写自更新首行')
+if (surgeNodes.text.includes('#!MANAGED-CONFIG')) problems.push('surge: 仅节点输出不应写自更新首行')
+for (const bad of ['https://tower.example.com/a b', 'javascript:alert(1)', 'https://tower.example.com/x\r\nFoo: bar', 'not-a-url']) {
+  const generated = generateConfig(client('surge'), SAMPLE, scheme, { contentMode: 'full', managedConfigURL: bad })
+  if (generated.text.startsWith('#!MANAGED-CONFIG')) problems.push(`surge: 非法地址不应写首行 → ${JSON.stringify(bad)}`)
+}
 
 // ---------- 仅节点交接 / 一键导入 ----------
 if (surgeNodes.extension !== 'txt' || surgeNodes.text.includes('[General]') || surgeNodes.text.includes('[Proxy]')) {
