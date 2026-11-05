@@ -3,7 +3,7 @@
 // subscription fetches the user explicitly triggers (via /api/fetch).
 import { create } from 'zustand'
 import { createJSONStorage, persist } from 'zustand/middleware'
-import type { AppState, ClientTarget, ExportContentMode, LatencyTestMethod, LatencyTestMode, LocalRuleSet, NodeNameFilterSettings, ProxyKind, ProxyNode, RuleScheme, SubscriptionRequestOptions, SubscriptionSource, SubscriptionUsage, TailnetConnection } from './models/types'
+import type { AppState, BuiltinSchemeOverride, ClientTarget, ExportContentMode, LatencyTestMethod, LatencyTestMode, LocalRuleSet, NodeNameFilterSettings, ProxyKind, ProxyNode, RuleScheme, SubscriptionRequestOptions, SubscriptionSource, SubscriptionUsage, TailnetConnection } from './models/types'
 import { usageFieldsFrom } from './models/types'
 import { loadTailnetAuthKeys, persistTailnetAuthKeys, pruneTailnetAuthKeys } from './models/tailnetAuthKeys'
 import type { PersistedData } from './backup'
@@ -32,6 +32,12 @@ export interface Store extends AppState {
   customSchemes: RuleScheme[]
   /** 用户保存在本机的独立规则集。 */
   localRuleSets: LocalRuleSet[]
+  /** 内置方案覆盖层：id → 固化后的方案 + 列表快照；原厂快照始终保留。 */
+  builtinSchemeOverrides: Record<string, BuiltinSchemeOverride>
+  /** 打开塔台时检查内置方案是否有上游更新；默认关闭，只提示不覆盖。 */
+  checkBuiltinSchemeUpdatesOnOpen: boolean
+  /** 本次会话的上游更新提示（scheme.id → 文案），不落盘。 */
+  builtinSchemeUpdateNotices: Record<string, string>
   /** 打开塔台时自动刷新已启用、带 URL 的订阅；默认关闭。 */
   autoRefreshOnOpen: boolean
   /** 打开塔台时刷新「我的规则集」里的在线订阅；默认关闭。 */
@@ -119,6 +125,12 @@ export interface Store extends AppState {
   removeCustomScheme: (id: string) => void
   addLocalRuleSet: (set: LocalRuleSet) => void
   removeLocalRuleSet: (id: string) => void
+  /** 固化内置方案：写入覆盖层，内置方案条目本身换成这份内容。 */
+  saveBuiltinSchemeOverride: (id: string, override: BuiltinSchemeOverride) => void
+  /** 清除覆盖层，回到原厂 `public/rulesets` 快照。 */
+  clearBuiltinSchemeOverride: (id: string) => void
+  setCheckBuiltinSchemeUpdatesOnOpen: (enabled: boolean) => void
+  setBuiltinSchemeUpdateNotice: (id: string, notice?: string) => void
   /** 从链接 / Base64 / Clash YAML / Surge 配置导入自有节点。 */
   addManualNodes: (text: string, preferredName?: string) => ManualNodeImportResult
   /** 改名或启用 / 停用一个自有节点。 */
@@ -422,6 +434,8 @@ export function persistedSnapshot(s: Store): PersistedData {
     policySelections: s.policySelections,
     customSchemes: s.customSchemes,
     localRuleSets: s.localRuleSets,
+    builtinSchemeOverrides: s.builtinSchemeOverrides,
+    checkBuiltinSchemeUpdatesOnOpen: s.checkBuiltinSchemeUpdatesOnOpen,
     autoRefreshOnOpen: s.autoRefreshOnOpen,
     autoRefreshRuleSetsOnOpen: s.autoRefreshRuleSetsOnOpen,
     preferRuleSets: s.preferRuleSets,
@@ -446,7 +460,7 @@ export function persistedSnapshot(s: Store): PersistedData {
 
 /** 服务器版工作区里会落盘的字段；只读时只拦这些，设备偏好不受影响。 */
 const WORKSPACE_STATE_KEYS = new Set<string>([
-  'sources', 'nodes', 'customSchemes', 'localRuleSets', 'selectedSchemeID',
+  'sources', 'nodes', 'customSchemes', 'localRuleSets', 'builtinSchemeOverrides', 'selectedSchemeID',
   'policySelections', 'exportConfigName', 'tailnets', 'tailnetAuthKeys',
 ])
 
@@ -480,6 +494,9 @@ export const useStore = create<Store>()(
       policySelections: {},
       customSchemes: [],
       localRuleSets: [],
+      builtinSchemeOverrides: {},
+      checkBuiltinSchemeUpdatesOnOpen: false,
+      builtinSchemeUpdateNotices: {},
       loadingSourceIDs: [],
       errors: {},
       latencyByNodeId: {},
@@ -1008,6 +1025,36 @@ export const useStore = create<Store>()(
         set((s) => ({
           localRuleSets: s.localRuleSets.filter((x) => x.id !== id),
         })),
+
+      saveBuiltinSchemeOverride: (id, override) =>
+        set((s) => {
+          const notices = { ...s.builtinSchemeUpdateNotices }
+          delete notices[id]
+          return {
+            builtinSchemeOverrides: { ...s.builtinSchemeOverrides, [id]: override },
+            builtinSchemeUpdateNotices: notices,
+          }
+        }),
+
+      clearBuiltinSchemeOverride: (id) =>
+        set((s) => {
+          const overrides = { ...s.builtinSchemeOverrides }
+          delete overrides[id]
+          const notices = { ...s.builtinSchemeUpdateNotices }
+          delete notices[id]
+          return { builtinSchemeOverrides: overrides, builtinSchemeUpdateNotices: notices }
+        }),
+
+      setCheckBuiltinSchemeUpdatesOnOpen: (enabled) =>
+        set({ checkBuiltinSchemeUpdatesOnOpen: enabled }),
+
+      setBuiltinSchemeUpdateNotice: (id, notice) =>
+        set((s) => {
+          const notices = { ...s.builtinSchemeUpdateNotices }
+          if (notice) notices[id] = notice
+          else delete notices[id]
+          return { builtinSchemeUpdateNotices: notices }
+        }),
 
       addManualNodes: (text, preferredName) => {
         const result = prepareManualNodes(text, preferredName ?? '', get().nodes)

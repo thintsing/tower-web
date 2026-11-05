@@ -277,7 +277,7 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 | `npm run selfcheck:workspace` | 校验服务器版工作区接口、版本号、密钥与并发写 |
 
 <details>
-<summary>全部 23 项自检</summary>
+<summary>全部 24 项自检</summary>
 
 ```text
 selfcheck:asn         离线 IP / ASN 查询
@@ -301,11 +301,12 @@ selfcheck:quota       订阅用量响应头 / Clash 方言探测 / 只取头
 selfcheck:regressions 审计回归：解析 / 命名 / 备份兼容 / 存储配额 / 隐式 TLS
 selfcheck:remote      代理集合与远程规则集
 selfcheck:rulesets    规则集方言转换
+selfcheck:upstream    上游方案更新：成功 / 部分失败 / 全部失败 / 空列表
 selfcheck:workspace   服务器版工作区：版本 / 304 / 409 / 密钥 / 坏文件 / 并发
 selfcheck:yaml        Clash YAML 结构
 ```
 
-自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 23 项自检。
+自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 24 项自检。
 
 </details>
 

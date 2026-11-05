@@ -452,6 +452,33 @@ export interface RuleScheme {
   updatedAt?: number
 }
 
+/** 上游文件快照：路径 + 同一 commit 下的 blob SHA；ETag 仅用于 trees API 失败时的备用检测。 */
+export interface BuiltinSchemeFile {
+  path: string
+  blobSha: string
+  etag?: string
+}
+
+/** 内置方案固化记录的上游标识：commit SHA 为主，逐文件 blob SHA 保证版本一致。 */
+export interface BuiltinSchemeSource {
+  iniURL: string
+  commitSha: string
+  files: BuiltinSchemeFile[]
+  fetchedAt: number
+  ruleCount: number
+  ruleSetCount: number
+}
+
+/**
+ * 内置方案覆盖层：固化后的方案与列表快照。
+ * 原厂 `public/rulesets/*.ini` 永不改动；删除这条记录即恢复兜底快照。
+ */
+export interface BuiltinSchemeOverride {
+  scheme: RuleScheme
+  ruleSets: LocalRuleSet[]
+  source: BuiltinSchemeSource
+}
+
 // ---------- Clients ----------
 
 export type ClientTarget =

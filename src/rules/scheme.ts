@@ -2,7 +2,7 @@
 //   ruleset=组名,https://…/Clash/Ruleset/X.list   (or []GEOIP,CN / []FINAL)
 //   custom_proxy_group=组名`类型`[]引用`正则`url`interval`,tolerance
 // Bundled rule lists are inlined into per-group rules at load time.
-import type { PolicyGroup, PolicyGroupType, RoutingRule, RuleScheme, RuleSchemeFormat, RuleSchemeSource, RuleSetFormat } from '../models/types'
+import type { BuiltinSchemeOverride, PolicyGroup, PolicyGroupType, RoutingRule, RuleScheme, RuleSchemeFormat, RuleSchemeSource, RuleSetFormat } from '../models/types'
 import { apiFetch } from '../util/apiAuth'
 import { ALL_RULE_TYPES } from './capabilities'
 
@@ -86,7 +86,34 @@ function localFileForURL(url: string, index: Record<string, string>): string | u
   return index[path]
 }
 
-export async function loadScheme(meta: SchemeMeta): Promise<RuleScheme> {
+/**
+ * 覆盖层结构校验：缺字段 / 类型不对都按「损坏」处理，交给原厂快照兜底。
+ * 只做加载需要的字段，不影响导出随后的校验。
+ */
+export function isBuiltinSchemeOverrideValid(value: unknown): value is BuiltinSchemeOverride {
+  if (!value || typeof value !== 'object') return false
+  const override = value as Partial<BuiltinSchemeOverride>
+  const scheme = override.scheme
+  if (!scheme || typeof scheme !== 'object') return false
+  if (!Array.isArray(scheme.groups) || !Array.isArray(scheme.rules)) return false
+  if (!Array.isArray(override.ruleSets)) return false
+  const source = override.source
+  return !!source
+    && typeof source === 'object'
+    && typeof source.iniURL === 'string'
+    && typeof source.commitSha === 'string'
+}
+
+export async function loadScheme(
+  meta: SchemeMeta,
+  overrides?: Record<string, BuiltinSchemeOverride>,
+): Promise<RuleScheme> {
+  // 覆盖层优先：固化后同一条内置条目直接读这份已内联的方案。
+  // 结构损坏 / 缺失时继续走下面的原厂快照，保证离线也能加载。
+  const override = overrides?.[meta.id]
+  if (isBuiltinSchemeOverrideValid(override)) {
+    return { ...override.scheme, id: meta.id, name: meta.name, description: meta.description }
+  }
   // 内置方案由 /rulesets 下的静态文件组成；切换 Tab、编辑自定义方案后回到
   // 导出页都会重新调用这里。缓存 Promise 后，第二次起不再重复发起 20+ 个
   // 请求，也不再重复解析上万条规则。失败不缓存，方便用户重试。
@@ -224,12 +251,16 @@ export function parsePlainRulesetText(
 /** Parse raw ACL4SSR INI text (same format as bundled files) into groups + rules.
  *  Used for both bundled schemes (through loadScheme) and user-imported custom schemes.
  *  Remote ruleset URLs are fetched through /api/fetch proxy so the browser's CORS does not block. */
-export async function parseSchemeINI(
-  id: string,
-  name: string,
-  description: string,
-  ini: string,
-): Promise<RuleScheme> {
+export interface SchemeINIParts {
+  groups: PolicyGroup[]
+  /** 按出现顺序排列的 `ruleset=组,目标` 引用（不含 `[]` 内联规则）。 */
+  rulesets: { group: string; target: string }[]
+  /** `ruleset=组,[]规则` 形式的内联规则。 */
+  inlineRules: { group: string; rule: string }[]
+}
+
+/** 只做语法拆分，不抓取任何规则集；内置加载与上游更新共用这一份解析。 */
+export function parseSchemeINIParts(ini: string): SchemeINIParts {
   const rulesets: { group: string; target: string }[] = []
   const groups: PolicyGroup[] = []
   const inlineRules: { group: string; rule: string }[] = []
@@ -255,6 +286,16 @@ export async function parseSchemeINI(
       if (g) groups.push(g)
     }
   }
+  return { groups, rulesets, inlineRules }
+}
+
+export async function parseSchemeINI(
+  id: string,
+  name: string,
+  description: string,
+  ini: string,
+): Promise<RuleScheme> {
+  const { groups, rulesets, inlineRules } = parseSchemeINIParts(ini)
 
   // Fetch remote rulesets in parallel. Bundled files are looked up via index.json,
   // unknown remote URLs go through /api/fetch proxy (same origin).

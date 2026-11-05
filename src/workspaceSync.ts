@@ -2,8 +2,8 @@
 // 只同步「多设备应该一致」的数据；导出目标、隐藏客户端、排序、Emoji、
 // 测速模式、地图与高级区展开等设备偏好仍留在 localStorage。
 import { useSyncExternalStore } from 'react'
-import type { LocalRuleSet, ProxyNode, RuleScheme, SubscriptionSource, TailnetConnection } from './models/types'
-import { normalizeSource } from './backup'
+import type { BuiltinSchemeOverride, LocalRuleSet, ProxyNode, RuleScheme, SubscriptionSource, TailnetConnection } from './models/types'
+import { normalizeBuiltinSchemeOverrides, normalizeSource } from './backup'
 import { persistTailnetAuthKeys } from './models/tailnetAuthKeys'
 import { useStore, type Store } from './store'
 import { apiFetch, getAPIKey } from './util/apiAuth'
@@ -14,6 +14,7 @@ export interface WorkspaceData {
   nodes: ProxyNode[]
   customSchemes: RuleScheme[]
   localRuleSets: LocalRuleSet[]
+  builtinSchemeOverrides: Record<string, BuiltinSchemeOverride>
   selectedSchemeID: string
   policySelections: Record<string, string>
   exportConfigName: string
@@ -100,6 +101,7 @@ export function normalizeWorkspaceData(raw: unknown): WorkspaceData {
     nodes: arrayField<ProxyNode>(raw, 'nodes'),
     customSchemes: arrayField<RuleScheme>(raw, 'customSchemes'),
     localRuleSets: arrayField<LocalRuleSet>(raw, 'localRuleSets'),
+    builtinSchemeOverrides: normalizeBuiltinSchemeOverrides(raw.builtinSchemeOverrides),
     selectedSchemeID: typeof raw.selectedSchemeID === 'string' && raw.selectedSchemeID
       ? raw.selectedSchemeID
       : 'acl4ssr-online',
@@ -119,6 +121,7 @@ export function workspaceSnapshot(state: Store): WorkspaceData {
     nodes: state.nodes,
     customSchemes: state.customSchemes,
     localRuleSets: state.localRuleSets,
+    builtinSchemeOverrides: state.builtinSchemeOverrides,
     selectedSchemeID: state.selectedSchemeID,
     policySelections: state.policySelections,
     exportConfigName: state.exportConfigName,
@@ -132,6 +135,7 @@ function hasContent(data: WorkspaceData): boolean {
     || data.nodes.length > 0
     || data.customSchemes.length > 0
     || data.localRuleSets.length > 0
+    || Object.keys(data.builtinSchemeOverrides).length > 0
     || data.tailnets.length > 0
 }
 
@@ -155,6 +159,7 @@ const WATCHED_KEYS = [
   'nodes',
   'customSchemes',
   'localRuleSets',
+  'builtinSchemeOverrides',
   'selectedSchemeID',
   'policySelections',
   'exportConfigName',
@@ -489,6 +494,7 @@ function applyServerData(data: WorkspaceData): void {
     nodes: data.nodes,
     customSchemes: data.customSchemes,
     localRuleSets: data.localRuleSets,
+    builtinSchemeOverrides: data.builtinSchemeOverrides,
     selectedSchemeID: data.selectedSchemeID,
     policySelections: data.policySelections,
     exportConfigName: data.exportConfigName,

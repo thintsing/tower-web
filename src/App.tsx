@@ -22,7 +22,8 @@ import {
   BackupHistoryError,
   type BackupHistoryItem,
 } from './backupHistory'
-import { BUILTIN_SCHEMES, allSchemeMetas, loadScheme, parseRuleList } from './rules/scheme'
+import { BUILTIN_SCHEMES, allSchemeMetas, loadScheme, parseRuleList, type SchemeMeta } from './rules/scheme'
+import { checkUpstreamUpdate, fetchUpstreamScheme } from './rules/upstreamScheme'
 import { detectRuleSchemeFormat, parseRuleSchemeText, RULE_SCHEME_FORMAT_TITLES } from './rules/importers'
 import { fetchRuleSet, parseRuleSetText, RULE_SET_FORMAT_TITLES, type RuleSetRule } from './rules/ruleSets'
 import { matchingGroupNames, matchingOrderAfterDragging } from './rules/matchingOrder'
@@ -114,6 +115,7 @@ function requestOptionsFrom(userAgent: string, doh: string) {
 function useScheme(): RuleScheme | undefined {
   const selectedSchemeID = useStore((s) => s.selectedSchemeID)
   const customSchemes = useStore((s) => s.customSchemes)
+  const builtinSchemeOverrides = useStore((s) => s.builtinSchemeOverrides)
   const [scheme, setScheme] = useState<RuleScheme | undefined>()
   useEffect(() => {
     const custom = customSchemes.find((c) => c.id === selectedSchemeID)
@@ -122,11 +124,12 @@ function useScheme(): RuleScheme | undefined {
     setScheme(undefined)
     const meta = BUILTIN_SCHEMES.find((m) => m.id === selectedSchemeID) ?? BUILTIN_SCHEMES[0]
     let cancelled = false
-    loadScheme(meta)
+    // 覆盖层优先（固化后的版本），没有再读 public/rulesets 原厂快照。
+    loadScheme(meta, builtinSchemeOverrides)
       .then((s) => { if (!cancelled) setScheme(s) })
       .catch(() => { if (!cancelled) setScheme(undefined) })
     return () => { cancelled = true }
-  }, [selectedSchemeID, customSchemes])
+  }, [selectedSchemeID, customSchemes, builtinSchemeOverrides])
   return scheme
 }
 
@@ -5157,7 +5160,15 @@ function RulesTab({
   const localRuleSets = useStore((s) => s.localRuleSets)
   const addLocalRuleSet = useStore((s) => s.addLocalRuleSet)
   const removeLocalRuleSet = useStore((s) => s.removeLocalRuleSet)
+  const builtinSchemeOverrides = useStore((s) => s.builtinSchemeOverrides)
+  const saveBuiltinSchemeOverride = useStore((s) => s.saveBuiltinSchemeOverride)
+  const clearBuiltinSchemeOverride = useStore((s) => s.clearBuiltinSchemeOverride)
+  const checkBuiltinSchemeUpdatesOnOpen = useStore((s) => s.checkBuiltinSchemeUpdatesOnOpen)
+  const setCheckBuiltinSchemeUpdatesOnOpen = useStore((s) => s.setCheckBuiltinSchemeUpdatesOnOpen)
+  const builtinSchemeUpdateNotices = useStore((s) => s.builtinSchemeUpdateNotices)
+  const setBuiltinSchemeUpdateNotice = useStore((s) => s.setBuiltinSchemeUpdateNotice)
   const [importingScheme, setImportingScheme] = useState(false)
+  const [updatingBuiltinScheme, setUpdatingBuiltinScheme] = useState(false)
   const [schemeName, setSchemeName] = useState('')
   const [schemeURL, setSchemeURL] = useState('')
   const [schemeText, setSchemeText] = useState('')
@@ -5203,6 +5214,9 @@ function RulesTab({
 
   const allMetas = allSchemeMetas(customSchemes)
   const selectedMeta = allMetas.find((m) => m.id === selectedSchemeID)
+  const selectedBuiltinOverride = selectedMeta && !('custom' in selectedMeta)
+    ? builtinSchemeOverrides[selectedMeta.id]
+    : undefined
   const customScheme = customSchemes.find((c) => c.id === scheme?.id)
   const schemeRules = useMemo(
     () => scheme ? orderedSchemeRules(scheme) : [],
@@ -5337,6 +5351,59 @@ function RulesTab({
     return copy
   }
 
+  // 从 ACL4SSR 上游拉最新 INI + 全部列表，直接固化到内置方案覆盖层。
+  // 全有或全无：失败时只报错，不写覆盖层，原厂快照继续兜底。
+  const freezeBuiltinScheme = async (meta: SchemeMeta) => {
+    setUpdatingBuiltinScheme(true)
+    setSchemeError(null)
+    try {
+      const result = await fetchUpstreamScheme(meta)
+      saveBuiltinSchemeOverride(meta.id, result.override)
+      setScheme(meta.id)
+      setFlash(`已更新并固化「${meta.name}」：${result.override.source.ruleCount} 条规则、${result.ruleSets.length} 个列表；原厂快照保留，可随时恢复。`)
+    } catch (e) {
+      setSchemeError((e as Error).message)
+    } finally {
+      setUpdatingBuiltinScheme(false)
+    }
+  }
+
+  // 「生成自定义副本」：分支修改用；只写自定义方案与「我的规则集」，不碰覆盖层。
+  const copyBuiltinSchemeFromUpstream = async (meta: SchemeMeta) => {
+    setUpdatingBuiltinScheme(true)
+    setSchemeError(null)
+    try {
+      const result = await fetchUpstreamScheme(meta)
+      for (const set of result.ruleSets) {
+        const existing = localRuleSets.find((item) => item.sourceURL === set.sourceURL)
+        addLocalRuleSet(existing ? { ...set, id: existing.id, paused: existing.paused } : set)
+      }
+      addCustomScheme(result.scheme)
+      setScheme(result.scheme.id)
+      setFlash(`已生成自定义副本「${result.scheme.name}」；内置方案未改动。`)
+    } catch (e) {
+      setSchemeError((e as Error).message)
+    } finally {
+      setUpdatingBuiltinScheme(false)
+    }
+  }
+
+  // 清掉覆盖层，立刻回到 public/rulesets 原厂快照；按钮回到初始态。
+  const restoreBuiltinSnapshot = async (meta: SchemeMeta) => {
+    setUpdatingBuiltinScheme(true)
+    setSchemeError(null)
+    try {
+      clearBuiltinSchemeOverride(meta.id)
+      // 覆盖层变化会触发 useScheme 重新 loadScheme；这里只确保仍选中这条内置方案。
+      setScheme(meta.id)
+      setFlash(`已恢复「${meta.name}」的原厂快照。`)
+    } catch (e) {
+      setSchemeError(`恢复原厂快照失败：${(e as Error).message}`)
+    } finally {
+      setUpdatingBuiltinScheme(false)
+    }
+  }
+
   const beginEditScheme = () => {
     if (!scheme) return
     const editable = customScheme ?? makeEditableScheme(scheme)
@@ -5356,7 +5423,7 @@ function RulesTab({
     if (!customScheme || !builtinForCustom) return
     setRestoreInitialConfirm(false)
     try {
-      const original = await loadScheme(builtinForCustom)
+      const original = await loadScheme(builtinForCustom, builtinSchemeOverrides)
       addCustomScheme({
         ...original,
         id: customScheme.id,
@@ -5977,7 +6044,9 @@ function RulesTab({
                     ? '来源：基于内置方案复制的自定义方案'
                     : selectedMeta && 'custom' in selectedMeta
                       ? '自定义方案 · 保存在本机'
-                      : '内置方案 · 离线可用'}
+                      : selectedBuiltinOverride
+                        ? `内置方案 · 已固化 · commit ${selectedBuiltinOverride.source.commitSha.slice(0, 7)} · 更新于 ${formatDate(selectedBuiltinOverride.source.fetchedAt)} · ${selectedBuiltinOverride.source.ruleCount} 条规则`
+                        : '内置方案 · 原厂快照 · 离线可用'}
           </div>
           <div className="scheme-source scheme-network-summary">
             DNS：{DNS_MODE_TITLES[scheme?.networkSettings?.dnsProtectionMode ?? 'standard']}
@@ -5989,6 +6058,69 @@ function RulesTab({
             <div className="hint">编辑、排序或添加规则会先生成一份自定义副本。</div>
           )}
         </details>
+        {selectedMeta && !('custom' in selectedMeta) && (
+          <div className="row wrap" style={{ gap: 8, marginTop: 8 }}>
+            <button
+              type="button"
+              className="btn"
+              {...writeGuard(readOnly)}
+              disabled={updatingBuiltinScheme}
+              onClick={() => void freezeBuiltinScheme(selectedMeta)}
+            >
+              {updatingBuiltinScheme ? '正在更新…' : selectedBuiltinOverride ? '重新更新并固化' : '更新并固化'}
+            </button>
+            <button
+              type="button"
+              className="btn ghost"
+              {...writeGuard(readOnly)}
+              disabled={updatingBuiltinScheme}
+              onClick={() => void copyBuiltinSchemeFromUpstream(selectedMeta)}
+            >
+              生成自定义副本
+            </button>
+            {selectedBuiltinOverride && (
+              <button
+                type="button"
+                className="btn ghost"
+                {...writeGuard(readOnly)}
+                disabled={updatingBuiltinScheme}
+                onClick={() => void restoreBuiltinSnapshot(selectedMeta)}
+              >
+                恢复原厂快照
+              </button>
+            )}
+          </div>
+        )}
+        {selectedMeta && !('custom' in selectedMeta) && (
+          <div style={{ marginTop: 8 }}>
+            <div className="hint">
+              「更新并固化」拉取 ACL4SSR 最新 INI 与全部列表，直接替换这条内置方案（多设备同步）；任一列表失败整次放弃，原厂快照始终保留可恢复。
+              「生成自定义副本」另存一份可编辑方案，不改内置方案。
+            </div>
+            <div className="hint" style={{ marginTop: 4 }}>
+              <label className="row" style={{ gap: 6 }}>
+                <input
+                  type="checkbox"
+                  checked={checkBuiltinSchemeUpdatesOnOpen}
+                  onChange={(e) => setCheckBuiltinSchemeUpdatesOnOpen(e.target.checked)}
+                />
+                打开塔台时检查内置方案是否有上游更新（只提示，不自动覆盖）
+              </label>
+            </div>
+            {builtinSchemeUpdateNotices[selectedMeta.id] && (
+              <div className="row wrap" style={{ gap: 8, marginTop: 6 }}>
+                <span className="scheme-source">{builtinSchemeUpdateNotices[selectedMeta.id]}</span>
+                <button
+                  type="button"
+                  className="btn ghost"
+                  onClick={() => setBuiltinSchemeUpdateNotice(selectedMeta.id, undefined)}
+                >
+                  知道了
+                </button>
+              </div>
+            )}
+          </div>
+        )}
         {customSchemes.length > 0 && (
           <div className="row wrap custom-scheme-chips">
             {customSchemes.map((s) => (
@@ -8365,6 +8497,7 @@ export function App() {
   const [exportTick, setExportTick] = useState(0)
   const autoRefreshStarted = useRef(false)
   const ruleSetAutoRefreshStarted = useRef(false)
+  const builtinUpdateCheckStarted = useRef(false)
   const keysPruned = useRef(false)
   const [storageFull, setStorageFull] = useState(isStorageFull)
 
@@ -8470,6 +8603,36 @@ export function App() {
         .map((s) => s.id)
       if (!ids.length) return
       void Promise.all(ids.map((id) => state.refreshSource(id)))
+    }
+    if (useStore.persist.hasHydrated()) {
+      run()
+      return
+    }
+    return useStore.persist.onFinishHydration(run)
+  }, [])
+
+  // 打开时只比对内置方案的上游响应头，发现变化写一条提示；绝不自动覆盖。
+  useEffect(() => {
+    if (builtinUpdateCheckStarted.current) return
+    builtinUpdateCheckStarted.current = true
+    const run = () => {
+      const state = useStore.getState()
+      if (!state.checkBuiltinSchemeUpdatesOnOpen) return
+      const targets = BUILTIN_SCHEMES.filter(
+        (meta) => meta.id === state.selectedSchemeID || !!state.builtinSchemeOverrides[meta.id],
+      )
+      void Promise.all(targets.map(async (meta) => {
+        const result = await checkUpstreamUpdate(meta, state.builtinSchemeOverrides[meta.id])
+        if (!result.updateAvailable) return
+        const changed = result.changedFiles.length
+          ? `：${result.changedFiles.slice(0, 3).map((path) => path.split('/').pop()).join('、')}${
+            result.changedFiles.length > 3 ? ` 等 ${result.changedFiles.length} 个文件` : ''}`
+          : '：方案配置 / 分组有变更'
+        useStore.getState().setBuiltinSchemeUpdateNotice(
+          meta.id,
+          `${meta.name} 上游有更新${result.method === 'head' ? '（备用检测）' : ''}${changed}，可点「更新并固化」。`,
+        )
+      }))
     }
     if (useStore.persist.hasHydrated()) {
       run()

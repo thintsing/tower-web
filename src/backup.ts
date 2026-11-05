@@ -2,6 +2,7 @@
 // 恢复前由界面再次确认；备份文件本身含订阅地址与节点凭据，不能公开分享。
 import { PROXY_KIND_TITLES } from './models/types'
 import type {
+  BuiltinSchemeOverride,
   ClientTarget,
   ExportContentMode,
   LatencyTestMode,
@@ -30,6 +31,9 @@ export interface PersistedData {
   policySelections: Record<string, string>
   customSchemes: RuleScheme[]
   localRuleSets: LocalRuleSet[]
+  /** 内置方案覆盖层；缺失或损坏时按空处理，加载会回落到原厂快照。 */
+  builtinSchemeOverrides?: Record<string, BuiltinSchemeOverride>
+  checkBuiltinSchemeUpdatesOnOpen?: boolean
   autoRefreshOnOpen: boolean
   autoRefreshRuleSetsOnOpen: boolean
   preferRuleSets: boolean
@@ -216,6 +220,49 @@ function validLocalRuleSet(value: unknown): value is LocalRuleSet {
     && value.rules.every(validRule)
 }
 
+function numberOr(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback
+}
+
+/**
+ * 内置方案覆盖层容错：单条记录损坏就丢弃，而不是让整个工作区 / 备份判定为损坏。
+ * 丢弃后 `loadScheme` 会自动回落到原厂快照。
+ */
+export function normalizeBuiltinSchemeOverrides(value: unknown): Record<string, BuiltinSchemeOverride> {
+  if (!isRecord(value)) return {}
+  const out: Record<string, BuiltinSchemeOverride> = {}
+  for (const [id, item] of Object.entries(value)) {
+    if (!isRecord(item) || !validScheme(item.scheme)) continue
+    if (!Array.isArray(item.ruleSets) || !item.ruleSets.every(validLocalRuleSet)) continue
+    const source = item.source
+    if (!isRecord(source) || !isString(source.iniURL)) continue
+    if (!isString(source.commitSha) || !/^[0-9a-f]{40}$/i.test(source.commitSha)) continue
+    const files = (Array.isArray(source.files) ? source.files : [])
+      .filter((file): file is Record<string, unknown> => isRecord(file)
+        && isString(file.path)
+        && isString(file.blobSha)
+        && /^[0-9a-f]{40}$/i.test(file.blobSha))
+      .map((file) => ({
+        path: file.path as string,
+        blobSha: file.blobSha as string,
+        ...(isString(file.etag) ? { etag: file.etag } : {}),
+      }))
+    out[id] = {
+      scheme: item.scheme,
+      ruleSets: item.ruleSets,
+      source: {
+        iniURL: source.iniURL,
+        commitSha: source.commitSha.toLowerCase(),
+        files,
+        fetchedAt: numberOr(source.fetchedAt, 0),
+        ruleCount: numberOr(source.ruleCount, item.scheme.rules.length),
+        ruleSetCount: numberOr(source.ruleSetCount, item.ruleSets.length),
+      },
+    }
+  }
+  return out
+}
+
 function validTailnet(value: unknown): value is TailnetConnection {
   return isRecord(value)
     && isString(value.id)
@@ -301,6 +348,8 @@ export function parseBackup(text: string): BackupFile {
       policySelections,
       customSchemes,
       localRuleSets,
+      builtinSchemeOverrides: normalizeBuiltinSchemeOverrides(data.builtinSchemeOverrides),
+      checkBuiltinSchemeUpdatesOnOpen: booleanOr(data.checkBuiltinSchemeUpdatesOnOpen, false),
       autoRefreshOnOpen: booleanOr(data.autoRefreshOnOpen, false),
       autoRefreshRuleSetsOnOpen: booleanOr(data.autoRefreshRuleSetsOnOpen, false),
       preferRuleSets: booleanOr(data.preferRuleSets, false),

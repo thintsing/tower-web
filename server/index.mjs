@@ -1346,6 +1346,12 @@ async function handleFetch(url, options, res) {
   if (title) headers['x-profile-title'] = title
   const interval = headerValue(upstream.headers, 'profile-update-interval')
   if (interval) headers['x-profile-update-interval'] = interval
+  // 上游 ETag / Last-Modified：内置方案「是否有更新」只靠这两个响应头判断，
+  // 不下载正文；上游没给时客户端会退回「URL + 拉取时间」。
+  const etag = headerValue(upstream.headers, 'etag')
+  if (etag) headers['x-upstream-etag'] = etag
+  const lastModified = headerValue(upstream.headers, 'last-modified')
+  if (lastModified) headers['x-upstream-last-modified'] = lastModified
   send(res, 200, upstream.body, headers)
 }
 
