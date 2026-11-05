@@ -111,7 +111,45 @@ docker compose up -d
 
 容器默认 `HOST=0.0.0.0`、`PORT=8787`，打开 <http://127.0.0.1:8787>。已发布订阅（生成好的客户端配置文本）保存在数据卷 `/app/data`，重建容器前请保留该卷；也可以用 `TOWER_DATA_DIR` 改路径。默认本地模式（`TOWER_MODE=local`）下，订阅源、解析后的节点、规则方案和规则集仍在浏览器 localStorage，不在这个数据卷里；设置 `TOWER_MODE=server` 后改为保存在 `/app/data/workspace.json`。ICMP 测速依赖镜像内的 `ping`，不可用时自动回退 TCP。
 
-容器内无法可靠区分「宿主机浏览器」和伪造 `Host: localhost` 的局域网客户端。需要管理密钥时，建议启动时设置 `TOWER_API_TOKEN`（16–128 位 `A-Z/a-z/0-9/_/-`）：
+#### 数据目录必须对容器内的 node 可写（bind mount 必读）
+
+容器默认以 `node`（UID 1000）运行。用 `-v /opt/tower/app/data:/app/data` 这类**宿主机目录**时，如果该目录由 root 创建（`sudo mkdir`、Docker 自动创建、或之前用 root 跑过），容器内的 `node` 就写不进去：服务器模式的工作区会一直为空，订阅与设置也存不下来。
+
+镜像会让这种情况变成可见故障，而不是静默的空页面：
+
+- `/api/health` 探测到数据目录不可写时返回 503，容器在 `docker ps` 里显示 `unhealthy`：
+
+  ```bash
+  docker inspect -f '{{.State.Health.Status}}' tower-web
+  # healthy：进程存活且数据目录可写
+  # unhealthy：数据目录不可写（或其它健康检查失败）
+  ```
+
+- 页面会显示「服务端数据目录不可写」，并给出修复命令。
+- 日志会打印 `[tower] 数据目录不可写…`（服务器模式启动时）或 `[tower] 警告：…数据目录不可写…`（entrypoint 以非 root 启动时）。
+
+修复任选其一：
+
+```bash
+# 1) 修正宿主机目录属主（推荐，一次即可）
+sudo chown -R 1000:1000 /opt/tower/app/data
+docker compose restart tower-web
+```
+
+```yaml
+# 2) 让容器自己修：以 root 启动，entrypoint 会 chown 后立刻降权到 node 运行服务端
+services:
+  tower-web:
+    user: "root"
+```
+
+> `user: "root"` 只影响容器启动的这一步，服务端进程仍是 UID 1000。不想让容器以 root 启动时用第 1 种方式。只读根文件系统（`read_only: true`）下 chown 会失败，entrypoint 只告警并继续启动，健康检查仍会给出 `unhealthy`。
+
+#### 健康检查的含义
+
+`healthy` = **进程存活且数据目录可写**；任一不满足就是 `unhealthy`。`unhealthy` 只是警示，**不会自动重启容器**（`restart: unless-stopped` 只对进程退出生效）。可写探测结果缓存 10 秒：修好权限后最多 10 秒恢复 `healthy`，不需要重启容器。
+
+容器内无法可靠区分「宿主机浏览器」和伪造 `Host: localhost` 的局域网客户端。需要管理密钥时，建议启动时设置 `TOWER_API_TOKEN`。校验规则：本地模式要求 16–128 位 `A-Z/a-z/0-9/_/-`；服务器模式（`TOWER_MODE=server`）放宽为 1–128 个不含空白 / 换行 / 控制字符的字符。**两种模式都建议直接使用 ≥32 位随机值**（例如 `openssl rand -hex 32`），不要用可读短词：
 
 ```bash
 docker run -d --name tower-web \
@@ -140,7 +178,20 @@ git tag v0.3.2
 git push origin v0.3.2
 ```
 
-> 镜像默认允许局域网访问，可以在「订阅设置 → 局域网与访问密钥」关闭共享或生成 API 密钥；Docker 下生成首个密钥建议用 `TOWER_API_TOKEN`。`-p 8787:8787` 仍会暴露到局域网，只建议在可信网络使用。
+> 镜像默认允许局域网访问，可以在「订阅设置 → 局域网与访问密钥」关闭共享或生成 API 密钥；Docker 下生成首个密钥建议用 `TOWER_API_TOKEN`。`-p 8787:8787` 会把端口暴露到局域网，只建议在可信网络使用。
+
+需要从外部访问、又不想把 8787 直接暴露给局域网或公网时，推荐把端口只绑到回环地址：
+
+```bash
+docker run -d --name tower-web \
+  -p 127.0.0.1:8787:8787 \
+  -v tower-data:/app/data \
+  ghcr.io/thintsing/tower-web:latest
+```
+
+compose 里对应写 `ports: ["127.0.0.1:8787:8787"]`。仓库内的 `docker-compose.yml` 默认仍是 `"8787:8787"`（方便局域网直连），这里只是建议，不改默认值。如果这台机器上已有 cloudflared、frp 或 nginx 之类的隧道 / 反向代理，把上游指向 `127.0.0.1:8787` 就已经足够，不需要再向局域网开放端口。
+
+> 隧道以 `127.0.0.1` 为源站时，服务端看到的源地址是回环，`/api/settings` 这类「仅本机可改」的接口会按本机放行（会返回包含管理密钥的 JSON）。因此隧道 / 公网场景必须叠加 Cloudflare Access 之类的访问控制，或让隧道侧注入 `x-tower-key`，不要只靠端口绑定。
 
 ### 局域网 / 手机访问
 
@@ -178,8 +229,9 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 
 - 工作区保存在 `TOWER_DATA_DIR/workspace.json`（默认 `server/workspace.json`，Docker 下 `/app/data/workspace.json`），结构为 `{ version, updatedAt, data }`。服务端已有数据时不要在运行中手工编辑这个文件。
 - 服务器模式下 `/api/workspace` 的所有请求都必须带访问密钥，`127.0.0.1` 也不例外；密钥来源沿用现有机制（`?key=`、`x-tower-key`、`Authorization: Bearer`、`tower_key` cookie）。
-- 服务器模式密钥放宽为 1–128 个不含空白 / 换行 / 控制字符的字符，首尾空白会 trim；本地模式仍要求 16–128 位 `A-Z/a-z/0-9/_/-`。短密钥能被穷举，强度请自行决定并配合可信网络使用。
-- 同一 IP 连续 10 次认证失败，服务端冷却 60 秒；认证成功会清零计数。`/api/auth-status` 带错误密钥的试探也计入失败，不能当成无限次试错的 oracle。
+- 服务器模式密钥放宽为 1–128 个不含空白 / 换行 / 控制字符的字符，首尾空白会 trim；本地模式仍要求 16–128 位 `A-Z/a-z/0-9/_/-`。服务端不强制长度，**请直接用 ≥32 位随机值**（`openssl rand -hex 32`）；短密钥能被穷举，隧道 / 公网场景还应叠加 Cloudflare Access 之类的访问控制。
+- 每台设备首次访问要授权一次：用带 `?key=<密钥>` 的地址打开，或在全屏「需要访问密钥」页里粘贴密钥。密钥存进**该浏览器**的 localStorage `tower-web-api-key`，不跨设备、不跨浏览器 profile；换域名、端口或 http/https 都算另一个来源，需要重新带一次 `?key=`。
+- 同一 IP 连续 10 次认证失败，服务端冷却 60 秒；认证成功会清零计数。注意 `/api/auth-status` 本身**不受冷却限制**（页面无密钥时也要能判断模式），带错误密钥时它会记录一次失败但仍正常响应——所以它可以被用来连续试探密钥，别把它当成防穷举的屏障。
 - 首次使用：服务端还没有 `workspace.json` 时，打开页面的客户端会把本机现有工作区上传创建，并提示「已上传本机工作区」。服务端已有数据后客户端只读取；要覆盖必须按当前版本号正常写入（例如覆盖恢复），不能静默清空。
 - 同步：页面可见时每 8 秒探测一次版本，窗口 `focus` / 标签页切换立即探测；本地改动 500ms 防抖后推送，内容没变不发送。
 - 并发写：版本不匹配返回 409，客户端提示「另一台设备刚改过」，随后自动拉取并替换为最新版本，不做自动合并。
@@ -259,8 +311,8 @@ selfcheck:yaml        Clash YAML 结构
 
 ## 已知限制
 
-- 服务端面向本机或可信局域网；可选管理 API 密钥和局域网共享开关，但没有用户隔离、限流或公网级防护，`/api/health`、订阅 / 分享 / 托管规则集等 GET 端点仍按独立凭证或公开规则处理。
-- 服务器版是单用户模型：没有角色、多人合并和资源级权限；工作区接口只做了认证失败节流（10 次 / 60 秒），不做公网级限流。服务器模式密钥可以短到 1 字符，强度需自行决定，详见 [SECURITY.md](SECURITY.md)。
+- 服务端面向本机或可信局域网；可选管理 API 密钥和局域网共享开关，但没有用户隔离、公网级限流或公网级防护（只有按 IP 的认证失败节流，10 次 / 60 秒），`/api/health`、订阅 / 分享 / 托管规则集等 GET 端点仍按独立凭证或公开规则处理。
+- 服务器版是单用户模型：没有角色、多人合并和资源级权限；`/api/auth-status` 不受认证失败冷却限制，不能挡住密钥穷举。服务器模式密钥可以短到 1 字符，**建议 ≥32 位随机**，详见 [SECURITY.md](SECURITY.md)。
 - 不能部署到 GitHub Pages，需要 Node 运行环境；公网部署必须额外加安全层。
 - 订阅解析对 Surge / Loon / Quantumult X 节点段的覆盖：
   - Surge `[Proxy]`：Shadowsocks（simple-obfs / ShadowTLS）、ShadowsocksR、VMess（TLS / WebSocket）、VLESS、Trojan（TLS / WebSocket）、Hysteria2（Salamander / gecko 密码、端口跳跃）、TUIC v5（`tuic-v5`）、WireGuard（`[WireGuard <name>]`，单 peer）、HTTP / HTTPS、SOCKS5、Snell、SSH（密码登录）、AnyTLS、TrustTunnel、MASQUE。
