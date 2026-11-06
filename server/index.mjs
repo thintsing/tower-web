@@ -114,8 +114,18 @@ const BLOCKED_RULESET_HOSTS = new Set([
 function isBlockedRuleSetTarget(target) {
   const host = target.hostname.toLowerCase().replace(/^\[|\]$/g, '')
   return BLOCKED_RULESET_HOSTS.has(host)
-    || host.startsWith('169.254.')
+    || blockedRuleSetAddress(host)
     || host.endsWith('.metadata.google.internal')
+}
+
+/** 解析结果也要校验：只按域名挡，A 记录指向 169.254.169.254 的域名仍能绕过。 */
+function blockedRuleSetAddress(address) {
+  const ip = String(address).trim().toLowerCase()
+  const mapped = ip.startsWith('::ffff:') ? ip.slice('::ffff:'.length) : ip
+  return /^169\.254\.\d{1,3}\.\d{1,3}$/.test(mapped)
+    || mapped === '100.100.100.200'
+    || /^fe80:/.test(ip)
+    || /^fd00:ec2::/.test(ip)
 }
 
 /** 读取内置规则文件或抓取远程列表，再转换成目标客户端方言。 */
@@ -162,7 +172,11 @@ async function buildRuleSetArtifact(query) {
     }
     let response
     try {
-      response = await fetchWithDoH(target, 'clash-verge/v2.4.2', undefined)
+      response = await fetchWithDoH(target, 'clash-verge/v2.4.2', undefined, false, (next) => {
+        if (isBlockedRuleSetTarget(next)) {
+          throw new Error('规则集地址不能指向链路本地或云元数据服务')
+        }
+      })
     } catch (error) {
       throw new RuleSetConversionError(`规则集抓取失败：${error.message}`, 502)
     }
@@ -1163,6 +1177,39 @@ function dohLookup(endpoint) {
   }
 }
 
+/** 没有 DoH 时的系统解析，签名与 dohLookup 保持一致。 */
+function systemLookup(hostname, options, callback) {
+  const all = typeof options === 'object' && options.all
+  const family = typeof options === 'object' ? Number(options.family || 0) : 0
+  lookup(hostname, { all: true, verbatim: true })
+    .then((addresses) => {
+      const list = family ? addresses.filter((item) => item.family === family) : addresses
+      if (!list.length) throw new Error(`没有 ${hostname} 的可用解析地址`)
+      if (all) callback(null, list)
+      else callback(null, list[0].address, list[0].family)
+    })
+    .catch((error) => callback(error))
+}
+
+/**
+ * 需要逐跳安全检查时使用：解析出的地址命中链路本地 / 云元数据就直接拒绝，
+ * 避免域名指向内网地址绕过只按 hostname 的拦截。
+ */
+function lookupWithGuard(endpoint, guard) {
+  const base = endpoint ? dohLookup(endpoint) : systemLookup
+  return (hostname, options, callback) => {
+    base(hostname, options, (error, address, family) => {
+      if (error) return callback(error)
+      const list = Array.isArray(address) ? address : [{ address, family }]
+      if (list.some((item) => blockedRuleSetAddress(item.address))) {
+        callback(new Error('规则集地址不能指向链路本地或云元数据服务'))
+        return
+      }
+      callback(null, address, family)
+    })
+  }
+}
+
 function headerValue(headers, name) {
   if (!headers) return null
   if (typeof headers.get === 'function') return headers.get(name)
@@ -1170,7 +1217,7 @@ function headerValue(headers, name) {
   return Array.isArray(value) ? value[0] : (value ?? null)
 }
 
-function requestOnce(target, userAgent, dohEndpoint, headersOnly = false) {
+function requestOnce(target, userAgent, dohEndpoint, headersOnly = false, guard = undefined) {
   return new Promise((resolve, reject) => {
     const transport = target.protocol === 'https:' ? httpsRequest : httpRequest
     const req = transport({
@@ -1180,7 +1227,9 @@ function requestOnce(target, userAgent, dohEndpoint, headersOnly = false) {
       path: `${target.pathname}${target.search}`,
       method: 'GET',
       agent: false,
-      lookup: dohEndpoint ? dohLookup(dohEndpoint) : undefined,
+      lookup: guard
+        ? lookupWithGuard(dohEndpoint, guard)
+        : (dohEndpoint ? dohLookup(dohEndpoint) : undefined),
       headers: {
         // Airports switch payloads on the UA; ask for the raw subscription.
         'user-agent': userAgent || 'clash-verge/v2.4.2',
@@ -1259,16 +1308,19 @@ async function readLimitedBody(response) {
   return Buffer.concat(chunks, size)
 }
 
-async function fetchWithDoH(target, userAgent, dohEndpoint, headersOnly = false) {
+async function fetchWithDoH(target, userAgent, dohEndpoint, headersOnly = false, guard = undefined) {
   let current = target
   for (let hop = 0; hop < 6; hop++) {
-    const result = await requestOnce(current, userAgent, dohEndpoint, headersOnly)
+    const result = await requestOnce(current, userAgent, dohEndpoint, headersOnly, guard)
     const location = headerValue(result.headers, 'location')
     if ([301, 302, 303, 307, 308].includes(result.status) && location) {
       const next = new URL(location, current)
       if (next.protocol !== 'http:' && next.protocol !== 'https:') {
         throw new Error('订阅地址重定向到了不支持的协议')
       }
+      // 免密钥的 /api/ruleset 必须逐跳校验：只挡住初始地址的话，
+      // 一个 302 指向 169.254.169.254 就能绕过元数据拦截。
+      if (guard) guard(next)
       current = next
       continue
     }
