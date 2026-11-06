@@ -1,6 +1,8 @@
 // 只读模式下写操作入口的统一禁用态：真实 disabled 优先，无法 disabled 的
 // 元素（summary / 自定义 div / 菜单项）退回 aria-disabled，样式统一在 styles.css。
-export const READONLY_NOTE = '只读模式：服务端离线，改动不会保存'
+// 只读不只在「服务端离线」时出现：未授权、工作区损坏、局域网共享关闭、
+// 认证冷却都会进入只读，统一提示不能再写死成离线原因。
+export const READONLY_NOTE = '只读模式：工作区当前不可写，改动不会保存'
 
 interface WriteGuardProps {
   disabled?: boolean

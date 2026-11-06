@@ -1,5 +1,5 @@
 // 方案 lint：默认只提示，不硬阻断导出。所有判断复用导出管线的规则顺序、策略组解析和客户端兼容性。
-import type { ClientInfo, LocalRuleSet, PolicyGroup, ProxyNode, RuleScheme, RoutingRule } from '../models/types'
+import type { ClientInfo, LocalRuleSet, PolicyGroup, ProxyNode, RuleScheme, RuleSetExclusionTable, RoutingRule } from '../models/types'
 import { CLIENTS } from '../models/types'
 import { prepareSchemeForExport, resolveGroups, uniqueDisplayNames } from '../generator/groups'
 import { analyzeRuleCompatibility } from '../generator/compatibility'
@@ -7,6 +7,7 @@ import { validateSchemePolicy } from './policyValidation'
 import { DOMAIN_TYPES } from './ruleMatcher'
 import { ruleSignature } from './ruleDiff'
 import { isTerminalRule } from './ruleKeys'
+import { filterExcludedRuleSets, isReadOnlyRuleSet } from './ruleSetExclusions'
 
 export type LintLevel = 'error' | 'warn' | 'info'
 
@@ -34,6 +35,18 @@ export interface SchemeLintIssue {
   hint?: string
   /** 是否允许一键删除；跨组遮蔽或前置规则已失效时为 false。 */
   deletable?: boolean
+  /** 跨组重复时，保留的那条规则所在策略组。 */
+  firstGroup?: string
+  /** 跨组重复时，前一条来自在线 / 内置只读规则集（刷新后可能消失）。 */
+  firstReadOnly?: boolean
+  /** 需要处理的这一条本身来自只读规则集；删除是假删除，只能屏蔽。 */
+  sourceSetId?: string
+  sourceSetName?: string
+  sourceReadOnly?: boolean
+  /** 这一条规则的签名；用于精确屏蔽，刷新后仍能定位。 */
+  ruleSignature?: string
+  /** 跨组 / 同组重复时，前一条本身已失效；此时不可动。 */
+  firstDead?: boolean
 }
 
 export interface SchemeLintOptions {
@@ -43,6 +56,8 @@ export interface SchemeLintOptions {
   localRuleSets?: LocalRuleSet[]
   preferRuleSets?: boolean
   clients?: ClientInfo[]
+  /** 只读规则集的本地屏蔽表；被屏蔽的条目不再参与检查。 */
+  ruleSetExclusions?: RuleSetExclusionTable
 }
 
 export interface SchemeLintSummary {
@@ -78,6 +93,17 @@ function locationForRule(rule: RoutingRule, index: number): LintLocation {
   }
 }
 
+/** 目标规则是否来自只读规则集；决定「可删除」还是「只能屏蔽」。 */
+function provenanceOf(rule: RoutingRule, readOnlySetIDs: Set<string>) {
+  if (!rule.sourceSetId) return {}
+  return {
+    sourceSetId: rule.sourceSetId,
+    sourceSetName: rule.sourceName,
+    sourceReadOnly: readOnlySetIDs.has(rule.sourceSetId) || undefined,
+    ruleSignature: ruleKey(rule),
+  }
+}
+
 function ancestorSuffixes(value: string): string[] {
   const domain = normalizeDomain(value)
   if (!domain) return []
@@ -90,7 +116,7 @@ function ancestorSuffixes(value: string): string[] {
 }
 
 /** 域名死规则检测：被更宽的域名后缀 / 关键词规则完全覆盖。 */
-function findShadowedDomainRules(rules: RoutingRule[]): SchemeLintIssue[] {
+function findShadowedDomainRules(rules: RoutingRule[], readOnlySetIDs: Set<string>): SchemeLintIssue[] {
   const issues: SchemeLintIssue[] = []
   const firstSuffix = new Map<string, { index: number; rule: RoutingRule }>()
   const firstExact = new Map<string, { index: number; rule: RoutingRule }>()
@@ -138,13 +164,20 @@ function findShadowedDomainRules(rules: RoutingRule[]): SchemeLintIssue[] {
     }
 
     if (coveredBy) {
+      const provenance = provenanceOf(rule, readOnlySetIDs)
+      const readOnly = provenance.sourceReadOnly === true
       issues.push({
         id: `dead:${index}`,
         level: 'info',
         code: 'shadowedRule',
-        message: `规则 ${ruleText(rule)} 永远不会命中：${reason}`,
-        hint: '前序规则已经覆盖同样的请求，可删除这一条或调整顺序',
-        deletable: true,
+        message: readOnly
+          ? `规则 ${ruleText(rule)} 永远不会命中：${reason}；它来自只读规则集「${rule.sourceName ?? rule.sourceSetId}」，直接删除会在刷新后恢复`
+          : `规则 ${ruleText(rule)} 永远不会命中：${reason}`,
+        hint: readOnly
+          ? '来源是只读规则集，请用「屏蔽」把它从编译与导出中排除；屏蔽可能改变去向'
+          : '前序规则已经覆盖同样的请求，可删除这一条或调整顺序',
+        deletable: !readOnly,
+        ...provenance,
         location: locationForRule(rule, index),
       })
     }
@@ -156,7 +189,12 @@ function findShadowedDomainRules(rules: RoutingRule[]): SchemeLintIssue[] {
   return issues
 }
 
-function findDuplicateRules(rules: RoutingRule[], dead: Set<number> = new Set()): SchemeLintIssue[] {
+function findDuplicateRules(
+  rules: RoutingRule[],
+  dead: Set<number> = new Set(),
+  readOnlyFirst: Set<string> = new Set(),
+  readOnlySetIDs: Set<string> = new Set(),
+): SchemeLintIssue[] {
   const issues: SchemeLintIssue[] = []
   const seen = new Map<string, { index: number; rule: RoutingRule }>()
   rules.forEach((rule, index) => {
@@ -168,18 +206,27 @@ function findDuplicateRules(rules: RoutingRule[], dead: Set<number> = new Set())
       return
     }
     const firstDead = dead.has(existing.index)
+    const firstReadOnly = readOnlyFirst.has(`${key}\0${existing.rule.group}`)
+    const provenance = provenanceOf(rule, readOnlySetIDs)
+    const targetReadOnly = provenance.sourceReadOnly === true
     if (existing.rule.group === rule.group) {
       issues.push({
         id: `dup:${index}`,
         level: 'info',
         code: 'duplicateRuleSameGroup',
-        message: firstDead
-          ? `规则 ${ruleText(rule)} 与第 ${existing.index + 1} 条重复（同一个策略组）；但第 ${existing.index + 1} 条本身已被更前面的规则遮蔽，不能据此判断后一条是否命中`
-          : `规则 ${ruleText(rule)} 与第 ${existing.index + 1} 条完全重复（同一个策略组）`,
-        hint: firstDead
-          ? '两条规则都已被更前面的规则遮蔽；清理前需要先确认前置规则的顺序'
-          : '重复规则不会改变结果，可以删除一条保持整洁',
-        deletable: !firstDead,
+        message: targetReadOnly
+          ? `规则 ${ruleText(rule)} 与第 ${existing.index + 1} 条完全重复（同一个策略组）；这一条来自只读规则集「${rule.sourceName ?? rule.sourceSetId}」，直接删除会在刷新后恢复`
+          : firstDead
+            ? `规则 ${ruleText(rule)} 与第 ${existing.index + 1} 条重复（同一个策略组）；但第 ${existing.index + 1} 条本身已被更前面的规则遮蔽，不能据此判断后一条是否命中`
+            : `规则 ${ruleText(rule)} 与第 ${existing.index + 1} 条完全重复（同一个策略组）`,
+        hint: targetReadOnly
+          ? '只读来源不能直接删除；用「屏蔽」把它从编译与导出中排除，屏蔽可能改变去向'
+          : firstDead
+            ? '两条规则都已被更前面的规则遮蔽；清理前需要先确认前置规则的顺序'
+            : '重复规则不会改变结果，可以删除一条保持整洁',
+        deletable: !firstDead && !targetReadOnly,
+        firstDead: firstDead || undefined,
+        ...provenance,
         location: locationForRule(rule, index),
       })
     } else {
@@ -187,18 +234,45 @@ function findDuplicateRules(rules: RoutingRule[], dead: Set<number> = new Set())
         id: `dup:${index}`,
         level: 'info',
         code: 'duplicateRule',
-        message: firstDead
-          ? `规则 ${ruleText(rule)} 与第 ${existing.index + 1} 条等价，但第 ${existing.index + 1} 条本身已被更前面的规则遮蔽，不能据此判断后一条是否命中（策略组 ${rule.group} / ${existing.rule.group}）`
-          : `规则 ${ruleText(rule)} 与第 ${existing.index + 1} 条完全重复，后一条永远不会命中（策略组 ${rule.group} 被前一条 ${existing.rule.group} 遮蔽）`,
-        hint: firstDead
-          ? '前一条已失效，先处理遮蔽它的规则；不要直接删除后一条'
-          : '删除后一条，或调整前一条的策略组',
-        deletable: false,
+        message: targetReadOnly
+          ? `规则 ${ruleText(rule)} 与第 ${existing.index + 1} 条等价（策略组 ${rule.group} / ${existing.rule.group}）；这一条来自只读规则集「${rule.sourceName ?? rule.sourceSetId}」，直接删除会在刷新后恢复`
+          : firstDead
+            ? `规则 ${ruleText(rule)} 与第 ${existing.index + 1} 条等价，但第 ${existing.index + 1} 条本身已被更前面的规则遮蔽，不能据此判断后一条是否命中（策略组 ${rule.group} / ${existing.rule.group}）`
+            : firstReadOnly
+              ? `规则 ${ruleText(rule)} 与第 ${existing.index + 1} 条等价（策略组 ${rule.group} / ${existing.rule.group}）；但前一条位于在线 / 内置只读规则集，刷新后可能消失`
+              : `规则 ${ruleText(rule)} 与第 ${existing.index + 1} 条完全重复，后一条永远不会命中（策略组 ${rule.group} 被前一条 ${existing.rule.group} 遮蔽）`,
+        hint: targetReadOnly
+          ? '只读来源不能直接删除；用「屏蔽」把它从编译与导出中排除，屏蔽可能改变去向'
+          : firstDead
+            ? '前一条已失效，先处理遮蔽它的规则；不要直接删除后一条'
+            : firstReadOnly
+              ? '前一条来自只读规则集，刷新后可能不再存在；先确认来源，别直接删后一条'
+              : `保留「${existing.rule.group}」，从「${rule.group}」删除；两处命中结果相同`,
+        deletable: !firstDead && !targetReadOnly && !firstReadOnly,
+        firstGroup: existing.rule.group,
+        firstReadOnly: firstReadOnly || undefined,
+        firstDead: firstDead || undefined,
+        ...provenance,
         location: locationForRule(rule, index),
       })
     }
   })
   return issues
+}
+
+/** 只读规则集里的规则签名 + 策略组；用于判断前一条是否会在刷新后消失。 */
+function readOnlyRuleKeys(scheme: RuleScheme): Set<string> {
+  const keys = new Set<string>()
+  for (const set of scheme.ruleSets ?? []) {
+    if (!isReadOnlyRuleSet(set)) continue
+    for (const rule of set.rules) keys.add(`${ruleKey(rule)}\0${set.group}`)
+  }
+  return keys
+}
+
+/** 只读规则集 id；用于判断要处理的这一条是否只能屏蔽。 */
+function readOnlySetIDsOf(scheme: RuleScheme): Set<string> {
+  return new Set((scheme.ruleSets ?? []).filter(isReadOnlyRuleSet).map((set) => set.id))
 }
 
 /**
@@ -207,7 +281,7 @@ function findDuplicateRules(rules: RoutingRule[], dead: Set<number> = new Set())
  */
 export function shadowedRuleIndexes(rules: RoutingRule[]): Set<number> {
   const dead = new Set<number>()
-  for (const issue of findShadowedDomainRules(rules)) {
+  for (const issue of findShadowedDomainRules(rules, new Set())) {
     if (issue.location.ruleIndex !== undefined) dead.add(issue.location.ruleIndex)
   }
   const terminal = rules.findIndex((rule) => isTerminalRule(rule))
@@ -352,13 +426,13 @@ function findRuleSetIssues(options: SchemeLintOptions, prepared: RuleScheme): Sc
   const issues: SchemeLintIssue[] = []
   const declared = new Set(prepared.groups.map((group) => group.name))
   const localSets = new Map((options.localRuleSets ?? []).map((set) => [set.id, set]))
-  for (const set of options.scheme.ruleSets ?? []) {
+  for (const set of prepared.ruleSets ?? []) {
     if (!set.rules.length) {
       issues.push({
         id: `ruleset:empty:${set.id}`,
         level: 'warn',
         code: 'emptyRuleSet',
-        message: `规则集「${set.name}」是空的（0 条规则），加入方案不会产生任何规则`,
+        message: `规则集「${set.name}」当前没有生效规则（为空或已被屏蔽），加入方案不会产生任何规则`,
         hint: '刷新该规则集，或从方案中移除',
         location: { kind: 'ruleSet', ruleSet: set.name, group: set.group },
       })
@@ -403,6 +477,7 @@ function findCompatibilityIssues(options: SchemeLintOptions): SchemeLintIssue[] 
     if (client.contentMode === 'nodes') continue
     const compatibility = analyzeRuleCompatibility(client, options.scheme, {
       preferRuleSets: options.preferRuleSets,
+      ruleSetExclusions: options.ruleSetExclusions,
     })
     if (compatibility.nodeOnly || compatibility.skipped === 0) continue
     const types = compatibility.unsupportedTypes.slice(0, 4).join('、')
@@ -420,14 +495,17 @@ function findCompatibilityIssues(options: SchemeLintOptions): SchemeLintIssue[] 
 
 /** 运行完整检查。返回按 error → warn → info 排序的问题列表。 */
 export function lintScheme(options: SchemeLintOptions): SchemeLintIssue[] {
-  const prepared = prepareSchemeForExport(options.scheme, options.policySelections ?? {}, {
+  const scheme = filterExcludedRuleSets(options.scheme, options.ruleSetExclusions)
+  const prepared = prepareSchemeForExport(scheme, options.policySelections ?? {}, {
     preferRuleSets: false,
+    ruleSetExclusions: options.ruleSetExclusions,
   })
   const rules = prepared.rules
   const dead = shadowedRuleIndexes(rules)
+  const readOnlyIDs = readOnlySetIDsOf(scheme)
   const issues = [
-    ...findDuplicateRules(rules, dead),
-    ...findShadowedDomainRules(rules),
+    ...findDuplicateRules(rules, dead, readOnlyRuleKeys(scheme), readOnlyIDs),
+    ...findShadowedDomainRules(rules, readOnlyIDs),
     ...findGroupIssues(options, prepared),
     ...findRuleSetIssues(options, prepared),
     ...findCompatibilityIssues(options),

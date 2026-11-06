@@ -1,8 +1,10 @@
 // 诊断结果里的「重复规则」一键清理。
 //
-// 准确性优先：只有「类型 + 归一化值 + 选项」完全等价、后一条与前一条同组、
-// 且前一条本身确实可达（没有被更前面的规则遮蔽）时，才允许删除后一条。
-// 跨组重复、只读规则集、前一条已失效的情况一律跳过，并在确认摘要里单列。
+// 准确性优先：只有「类型 + 归一化值 + 选项」完全等价、且前一条本身确实可达
+//（没有被更前面的规则遮蔽）时，才允许删除后一条。
+// 同组重复删掉后一条不影响命中；跨组重复删掉后一条同样不影响命中——流量本来
+// 就已被前一条接住。跨组的前提是前一条可写且存活：前一条若来自在线 / 内置只读
+// 规则集，刷新后可能消失，删除后一条就会改变路由，因此跳过并单列。
 import type { RuleScheme, RoutingRule } from '../models/types'
 import { reorderRulesByMatchingOrder } from './matchingOrder'
 import { ruleSignature } from './ruleDiff'
@@ -20,6 +22,9 @@ export interface RulePlace {
   ruleSetName?: string
 }
 
+/** 同组重复：后一条与前一条指向同一个组；跨组重复：两份规则分流到不同组。 */
+export type DuplicateKind = 'sameGroup' | 'crossGroup'
+
 export interface DuplicateDeletion {
   place: RulePlace
   rule: RoutingRule
@@ -28,9 +33,10 @@ export interface DuplicateDeletion {
   /** 保留的前一条在扁平化后的位置（从 1 开始）。 */
   duplicateOfIndex: number
   duplicateOfGroup: string
+  kind: DuplicateKind
 }
 
-export type SkipReason = 'readOnly' | 'crossGroup' | 'deadPredecessor'
+export type SkipReason = 'readOnly' | 'deadPredecessor'
 
 export interface SkippedDuplicate {
   ruleText: string
@@ -41,12 +47,32 @@ export interface SkippedDuplicate {
   index: number
   reason: SkipReason
   source: string
+  /** 前一条所在来源；前一条不可写时用来解释为什么不能删。 */
+  firstSource?: string
+}
+
+/** 跨组删除的「保留组 → 删除组」配对，供确认弹窗展示明细。 */
+export interface CrossGroupPair {
+  keepGroup: string
+  dropGroup: string
+  count: number
+  /** 该配对下被删除的规则文本，按规则顺序。 */
+  rules: string[]
 }
 
 export interface DuplicateCleanupPlan {
-  /** 可以无风险删除的后一条规则。 */
+  /** 可以无风险删除的后一条规则（含同组与跨组）。 */
   deletions: DuplicateDeletion[]
   skipped: Record<SkipReason, SkippedDuplicate[]>
+  /** 同组重复条数。 */
+  sameGroupCount: number
+  /** 跨组重复条数。 */
+  crossGroupCount: number
+  /** 跨组删除里保留的策略组数量。 */
+  keptGroups: number
+  /** 跨组删除里被删除条目的策略组数量。 */
+  droppedGroups: number
+  crossPairs: CrossGroupPair[]
   /** 删除会涉及的策略组数量。 */
   groups: number
   /** 命中的重复总数（可删 + 跳过）。 */
@@ -146,7 +172,8 @@ function flattenScheme(scheme: RuleScheme): TaggedRule[] {
 
 /**
  * 分析重复。判定顺序：可写性 → 前一条是否失效 → 是否跨组。
- * 任何一种跳过原因都不会进入 deletions。
+ * 前一条失效（本身被更宽的规则遮蔽）时不删后一条：无法证明后一条不会命中。
+ * 跨组时还要求前一条可写：前一条来自只读规则集，刷新后可能消失。
  */
 export function analyzeDuplicateCleanup(scheme: RuleScheme): DuplicateCleanupPlan {
   const tagged = flattenScheme(scheme)
@@ -157,7 +184,6 @@ export function analyzeDuplicateCleanup(scheme: RuleScheme): DuplicateCleanupPla
   const deletions: DuplicateDeletion[] = []
   const skipped: DuplicateCleanupPlan['skipped'] = {
     readOnly: [],
-    crossGroup: [],
     deadPredecessor: [],
   }
   let total = 0
@@ -187,8 +213,11 @@ export function analyzeDuplicateCleanup(scheme: RuleScheme): DuplicateCleanupPla
       skipped.deadPredecessor.push({ ...base, reason: 'deadPredecessor' })
       continue
     }
-    if (!sameGroup(first.rule.group, tag.rule.group)) {
-      skipped.crossGroup.push({ ...base, reason: 'crossGroup' })
+    const crossGroup = !sameGroup(first.rule.group, tag.rule.group)
+    // 前一条来自在线 / 内置只读规则集：刷新后它可能消失，此时后一条会重新生效，
+    // 删除就真的会改变路由，因此跨组不删。
+    if (crossGroup && !placeWritable(first.place, scheme)) {
+      skipped.readOnly.push({ ...base, reason: 'readOnly', firstSource: placeSource(first.place) })
       continue
     }
     deletions.push({
@@ -198,11 +227,40 @@ export function analyzeDuplicateCleanup(scheme: RuleScheme): DuplicateCleanupPla
       group: tag.rule.group,
       duplicateOfIndex: first.position + 1,
       duplicateOfGroup: first.rule.group,
+      kind: crossGroup ? 'crossGroup' : 'sameGroup',
     })
   }
 
+  const crossDeletions = deletions.filter((item) => item.kind === 'crossGroup')
+  const crossPairs: CrossGroupPair[] = []
+  const pairByKey = new Map<string, CrossGroupPair>()
+  for (const item of crossDeletions) {
+    const keepGroup = item.duplicateOfGroup.trim()
+    const dropGroup = item.group.trim()
+    const key = `${keepGroup}\0${dropGroup}`
+    const existing = pairByKey.get(key)
+    if (existing) {
+      existing.count += 1
+      existing.rules.push(item.ruleText)
+    } else {
+      const pair = { keepGroup, dropGroup, count: 1, rules: [item.ruleText] }
+      pairByKey.set(key, pair)
+      crossPairs.push(pair)
+    }
+  }
+
   const groups = new Set(deletions.map((item) => item.group.trim()))
-  return { deletions, skipped, groups: groups.size, total }
+  return {
+    deletions,
+    skipped,
+    sameGroupCount: deletions.length - crossDeletions.length,
+    crossGroupCount: crossDeletions.length,
+    keptGroups: new Set(crossDeletions.map((item) => item.duplicateOfGroup.trim())).size,
+    droppedGroups: new Set(crossDeletions.map((item) => item.group.trim())).size,
+    crossPairs,
+    groups: groups.size,
+    total,
+  }
 }
 
 export interface DuplicateApplyResult {

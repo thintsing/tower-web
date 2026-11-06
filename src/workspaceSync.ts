@@ -2,8 +2,10 @@
 // 只同步「多设备应该一致」的数据；导出目标、隐藏客户端、排序、Emoji、
 // 测速模式、地图与高级区展开等设备偏好仍留在 localStorage。
 import { useSyncExternalStore } from 'react'
-import type { BuiltinSchemeOverride, LocalRuleSet, ProxyNode, RuleScheme, SubscriptionSource, TailnetConnection } from './models/types'
-import { normalizeBuiltinSchemeOverrides, normalizeSource } from './backup'
+import type { BuiltinSchemeOverrideRef, BuiltinSchemeSnapshot, LocalRuleSet, ProxyNode, RuleScheme, RuleSetExclusionTable, SubscriptionSource, TailnetConnection } from './models/types'
+import { normalizeBuiltinSchemes, normalizeSource } from './backup'
+import { BUILTIN_SCHEMES } from './rules/scheme'
+import { normalizeRuleSetExclusions } from './rules/ruleSetExclusions'
 import { persistTailnetAuthKeys } from './models/tailnetAuthKeys'
 import { useStore, type Store } from './store'
 import { apiFetch, getAPIKey } from './util/apiAuth'
@@ -14,7 +16,12 @@ export interface WorkspaceData {
   nodes: ProxyNode[]
   customSchemes: RuleScheme[]
   localRuleSets: LocalRuleSet[]
-  builtinSchemeOverrides: Record<string, BuiltinSchemeOverride>
+  builtinSchemeOverrides: Record<string, BuiltinSchemeOverrideRef>
+  /** 独立固化快照；与覆盖层指针一起同步，才能解引用。 */
+  schemeSnapshots: Record<string, BuiltinSchemeSnapshot>
+  snapshotSeq: number
+  /** 只读规则集的本地屏蔽表；必须跟工作区一起同步。 */
+  ruleSetExclusions: RuleSetExclusionTable
   selectedSchemeID: string
   policySelections: Record<string, string>
   exportConfigName: string
@@ -96,15 +103,29 @@ function arrayField<T>(raw: Record<string, unknown>, field: string): T[] {
 export function normalizeWorkspaceData(raw: unknown): WorkspaceData {
   if (!isRecord(raw)) throw new WorkspaceDataError('工作区数据不是对象')
   const sources = arrayField<SubscriptionSource>(raw, 'sources').map(normalizeSource)
+  const customSchemes = arrayField<RuleScheme>(raw, 'customSchemes')
+  const builtinSchemes = normalizeBuiltinSchemes(
+    raw.builtinSchemeOverrides,
+    raw.schemeSnapshots,
+    raw.snapshotSeq,
+    // 旧数据 / 手工改坏的数据里 ruleSets 可能不是数组；这里只读 id，
+    // 不能因为一个方案的脏字段让整个工作区加载失败。
+    customSchemes.flatMap((scheme) => Array.isArray(scheme?.ruleSets) ? scheme.ruleSets.map((ruleSet) => ruleSet.id) : []),
+  )
   return {
     sources,
     nodes: arrayField<ProxyNode>(raw, 'nodes'),
-    customSchemes: arrayField<RuleScheme>(raw, 'customSchemes'),
+    customSchemes,
     localRuleSets: arrayField<LocalRuleSet>(raw, 'localRuleSets'),
-    builtinSchemeOverrides: normalizeBuiltinSchemeOverrides(raw.builtinSchemeOverrides),
-    selectedSchemeID: typeof raw.selectedSchemeID === 'string' && raw.selectedSchemeID
+    ...builtinSchemes,
+    ruleSetExclusions: normalizeRuleSetExclusions(raw.ruleSetExclusions),
+    // useScheme 对未知 id 会静默显示第一个内置方案，但选择器 / 方案卡仍按未知
+    // id 找不到对象，出现「内容有、标题和快照面板空」的半空状态。
+    selectedSchemeID: typeof raw.selectedSchemeID === 'string'
+      && (BUILTIN_SCHEMES.some((meta) => meta.id === raw.selectedSchemeID)
+        || customSchemes.some((scheme) => scheme.id === raw.selectedSchemeID))
       ? raw.selectedSchemeID
-      : 'acl4ssr-online',
+      : BUILTIN_SCHEMES[0].id,
     policySelections: stringRecord(raw.policySelections, 'policySelections'),
     exportConfigName: typeof raw.exportConfigName === 'string'
       ? raw.exportConfigName.replace(/[\r\n]/g, '').slice(0, 48) || 'tower'
@@ -122,6 +143,9 @@ export function workspaceSnapshot(state: Store): WorkspaceData {
     customSchemes: state.customSchemes,
     localRuleSets: state.localRuleSets,
     builtinSchemeOverrides: state.builtinSchemeOverrides,
+    schemeSnapshots: state.schemeSnapshots,
+    snapshotSeq: state.snapshotSeq,
+    ruleSetExclusions: state.ruleSetExclusions,
     selectedSchemeID: state.selectedSchemeID,
     policySelections: state.policySelections,
     exportConfigName: state.exportConfigName,
@@ -136,6 +160,8 @@ function hasContent(data: WorkspaceData): boolean {
     || data.customSchemes.length > 0
     || data.localRuleSets.length > 0
     || Object.keys(data.builtinSchemeOverrides).length > 0
+    || Object.keys(data.schemeSnapshots).length > 0
+    || Object.keys(data.ruleSetExclusions).length > 0
     || data.tailnets.length > 0
 }
 
@@ -160,6 +186,9 @@ const WATCHED_KEYS = [
   'customSchemes',
   'localRuleSets',
   'builtinSchemeOverrides',
+  'schemeSnapshots',
+  'snapshotSeq',
+  'ruleSetExclusions',
   'selectedSchemeID',
   'policySelections',
   'exportConfigName',
@@ -380,6 +409,9 @@ async function pollVersion(): Promise<void> {
     return
   }
   pollFailures = 0
+  // 版本请求返回前用户可能刚改了东西（已排入 500ms 防抖）：此时直接拉全量
+  // 会把这段尚未推送的改动覆盖掉。重新检查后再决定。
+  if (debounceTimer !== undefined || writing) return
   if (version !== serverVersion) {
     await fetchFull({ notice: '已同步其他设备的改动。' })
   }
@@ -486,7 +518,7 @@ function markOnline(version: number, message: string): void {
   updateStatus({ mode: 'server', state: 'online', readOnly: false, version, message })
 }
 
-function applyServerData(data: WorkspaceData): void {
+export function applyServerData(data: WorkspaceData): void {
   const previous = useStore.getState()
   // 服务端是这些字段的唯一事实来源；运行时测速结果按节点 id 绑定，重新拉取后清空。
   useStore.setState({
@@ -495,6 +527,11 @@ function applyServerData(data: WorkspaceData): void {
     customSchemes: data.customSchemes,
     localRuleSets: data.localRuleSets,
     builtinSchemeOverrides: data.builtinSchemeOverrides,
+    // 快照正文必须跟指针一起落地；只同步指针会让 loadScheme 回落到
+    // 上一版 / 原厂，固化内容在第二台设备上凭空消失。
+    schemeSnapshots: data.schemeSnapshots,
+    snapshotSeq: data.snapshotSeq,
+    ruleSetExclusions: data.ruleSetExclusions,
     selectedSchemeID: data.selectedSchemeID,
     policySelections: data.policySelections,
     exportConfigName: data.exportConfigName,

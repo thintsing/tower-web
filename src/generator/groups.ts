@@ -1,7 +1,8 @@
 // Shared group→node resolution for all generators.
 // A scheme group's nodeFilter regex is matched against node display names;
 // declared options ([]引用 / DIRECT / REJECT) always come first.
-import type { ClientTarget, ExportContentMode, PolicyGroup, ProxyNode, RemoteSubscriptionEntry, RoutingRule, RuleScheme, RuleSetFormat, SchemeRuleSet, SubFormat, TailnetExport } from '../models/types'
+import type { ClientTarget, ExportContentMode, PolicyGroup, ProxyNode, RemoteSubscriptionEntry, RoutingRule, RuleScheme, RuleSetExclusionTable, RuleSetFormat, SchemeRuleSet, SubFormat, TailnetExport } from '../models/types'
+import { filterExcludedRuleSets } from '../rules/ruleSetExclusions'
 import {
   classicalRulesFitTarget,
   hostedDialectForFormat,
@@ -258,6 +259,8 @@ export interface PrepareSchemeOptions {
   format?: SubFormat
   /** 目标客户端；用于判断 MRS、Shadowrocket 等专属限制。 */
   target?: ClientTarget
+  /** 只读规则集的本地屏蔽表；编译、检查与导出都必须带上。 */
+  ruleSetExclusions?: RuleSetExclusionTable
 }
 
 export interface RemoteRuleSetReference {
@@ -303,9 +306,13 @@ export function remoteRuleSetCandidates(
   scheme: RuleScheme,
   options: PrepareSchemeOptions,
 ): RemoteRuleSetCandidate[] {
-  const sets = scheme.ruleSets ?? []
+  // 内联规则集（固化快照）的规则已经在 scheme.rules 里，不能再作为独立块插入，
+  // 否则同一批规则会出现两份、并打乱匹配顺序。
+  const sets = (scheme.ruleSets ?? []).filter((set) => !set.inlined)
   const hostedDialect = hostedDialectForFormat(options.format)
   const candidates = sets.map((set) => {
+    // 有屏蔽条目时必须内联：远程 RULE-SET 引用会把被屏蔽的规则一起带回来。
+    if (options.ruleSetExclusions?.[set.id]?.length) return { set, url: undefined, format: undefined }
     if (!options.preferRuleSets || !options.format) return { set, url: undefined, format: undefined }
     const originalURL = remoteRuleSetURL(set)
     const originalFormat = ruleSetFormatOfSet(set, originalURL)
@@ -407,10 +414,12 @@ export function remoteRuleSetCandidates(
  * - 本地规则集/不支持远程的客户端继续内联，保证配置可用。
  */
 export function prepareSchemeForExport(
-  scheme: RuleScheme,
+  sourceScheme: RuleScheme,
   policySelections: Record<string, string>,
   options: PrepareSchemeOptions = {},
 ): RuleScheme {
+  // 屏蔽在进入任何生成器之前生效，保证预览、检查与导出看到的是同一份规则。
+  const scheme = filterExcludedRuleSets(sourceScheme, options.ruleSetExclusions)
   const groups = scheme.groups.map((group) => {
     let updated = group
     if (group.type === 'conditional'
@@ -441,6 +450,8 @@ export function prepareSchemeForExport(
       const residualRules: RoutingRule[] = (residual ?? []).map((rule) => ({
         ...rule,
         group: set.group,
+        sourceName: set.name,
+        sourceSetId: set.id,
       }))
       rules = [...remoteRules, ...residualRules]
     } else if (remote && url) {
@@ -457,8 +468,8 @@ export function prepareSchemeForExport(
         ? inlineRuleSetMetadata(set, options.format, options.target)
         : undefined
       rules = inline
-        ? set.rules.map((rule) => ({ ...rule, inlineSet: inline }))
-        : set.rules.map((rule) => ({ ...rule, group: set.group }))
+        ? set.rules.map((rule) => ({ ...rule, inlineSet: inline, sourceSetId: set.id }))
+        : set.rules.map((rule) => ({ ...rule, group: set.group, sourceName: set.name, sourceSetId: set.id }))
     }
     return {
       group: set.group,

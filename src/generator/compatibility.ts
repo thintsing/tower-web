@@ -1,7 +1,7 @@
 // Per-client rule capability summary. The result describes what the current
 // generators can actually express, so the export page never promises a
 // fully-compatible config when a client will drop rules.
-import { subFormatFor, type ClientInfo, type ExportContentMode, type RuleScheme } from '../models/types'
+import { subFormatFor, type ClientInfo, type ExportContentMode, type RuleScheme, type RuleSetExclusionTable } from '../models/types'
 import { targetSupportsRule } from '../rules/capabilities'
 import { targetSupportsInlineRuleSets } from '../rules/inlineSets'
 import { formatSupportsRemoteRuleSets, supportsRuleSetReference } from '../rules/remoteFormats'
@@ -30,6 +30,8 @@ export interface AnalyzeRuleOptions {
   preferRuleSets?: boolean
   /** 仅节点模式会主动省略所有规则，不论客户端本身是否支持。 */
   contentMode?: ExportContentMode
+  /** 只读规则集的本地屏蔽表；必须与实际导出使用同一份。 */
+  ruleSetExclusions?: RuleSetExclusionTable
 }
 
 /**
@@ -42,7 +44,9 @@ export function analyzeRuleCompatibility(
   options: AnalyzeRuleOptions = {},
 ): RuleCompatibility {
   const format = subFormatFor(client)
-  const ruleSetCount = scheme.ruleSets?.length ?? 0
+  // 内联规则集（固化快照）已经写在方案规则里，不计入「导出时要展开的规则集」。
+  const countedSets = (scheme.ruleSets ?? []).filter((set) => !set.inlined)
+  const ruleSetCount = countedSets.length
 
   if (format === 'base64' || options.contentMode === 'nodes') {
     return {
@@ -64,10 +68,11 @@ export function analyzeRuleCompatibility(
     preferRuleSets: options.preferRuleSets,
     format,
     target: client.target,
+    ruleSetExclusions: options.ruleSetExclusions,
   })
   const remoteRuleSets = candidates.filter((item) => item.remote).length
   const inlineRuleSets = ruleSetCount - remoteRuleSets
-  const urlSets = (scheme.ruleSets ?? []).filter((set) => remoteRuleSetURL(set)).length
+  const urlSets = countedSets.filter((set) => remoteRuleSetURL(set)).length
   const blockedByOrder = candidates.some((item) => item.url && !item.remote)
   const localSetsInline = targetSupportsInlineRuleSets(format, client.target)
 
@@ -76,6 +81,7 @@ export function analyzeRuleCompatibility(
     preferRuleSets: options.preferRuleSets,
     format,
     target: client.target,
+    ruleSetExclusions: options.ruleSetExclusions,
   })
   const typeUnsupported = prepared.rules.filter((rule) => !targetSupportsRule(client.target, rule.type))
   const setUnsupported = prepared.rules.filter((rule) =>

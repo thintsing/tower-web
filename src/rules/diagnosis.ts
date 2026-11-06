@@ -3,6 +3,7 @@
 import type { RuleScheme, RoutingRule, SchemeRuleSet } from '../models/types'
 import type { ExplainResult, ExplainedStep } from './ruleExplain'
 import type { SchemeLintIssue } from './schemeLint'
+import type { RemovedRuleRecord } from './duplicateCleanup'
 import type { RuleSetHistory } from './ruleSetHistory'
 import {
   diffRules,
@@ -193,7 +194,7 @@ export function describeRuleSetChange(
   }
 }
 
-export type FixActionKind = 'delete-rule' | 'locate-group' | 'locate-rule-set' | 'go-export' | 'manual'
+export type FixActionKind = 'delete-rule' | 'block-rule' | 'locate-group' | 'locate-rule-set' | 'go-export' | 'manual'
 
 export interface FixAction {
   kind: FixActionKind
@@ -206,6 +207,10 @@ export interface FixAction {
   ruleSet?: string
   ruleIndex?: number
   target?: string
+  /** 屏蔽：来源规则集 id 与规则签名。 */
+  ruleSetId?: string
+  ruleSetName?: string
+  ruleSignature?: string
 }
 
 /** 每条 lint 发现的可执行修复动作：能安全执行的在前面，其余给出确切改法。 */
@@ -219,15 +224,51 @@ export function buildFixActions(issue: SchemeLintIssue): FixAction[] {
     : undefined
   const goExport: FixAction = { kind: 'go-export', label: '去导出页调整客户端', detail: '在导出页选择支持这些规则的客户端，或关闭该客户端的导出。' }
 
-  if (SAFE_DELETE_CODES.has(issue.code) && issue.deletable !== false) {
-    const readOnlySetNote = '若这条规则来自在线 / 订阅规则集，删除只对当前方案快照生效，刷新规则集后会恢复。'
+  // 只读规则集里的条目：直接删只是删方案快照，刷新会回来。改成屏蔽（会改变去向）。
+  if (issue.sourceReadOnly && issue.sourceSetId && !issue.firstDead) {
+    const setLabel = issue.sourceSetName ?? issue.sourceSetId
+    const signature = issue.ruleSignature ?? ''
+    const block: FixAction = {
+      kind: 'block-rule',
+      label: `可屏蔽 · 屏蔽「${setLabel}」里的这条规则（会改变去向）`,
+      detail: `它来自只读规则集「${setLabel}」，刷新来源后会重新出现，所以不能直接删除。屏蔽会把这条从编译与导出中排除，命中可能落到下一条规则；屏蔽和解除都可以撤销。`,
+      safe: true,
+      ruleText: loc.rule,
+      group: loc.group,
+      ruleIndex: loc.ruleIndex,
+      ruleSetId: issue.sourceSetId,
+      ruleSetName: issue.sourceSetName,
+      ruleSignature: signature,
+    }
+    return [block, ...(locateGroup ? [locateGroup] : []), ...(locateSet ? [locateSet] : [])]
+  }
+
+  if (SAFE_DELETE_CODES.has(issue.code) && issue.deletable === true) {
     return [
       {
         kind: 'delete-rule',
-        label: issue.code === 'shadowedRule' ? '删除这条永远不命中的规则' : '删除重复的后一条规则',
+        label: issue.code === 'shadowedRule' ? '可删除 · 删除这条永远不命中的规则' : '可删除 · 删除重复的后一条规则',
         detail: issue.code === 'shadowedRule'
-          ? `它被前面的规则完全覆盖，删除不会改变任何匹配结果。${readOnlySetNote}`
-          : `保留前面那条即可，删除不会改变匹配结果。${readOnlySetNote}`,
+          ? '它被前面的规则完全覆盖，删除不会改变任何匹配结果。'
+          : '保留前面那条即可，删除不会改变匹配结果。',
+        safe: true,
+        ruleText: loc.rule,
+        group: loc.group,
+        ruleIndex: loc.ruleIndex,
+      },
+      ...(locateGroup ? [locateGroup] : []),
+      ...(locateSet ? [locateSet] : []),
+    ]
+  }
+
+  if (issue.code === 'duplicateRule' && issue.deletable === true) {
+    const keep = issue.firstGroup ?? '前一条'
+    const drop = loc.group ?? '当前策略组'
+    return [
+      {
+        kind: 'delete-rule',
+        label: `可删除 · 保留「${keep}」，从「${drop}」删除`,
+        detail: `保留「${keep}」，从「${drop}」删除；两条规则签名与选项一致，命中结果不变。`,
         safe: true,
         ruleText: loc.rule,
         group: loc.group,
@@ -243,8 +284,16 @@ export function buildFixActions(issue: SchemeLintIssue): FixAction[] {
     case 'duplicateRule':
       actions.push({
         kind: 'manual',
-        label: '需你决定：删除后一条或调整前一条策略组',
-        detail: '两条规则等价但策略组不同，删除后一条会改变这些流量的去向。请确认意图后手动处理，或把它们移到前面并重排顺序。',
+        label: issue.firstDead
+          ? '不可动 · 前一条已失效，先处理遮蔽规则'
+          : issue.firstReadOnly
+            ? '不可动 · 前一条来自只读规则集，需手动确认'
+            : '不可动 · 删除后一条或调整前一条策略组',
+        detail: issue.firstDead
+          ? '前一条重复规则本身已被更前面的规则遮蔽，先调整前置规则顺序；这时动后一条会让诊断结论失真。'
+          : issue.firstReadOnly
+            ? '前一条位于在线 / 内置只读规则集，刷新后可能消失；直接删除后一条可能改变路由。请先确认来源，或用批量清理并留意跳过项。'
+            : '两条规则等价但策略组不同，删除后一条会改变这些流量的去向。请确认意图后手动处理，或把它们移到前面并重排顺序。',
         group: loc.group,
         ruleText: loc.rule,
         ruleIndex: loc.ruleIndex,
@@ -253,7 +302,7 @@ export function buildFixActions(issue: SchemeLintIssue): FixAction[] {
     case 'duplicateRuleSameGroup':
       actions.push({
         kind: 'manual',
-        label: '先处理遮蔽前一条的规则',
+        label: '不可动 · 先处理遮蔽前一条的规则',
         detail: '前一条重复规则本身已被更前面的规则遮蔽，直接删后一条会让诊断结论失真；请先调整前置规则顺序。',
         group: loc.group,
         ruleText: loc.rule,
@@ -323,7 +372,7 @@ export function buildFixActions(issue: SchemeLintIssue): FixAction[] {
       actions.push({
         kind: 'manual',
         label: '补充或移除空规则集',
-        detail: '规则集里没有规则，不会命中任何流量；刷新来源，或从方案中移除它。',
+        detail: '规则集里没有可用规则（可能本来就是空列表，或规则已被全部屏蔽）；先解除屏蔽、再刷新来源，或从方案中移除它。',
         ruleSet: loc.ruleSet,
       })
       break
@@ -380,6 +429,8 @@ export interface ApplyFixResult {
   scheme: RuleScheme
   removedFrom: 'custom' | 'ruleset' | 'scheme'
   removedText: string
+  /** 被删条目的原始位置，供撤销精确回插。 */
+  removed?: RemovedRuleRecord
 }
 
 function sameRule(rule: RoutingRule, text: string, group?: string): boolean {
@@ -402,6 +453,7 @@ export function applyFixAction(scheme: RuleScheme, action: FixAction): ApplyFixR
         scheme: { ...scheme, customRules: nextCustom },
         removedFrom: 'custom',
         removedText: ruleDisplayText(customRules[index]),
+        removed: { place: { kind: 'custom', index }, rule: customRules[index] },
       }
     }
   }
@@ -415,6 +467,7 @@ export function applyFixAction(scheme: RuleScheme, action: FixAction): ApplyFixR
         scheme: { ...scheme, rules: scheme.rules.filter((_, i) => i !== index) },
         removedFrom: 'scheme',
         removedText: ruleDisplayText(rule),
+        removed: { place: { kind: 'scheme', index }, rule },
       }
     }
   }
@@ -434,6 +487,10 @@ export function applyFixAction(scheme: RuleScheme, action: FixAction): ApplyFixR
             scheme: { ...scheme, ruleSets: nextSets },
             removedFrom: 'ruleset',
             removedText: ruleDisplayText(rule),
+            removed: {
+              place: { kind: 'ruleSet', index, ruleSetId: set.id, ruleSetName: set.name },
+              rule,
+            },
           }
         }
       }

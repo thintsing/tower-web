@@ -45,6 +45,8 @@ export interface RuleSetBlock {
   sourceURL?: string
   /** 真正写入配置的规则（可能是 MRS/SRS 的远程引用加残余内联规则）。 */
   rules: RoutingRule[]
+  /** 规则已经在 baseRules 内联保存（固化快照），不再插入，避免同一批规则出现两份。 */
+  inlined?: boolean
 }
 
 /**
@@ -82,6 +84,8 @@ export function insertRuleSetBlocks(
   const finals = baseRules.filter(isTerminalRule)
   const buckets = new Map<number, RoutingRule[]>()
   for (const block of blocks) {
+    // 内联块（固化快照）的规则已经在 baseRules 里；跳过是导出逐字节一致的前提。
+    if (block.inlined) continue
     const index = ruleSetInsertionIndex(ordinary, block)
     buckets.set(index, [...(buckets.get(index) ?? []), ...block.rules])
   }
@@ -104,6 +108,7 @@ export function orderedSchemeBaseRules(scheme: RuleScheme): RoutingRule[] {
     matchRules: set.rules,
     sourceURL: set.sourceRef,
     rules: set.rules.map((rule) => ({ ...rule, group: set.group })),
+    inlined: set.inlined,
   }))
   return reorderRulesByMatchingOrder(
     insertRuleSetBlocks(scheme.rules, blocks),

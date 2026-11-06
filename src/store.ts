@@ -3,11 +3,14 @@
 // subscription fetches the user explicitly triggers (via /api/fetch).
 import { create } from 'zustand'
 import { createJSONStorage, persist } from 'zustand/middleware'
-import type { AppState, BuiltinSchemeOverride, ClientTarget, ExportContentMode, LatencyTestMethod, LatencyTestMode, LocalRuleSet, NodeNameFilterSettings, ProxyKind, ProxyNode, RuleScheme, SubscriptionRequestOptions, SubscriptionSource, SubscriptionUsage, TailnetConnection } from './models/types'
+import type { AppState, BuiltinSchemeOverrideRef, BuiltinSchemeSnapshot, BuiltinSchemeSnapshotContent, ClientTarget, ExportContentMode, LatencyTestMethod, LatencyTestMode, LocalRuleSet, NodeNameFilterSettings, ProxyKind, ProxyNode, RuleScheme, RuleSetExclusionTable, SubscriptionRequestOptions, SubscriptionSource, SubscriptionUsage, TailnetConnection } from './models/types'
 import { usageFieldsFrom } from './models/types'
+import { isBuiltinSchemeSnapshotValid, writeBuiltinSchemeSnapshot } from './rules/schemeSnapshots'
+import { addRuleSetExclusion as addExclusion, normalizeRuleSetExclusions, removeRuleSetExclusion as removeExclusion } from './rules/ruleSetExclusions'
 import { loadTailnetAuthKeys, persistTailnetAuthKeys, pruneTailnetAuthKeys } from './models/tailnetAuthKeys'
 import type { PersistedData } from './backup'
-import { normalizeSource } from './backup'
+import { normalizeBuiltinSchemes, normalizeSource } from './backup'
+import { BUILTIN_SCHEMES } from './rules/scheme'
 import { prepareManualNodes, type ManualNodeImportResult } from './manualNodes'
 import { mergeUsage, parse, parseUserinfoHeader } from './parser'
 import { apiFetch } from './util/apiAuth'
@@ -32,8 +35,14 @@ export interface Store extends AppState {
   customSchemes: RuleScheme[]
   /** 用户保存在本机的独立规则集。 */
   localRuleSets: LocalRuleSet[]
-  /** 内置方案覆盖层：id → 固化后的方案 + 列表快照；原厂快照始终保留。 */
-  builtinSchemeOverrides: Record<string, BuiltinSchemeOverride>
+  /** 内置方案覆盖层指针：方案 id → snapshotId；正文在 schemeSnapshots。 */
+  builtinSchemeOverrides: Record<string, BuiltinSchemeOverrideRef>
+  /** 独立固化快照：自增 id → 方案 + 列表 + 来源；最多保留 2 个（原厂另算一版）。 */
+  schemeSnapshots: Record<string, BuiltinSchemeSnapshot>
+  /** 快照 id 自增序列，保证淘汰后不复用。 */
+  snapshotSeq: number
+  /** 只读规则集的本地屏蔽表：规则集 id → ruleSignature[]，刷新来源后仍生效。 */
+  ruleSetExclusions: RuleSetExclusionTable
   /** 打开塔台时检查内置方案是否有上游更新；默认关闭，只提示不覆盖。 */
   checkBuiltinSchemeUpdatesOnOpen: boolean
   /** 本次会话的上游更新提示（scheme.id → 文案），不落盘。 */
@@ -125,8 +134,16 @@ export interface Store extends AppState {
   removeCustomScheme: (id: string) => void
   addLocalRuleSet: (set: LocalRuleSet) => void
   removeLocalRuleSet: (id: string) => void
-  /** 固化内置方案：写入覆盖层，内置方案条目本身换成这份内容。 */
-  saveBuiltinSchemeOverride: (id: string, override: BuiltinSchemeOverride) => void
+  /** 屏蔽只读规则集里的一条规则；按签名记录，刷新后仍生效。 */
+  addRuleSetExclusion: (ruleSetID: string, signature: string) => void
+  /** 解除一条屏蔽。 */
+  removeRuleSetExclusion: (ruleSetID: string, signature: string) => void
+  /** 撤销时用：整组恢复某个规则集之前的屏蔽列表。 */
+  restoreRuleSetExclusions: (ruleSetID: string, signatures: string[]) => void
+  /** 固化内置方案：新建独立快照并把指针指过去，返回新快照 id。 */
+  saveBuiltinSchemeOverride: (id: string, content: BuiltinSchemeSnapshotContent) => number
+  /** 回退到某个历史快照；快照缺失或归属不符时返回 false。 */
+  restoreBuiltinSchemeSnapshot: (id: string, snapshotId: number) => boolean
   /** 清除覆盖层，回到原厂 `public/rulesets` 快照。 */
   clearBuiltinSchemeOverride: (id: string) => void
   setCheckBuiltinSchemeUpdatesOnOpen: (enabled: boolean) => void
@@ -435,6 +452,9 @@ export function persistedSnapshot(s: Store): PersistedData {
     customSchemes: s.customSchemes,
     localRuleSets: s.localRuleSets,
     builtinSchemeOverrides: s.builtinSchemeOverrides,
+    schemeSnapshots: s.schemeSnapshots,
+    snapshotSeq: s.snapshotSeq,
+    ruleSetExclusions: s.ruleSetExclusions,
     checkBuiltinSchemeUpdatesOnOpen: s.checkBuiltinSchemeUpdatesOnOpen,
     autoRefreshOnOpen: s.autoRefreshOnOpen,
     autoRefreshRuleSetsOnOpen: s.autoRefreshRuleSetsOnOpen,
@@ -460,7 +480,7 @@ export function persistedSnapshot(s: Store): PersistedData {
 
 /** 服务器版工作区里会落盘的字段；只读时只拦这些，设备偏好不受影响。 */
 const WORKSPACE_STATE_KEYS = new Set<string>([
-  'sources', 'nodes', 'customSchemes', 'localRuleSets', 'builtinSchemeOverrides', 'selectedSchemeID',
+  'sources', 'nodes', 'customSchemes', 'localRuleSets', 'builtinSchemeOverrides', 'schemeSnapshots', 'snapshotSeq', 'ruleSetExclusions', 'selectedSchemeID',
   'policySelections', 'exportConfigName', 'tailnets', 'tailnetAuthKeys',
 ])
 
@@ -495,6 +515,9 @@ export const useStore = create<Store>()(
       customSchemes: [],
       localRuleSets: [],
       builtinSchemeOverrides: {},
+      schemeSnapshots: {},
+      snapshotSeq: 0,
+      ruleSetExclusions: {},
       checkBuiltinSchemeUpdatesOnOpen: false,
       builtinSchemeUpdateNotices: {},
       loadingSourceIDs: [],
@@ -1011,7 +1034,7 @@ export const useStore = create<Store>()(
         set((s) => ({
           customSchemes: s.customSchemes.filter((x) => x.id !== id),
           selectedSchemeID:
-            s.selectedSchemeID === id ? 'acl4ssr-online' : s.selectedSchemeID,
+            s.selectedSchemeID === id ? BUILTIN_SCHEMES[0].id : s.selectedSchemeID,
           policySelections:
             s.selectedSchemeID === id ? {} : s.policySelections,
         })),
@@ -1026,24 +1049,82 @@ export const useStore = create<Store>()(
           localRuleSets: s.localRuleSets.filter((x) => x.id !== id),
         })),
 
-      saveBuiltinSchemeOverride: (id, override) =>
+      addRuleSetExclusion: (ruleSetID, signature) =>
+        set((s) => ({
+          ruleSetExclusions: addExclusion(s.ruleSetExclusions, ruleSetID, signature),
+        })),
+
+      removeRuleSetExclusion: (ruleSetID, signature) =>
+        set((s) => ({
+          ruleSetExclusions: removeExclusion(s.ruleSetExclusions, ruleSetID, signature),
+        })),
+
+      restoreRuleSetExclusions: (ruleSetID, signatures) =>
+        set((s) => {
+          const exclusions: RuleSetExclusionTable = { ...s.ruleSetExclusions }
+          const next = [...new Set(signatures.filter(Boolean))].sort()
+          if (next.length) exclusions[ruleSetID] = next
+          else delete exclusions[ruleSetID]
+          return { ruleSetExclusions: exclusions }
+        }),
+
+      saveBuiltinSchemeOverride: (id, content) => {
+        if (isWorkspaceReadOnly()) return 0
+        const result = writeBuiltinSchemeSnapshot(
+          get().schemeSnapshots,
+          get().builtinSchemeOverrides,
+          get().snapshotSeq,
+          id,
+          content,
+          Date.now(),
+          // 自定义方案引用到的规则集 id：这些快照不淘汰，避免方案指向旧版。
+          get().customSchemes.flatMap((scheme) => (scheme.ruleSets ?? []).map((ruleSet) => ruleSet.id)),
+        )
+        // 写进去也必须能通过同一套校验；否则下次加载会被静默判坏，
+        // 用户看到的只是「已固化」，重启后却回落到原厂。
+        if (!isBuiltinSchemeSnapshotValid(result.snapshot)) return 0
         set((s) => {
           const notices = { ...s.builtinSchemeUpdateNotices }
           delete notices[id]
           return {
-            builtinSchemeOverrides: { ...s.builtinSchemeOverrides, [id]: override },
+            schemeSnapshots: result.snapshots,
+            builtinSchemeOverrides: result.overrides,
+            snapshotSeq: result.snapshotSeq,
             builtinSchemeUpdateNotices: notices,
           }
-        }),
+        })
+        return result.snapshot.id
+      },
 
-      clearBuiltinSchemeOverride: (id) =>
+      restoreBuiltinSchemeSnapshot: (id, snapshotId) => {
+        if (isWorkspaceReadOnly()) return false
+        const s = get()
+        const snapshot = s.schemeSnapshots[String(snapshotId)]
+        // 和 loadScheme 用同一套校验：结构损坏的快照不能当成回退成功，
+        // 否则界面提示已切换，实际仍停留在上一版 / 原厂。
+        if (!snapshot || snapshot.schemeID !== id || !isBuiltinSchemeSnapshotValid(snapshot)) return false
+        set((state) => {
+          const notices = { ...state.builtinSchemeUpdateNotices }
+          delete notices[id]
+          return {
+            builtinSchemeOverrides: { ...state.builtinSchemeOverrides, [id]: { snapshotId } },
+            builtinSchemeUpdateNotices: notices,
+          }
+        })
+        return true
+      },
+
+      clearBuiltinSchemeOverride: (id) => {
+        // 与固化 / 回退保持一致：只读时不能清指针，否则 UI 会报成功但没变化。
+        if (isWorkspaceReadOnly()) return
         set((s) => {
           const overrides = { ...s.builtinSchemeOverrides }
           delete overrides[id]
           const notices = { ...s.builtinSchemeUpdateNotices }
           delete notices[id]
           return { builtinSchemeOverrides: overrides, builtinSchemeUpdateNotices: notices }
-        }),
+        })
+      },
 
       setCheckBuiltinSchemeUpdatesOnOpen: (enabled) =>
         set({ checkBuiltinSchemeUpdatesOnOpen: enabled }),
@@ -1118,8 +1199,15 @@ export const useStore = create<Store>()(
       restoreBackup: (data) => {
         // 备份覆盖包含导出设置等设备偏好；只读时整笔拒绝，避免只恢复一半。
         if (isWorkspaceReadOnly()) return
+        // 备份里的方案 id 可能已被删掉（例如从别的设备导出的旧备份），
+        // 直接落库会留下一份「内容有、标题空」的半空选择状态。
+        const selectedSchemeID = BUILTIN_SCHEMES.some((meta) => meta.id === data.selectedSchemeID)
+          || data.customSchemes.some((scheme) => scheme?.id === data.selectedSchemeID)
+          ? data.selectedSchemeID
+          : BUILTIN_SCHEMES[0].id
         set((s) => ({
           ...data,
+          selectedSchemeID,
           // 备份不含测速结果与瞬时错误；恢复后从头开始，避免旧 ID 的结果串到新节点。
           loadingSourceIDs: [],
           errors: {},
@@ -1143,12 +1231,33 @@ export const useStore = create<Store>()(
       // 否则渲染和刷新会读到 undefined 直接抛错。
       merge: (persisted, current) => {
         const data = persisted as Partial<PersistedData> | undefined
+        // 旧版本 localStorage 里可能是内联单版覆盖层：这里归一化成快照 + 指针。
+        // 自定义方案引用到的规则集快照不能在这一步被淘汰。
+        const customSchemes = Array.isArray(data?.customSchemes) ? data.customSchemes : current.customSchemes
+        const builtin = normalizeBuiltinSchemes(
+          (data as { builtinSchemeOverrides?: unknown } | undefined)?.builtinSchemeOverrides,
+          data?.schemeSnapshots,
+          data?.snapshotSeq,
+          customSchemes.flatMap((scheme) => Array.isArray(scheme?.ruleSets) ? scheme.ruleSets.map((ruleSet) => ruleSet.id) : []),
+        )
+        // 旧的 / 被删方案的 id 会让选择器与方案卡找不到对象，出现「内容有、
+        // 标题和快照面板空」的半空状态；与服务端归一化保持同一口径。
+        const selectedSchemeID = typeof data?.selectedSchemeID === 'string'
+          && (BUILTIN_SCHEMES.some((meta) => meta.id === data.selectedSchemeID)
+            || customSchemes.some((scheme) => scheme?.id === data.selectedSchemeID))
+          ? data.selectedSchemeID
+          : current.selectedSchemeID
         return {
           ...current,
           ...(data ?? {}),
+          ...builtin,
+          selectedSchemeID,
           sources: Array.isArray(data?.sources)
             ? data.sources.map(normalizeSource)
             : current.sources,
+          ruleSetExclusions: normalizeRuleSetExclusions(
+            data?.ruleSetExclusions ?? current.ruleSetExclusions,
+          ),
         }
       },
     },

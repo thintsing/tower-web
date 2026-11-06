@@ -23,14 +23,15 @@ import {
   type BackupHistoryItem,
 } from './backupHistory'
 import { BUILTIN_SCHEMES, allSchemeMetas, loadScheme, parseRuleList, type SchemeMeta } from './rules/scheme'
+import { planSnapshotRollback, resolveBuiltinSchemeSnapshot, snapshotsForScheme, type SnapshotRollbackPlan } from './rules/schemeSnapshots'
 import { checkUpstreamUpdate, fetchUpstreamScheme } from './rules/upstreamScheme'
 import { detectRuleSchemeFormat, parseRuleSchemeText, RULE_SCHEME_FORMAT_TITLES } from './rules/importers'
-import { fetchRuleSet, parseRuleSetText, RULE_SET_FORMAT_TITLES, type RuleSetRule } from './rules/ruleSets'
+import { describeRuleSetParse, fetchRuleSet, parseRuleSetText, RULE_SET_FORMAT_TITLES, type RuleSetRule } from './rules/ruleSets'
 import { matchingGroupNames, matchingOrderAfterDragging } from './rules/matchingOrder'
 import { findRuleOrderConflicts, type RuleOrderConflict } from './rules/orderConflicts'
 import { policyIssueText, validateSchemePolicy } from './rules/policyValidation'
 import { orderedSchemeBaseRules, orderedSchemeRules } from './rules/ruleOrder'
-import { buildNodeFilterGroup, nextGroupName, previewNodeMatches, removePolicyGroup, validateNodeGroupDraft, type NodeGroupDraft } from './rules/groupEditing'
+import { autoGroupReferenceWarning, buildNodeFilterGroup, findGroupCyclePath, nextGroupName, previewNodeMatches, removePolicyGroup, validateGroupCandidates, validateNodeGroupDraft, type NodeGroupDraft } from './rules/groupEditing'
 import { ONLINE_RULE_CATALOG } from './rules/ruleCatalog'
 import type { ManualNodeImportResult } from './manualNodes'
 import { MAX_BATCH_SUBSCRIPTIONS, splitSubscriptionURLs, subscriptionLabel } from './batchSubscriptions'
@@ -66,6 +67,8 @@ import { applyFixAction, type FixAction } from './rules/diagnosis'
 import { applyDuplicateCleanup, restoreRemovedRules, type DuplicateCleanupPlan, type RemovedRuleRecord } from './rules/duplicateCleanup'
 import { clearRuleSetHistory, digestRules, recordRuleSetSnapshot } from './rules/ruleSetHistory'
 import { lintScheme, lintSummary, type SchemeLintIssue } from './rules/schemeLint'
+import { createEditableSchemeCopy, stripSchemeCustomSuffix, undoEditableSchemeCopy } from './rules/schemeCopy'
+import { isReadOnlyRuleSet } from './rules/ruleSetExclusions'
 
 const SELF_CONFIGURATION_NAME = 'Self-Configuration'
 const SELF_CONFIGURATION_URL = 'https://raw.githubusercontent.com/ClashConnectRules/Self-Configuration/main/Clash.yaml'
@@ -116,6 +119,7 @@ function useScheme(): RuleScheme | undefined {
   const selectedSchemeID = useStore((s) => s.selectedSchemeID)
   const customSchemes = useStore((s) => s.customSchemes)
   const builtinSchemeOverrides = useStore((s) => s.builtinSchemeOverrides)
+  const schemeSnapshots = useStore((s) => s.schemeSnapshots)
   const [scheme, setScheme] = useState<RuleScheme | undefined>()
   useEffect(() => {
     const custom = customSchemes.find((c) => c.id === selectedSchemeID)
@@ -125,11 +129,11 @@ function useScheme(): RuleScheme | undefined {
     const meta = BUILTIN_SCHEMES.find((m) => m.id === selectedSchemeID) ?? BUILTIN_SCHEMES[0]
     let cancelled = false
     // 覆盖层优先（固化后的版本），没有再读 public/rulesets 原厂快照。
-    loadScheme(meta, builtinSchemeOverrides)
+    loadScheme(meta, builtinSchemeOverrides, schemeSnapshots)
       .then((s) => { if (!cancelled) setScheme(s) })
       .catch(() => { if (!cancelled) setScheme(undefined) })
     return () => { cancelled = true }
-  }, [selectedSchemeID, customSchemes, builtinSchemeOverrides])
+  }, [selectedSchemeID, customSchemes, builtinSchemeOverrides, schemeSnapshots])
   return scheme
 }
 
@@ -462,11 +466,6 @@ function NodeCountryDialog({
 function configFileStem(name: string): string {
   const cleaned = name.trim().replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ')
   return cleaned || 'tower'
-}
-
-/** 自定义方案名可能已带“· 自定义”后缀，展示时只保留一次。 */
-function stripSchemeCustomSuffix(name: string): string {
-  return name.replace(/(?:\s*·\s*自定义)+\s*$/u, '').trim() || name
 }
 
 function schemeDisplayName(name: string, custom?: boolean): string {
@@ -4092,6 +4091,129 @@ function AddCustomRuleDialog({
   )
 }
 
+/** 显式候选选择区：策略组 / 内置策略 / 节点三块，共用给新建与编辑对话框。 */
+function GroupCandidatePicker({
+  scheme,
+  groupName,
+  originalName,
+  type,
+  selected,
+  matchedNodeNames,
+  readOnly,
+  onChange,
+}: {
+  scheme: RuleScheme
+  groupName: string
+  /** 编辑时正在改名的组原名；候选里要排除它，避免把自己加进去。 */
+  originalName?: string
+  type: PolicyGroup['type']
+  selected: string[]
+  matchedNodeNames: string[]
+  readOnly: boolean
+  onChange: (next: string[]) => void
+}) {
+  const referenceGroups = scheme.groups
+    .filter((group) => group.name !== groupName && group.name !== originalName)
+    .map((group) => group.name)
+  const autoWarning = autoGroupReferenceWarning(type, selected, referenceGroups)
+  const label = (name: string) => groupDisplayName(name, true)
+  const toggle = (name: string) => {
+    if (readOnly) return
+    onChange(selected.includes(name)
+      ? selected.filter((option) => option !== name)
+      : [...selected, name])
+  }
+  const move = (index: number, delta: number) => {
+    if (readOnly) return
+    const to = index + delta
+    if (to < 0 || to >= selected.length) return
+    const next = [...selected]
+    const [item] = next.splice(index, 1)
+    next.splice(to, 0, item)
+    onChange(next)
+  }
+  return (
+    <div className="candidate-picker">
+      <div className="candidate-list">
+        {selected.length === 0 && <span className="hint">还没有显式候选；节点可通过名称匹配进入。</span>}
+        {selected.map((option, index) => (
+          <span className="candidate-chip" key={option}>
+            {type === 'select' && <span className="candidate-order">{index + 1}</span>}
+            {label(option)}
+            <button
+              type="button"
+              aria-label={`上移候选 ${option}`}
+              disabled={readOnly || index === 0}
+              title={index === 0 ? '已经是第一项' : readOnly ? READONLY_NOTE : '上移'}
+              onClick={() => move(index, -1)}
+            >↑</button>
+            <button
+              type="button"
+              aria-label={`下移候选 ${option}`}
+              disabled={readOnly || index === selected.length - 1}
+              title={readOnly ? READONLY_NOTE : '下移'}
+              onClick={() => move(index, 1)}
+            >↓</button>
+            <button
+              type="button"
+              aria-label={`移除候选 ${option}`}
+              {...writeGuard(readOnly)}
+              onClick={() => toggle(option)}
+            >×</button>
+          </span>
+        ))}
+      </div>
+      {type === 'select' && selected.length > 0 && (
+        <div className="hint">第一项「{label(selected[0])}」是默认选中；顺序会影响客户端里的默认策略。</div>
+      )}
+      {autoWarning && (
+        <div className="hint is-error">{autoWarning}</div>
+      )}
+      <div className="candidate-section">
+        <div className="candidate-section-title">策略组</div>
+        <div className="candidate-list">
+          {referenceGroups.length === 0 && <span className="hint">当前方案还没有其他策略组。</span>}
+          {referenceGroups.map((name) => (
+            <button
+              type="button"
+              key={name}
+              className={`candidate-pick${selected.includes(name) ? ' is-on' : ''}`}
+              aria-pressed={selected.includes(name)}
+              {...writeGuard(readOnly)}
+              onClick={() => toggle(name)}
+            >{selected.includes(name) ? '✓ ' : '+ '}{label(name)}</button>
+          ))}
+        </div>
+      </div>
+      <div className="candidate-section">
+        <div className="candidate-section-title">内置直连与拦截</div>
+        <div className="candidate-list">
+          {['DIRECT', 'REJECT'].map((name) => (
+            <button
+              type="button"
+              key={name}
+              className={`candidate-pick${selected.includes(name) ? ' is-on' : ''}`}
+              aria-pressed={selected.includes(name)}
+              {...writeGuard(readOnly)}
+              onClick={() => toggle(name)}
+            >{selected.includes(name) ? '✓ ' : '+ '}{name}</button>
+          ))}
+        </div>
+      </div>
+      <div className="candidate-section">
+        <div className="candidate-section-title">节点（由名称匹配进入）</div>
+        <div className="candidate-list">
+          {matchedNodeNames.slice(0, 8).map((name) => (
+            <span className="candidate-chip" key={name}>{name}</span>
+          ))}
+          {matchedNodeNames.length > 8 && <span className="hint">另有 {matchedNodeNames.length - 8} 个</span>}
+          {matchedNodeNames.length === 0 && <span className="hint">当前名称匹配没有命中节点。</span>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function GroupEditorDialog({
   scheme,
   group,
@@ -4120,7 +4242,6 @@ function GroupEditorDialog({
   const [name, setName] = useState(group.name)
   const [type, setType] = useState<PolicyGroup['type']>(group.type)
   const [options, setOptions] = useState<string[]>(group.options)
-  const [newOption, setNewOption] = useState('')
   const [nodeFilter, setNodeFilter] = useState(group.nodeFilter ?? '')
   const [url, setURL] = useState(group.url ?? '')
   const [algorithm, setAlgorithm] = useState(group.algorithm ?? '')
@@ -4135,40 +4256,16 @@ function GroupEditorDialog({
 
   useEffect(() => { ref.current?.showModal() }, [])
 
-  const referenceNames = scheme.groups
-    .filter((g) => g.name !== group.name)
-    .map((g) => g.name)
   const trimmedFilter = nodeFilter.trim()
   let filterError = ''
-  let matchedNodes = 0
+  let matchedNodeNames: string[] = []
   if (trimmedFilter) {
     try {
       const regex = new RegExp(trimmedFilter)
-      matchedNodes = nodes.filter((node) => regex.test(node.name)).length
+      matchedNodeNames = nodes.filter((node) => regex.test(node.name)).map((node) => node.name)
     } catch {
       filterError = '节点名称匹配不是有效的正则表达式'
     }
-  }
-
-  const addOption = (value: string) => {
-    if (readOnly) return
-    const trimmed = value.trim()
-    if (!trimmed) return
-    if (trimmed === name.trim()) {
-      setError('策略组不能把自己加入候选')
-      return
-    }
-    if (trimmed !== 'DIRECT' && trimmed !== 'REJECT' && !referenceNames.includes(trimmed)) {
-      setError('候选只能填其他策略组名、DIRECT 或 REJECT；节点请用名称匹配')
-      return
-    }
-    if (options.includes(trimmed)) {
-      setError('这个候选已经在列表里')
-      return
-    }
-    setOptions([...options, trimmed])
-    setNewOption('')
-    setError('')
   }
 
   const groupRules = rules.filter((rule) => rule.group === group.name)
@@ -4216,20 +4313,27 @@ function GroupEditorDialog({
   const save = () => {
     const trimmedName = name.trim()
     if (!trimmedName) { setError('请填写策略组名称'); return }
-    if (scheme.groups.some((g) => g.name !== group.name && g.name === trimmedName)) {
+    // 与新建（groupEditing）保持同一口径：组名大小写不敏感，否则能改出一个
+    // 只差大小写的同名组，引用与匹配顺序按名字对不上。
+    if (scheme.groups.some((g) => g.name !== group.name && g.name.toLowerCase() === trimmedName.toLowerCase())) {
       setError('已经有同名策略组')
       return
     }
     if (filterError) { setError(filterError); return }
-    const invalidCandidate = options.find(
-      (option) => option !== 'DIRECT' && option !== 'REJECT' && !referenceNames.includes(option),
-    )
-    if (invalidCandidate) {
-      setError(`候选「${invalidCandidate}」不存在；请移除，或改成其他策略组 / DIRECT / REJECT`)
-      return
-    }
-    if (new Set(options).size !== options.length) {
-      setError('候选策略里有重复项')
+    const candidateError = validateGroupCandidates(scheme, trimmedName, options, group.name)
+    if (candidateError) { setError(candidateError); return }
+    // 改名后其他组的引用会同步改到新名字，成环检测也按改名后的图来算。
+    const draftGroups = scheme.groups.map((item) => (
+      item.name === group.name
+        ? { ...item, name: trimmedName, options }
+        : {
+            ...item,
+            options: item.options.map((option) => (option === group.name ? trimmedName : option)),
+          }
+    ))
+    const cycle = findGroupCyclePath(draftGroups, trimmedName)
+    if (cycle) {
+      setError(`策略组循环引用：${cycle.join(' → ')}`)
       return
     }
     if (options.length === 0 && !trimmedFilter) {
@@ -4317,37 +4421,16 @@ function GroupEditorDialog({
         </div>
         <div className="field">
           <label>候选策略</label>
-          <div className="candidate-list">
-            {options.map((option) => (
-              <span className="candidate-chip" key={option}>
-                {groupDisplayName(option)}
-                <button
-                  type="button"
-                  aria-label={`移除候选 ${option}`}
-                  {...writeGuard(readOnly)}
-                  onClick={() => setOptions(options.filter((o) => o !== option))}
-                >×</button>
-              </span>
-            ))}
-            {options.length === 0 && <span className="hint">没有显式候选，节点将由名称匹配加入。</span>}
-          </div>
-          <div className="row candidate-add">
-            <input
-              className="input"
-              value={newOption}
-              placeholder="策略组名 / DIRECT / REJECT"
-              onChange={(e) => setNewOption(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  e.preventDefault()
-                  addOption(newOption)
-                }
-              }}
-            />
-            <button type="button" className="btn" {...writeGuard(readOnly)} onClick={() => addOption(newOption)}>添加</button>
-            {!options.includes('DIRECT') && <button type="button" className="btn ghost" {...writeGuard(readOnly)} onClick={() => addOption('DIRECT')}>+ DIRECT</button>}
-            {!options.includes('REJECT') && <button type="button" className="btn ghost" {...writeGuard(readOnly)} onClick={() => addOption('REJECT')}>+ REJECT</button>}
-          </div>
+          <GroupCandidatePicker
+            scheme={scheme}
+            groupName={name.trim() || group.name}
+            originalName={group.name}
+            type={type}
+            selected={options}
+            matchedNodeNames={matchedNodeNames}
+            readOnly={readOnly}
+            onChange={setOptions}
+          />
         </div>
         <div className="field">
           <label>节点名称匹配（正则，可选）</label>
@@ -4359,7 +4442,7 @@ function GroupEditorDialog({
             onChange={(e) => setNodeFilter(e.target.value)}
           />
           <div className={`hint${filterError ? ' is-error' : ''}`}>
-            {filterError || (trimmedFilter ? `当前匹配 ${matchedNodes} 个已启用节点` : '留空表示不按名称自动加入节点')}
+            {filterError || (trimmedFilter ? `当前匹配 ${matchedNodeNames.length} 个已启用节点` : '留空表示不按名称自动加入节点')}
           </div>
         </div>
         {type !== 'select' && (
@@ -4464,6 +4547,7 @@ function GroupCreateDialog({
   const [name, setName] = useState(() => nextGroupName(scheme))
   const [type, setType] = useState<NodeGroupDraft['type']>('select')
   const [pattern, setPattern] = useState('')
+  const [options, setOptions] = useState<string[]>([])
   const [error, setError] = useState('')
   const readOnly = useWorkspaceStatus().readOnly
 
@@ -4472,12 +4556,12 @@ function GroupCreateDialog({
   const preview = useMemo(() => previewNodeMatches(pattern, nodes), [pattern, nodes])
 
   const save = () => {
-    const validation = validateNodeGroupDraft(scheme, { name, type, pattern })
+    const validation = validateNodeGroupDraft(scheme, { name, type, pattern, options })
     if (validation) {
       setError(validation)
       return
     }
-    onCreate(buildNodeFilterGroup({ name, type, pattern }))
+    onCreate(buildNodeFilterGroup({ name, type, pattern, options }))
     ref.current?.close()
   }
 
@@ -4504,7 +4588,19 @@ function GroupCreateDialog({
           </select>
         </div>
         <div className="field">
-          <label>节点名称匹配（正则）</label>
+          <label>候选策略</label>
+          <GroupCandidatePicker
+            scheme={scheme}
+            groupName={name.trim()}
+            type={type}
+            selected={options}
+            matchedNodeNames={preview.names}
+            readOnly={readOnly}
+            onChange={setOptions}
+          />
+        </div>
+        <div className="field">
+          <label>节点名称匹配（正则，可选）</label>
           <input
             className="field mono"
             value={pattern}
@@ -4514,16 +4610,8 @@ function GroupCreateDialog({
           <div className={`hint${preview.error ? ' is-error' : ''}`}>
             {preview.error ?? (pattern.trim()
               ? `当前匹配 ${preview.names.length} 个已启用节点`
-              : '区分大小写；留空不会创建组。')}
+              : '留空则只使用上面选中的候选；区分大小写。')}
           </div>
-          {preview.names.length > 0 && (
-            <div className="candidate-list">
-              {preview.names.slice(0, 6).map((nodeName) => (
-                <span className="candidate-chip" key={nodeName}>{nodeName}</span>
-              ))}
-              {preview.names.length > 6 && <span className="hint">另有 {preview.names.length - 6} 个节点</span>}
-            </div>
-          )}
         </div>
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="actions">
@@ -4959,7 +5047,7 @@ function RemoteRuleSetDialog({
 }: {
   scheme: RuleScheme
   onClose: () => void
-  onSave: (set: LocalRuleSet, joinGroup?: string) => void
+  onSave: (set: LocalRuleSet, joinGroup?: string, notice?: string) => void
 }) {
   const ref = useRef<HTMLDialogElement>(null)
   const [url, setUrl] = useState('')
@@ -4993,7 +5081,7 @@ function RemoteRuleSetDialog({
         updatedAt: Date.now(),
         sourceURL: target,
         format: parsed.format,
-      }, join && group ? group : undefined)
+      }, join && group ? group : undefined, describeRuleSetParse(parsed))
       ref.current?.close()
     } catch (e) {
       setError((e as Error).message)
@@ -5158,10 +5246,13 @@ function RulesTab({
   const addCustomScheme = useStore((s) => s.addCustomScheme)
   const removeCustomScheme = useStore((s) => s.removeCustomScheme)
   const localRuleSets = useStore((s) => s.localRuleSets)
+  const ruleSetExclusions = useStore((s) => s.ruleSetExclusions)
   const addLocalRuleSet = useStore((s) => s.addLocalRuleSet)
   const removeLocalRuleSet = useStore((s) => s.removeLocalRuleSet)
   const builtinSchemeOverrides = useStore((s) => s.builtinSchemeOverrides)
+  const schemeSnapshots = useStore((s) => s.schemeSnapshots)
   const saveBuiltinSchemeOverride = useStore((s) => s.saveBuiltinSchemeOverride)
+  const restoreBuiltinSchemeSnapshot = useStore((s) => s.restoreBuiltinSchemeSnapshot)
   const clearBuiltinSchemeOverride = useStore((s) => s.clearBuiltinSchemeOverride)
   const checkBuiltinSchemeUpdatesOnOpen = useStore((s) => s.checkBuiltinSchemeUpdatesOnOpen)
   const setCheckBuiltinSchemeUpdatesOnOpen = useStore((s) => s.setCheckBuiltinSchemeUpdatesOnOpen)
@@ -5178,6 +5269,7 @@ function RulesTab({
   const [editingScheme, setEditingScheme] = useState<RuleScheme | null>(null)
   const [textEditorScheme, setTextEditorScheme] = useState<RuleScheme | null>(null)
   const [restoreInitialConfirm, setRestoreInitialConfirm] = useState(false)
+  const [pendingSnapshotRollback, setPendingSnapshotRollback] = useState<SnapshotRollbackPlan | null>(null)
   const [creatingGroup, setCreatingGroup] = useState<RuleScheme | null>(null)
   const [pendingGroupDelete, setPendingGroupDelete] = useState<PolicyGroup | null>(null)
   const [customRuleTarget, setCustomRuleTarget] = useState<RuleScheme | null>(null)
@@ -5214,8 +5306,21 @@ function RulesTab({
 
   const allMetas = allSchemeMetas(customSchemes)
   const selectedMeta = allMetas.find((m) => m.id === selectedSchemeID)
-  const selectedBuiltinOverride = selectedMeta && !('custom' in selectedMeta)
-    ? builtinSchemeOverrides[selectedMeta.id]
+  // 覆盖层只存指针；这里解引用成快照。损坏时自动回落并在下方逐级提示。
+  const selectedBuiltinResolution = selectedMeta && !('custom' in selectedMeta)
+    ? resolveBuiltinSchemeSnapshot(selectedMeta.id, builtinSchemeOverrides, schemeSnapshots)
+    : undefined
+  const selectedBuiltinOverride = selectedBuiltinResolution?.snapshot
+  const selectedSnapshotHistory = useMemo(
+    () => selectedMeta && !('custom' in selectedMeta)
+      ? snapshotsForScheme(schemeSnapshots, selectedMeta.id)
+      : [],
+    [selectedMeta, schemeSnapshots],
+  )
+  const snapshotFallbackNotice = selectedBuiltinResolution?.missingId !== undefined
+    ? selectedBuiltinResolution.fallback === 'previous' && selectedBuiltinResolution.snapshot
+      ? `固化快照 #${selectedBuiltinResolution.missingId} 损坏或缺失，已自动回落到上一版 #${selectedBuiltinResolution.snapshot.id}。`
+      : `固化快照 #${selectedBuiltinResolution.missingId} 损坏或缺失，已自动回落到原厂快照。`
     : undefined
   const customScheme = customSchemes.find((c) => c.id === scheme?.id)
   const schemeRules = useMemo(
@@ -5332,22 +5437,14 @@ function RulesTab({
   const makeEditableScheme = (source: RuleScheme): RuleScheme => {
     const existing = customSchemes.find((c) => c.id === source.id)
     if (existing) return existing
-    const copy: RuleScheme = {
-      ...source,
-      id: `custom-${Date.now()}`,
-      name: `${stripSchemeCustomSuffix(source.name)} · 自定义`,
-      description: source.description,
-      sourceKind: 'copy',
-      updatedAt: Date.now(),
-      customRules: [],
-    }
+    const copy = createEditableSchemeCopy(source, { id: `custom-${Date.now()}` })
     const previousSelections = useStore.getState().policySelections
     addCustomScheme(copy)
     setScheme(copy.id)
     for (const [group, selection] of Object.entries(previousSelections)) {
       useStore.getState().setPolicy(group, selection)
     }
-    setFlash('已复制为自定义方案，后续修改不会影响内置方案。')
+    setFlash(`已创建副本「${copy.name}」，后续修改只作用于副本，原内置方案「${source.name}」不变。`)
     return copy
   }
 
@@ -5358,9 +5455,14 @@ function RulesTab({
     setSchemeError(null)
     try {
       const result = await fetchUpstreamScheme(meta)
-      saveBuiltinSchemeOverride(meta.id, result.override)
+      const snapshotId = saveBuiltinSchemeOverride(meta.id, result.override)
+      // 0 表示写保护生效（等待期间切到只读）或内容未通过快照校验。
+      if (snapshotId === 0) {
+        setSchemeError('未能保存固化快照：当前工作区处于只读状态，或快照内容校验失败。')
+        return
+      }
       setScheme(meta.id)
-      setFlash(`已更新并固化「${meta.name}」：${result.override.source.ruleCount} 条规则、${result.ruleSets.length} 个列表；原厂快照保留，可随时恢复。`)
+      setFlash(`已更新并固化「${meta.name}」：${result.override.source.ruleCount} 条规则、${result.ruleSets.length} 个列表（快照 #${snapshotId}）；已导出的客户端配置不会自动回滚。原厂快照保留，可随时恢复或回退。`)
     } catch (e) {
       setSchemeError((e as Error).message)
     } finally {
@@ -5378,9 +5480,20 @@ function RulesTab({
         const existing = localRuleSets.find((item) => item.sourceURL === set.sourceURL)
         addLocalRuleSet(existing ? { ...set, id: existing.id, paused: existing.paused } : set)
       }
-      addCustomScheme(result.scheme)
-      setScheme(result.scheme.id)
-      setFlash(`已生成自定义副本「${result.scheme.name}」；内置方案未改动。`)
+      // fetchUpstreamScheme 返回的 scheme.id 仍是内置方案 id（它要用来写覆盖层）。
+      // 直接塞进 customSchemes 会跟内置方案同 id：列表里显示内置方案，
+      // 内容却来自副本，恢复原厂 / 固化都会被副本遮住。
+      // 名称补上「· 自定义」，与按钮和提示里的「自定义副本」一致；
+      // 上游日期保留，便于在方案列表里区分不同批次。
+      const copy = {
+        ...result.scheme,
+        id: `custom-${Date.now()}`,
+        name: `${result.scheme.name} · 自定义`,
+        sourceKind: 'copy' as const,
+      }
+      addCustomScheme(copy)
+      setScheme(copy.id)
+      setFlash(`已生成自定义副本「${copy.name}」；内置方案未改动。`)
     } catch (e) {
       setSchemeError((e as Error).message)
     } finally {
@@ -5404,6 +5517,39 @@ function RulesTab({
     }
   }
 
+  // 回退前先算清数字与受影响方案：规则数变化、自定义方案、已导出配置提示。
+  const requestSnapshotRollback = (meta: SchemeMeta, snapshotId: number) => {
+    const plan = planSnapshotRollback({
+      snapshots: schemeSnapshots,
+      overrides: builtinSchemeOverrides,
+      customSchemes,
+      schemeID: meta.id,
+      targetID: snapshotId,
+      factoryRuleCount: scheme?.rules.length,
+    })
+    if (!plan) {
+      setSchemeError(`快照 #${snapshotId} 不可用，无法回退。`)
+      return
+    }
+    setPendingSnapshotRollback(plan)
+  }
+
+  const confirmSnapshotRollback = () => {
+    const plan = pendingSnapshotRollback
+    setPendingSnapshotRollback(null)
+    if (!plan) return
+    // 以计划里的 schemeID 为准：弹窗打开期间别的设备同步可能切换当前方案，
+    // 用 selectedMeta 会把回退落到错误的内置方案上。
+    const targetSchemeID = plan.target.schemeID
+    if (!restoreBuiltinSchemeSnapshot(targetSchemeID, plan.target.id)) {
+      setSchemeError(`回退失败：快照 #${plan.target.id} 不可用。`)
+      return
+    }
+    const targetMeta = BUILTIN_SCHEMES.find((meta) => meta.id === targetSchemeID)
+    setScheme(targetSchemeID)
+    setFlash(`已回退「${targetMeta?.name ?? targetSchemeID}」到快照 #${plan.target.id}：规则 ${plan.fromCount} → ${plan.toCount} 条。已导出的客户端配置不会自动回滚，需要重新导出或让客户端刷新订阅。`)
+  }
+
   const beginEditScheme = () => {
     if (!scheme) return
     const editable = customScheme ?? makeEditableScheme(scheme)
@@ -5423,7 +5569,7 @@ function RulesTab({
     if (!customScheme || !builtinForCustom) return
     setRestoreInitialConfirm(false)
     try {
-      const original = await loadScheme(builtinForCustom, builtinSchemeOverrides)
+      const original = await loadScheme(builtinForCustom, builtinSchemeOverrides, schemeSnapshots)
       addCustomScheme({
         ...original,
         id: customScheme.id,
@@ -5432,7 +5578,8 @@ function RulesTab({
         sourceKind: 'copy',
         rawConfigurationText: undefined,
         customRules: [],
-        ruleSets: [],
+        // 恢复初始规则时用快照重新挂回的只读规则集（inlined）；用户自己加的规则集清空。
+        ruleSets: original.ruleSets ?? [],
         matchingOrder: undefined,
         updatedAt: Date.now(),
       })
@@ -5485,6 +5632,9 @@ function RulesTab({
     if (result.removedRules > 0) details.push(`${result.removedRules} 条规则`)
     if (result.removedCustomRules > 0) details.push(`${result.removedCustomRules} 条自定义规则`)
     if (result.removedRuleSets > 0) details.push(`${result.removedRuleSets} 组规则集`)
+    if (result.referencingGroups.length > 0) {
+      details.push(`${result.referencingGroups.length} 个组引用（${result.referencingGroups.map((name) => groupDisplayName(name, true)).join('、')}）`)
+    }
     setFlash(`已删除策略组「${group.name}」${details.length ? `，同时移除了 ${details.join('、')}` : ''}。`)
   }
 
@@ -5631,7 +5781,9 @@ function RulesTab({
         rule.group === oldName ? { ...rule, group: newName } : rule,
       ),
     }))
-    addCustomScheme({ ...fresh, groups, rules, customRules, ruleSets, updatedAt: Date.now() })
+    // 拖拽排序记录的是组名；改名后不改这里，规则会悄悄丢掉用户排好的匹配顺序。
+    const matchingOrder = (fresh.matchingOrder ?? []).map((name) => name === oldName ? newName : name)
+    addCustomScheme({ ...fresh, groups, rules, customRules, ruleSets, matchingOrder, updatedAt: Date.now() })
     if (oldName !== newName) {
       useStore.getState().renamePolicySelection(oldName, newName)
       setFlash(`策略组已改名为「${newName}」，规则和候选引用已同步更新。`)
@@ -5803,19 +5955,20 @@ function RulesTab({
     })
   }
 
-  const saveRemoteRuleSet = (set: LocalRuleSet, joinGroup?: string) => {
+  const saveRemoteRuleSet = (set: LocalRuleSet, joinGroup?: string, notice?: string) => {
     // 同一地址只保留一条订阅，重复添加时更新快照。
     const existing = localRuleSets.find((item) => item.sourceURL === set.sourceURL)
     if (existing && digestRules(existing.rules) !== digestRules(set.rules)) {
       recordRuleSetSnapshot(existing.id, existing.rules, useStore.getState().ruleSetVersionHistory)
     }
     const saved = existing ? { ...set, id: existing.id, paused: existing.paused } : set
+    const detail = notice ? `；${notice}` : ''
     addLocalRuleSet(saved)
     if (joinGroup && scheme) {
       addLocalSetToScheme(scheme, saved, joinGroup)
-      setFlash(`已保存并加入「${saved.name}」：${saved.rules.length} 条规则。`)
+      setFlash(`已保存并加入「${saved.name}」：${saved.rules.length} 条规则${detail}。`)
     } else {
-      setFlash(`已保存在线规则集「${saved.name}」：${saved.rules.length} 条规则。`)
+      setFlash(`已保存在线规则集「${saved.name}」：${saved.rules.length} 条规则${detail}。`)
     }
   }
 
@@ -5836,7 +5989,7 @@ function RulesTab({
         updatedAt: Date.now(),
         lastError: undefined,
       })
-      setFlash(`已刷新「${set.name}」：${parsed.rules.length} 条规则。`)
+      setFlash(`已刷新「${set.name}」：${parsed.rules.length} 条规则；${describeRuleSetParse(parsed)}。`)
     } catch (e) {
       const message = (e as Error).message
       addLocalRuleSet({ ...set, lastError: message })
@@ -5852,10 +6005,12 @@ function RulesTab({
     setRefreshingRuleSetID('all')
     setRuleSetError(null)
     let ok = 0
+    let skippedTotal = 0
     const errors: string[] = []
     for (const set of sets) {
       try {
         const parsed = await fetchRuleSet(set.sourceURL!)
+        skippedTotal += parsed.skippedLines ?? 0
         if (digestRules(parsed.rules) !== digestRules(set.rules)) {
           recordRuleSetSnapshot(set.id, set.rules, useStore.getState().ruleSetVersionHistory)
         }
@@ -5874,7 +6029,7 @@ function RulesTab({
       }
     }
     setRefreshingRuleSetID(null)
-    setFlash(`已刷新 ${ok} 个在线规则集${errors.length ? `，${errors.length} 个失败` : ''}。`)
+    setFlash(`已刷新 ${ok} 个在线规则集${errors.length ? `，${errors.length} 个失败` : ''}${skippedTotal ? `，跳过 ${skippedTotal} 行` : ''}。`)
     if (errors.length) setRuleSetError(errors.join('；'))
   }
 
@@ -5898,11 +6053,13 @@ function RulesTab({
     const taken = new Set(localRuleSets.map((set) => set.name.trim()))
     const created: LocalRuleSet[] = []
     const errors: string[] = []
+    let skippedTotal = 0
     for (const file of files) {
       try {
         if (file.size > 8 * 1024 * 1024) throw new Error('文件大于 8 MB')
         const textBody = await file.text()
         const parsed = parseRuleSetText(textBody)
+        skippedTotal += parsed.skippedLines ?? 0
         const base = file.name.replace(/\.[^.]+$/, '').trim() || '导入规则集'
         let name = base
         let suffix = 2
@@ -5923,7 +6080,7 @@ function RulesTab({
       }
     }
     for (const set of created) addLocalRuleSet(set)
-    if (created.length) setFlash(`已导入 ${created.length} 个规则集。`)
+    if (created.length) setFlash(`已导入 ${created.length} 个规则集${skippedTotal ? `，跳过 ${skippedTotal} 行` : ''}。`)
     if (errors.length) setRuleSetError(errors.join('；'))
   }
 
@@ -5955,7 +6112,7 @@ function RulesTab({
           : item),
         updatedAt: Date.now(),
       })
-      setFlash(`已刷新「${set.name}」：${parsed.rules.length} 条规则。`)
+      setFlash(`已刷新「${set.name}」：${parsed.rules.length} 条规则；${describeRuleSetParse(parsed)}。`)
     } catch (e) {
       setRuleSetError(`「${set.name}」刷新失败：${(e as Error).message}`)
     } finally {
@@ -6048,6 +6205,40 @@ function RulesTab({
                         ? `内置方案 · 已固化 · commit ${selectedBuiltinOverride.source.commitSha.slice(0, 7)} · 更新于 ${formatDate(selectedBuiltinOverride.source.fetchedAt)} · ${selectedBuiltinOverride.source.ruleCount} 条规则`
                         : '内置方案 · 原厂快照 · 离线可用'}
           </div>
+          {snapshotFallbackNotice && (
+            <div className="hint scheme-snapshot-warning">{snapshotFallbackNotice}</div>
+          )}
+          {selectedMeta && !('custom' in selectedMeta) && selectedSnapshotHistory.length > 0 && (
+            <div className="scheme-snapshot-history">
+              <div className="hint">固化历史（原厂 + 最近 2 版；回退后正在用的旧版会额外保留）。回退只改本机与同步工作区，不影响已导出的客户端配置。</div>
+              <ul>
+                {selectedSnapshotHistory.map((snapshot) => {
+                  // 指针损坏时会回落到上一版，此时「当前」应标在实际生效的那一版，
+                  // 否则历史列表里一行「当前」都没有，跟上方回落提示自相矛盾。
+                  const isCurrent = snapshot.id === selectedBuiltinOverride?.id
+                  return (
+                    <li key={snapshot.id} className={isCurrent ? 'snapshot-current' : undefined}>
+                      <span className="snapshot-label">
+                        快照 #{snapshot.id}{isCurrent ? ' · 当前' : ''} · commit {snapshot.source.commitSha.slice(0, 7)} · {snapshot.source.ruleCount} 条规则 · {formatDate(snapshot.createdAt)}
+                      </span>
+                      {!isCurrent && (
+                        <button
+                          type="button"
+                          className="btn ghost"
+                          disabled={readOnly || updatingBuiltinScheme}
+                          title={readOnly ? READONLY_NOTE : undefined}
+                          onClick={() => requestSnapshotRollback(selectedMeta, snapshot.id)}
+                        >回退至此版</button>
+                      )}
+                    </li>
+                  )
+                })}
+                <li>
+                  <span className="snapshot-label">原厂快照 · 离线可用{selectedBuiltinResolution?.fallback === 'factory' ? ' · 当前' : ''}</span>
+                </li>
+              </ul>
+            </div>
+          )}
           <div className="scheme-source scheme-network-summary">
             DNS：{DNS_MODE_TITLES[scheme?.networkSettings?.dnsProtectionMode ?? 'standard']}
             {scheme?.networkSettings?.proxyTestURLString
@@ -6406,36 +6597,47 @@ function RulesTab({
             </div>
             {(scheme.ruleSets?.length ?? 0) > 0 ? (
               <ul className="rs-list">
-                {scheme.ruleSets!.map((set) => (
-                  <li key={set.id}>
-                    <div>
-                      <strong>{set.name}</strong>
-                      <span className="pill">{groupDisplayName(set.group, showGroupEmoji)}</span>
-                      <span className="hint">
-                        {set.rules.length} 条 · {set.sourceKind === 'library' ? '内置规则库' : set.sourceKind === 'url' ? '在线订阅' : '我的规则集'}
-                        {set.format ? ` · ${RULE_SET_FORMAT_TITLES[set.format]}` : ''}
-                        {set.updatedAt ? ` · 更新于 ${formatDate(set.updatedAt)}` : ''}
-                      </span>
-                    </div>
-                    <div className="rs-actions">
-                      {set.sourceKind === 'url' && (
-                        <button
-                          className="btn ghost"
-                          disabled={refreshingRuleSetID !== null}
-                          onClick={() => void refreshSchemeRuleSet(set)}
-                        >
-                          {refreshingRuleSetID === set.id ? '刷新中…' : '刷新'}
-                        </button>
-                      )}
-                      <button
-                        className="icon-btn"
-                        aria-label={`从当前方案移除规则集「${set.name}」`}
-                        title="移除整组规则"
-                        onClick={() => removeSchemeRuleSet(set.id)}
-                      >×</button>
-                    </div>
-                  </li>
-                ))}
+                {scheme.ruleSets!.map((set) => {
+                  const blockedCount = ruleSetExclusions[set.id]?.length ?? 0
+                  return (
+                    <li key={set.id}>
+                      <div>
+                        <strong>{set.name}</strong>
+                        <span className="pill">{groupDisplayName(set.group, showGroupEmoji)}</span>
+                        {set.inlined && <span className="pill" title="来自固化快照，不能删除或刷新；可按签名逐条屏蔽">只读</span>}
+                        {blockedCount > 0 && (
+                          <span className="pill warn" title="原始规则集与快照不变；只在编译与导出时排除">
+                            已屏蔽 {blockedCount} 条 · 仅编译期生效
+                          </span>
+                        )}
+                        <span className="hint">
+                          {set.rules.length} 条 · {set.inlined ? '固化快照（只读）' : set.sourceKind === 'library' ? '内置规则库' : set.sourceKind === 'url' ? '在线订阅' : '我的规则集'}
+                          {set.format ? ` · ${RULE_SET_FORMAT_TITLES[set.format]}` : ''}
+                          {set.updatedAt ? ` · 更新于 ${formatDate(set.updatedAt)}` : ''}
+                        </span>
+                      </div>
+                      <div className="rs-actions">
+                        {!set.inlined && set.sourceKind === 'url' && (
+                          <button
+                            className="btn ghost"
+                            disabled={refreshingRuleSetID !== null}
+                            onClick={() => void refreshSchemeRuleSet(set)}
+                          >
+                            {refreshingRuleSetID === set.id ? '刷新中…' : '刷新'}
+                          </button>
+                        )}
+                        {!set.inlined && (
+                          <button
+                            className="icon-btn"
+                            aria-label={`从当前方案移除规则集「${set.name}」`}
+                            title="移除整组规则"
+                            onClick={() => removeSchemeRuleSet(set.id)}
+                          >×</button>
+                        )}
+                      </div>
+                    </li>
+                  )
+                })}
               </ul>
             ) : (
               <div className="hint">还没有加入规则集。规则集会排在自定义规则之后、方案规则之前。</div>
@@ -6627,8 +6829,8 @@ function RulesTab({
           key={scheme.id}
           scheme={scheme}
           onClose={() => setRemoteSetOpen(false)}
-          onSave={(set, group) => {
-            saveRemoteRuleSet(set, group)
+          onSave={(set, group, notice) => {
+            saveRemoteRuleSet(set, group, notice)
             setRemoteSetOpen(false)
           }}
         />
@@ -6681,6 +6883,27 @@ function RulesTab({
           onConfirm={() => void restoreInitialRules()}
         />
       )}
+      {pendingSnapshotRollback && selectedMeta && !('custom' in selectedMeta) && (
+        <ConfirmDialog
+          open
+          title={`回退「${selectedMeta.name}」到快照 #${pendingSnapshotRollback.target.id}？`}
+          body={(
+            <>
+              <span>{pendingSnapshotRollback.message}</span>
+              {pendingSnapshotRollback.affectedSchemes.length > 0 && (
+                <span className="hint" style={{ display: 'block', marginTop: 6 }}>
+                  受影响的自定义方案会改成引用这份旧版规则集，导出结果随之变化。
+                </span>
+              )}
+            </>
+          )}
+          confirmLabel="回退至此版"
+          danger
+          confirmDisabled={readOnly}
+          onCancel={() => setPendingSnapshotRollback(null)}
+          onConfirm={confirmSnapshotRollback}
+        />
+      )}
       {pendingGroupDelete && scheme && (
         <ConfirmDialog
           open
@@ -6688,7 +6911,14 @@ function RulesTab({
           body={(
             <>
               将删除 <b>「{pendingGroupDelete.name}」</b>，并移除 {schemeRules.filter((rule) => rule.group === pendingGroupDelete.name).length} 条规则。
-              其他策略组和规则里对它的引用也会一并移除。此操作会先复制为自定义方案，内置方案本身不受影响。
+              {(() => {
+                const referencing = scheme.groups
+                  .filter((g) => g.name !== pendingGroupDelete.name && g.options.includes(pendingGroupDelete.name))
+                  .map((g) => groupDisplayName(g.name, true))
+                if (referencing.length === 0) return '其他策略组里的引用也会一并移除。'
+                return <>候选里引用它的策略组：{referencing.join('、')}，这些候选会一并移除。</>
+              })()}
+              此操作会先复制为自定义方案，内置方案本身不受影响。
             </>
           )}
           confirmLabel="删除策略组"
@@ -6728,6 +6958,10 @@ function RulesTab({
 // 只记录“被删掉的条目 + 原始位置”，撤销时精确回插；不再保存整份方案快照，
 // 否则清理之后用户在同一方案里做的其它编辑会被一起回滚。
 let cleanupUndoRecord: { schemeID: string; records: RemovedRuleRecord[] } | null = null
+/** 本次自动复制出的方案；撤销时删掉副本并回到原内置方案。 */
+let copyUndoRecord: { copyID: string; sourceID: string; sourceName: string } | null = null
+/** 屏蔽 / 解除屏蔽的撤销槽（只保留最近一次），记录某个规则集完整的屏蔽列表。 */
+let exclusionUndoRecord: { setId: string; before: string[]; label: string } | null = null
 
 function CheckTab({
   onGo,
@@ -6746,6 +6980,9 @@ function CheckTab({
   const preferRuleSets = useStore((s) => s.preferRuleSets)
   const showGroupEmoji = useStore((s) => s.showGroupEmoji)
   const ruleSetVersionHistory = useStore((s) => s.ruleSetVersionHistory)
+  const ruleSetExclusions = useStore((s) => s.ruleSetExclusions)
+  const customSchemes = useStore((s) => s.customSchemes)
+  const readOnly = useWorkspaceStatus().readOnly
   const enabledForRules = useMemo(() => enabledNodes({ sources, nodes }), [sources, nodes])
   const sourceErrors = useMemo(
     () => sources.map((source) => errors[source.id]?.trim()).filter((value): value is string => !!value),
@@ -6771,6 +7008,10 @@ function CheckTab({
   })
 
   const canUndoCleanup = cleanupUndoRecord !== null
+  const canUndoCopy = copyUndoRecord !== null
+  const canUndoExclusion = exclusionUndoRecord !== null
+  /** 当前方案是不是内置只读方案：删除前必须显式告知会创建副本。 */
+  const requiresCopy = scheme ? !customSchemes.some((item) => item.id === scheme.id) : false
 
   /** 选中内置方案时，先把当前内容复制成可编辑方案。保留已有 customRules，避免索引错位。 */
   const ensureEditable = (): RuleScheme | null => {
@@ -6779,14 +7020,7 @@ function CheckTab({
     const existing = state.customSchemes.find((item) => item.id === scheme.id)
     if (existing) return existing
     const previousSelections = { ...state.policySelections }
-    const editable: RuleScheme = {
-      ...scheme,
-      id: `custom-${Date.now()}`,
-      name: `${stripSchemeCustomSuffix(scheme.name)} · 自定义`,
-      sourceKind: 'copy',
-      updatedAt: Date.now(),
-      customRules: scheme.customRules ?? [],
-    }
+    const editable = createEditableSchemeCopy(scheme, { id: `custom-${Date.now()}` })
     state.addCustomScheme(editable)
     state.setScheme(editable.id)
     for (const [group, selection] of Object.entries(previousSelections)) {
@@ -6797,17 +7031,57 @@ function CheckTab({
 
   const applyFix = (action: FixAction): FixOutcome => {
     if (!scheme) return { ok: false, message: '规则方案还没加载完成。' }
+    if (readOnly) return { ok: false, message: '当前工作区只读，无法修改规则。' }
+
+    // 只读规则集的条目：不删快照，改为按签名屏蔽。它不复制方案，改动立即作用于编译与导出。
+    if (action.kind === 'block-rule') {
+      const setId = action.ruleSetId
+      const signature = action.ruleSignature
+      const set = scheme.ruleSets?.find((item) => item.id === setId)
+      if (!setId || !set || !signature || !isReadOnlyRuleSet(set)) {
+        return { ok: false, message: '这条规则不在只读规则集里，请刷新诊断后重试。' }
+      }
+      const state = useStore.getState()
+      exclusionUndoRecord = {
+        setId,
+        before: [...(state.ruleSetExclusions[setId] ?? [])],
+        label: action.ruleText ?? signature,
+      }
+      state.addRuleSetExclusion(setId, signature)
+      return {
+        ok: true,
+        message: `已屏蔽「${action.ruleText ?? signature}」（来源：${set.name}）。它不会再参与编译与导出，命中可能落到下一条规则；可撤销本次屏蔽。`,
+      }
+    }
+
     // 先在当前方案上试算：规则不在了就不要复制出一个多余的「自定义」方案。
     if (!applyFixAction(scheme, action)) return { ok: false, message: '没有找到这条规则，可能已被修改。' }
+    const wasReadOnly = requiresCopy
     const editable = ensureEditable()
     if (!editable) return { ok: false, message: '规则方案还没加载完成。' }
     const next = applyFixAction(editable, action)
     if (!next) return { ok: false, message: '没有找到这条规则，可能已被修改。' }
     useStore.getState().addCustomScheme({ ...next.scheme, updatedAt: Date.now() })
-    // 这次单条删除不影响撤销记录的语义：撤销只回插清理时删掉的条目，
-    // 不会覆盖这次编辑。保留记录，用户仍然可以撤销上一次批量清理。
+    // 单条删除也写入同一条撤销记录：撤销按原位置回插，不会覆盖之后做的其它编辑。
+    if (next.removed) {
+      cleanupUndoRecord = {
+        schemeID: editable.id,
+        records: [{ place: next.removed.place, rule: { ...next.removed.rule } }],
+      }
+    }
+    if (wasReadOnly) {
+      copyUndoRecord = { copyID: editable.id, sourceID: scheme.id, sourceName: scheme.name }
+    } else {
+      copyUndoRecord = null
+    }
     const where = next.removedFrom === 'custom' ? '自定义规则' : next.removedFrom === 'ruleset' ? '规则集' : '方案规则'
-    return { ok: true, message: `已从${where}删除「${next.removedText}」，方案已保存。` }
+    const copyNote = wasReadOnly
+      ? `已创建副本「${editable.name}」，后续修改只作用于副本，原内置方案「${scheme.name}」不变；可撤销本次复制回到原方案。`
+      : ''
+    return {
+      ok: true,
+      message: `已从${where}删除「${next.removedText}」，方案已保存${copyNote ? `；${copyNote}` : `；可撤销这次删除。`}`,
+    }
   }
 
   const cleanDuplicates = (plan: DuplicateCleanupPlan): FixOutcome => {
@@ -6817,6 +7091,7 @@ function CheckTab({
     if (!applyDuplicateCleanup(scheme, plan).removed) {
       return { ok: false, message: '规则已经变化，请重新运行诊断后再清理。' }
     }
+    const wasReadOnly = requiresCopy
     const editable = ensureEditable()
     if (!editable) return { ok: false, message: '规则方案还没加载完成。' }
     const result = applyDuplicateCleanup(editable, plan)
@@ -6825,16 +7100,73 @@ function CheckTab({
       schemeID: editable.id,
       records: result.applied.map((item) => ({ place: item.place, rule: { ...item.rule } })),
     }
+    if (wasReadOnly) {
+      copyUndoRecord = { copyID: editable.id, sourceID: scheme.id, sourceName: scheme.name }
+    } else {
+      copyUndoRecord = null
+    }
     useStore.getState().addCustomScheme({ ...result.scheme, updatedAt: Date.now() })
+    const copyNote = wasReadOnly
+      ? `已创建副本「${editable.name}」，原内置方案「${scheme.name}」不变；可撤销本次复制回到原方案。`
+      : ''
     return {
       ok: true,
-      message: `已删除 ${result.removed} 条同组重复规则，方案已保存；可撤销本次清理（只恢复这几条，不影响其它修改）。`,
+      message: `已删除 ${result.removed} 条重复规则（同组 ${plan.sameGroupCount} 条 / 跨组 ${plan.crossGroupCount} 条），方案已保存${copyNote ? `；${copyNote}` : `；可撤销本次清理（只恢复这几条，不影响其它修改）。`}`,
+    }
+  }
+
+  const undoCopy = (): FixOutcome => {
+    const record = copyUndoRecord
+    if (!record) return { ok: false, message: '没有可撤销的复制。' }
+    if (readOnly) return { ok: false, message: '当前工作区只读，无法撤销。' }
+    const state = useStore.getState()
+    const plan = undoEditableSchemeCopy(state.customSchemes, record.sourceID, record.copyID)
+    copyUndoRecord = null
+    if (!plan.removed) {
+      useStore.setState({ selectedSchemeID: record.sourceID })
+      return { ok: false, message: '副本已经不在了，已切回原方案。' }
+    }
+    cleanupUndoRecord = null
+    useStore.setState({
+      customSchemes: plan.customSchemes,
+      selectedSchemeID: plan.selectedSchemeID,
+    })
+    return { ok: true, message: `已撤销本次复制，删除副本并回到原方案「${record.sourceName}」。` }
+  }
+
+  const unblockRule = (ruleSetID: string, signature: string, label: string): FixOutcome => {
+    if (readOnly) return { ok: false, message: '当前工作区只读，无法解除屏蔽。' }
+    const state = useStore.getState()
+    const set = scheme?.ruleSets?.find((item) => item.id === ruleSetID)
+    if (!set || !isReadOnlyRuleSet(set)) return { ok: false, message: '找不到这个只读规则集。' }
+    const before = [...(state.ruleSetExclusions[ruleSetID] ?? [])]
+    if (!before.includes(signature)) return { ok: false, message: '这条规则没有被屏蔽。' }
+    exclusionUndoRecord = { setId: ruleSetID, before, label }
+    state.removeRuleSetExclusion(ruleSetID, signature)
+    return {
+      ok: true,
+      message: `已解除屏蔽「${label}」，它会重新参与编译与导出；可撤销本次解除。`,
+    }
+  }
+
+  const undoExclusion = (): FixOutcome => {
+    const record = exclusionUndoRecord
+    if (!record) return { ok: false, message: '没有可撤销的屏蔽操作。' }
+    if (readOnly) return { ok: false, message: '当前工作区只读，无法撤销。' }
+    exclusionUndoRecord = null
+    useStore.getState().restoreRuleSetExclusions(record.setId, record.before)
+    return {
+      ok: true,
+      message: `已撤销上次屏蔽 / 解除，恢复「${record.label}」之前的屏蔽状态。`,
     }
   }
 
   const undoCleanup = (): FixOutcome => {
     const record = cleanupUndoRecord
     if (!record) return { ok: false, message: '没有可撤销的清理。' }
+    // undoCopy / undoExclusion 都拦了只读；这里漏拦会让 addCustomScheme 被
+    // 静默过滤，界面却提示「已恢复」。
+    if (readOnly) return { ok: false, message: '当前工作区只读，无法撤销。' }
     const state = useStore.getState()
     const target = state.customSchemes.find((item) => item.id === record.schemeID)
     if (!target) {
@@ -6889,15 +7221,23 @@ function CheckTab({
           policySelections={policySelections}
           latencyByNodeId={latencyByNodeId}
           localRuleSets={localRuleSets}
+          ruleSetExclusions={ruleSetExclusions}
           preferRuleSets={preferRuleSets}
           showGroupEmoji={showGroupEmoji}
           versionHistoryEnabled={ruleSetVersionHistory}
           historyRevision={ruleSetVersionHistory ? 1 : 0}
+          requiresCopy={requiresCopy}
           onLocate={(issue) => onLocate?.(issue)}
           onApplyFix={applyFix}
           onCleanDuplicates={cleanDuplicates}
           onUndoCleanup={undoCleanup}
           canUndoCleanup={canUndoCleanup}
+          canUndoCopy={canUndoCopy}
+          onUndoCopy={undoCopy}
+          copySourceName={copyUndoRecord?.sourceName}
+          canUndoExclusion={canUndoExclusion}
+          onUnblockRule={unblockRule}
+          onUndoExclusion={undoExclusion}
           onGo={(key) => onGo?.(key)}
         />
       )}
@@ -6960,6 +7300,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const policySelections = useStore((s) => s.policySelections)
   const preferRuleSets = useStore((s) => s.preferRuleSets)
   const setPreferRuleSets = useStore((s) => s.setPreferRuleSets)
+  const ruleSetExclusions = useStore((s) => s.ruleSetExclusions)
   const exportContentMode = useStore((s) => s.exportContentMode)
   const exportContentModes = useStore((s) => s.exportContentModes)
   const setExportContentModeFor = useStore((s) => s.setExportContentModeFor)
@@ -7001,12 +7342,13 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       preferRuleSets,
       format: targetFormat,
       target: target.target,
+      ruleSetExclusions,
     }) : undefined,
-    [scheme, policySelections, preferRuleSets, targetFormat, target.target],
+    [scheme, policySelections, preferRuleSets, targetFormat, target.target, ruleSetExclusions],
   )
   const compatibility = useMemo(
-    () => scheme ? analyzeRuleCompatibility(target, scheme, { preferRuleSets, contentMode }) : undefined,
-    [target, scheme, preferRuleSets, contentMode],
+    () => scheme ? analyzeRuleCompatibility(target, scheme, { preferRuleSets, contentMode, ruleSetExclusions }) : undefined,
+    [target, scheme, preferRuleSets, contentMode, ruleSetExclusions],
   )
   const [clientQuery, setClientQuery] = useState('')
   const [manageClients, setManageClients] = useState(false)
@@ -7446,6 +7788,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       const formats = generateSubscriptionFormats(usable, scheme, {
         policySelections,
         preferRuleSets,
+        ruleSetExclusions,
         contentMode,
         contentModeByFormat,
         nameForNode,
@@ -7464,6 +7807,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           preferRuleSets,
           format: 'yaml',
           target: 'shadowrocket',
+          ruleSetExclusions,
         })
         const mode = effectiveContentMode(shadowrocket, exportContentModes, exportContentMode)
         targets.shadowrocket = generateConfig(shadowrocket, usable, prepared, {
@@ -7480,6 +7824,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           preferRuleSets,
           format: 'yaml',
           target: 'karing',
+          ruleSetExclusions,
         })
         const mode = effectiveContentMode(karing, exportContentModes, exportContentMode)
         targets.karing = generateConfig(karing, usable, prepared, {
@@ -7499,6 +7844,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           preferRuleSets,
           format: 'json',
           target: targetKey,
+          ruleSetExclusions,
         })
         targets[targetKey] = generateConfig(client, usable, prepared, {
           contentMode: mode,
@@ -7518,6 +7864,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
             preferRuleSets,
             format,
             target: targetKey,
+            ruleSetExclusions,
           })
           targets[targetKey] = generateConfig(client, usable, prepared, {
             contentMode: mode,
@@ -8622,7 +8969,10 @@ export function App() {
         (meta) => meta.id === state.selectedSchemeID || !!state.builtinSchemeOverrides[meta.id],
       )
       void Promise.all(targets.map(async (meta) => {
-        const result = await checkUpstreamUpdate(meta, state.builtinSchemeOverrides[meta.id])
+        // 覆盖层只存指针，比对上游需要快照正文；损坏时按原厂比对。
+        const ref = state.builtinSchemeOverrides[meta.id]
+        const stored = ref ? state.schemeSnapshots[String(ref.snapshotId)] : undefined
+        const result = await checkUpstreamUpdate(meta, stored)
         if (!result.updateAvailable) return
         const changed = result.changedFiles.length
           ? `：${result.changedFiles.slice(0, 3).map((path) => path.split('/').pop()).join('、')}${

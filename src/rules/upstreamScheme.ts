@@ -7,7 +7,7 @@
 //   记录，确保 14 个文件来自同一个 commit，不会拼成混合版本。
 // - 复用服务端 /api/fetch 的 SSRF 防护（协议白名单、云元数据拦截、大小与超时上限）。
 
-import type { BuiltinSchemeOverride, BuiltinSchemeSource, LocalRuleSet, RoutingRule, RuleScheme } from '../models/types'
+import type { BuiltinSchemeSnapshotContent, BuiltinSchemeSource, LocalRuleSet, RoutingRule, RuleScheme } from '../models/types'
 import { apiFetch } from '../util/apiAuth'
 import {
   parseInlineRule,
@@ -69,7 +69,7 @@ export interface UpstreamSchemeResult {
   /** 分支用的自定义副本：新 id、名字带「上游 日期」。 */
   scheme: RuleScheme
   /** 固化用的覆盖层：保持内置 id / 原名，写入后同一条内置方案直接生效。 */
-  override: BuiltinSchemeOverride
+  override: BuiltinSchemeSnapshotContent
   /** 拉取成功的列表快照。 */
   ruleSets: LocalRuleSet[]
   sources: UpstreamSchemeSource[]
@@ -338,6 +338,7 @@ export async function fetchUpstreamScheme(
     ruleSets.push({
       id: `upstream-${source.url.replace(/[^a-z0-9]+/gi, '-').slice(-48)}`,
       name: ruleSetName(source.url),
+      group: source.group,
       rules: source.rules,
       updatedAt: now,
       sourceURL: source.url,
@@ -374,7 +375,7 @@ export async function fetchUpstreamScheme(
   }
   // 固化记录保留内置 id / 原名：更新完成后还是同一条「ACL4SSR 在线版」，
   // 刷新页面 / 换设备 / 重启容器都由工作区里的这份覆盖层决定。
-  const override: BuiltinSchemeOverride = {
+  const override: BuiltinSchemeSnapshotContent = {
     scheme: {
       ...scheme,
       id: meta.id,
@@ -410,7 +411,7 @@ export interface CheckUpstreamOptions {
  */
 export async function checkUpstreamUpdate(
   _meta: SchemeMeta,
-  stored?: BuiltinSchemeOverride,
+  stored?: { source: BuiltinSchemeSource },
   options: CheckUpstreamOptions = {},
 ): Promise<UpstreamUpdateCheck> {
   const previous = stored?.source

@@ -1,6 +1,6 @@
 // 规则诊断：围绕「这条流量为什么走这里 · 有什么变化 · 导出会不会丢语义」的一条链路。
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { LocalRuleSet, ProxyNode, RuleScheme } from '../models/types'
+import type { LocalRuleSet, ProxyNode, RuleScheme, RuleSetExclusionTable } from '../models/types'
 import { compileScheme, explainWith, type ExplainedStep, type ExplainResult } from '../rules/ruleExplain'
 import { lintScheme, lintSummary, type LintLevel, type SchemeLintIssue } from '../rules/schemeLint'
 import {
@@ -14,6 +14,7 @@ import {
 } from '../rules/diagnosis'
 import { readRuleSetHistory, type RuleSetHistory } from '../rules/ruleSetHistory'
 import { analyzeDuplicateCleanup, type DuplicateCleanupPlan } from '../rules/duplicateCleanup'
+import { listSchemeExclusions } from '../rules/ruleSetExclusions'
 import { useWorkspaceStatus } from '../workspaceSync'
 import { READONLY_NOTE } from '../util/readOnlyUi'
 import { groupDisplayName } from './GroupIcon'
@@ -67,10 +68,14 @@ interface DiagnosisPanelProps {
   policySelections: Record<string, string>
   latencyByNodeId: Record<string, number | null>
   localRuleSets: LocalRuleSet[]
+  /** 只读规则集的本地屏蔽表；命中解释与检查必须和导出使用同一份。 */
+  ruleSetExclusions: RuleSetExclusionTable
   preferRuleSets: boolean
   showGroupEmoji: boolean
   versionHistoryEnabled: boolean
   historyRevision?: number
+  /** 当前方案是内置只读方案；删除前必须先说明会创建副本。 */
+  requiresCopy: boolean
   onLocate: (issue: SchemeLintIssue) => void
   /** 由 App 负责把修改落到自定义方案；返回是否成功。 */
   onApplyFix: (action: FixAction) => FixOutcome
@@ -80,6 +85,14 @@ interface DiagnosisPanelProps {
   onUndoCleanup: () => FixOutcome
   /** 当前会话是否存在可撤销的清理快照。 */
   canUndoCleanup: boolean
+  /** 本次自动复制出的方案能否撤销。 */
+  canUndoCopy: boolean
+  onUndoCopy: () => FixOutcome
+  copySourceName?: string
+  /** 屏蔽 / 解除屏蔽是否可撤销。 */
+  canUndoExclusion: boolean
+  onUnblockRule: (ruleSetID: string, signature: string, label: string) => FixOutcome
+  onUndoExclusion: () => FixOutcome
   onGo: (key: 'sub' | 'rules' | 'export') => void
 }
 
@@ -89,15 +102,23 @@ export function DiagnosisPanel({
   policySelections,
   latencyByNodeId,
   localRuleSets,
+  ruleSetExclusions,
   preferRuleSets,
   showGroupEmoji,
   versionHistoryEnabled,
   historyRevision = 0,
+  requiresCopy,
   onLocate,
   onApplyFix,
   onCleanDuplicates,
   onUndoCleanup,
   canUndoCleanup,
+  canUndoCopy,
+  onUndoCopy,
+  copySourceName,
+  canUndoExclusion,
+  onUnblockRule,
+  onUndoExclusion,
   onGo,
 }: DiagnosisPanelProps) {
   const [input, setInput] = useState('www.google.com')
@@ -106,19 +127,23 @@ export function DiagnosisPanel({
   const [baselineQuery, setBaselineQuery] = useState('')
   const [showAllChain, setShowAllChain] = useState(false)
   const [fixNote, setFixNote] = useState('')
-  const [lastFix, setLastFix] = useState<{ code: string; ruleText?: string } | null>(null)
+  const [lastFix, setLastFix] = useState<{ code: string; kind?: string; ruleText?: string } | null>(null)
+  const [pendingCopy, setPendingCopy] = useState<{ issue: SchemeLintIssue; action: FixAction } | null>(null)
+  const [copyDialogNote, setCopyDialogNote] = useState('')
+  const [exclusionNote, setExclusionNote] = useState('')
   const [cleanupOpen, setCleanupOpen] = useState(false)
   const [cleanupNote, setCleanupNote] = useState('')
   const cleanupBusy = useRef(false)
+  const copyDialog = useRef<HTMLDialogElement>(null)
   const [error, setError] = useState('')
   const cleanupDialog = useRef<HTMLDialogElement>(null)
   const readOnly = useWorkspaceStatus().readOnly
 
   const compiled = useMemo(
     () => (scheme
-      ? compileScheme({ scheme, nodes, policySelections, latencyByNodeId, localRuleSets })
+      ? compileScheme({ scheme, nodes, policySelections, latencyByNodeId, localRuleSets, ruleSetExclusions })
       : null),
-    [scheme, nodes, policySelections, latencyByNodeId, localRuleSets],
+    [scheme, nodes, policySelections, latencyByNodeId, localRuleSets, ruleSetExclusions],
   )
 
   const result = useMemo(() => {
@@ -129,9 +154,9 @@ export function DiagnosisPanel({
   // 诊断数据只在用户真正查询后才计算，避免首屏就把 5000 条规则的全部检查跑一遍。
   const lintState = useMemo(() => {
     if (!scheme || !result) return { issues: [] as SchemeLintIssue[], summary: { error: 0, warn: 0, info: 0, total: 0 } }
-    const issues = lintScheme({ scheme, nodes, policySelections, localRuleSets, preferRuleSets })
+    const issues = lintScheme({ scheme, nodes, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions })
     return { issues, summary: lintSummary(issues) }
-  }, [scheme, result, nodes, policySelections, localRuleSets, preferRuleSets])
+  }, [scheme, result, nodes, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions])
 
   const history = useMemo<RuleSetHistory>(
     () => (versionHistoryEnabled ? readRuleSetHistory() : {}),
@@ -154,6 +179,10 @@ export function DiagnosisPanel({
     () => (scheme && result ? analyzeDuplicateCleanup(scheme) : null),
     [scheme, result],
   )
+  const exclusionItems = useMemo(
+    () => (scheme ? listSchemeExclusions(scheme, ruleSetExclusions) : []),
+    [scheme, ruleSetExclusions],
+  )
   const noiseItems = ranked.filter((item) => NOISE_CODES.has(item.issue.code))
   // error / warn 以及其它可操作提示优先展示；重复/遮蔽单独折叠。
   const signalRelevant = relevant.filter((item) => !NOISE_CODES.has(item.issue.code))
@@ -167,6 +196,11 @@ export function DiagnosisPanel({
     if (cleanupOpen) cleanupDialog.current?.showModal()
     else cleanupDialog.current?.close()
   }, [cleanupOpen])
+
+  useEffect(() => {
+    if (pendingCopy) copyDialog.current?.showModal()
+    else copyDialog.current?.close()
+  }, [pendingCopy])
 
   const run = () => {
     const value = input.trim()
@@ -194,7 +228,7 @@ export function DiagnosisPanel({
     window.setTimeout(() => setSubmitted(input.trim()), 0)
   }
 
-  const performFix = (issue: SchemeLintIssue, action: FixAction) => {
+  const applyAndTrack = (issue: SchemeLintIssue, action: FixAction) => {
     if (!result) return
     const outcome = onApplyFix(action)
     if (!outcome.ok) {
@@ -203,8 +237,43 @@ export function DiagnosisPanel({
     }
     setBaseline(result)
     setBaselineQuery(submitted)
-    setLastFix({ code: issue.code, ruleText: issue.location.rule })
+    setLastFix({ code: issue.code, kind: action.kind, ruleText: issue.location.rule })
     setFixNote(outcome.message)
+  }
+
+  const performFix = (issue: SchemeLintIssue, action: FixAction) => {
+    if (!result) return
+    // 内置方案不能直接改：先显式说明会创建副本，再执行。
+    if (action.kind === 'delete-rule' && requiresCopy) {
+      setCopyDialogNote('')
+      setPendingCopy({ issue, action })
+      return
+    }
+    applyAndTrack(issue, action)
+  }
+
+  const confirmCopyFix = () => {
+    if (!pendingCopy) return
+    const { issue, action } = pendingCopy
+    setPendingCopy(null)
+    setCopyDialogNote('')
+    applyAndTrack(issue, action)
+  }
+
+  const unblock = (ruleSetID: string, signature: string, label: string) => {
+    const outcome = onUnblockRule(ruleSetID, signature, label)
+    setExclusionNote(outcome.message)
+    if (outcome.ok && result) {
+      setBaseline(result)
+      setBaselineQuery(submitted)
+      setLastFix(null)
+      setFixNote('')
+    }
+  }
+
+  const undoExclusion = () => {
+    const outcome = onUndoExclusion()
+    setExclusionNote(outcome.message)
   }
 
   const confirmCleanup = () => {
@@ -228,6 +297,16 @@ export function DiagnosisPanel({
   const undoCleanup = () => {
     const outcome = onUndoCleanup()
     setCleanupNote(outcome.message)
+  }
+
+  const undoCopy = () => {
+    const outcome = onUndoCopy()
+    setCleanupNote(outcome.message)
+    if (outcome.ok) {
+      setBaseline(null)
+      setLastFix(null)
+      setFixNote('')
+    }
   }
 
   const stillPresent = lastFix
@@ -448,14 +527,18 @@ export function DiagnosisPanel({
                     {cleanup.deletions.length > 0 && ` · 涉及 ${cleanup.groups} 个策略组`}
                   </span>
                   <div className="diag-cleanup-skip">
-                    {cleanup.skipped.readOnly.length > 0 && (
-                      <span>只读来源 {cleanup.skipped.readOnly.length} 条（无法删除）</span>
-                    )}
-                    {cleanup.skipped.crossGroup.length > 0 && (
-                      <span>跨组遮蔽 {cleanup.skipped.crossGroup.length} 条（需你决定）</span>
+                    {cleanup.sameGroupCount > 0 && <span>同组重复 {cleanup.sameGroupCount} 条</span>}
+                    {cleanup.crossGroupCount > 0 && (
+                      <span>
+                        跨组重复 {cleanup.crossGroupCount} 条（保留 {cleanup.keptGroups} 组 / 删除{' '}
+                        {cleanup.droppedGroups} 组）
+                      </span>
                     )}
                     {cleanup.skipped.deadPredecessor.length > 0 && (
-                      <span>前置规则已失效 {cleanup.skipped.deadPredecessor.length} 条</span>
+                      <span>前置规则失效 {cleanup.skipped.deadPredecessor.length} 条需你决定</span>
+                    )}
+                    {cleanup.skipped.readOnly.length > 0 && (
+                      <span>只读来源 {cleanup.skipped.readOnly.length} 条跳过</span>
                     )}
                   </div>
                   {cleanupNote && <div className="diag-hint">{cleanupNote}</div>}
@@ -464,13 +547,13 @@ export function DiagnosisPanel({
                   <button
                     className="btn primary"
                     disabled={readOnly || cleanup.deletions.length === 0}
-                    title={readOnly ? READONLY_NOTE : '确认后一次性删除同组纯冗余规则'}
+                    title={readOnly ? READONLY_NOTE : '确认后一次性删除同组与跨组的冗余规则'}
                     onClick={() => setCleanupOpen(true)}
                   >
                     一键清理重复规则
                   </button>
                   {canUndoCleanup && (
-                    <button className="btn ghost" disabled={readOnly} onClick={undoCleanup}>撤销本次清理</button>
+                    <button className="btn ghost" disabled={readOnly} onClick={undoCleanup}>撤销上次删除</button>
                   )}
                 </div>
               </div>
@@ -480,11 +563,76 @@ export function DiagnosisPanel({
               // 否则「删完才发现删错」时用户根本点不到撤销。
               <div className="diag-cleanup">
                 <div className="diag-cleanup-copy">
-                  <strong>最近一次清理</strong>
-                  <span className="diag-cleanup-count">重复规则已删除并保存；撤销只恢复被清理的条目，不会回退清理之后的其它修改。</span>
+                  <strong>最近一次删除</strong>
+                  <span className="diag-cleanup-count">重复规则已删除并保存；撤销只恢复被删的条目，不会回退删除之后的其它修改。</span>
                 </div>
                 <div className="diag-cleanup-actions">
-                  <button className="btn ghost" disabled={readOnly} onClick={undoCleanup}>撤销本次清理</button>
+                  <button className="btn ghost" disabled={readOnly} onClick={undoCleanup}>撤销上次删除</button>
+                </div>
+              </div>
+            )}
+            {canUndoCopy && (
+              <div className="diag-cleanup">
+                <div className="diag-cleanup-copy">
+                  <strong>本次修改自动创建了副本</strong>
+                  <span className="diag-cleanup-count">
+                    原内置方案 {copySourceName ?? ''} 未被改动。撤销复制会删除这份副本并切回原方案；
+                    副本里之后的其它修改也会一并丢弃。
+                  </span>
+                </div>
+                <div className="diag-cleanup-actions">
+                  <button className="btn ghost" disabled={readOnly} onClick={undoCopy}>
+                    撤销本次复制，回到「{copySourceName ?? '原方案'}」
+                  </button>
+                </div>
+              </div>
+            )}
+            {(exclusionItems.length > 0 || canUndoExclusion) && (
+              <div className="diag-cleanup">
+                <div className="diag-cleanup-copy">
+                  <strong>{exclusionItems.length > 0 ? `已屏蔽 ${exclusionItems.length} 条只读规则` : '当前没有已屏蔽条目'}</strong>
+                  {exclusionItems.length > 0 && (
+                    <span className="diag-cleanup-count">
+                      这些条目来自在线 / 内置只读规则集，刷新来源后会重新出现，所以用「屏蔽」而不是删除。
+                      屏蔽会改变去向；解除后重新参与编译与导出。
+                    </span>
+                  )}
+                  {exclusionItems.length > 0 && (
+                    <details className="diag-noise">
+                      <summary>查看已屏蔽条目</summary>
+                      <ul className="diag-issues">
+                        {exclusionItems.map((item) => (
+                          <li key={`${item.setId}:${item.signature}`} className="diag-issue">
+                            <div className="diag-issue-head">
+                              <span className="diag-issue-level info">已屏蔽</span>
+                              <code className="diag-issue-title mono">{item.text}</code>
+                            </div>
+                            <div className="diag-issue-detail">
+                               来源：{item.setName} · {item.group}
+                              {!item.present && '（当前快照里已不存在，刷新后会重新匹配）'}
+                            </div>
+                            <div className="diag-actions">
+                              <button
+                                className="btn ghost"
+                                disabled={readOnly}
+                                onClick={() => unblock(item.setId, item.signature, item.text)}
+                              >
+                                解除屏蔽
+                              </button>
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
+                    </details>
+                  )}
+                  {exclusionNote && <div className="diag-hint">{exclusionNote}</div>}
+                </div>
+                <div className="diag-cleanup-actions">
+                  {canUndoExclusion && (
+                    <button className="btn ghost" disabled={readOnly} onClick={undoExclusion}>
+                      撤销上次屏蔽 / 解除
+                    </button>
+                  )}
                 </div>
               </div>
             )}
@@ -573,14 +721,19 @@ export function DiagnosisPanel({
                 <div className={`diag-verify-note${stillPresent ? ' is-warn' : ''}`}>
                   {stillPresent
                     ? '同类检查项仍然存在：可能还有第二条相同问题，或修复没有落到当前方案。'
-                    : baseline.final.group === result.final.group && baseline.final.node === result.final.node
-                      ? `匹配结果没有变化：仍然走「${result.final.group ? groupDisplayName(result.final.group, showGroupEmoji) : '—'}」${result.final.node ? ` · ${result.final.node}` : ''}。${
-                        baseline.match && result.match && baseline.match.index !== result.match.index
-                          ? '规则序号的变化来自规则集插入位置调整，不是分流改变。'
-                          : '删除的是不影响判定的规则，符合预期。'
-                      }`
-                      : `命中结果已改变：现在走「${result.final.group ? groupDisplayName(result.final.group, showGroupEmoji) : '—'}」。如果这不是预期，请撤销或重新检查规则顺序。`}
+                    : lastFix?.kind === 'block-rule'
+                      ? baseline.final.group === result.final.group && baseline.final.node === result.final.node
+                        ? `这次屏蔽没有改变命中：仍然走「${result.final.group ? groupDisplayName(result.final.group, showGroupEmoji) : '—'}」${result.final.node ? ` · ${result.final.node}` : ''}。屏蔽会过滤掉该规则集里所有同签名条目，所以这个域名仍由更宽的规则（或方案里内联的规则）命中。`
+                        : `屏蔽已改变去向：原本 ${baseline.final.group ? groupDisplayName(baseline.final.group, showGroupEmoji) : '无命中'} → 现在 ${result.final.group ? groupDisplayName(result.final.group, showGroupEmoji) : '无命中'}。如果这不是预期，请解除屏蔽。`
+                      : baseline.final.group === result.final.group && baseline.final.node === result.final.node
+                        ? `匹配结果没有变化：仍然走「${result.final.group ? groupDisplayName(result.final.group, showGroupEmoji) : '—'}」${result.final.node ? ` · ${result.final.node}` : ''}。${
+                          baseline.match && result.match && baseline.match.index !== result.match.index
+                            ? '规则序号的变化来自规则集插入位置调整，不是分流改变。'
+                            : '删除的是不影响判定的规则，符合预期。'
+                        }`
+                        : `命中结果已改变：现在走「${result.final.group ? groupDisplayName(result.final.group, showGroupEmoji) : '—'}」。如果这不是预期，请撤销或重新检查规则顺序。`}
                 </div>
+                {fixNote && lastFix?.kind === 'block-rule' && <div className="diag-fix-note">{fixNote}</div>}
                 <div className="diag-actions">
                   <button className="btn ghost" onClick={rerun}>重新运行同一条查询</button>
                   <button className="btn ghost" onClick={() => onGo('export')}>去导出页确认客户端行为</button>
@@ -604,6 +757,29 @@ export function DiagnosisPanel({
         </div>
       )}
 
+      {pendingCopy && (
+        <dialog
+          ref={copyDialog}
+          className="diag-cleanup-dialog"
+          onClose={() => { setPendingCopy(null); setCopyDialogNote('') }}
+          aria-labelledby="diag-copy-title"
+        >
+          <h3 id="diag-copy-title">创建副本并删除？</h3>
+          <p>
+            「{scheme.name}」是内置方案，不能直接修改。将创建副本「{scheme.name} · 自定义」并切换过去；
+            这次删除只作用于副本，原内置方案不变。
+          </p>
+          <p>
+            删除后可以「撤销本次删除」只恢复这一条，也可以「撤销本次复制」删除副本并回到原方案。
+          </p>
+          {copyDialogNote && <div className="diag-hint">{copyDialogNote}</div>}
+          <div className="actions">
+            <button className="btn primary" disabled={readOnly} onClick={confirmCopyFix}>创建副本并删除</button>
+            <button className="btn ghost" autoFocus onClick={() => setPendingCopy(null)}>取消</button>
+          </div>
+        </dialog>
+      )}
+
       {cleanup && (
         <dialog
           ref={cleanupDialog}
@@ -613,39 +789,70 @@ export function DiagnosisPanel({
         >
           <h3 id="diag-cleanup-title">清理重复规则</h3>
           <p>
-            将删除 <strong>{cleanup.deletions.length}</strong> 条规则，涉及{' '}
-            <strong>{cleanup.groups}</strong> 个策略组。
+            将删除 <strong>{cleanup.deletions.length}</strong> 条规则（同组 {cleanup.sameGroupCount} 条 /
+            跨组 {cleanup.crossGroupCount} 条），涉及 <strong>{cleanup.groups}</strong> 个策略组。
           </p>
+          {requiresCopy && (
+            <p>
+              当前是内置方案，清理前会先创建副本并切换过去；原内置方案不变，之后可撤销本次复制。
+            </p>
+          )}
           <div className="diag-cleanup-skip is-dialog">
             {cleanup.skipped.readOnly.length > 0 && (
-              <span>只读来源 {cleanup.skipped.readOnly.length} 条：位于在线 / 内置规则集，无法删除</span>
-            )}
-            {cleanup.skipped.crossGroup.length > 0 && (
-              <span>跨组遮蔽 {cleanup.skipped.crossGroup.length} 条：删除会改变路由，未自动删除</span>
+              <span>只读来源 {cleanup.skipped.readOnly.length} 条跳过：后一条位于在线 / 内置规则集，或前一条只存在于只读规则集</span>
             )}
             {cleanup.skipped.deadPredecessor.length > 0 && (
-              <span>前置规则已失效 {cleanup.skipped.deadPredecessor.length} 条：前一条本身不会命中，不据此删除</span>
+              <span>前置规则失效 {cleanup.skipped.deadPredecessor.length} 条需你决定：前一条本身不会命中，不能据此删除后一条</span>
             )}
           </div>
-          {cleanup.skipped.crossGroup.length > 0 && (
+          {cleanup.crossGroupCount > 0 && (
             <div className="diag-cleanup-cross">
-              <strong>需你决定：跨组遮蔽 {cleanup.skipped.crossGroup.length} 条</strong>
-              <p>下面这些后一条规则与前面的规则等价，但策略组不同；自动删除会静默丢掉后一条的分流意图。</p>
+              <strong>
+                跨组明细：保留 {cleanup.keptGroups} 组 → 删除 {cleanup.droppedGroups} 组
+              </strong>
               <ul>
-                {cleanup.skipped.crossGroup.slice(0, 6).map((item) => (
-                  <li key={`${item.index}-${item.ruleText}`}>
-                    第 {item.index} 条 <span className="mono">{item.ruleText}</span>
-                    <span className="diag-meta">「{item.firstGroup}」→「{item.group}」</span>
+                {cleanup.crossPairs.slice(0, 8).map((pair) => (
+                  <li key={`${pair.keepGroup}-${pair.dropGroup}`}>
+                    保留「{pair.keepGroup}」→ 从「{pair.dropGroup}」删除 {pair.count} 条
                   </li>
                 ))}
               </ul>
-              {cleanup.skipped.crossGroup.length > 6 && (
-                <div className="diag-meta">还有 {cleanup.skipped.crossGroup.length - 6} 条，请到规则页单独处理。</div>
+              {cleanup.crossPairs.length > 8 && (
+                <div className="diag-meta">还有 {cleanup.crossPairs.length - 8} 组配对，可在下方展开查看。</div>
               )}
+              <div className="diag-meta">前 6 例：</div>
+              <ul>
+                {cleanup.deletions
+                  .filter((item) => item.kind === 'crossGroup')
+                  .slice(0, 6)
+                  .map((item, positionIndex) => (
+                    <li key={`sample-${positionIndex}-${item.duplicateOfIndex}`}>
+                      <span className="mono">{item.ruleText}</span>
+                      <span className="diag-meta">
+                        保留「{item.duplicateOfGroup}」，从「{item.group}」删除
+                      </span>
+                    </li>
+                  ))}
+              </ul>
+              <details>
+                <summary>展开全部 {cleanup.crossGroupCount} 条跨组删除</summary>
+                <ul>
+                  {cleanup.deletions
+                    .filter((item) => item.kind === 'crossGroup')
+                    .map((item, positionIndex) => (
+                      <li key={`all-${positionIndex}-${item.duplicateOfIndex}`}>
+                        <span className="mono">{item.ruleText}</span>
+                        <span className="diag-meta">
+                          保留「{item.duplicateOfGroup}」，从「{item.group}」删除
+                        </span>
+                      </li>
+                    ))}
+                </ul>
+              </details>
             </div>
           )}
           <p className="diag-hint">
-            只删除「类型与归一化值相同、选项相同、同组、且前一条确实可达」的后一条规则。
+            只删除「类型与归一化值相同、选项相同、前一条可写且确实可达」的后一条规则；同组与跨组都适用。
             撤销会把它们按原位插回，不会影响你之后做的其它编辑。
           </p>
           <div className="actions">
@@ -743,8 +950,8 @@ function IssueCard({
           )
         })}
       </div>
-      {actions.filter((action) => action.kind === 'manual').map((action) => (
-        <div key={`${action.label}-detail`} className="diag-manual-detail">{action.detail}</div>
+      {actions.filter((action) => action.kind === 'manual' || action.kind === 'block-rule' || action.kind === 'delete-rule').map((action) => (
+        <div key={`${action.kind}-${action.label}-detail`} className="diag-manual-detail">{action.detail}</div>
       ))}
     </li>
   )

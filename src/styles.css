@@ -1051,6 +1051,39 @@ dialog.confirm { width: min(420px, 92vw); }
 .candidate-chip button:hover { background: var(--active); color: var(--text); }
 .candidate-add { gap: 6px; flex-wrap: wrap; }
 .candidate-add .input { flex: 1; min-width: 140px; }
+/* 新建 / 编辑策略组的候选选择区：策略组、内置策略、节点三块。 */
+.candidate-picker { display: grid; gap: 2px; }
+.candidate-section { margin-top: 8px; }
+.candidate-section-title {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.candidate-pick {
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: var(--raised);
+  color: var(--muted);
+  font-size: 12px;
+}
+.candidate-pick:hover { color: var(--text); }
+.candidate-pick.is-on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+.candidate-order {
+  min-width: 18px;
+  height: 18px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--active);
+  color: var(--muted);
+  font-size: 10px;
+}
 .group-auto-fields { display: grid; grid-template-columns: 1.4fr 0.8fr 0.8fr; gap: 10px; }
 .hint.is-error { color: var(--negative); }
 .rs-section { border-top: 1px solid var(--rule); padding-top: 14px; margin-top: 14px; }
@@ -2747,6 +2780,23 @@ pre.preview {
 .scheme-details { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--rule); }
 .scheme-details summary { font-size: 11.5px; color: var(--muted); cursor: pointer; }
 .scheme-details .scheme-source, .scheme-details .hint { margin-top: 7px; font-size: 11.5px; color: var(--faint); }
+.scheme-snapshot-warning { color: var(--negative); }
+.scheme-snapshot-history { margin-top: 7px; }
+.scheme-snapshot-history ul { display: grid; gap: 4px; margin: 6px 0 0; padding: 0; list-style: none; }
+.scheme-snapshot-history li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  font-size: 11.5px;
+  color: var(--faint);
+}
+.scheme-snapshot-history li.snapshot-current { border-color: var(--accent); color: var(--text); }
+.scheme-snapshot-history .snapshot-label { display: flex; flex-wrap: wrap; gap: 2px 6px; }
+.scheme-snapshot-history .btn { height: 26px; padding: 0 8px; font-size: 11px; }
 .custom-scheme-chips { gap: 4px; margin-top: 10px; }
 .custom-scheme-chips .btn { height: 28px; padding: 0 8px; font-size: 11.5px; }
 .group-list {

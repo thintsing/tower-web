@@ -3,10 +3,12 @@ import type {
   LocalRuleSet,
   ProxyNode,
   RuleScheme,
+  RuleSetExclusionTable,
   RoutingRule,
   SchemeRuleSet,
 } from '../models/types'
 import { prepareSchemeForExport, resolveGroups, uniqueDisplayNames } from '../generator/groups'
+import { filterExcludedRuleSets } from './ruleSetExclusions'
 import { evaluateRule, parseQuery } from './ruleMatcher'
 import type { QueryTarget, RuleEvaluation, RuleStepStatus } from './ruleMatcher'
 
@@ -60,6 +62,8 @@ export interface CompileExplainOptions {
   policySelections?: Record<string, string>
   latencyByNodeId?: Record<string, number | null>
   localRuleSets?: LocalRuleSet[]
+  /** 只读规则集的本地屏蔽表；命中解释与导出必须用同一份。 */
+  ruleSetExclusions?: RuleSetExclusionTable
 }
 
 export interface CompiledScheme {
@@ -84,7 +88,11 @@ function ruleKey(rule: Pick<RoutingRule, 'type' | 'value' | 'group' | 'raw'>): s
 /** 把方案按导出顺序展开一次，供批量查询复用。 */
 export function compileScheme(options: CompileExplainOptions): CompiledScheme {
   const policySelections = options.policySelections ?? {}
-  const prepared = prepareSchemeForExport(options.scheme, policySelections, { preferRuleSets: false })
+  const scheme = filterExcludedRuleSets(options.scheme, options.ruleSetExclusions)
+  const prepared = prepareSchemeForExport(scheme, policySelections, {
+    preferRuleSets: false,
+    ruleSetExclusions: options.ruleSetExclusions,
+  })
   const displayNameByNodeID = uniqueDisplayNames(options.nodes, (value) => value)
   const nodeByDisplayName = new Map<string, ProxyNode>()
   for (const node of options.nodes) {
@@ -95,10 +103,10 @@ export function compileScheme(options: CompileExplainOptions): CompiledScheme {
   const resolvedMembers = new Map(resolved.map((item) => [item.group.name, item.members]))
 
   const origins = new Map<string, RuleOrigin>()
-  for (const rule of options.scheme.rules) {
+  for (const rule of scheme.rules) {
     origins.set(ruleKey(rule), { source: '方案内置规则', kind: 'scheme', group: rule.group })
   }
-  for (const set of options.scheme.ruleSets ?? []) {
+  for (const set of scheme.ruleSets ?? []) {
     for (const rule of set.rules) {
       origins.set(ruleKey({ ...rule, group: set.group }), {
         source: set.name,
@@ -108,7 +116,7 @@ export function compileScheme(options: CompileExplainOptions): CompiledScheme {
       })
     }
   }
-  for (const rule of options.scheme.customRules ?? []) {
+  for (const rule of scheme.customRules ?? []) {
     origins.set(ruleKey(rule), { source: '自定义规则', kind: 'custom', group: rule.group })
   }
 
@@ -123,12 +131,12 @@ export function compileScheme(options: CompileExplainOptions): CompiledScheme {
   const isPaused = (set: SchemeRuleSet): boolean =>
     pausedSetNames.has(set.name) || (set.sourceRef ? pausedSetNames.has(set.sourceRef) : false)
   const notes: string[] = []
-  for (const set of options.scheme.ruleSets ?? []) {
-    if (set.rules.length === 0) notes.push(`规则集「${set.name}」是空的（0 条规则），不会参与匹配。`)
+  for (const set of scheme.ruleSets ?? []) {
+    if (set.rules.length === 0) notes.push(`规则集「${set.name}」当前没有生效规则，不会参与匹配。`)
     if (isPaused(set)) notes.push(`规则集「${set.name}」的来源订阅已暂停自动刷新，当前仍使用已加入方案的快照。`)
   }
-  const declaredGroups = new Set(options.scheme.groups.map((group) => group.name))
-  for (const set of options.scheme.ruleSets ?? []) {
+  const declaredGroups = new Set(scheme.groups.map((group) => group.name))
+  for (const set of scheme.ruleSets ?? []) {
     if (!declaredGroups.has(set.group)) notes.push(`规则集「${set.name}」指向的策略组「${set.group}」不存在。`)
   }
 
@@ -140,7 +148,7 @@ export function compileScheme(options: CompileExplainOptions): CompiledScheme {
     resolvedMembers,
     groupsByName: new Map(prepared.groups.map((group) => [group.name, { name: group.name, type: group.type }])),
     origins,
-    ruleSets: options.scheme.ruleSets ?? [],
+    ruleSets: scheme.ruleSets ?? [],
     pausedSetNames,
     notes,
     latencyByNodeId: options.latencyByNodeId ?? {},

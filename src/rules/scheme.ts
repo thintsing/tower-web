@@ -2,7 +2,8 @@
 //   ruleset=组名,https://…/Clash/Ruleset/X.list   (or []GEOIP,CN / []FINAL)
 //   custom_proxy_group=组名`类型`[]引用`正则`url`interval`,tolerance
 // Bundled rule lists are inlined into per-group rules at load time.
-import type { BuiltinSchemeOverride, PolicyGroup, PolicyGroupType, RoutingRule, RuleScheme, RuleSchemeFormat, RuleSchemeSource, RuleSetFormat } from '../models/types'
+import type { BuiltinSchemeOverrideRef, BuiltinSchemeSnapshot, PolicyGroup, PolicyGroupType, RoutingRule, RuleScheme, RuleSchemeFormat, RuleSchemeSource, RuleSetFormat } from '../models/types'
+import { resolveBuiltinSchemeSnapshot, attachSnapshotRuleSets } from './schemeSnapshots'
 import { apiFetch } from '../util/apiAuth'
 import { ALL_RULE_TYPES } from './capabilities'
 
@@ -86,33 +87,21 @@ function localFileForURL(url: string, index: Record<string, string>): string | u
   return index[path]
 }
 
-/**
- * 覆盖层结构校验：缺字段 / 类型不对都按「损坏」处理，交给原厂快照兜底。
- * 只做加载需要的字段，不影响导出随后的校验。
- */
-export function isBuiltinSchemeOverrideValid(value: unknown): value is BuiltinSchemeOverride {
-  if (!value || typeof value !== 'object') return false
-  const override = value as Partial<BuiltinSchemeOverride>
-  const scheme = override.scheme
-  if (!scheme || typeof scheme !== 'object') return false
-  if (!Array.isArray(scheme.groups) || !Array.isArray(scheme.rules)) return false
-  if (!Array.isArray(override.ruleSets)) return false
-  const source = override.source
-  return !!source
-    && typeof source === 'object'
-    && typeof source.iniURL === 'string'
-    && typeof source.commitSha === 'string'
-}
-
 export async function loadScheme(
   meta: SchemeMeta,
-  overrides?: Record<string, BuiltinSchemeOverride>,
+  overrides?: Record<string, BuiltinSchemeOverrideRef>,
+  snapshots?: Record<string, BuiltinSchemeSnapshot>,
 ): Promise<RuleScheme> {
-  // 覆盖层优先：固化后同一条内置条目直接读这份已内联的方案。
-  // 结构损坏 / 缺失时继续走下面的原厂快照，保证离线也能加载。
-  const override = overrides?.[meta.id]
-  if (isBuiltinSchemeOverrideValid(override)) {
-    return { ...override.scheme, id: meta.id, name: meta.name, description: meta.description }
+  // 覆盖层只存指针：解引用成功才用快照；缺失 / 损坏回落到上一版，再回落到原厂。
+  // 原厂 `public/rulesets/*.ini` 永不改动，保证离线也能加载。
+  const resolution = resolveBuiltinSchemeSnapshot(meta.id, overrides, snapshots)
+  if (resolution.snapshot) {
+    // 快照正文把列表规则内联在 scheme.rules 里；挂回只读规则集时用 inlined 标记，
+    // 保证编译期不重复插入同一批规则，同时让规则页 / 诊断可以逐条屏蔽。
+    return attachSnapshotRuleSets(
+      { ...resolution.snapshot.scheme, id: meta.id, name: meta.name, description: meta.description },
+      resolution.snapshot.ruleSets,
+    )
   }
   // 内置方案由 /rulesets 下的静态文件组成；切换 Tab、编辑自定义方案后回到
   // 导出页都会重新调用这里。缓存 Promise 后，第二次起不再重复发起 20+ 个

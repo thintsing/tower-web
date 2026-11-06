@@ -1,5 +1,5 @@
 // Export dispatch: pick the generator for a client target.
-import type { ClientInfo, ClientTarget, ExportContentMode, ProxyNode, RuleScheme } from '../models/types'
+import type { ClientInfo, ClientTarget, ExportContentMode, ProxyNode, RuleScheme, RuleSetExclusionTable } from '../models/types'
 import { subFormatFor, type SubFormat } from '../models/types'
 import { generateBase64Subscription } from './base64Sub'
 import { clashSkippedCount, generateClashYAML } from './clashYaml'
@@ -48,6 +48,8 @@ export interface SubscriptionFormats {
 export interface SubscriptionFormatOptions extends OutputOptions {
   policySelections?: Record<string, string>
   preferRuleSets?: boolean
+  /** 只读规则集的本地屏蔽表；发布出去的每个载体都要过滤。 */
+  ruleSetExclusions?: RuleSetExclusionTable
   /** 每个载体可以有自己的内容模式（完整配置 / 仅节点）。 */
   contentModeByFormat?: Partial<Record<SubFormat, ExportContentMode>>
 }
@@ -78,6 +80,7 @@ export function generateSubscriptionFormats(
       preferRuleSets: options.preferRuleSets,
       format,
       target: options.target ?? targetByFormat[format],
+      ruleSetExclusions: options.ruleSetExclusions,
     })
   // 通用载体没有 target；选一个有代表性的图标写法，避免发布出去的订阅丢图标。
   const iconTargetByFormat: Partial<Record<SubFormat, ClientTarget>> = {

@@ -6,6 +6,7 @@ import { compileScheme, explainWith, type ExplainResult, type ExplainedStep } fr
 import { lintScheme, lintSummary, type LintLevel, type SchemeLintIssue } from '../rules/schemeLint'
 import { diffRules, diffTotal, filterDiff, type DiffKind, type RuleDiffResult } from '../rules/ruleDiff'
 import { clearRuleSetHistory, readRuleSetHistory } from '../rules/ruleSetHistory'
+import { useStore } from '../store'
 import { groupDisplayName } from './GroupIcon'
 
 type ToolKey = 'explain' | 'lint' | 'diff'
@@ -65,12 +66,13 @@ function ExplainPanel({
   const [selected, setSelected] = useState(0)
   const [showAll, setShowAll] = useState(false)
   const [error, setError] = useState('')
+  const ruleSetExclusions = useStore((state) => state.ruleSetExclusions)
 
   const compiled = useMemo(
-    () => compileScheme({ scheme, nodes, policySelections, latencyByNodeId, localRuleSets }),
-    [scheme, nodes, policySelections, latencyByNodeId, localRuleSets],
+    () => compileScheme({ scheme, nodes, policySelections, latencyByNodeId, localRuleSets, ruleSetExclusions }),
+    [scheme, nodes, policySelections, latencyByNodeId, localRuleSets, ruleSetExclusions],
   )
-  const compiledKey = `${scheme.id}|${scheme.updatedAt ?? 0}|${nodes.length}|${localRuleSets.map((set) => `${set.id}:${set.paused ? 1 : 0}`).join(',')}`
+  const compiledKey = `${scheme.id}|${scheme.updatedAt ?? 0}|${nodes.length}|${localRuleSets.map((set) => `${set.id}:${set.paused ? 1 : 0}`).join(',')}|${JSON.stringify(ruleSetExclusions)}`
 
   useEffect(() => {
     setResults([])
@@ -257,10 +259,12 @@ function LintPanel({
   const [linting, setLinting] = useState(false)
   const [level, setLevel] = useState<LintLevel | 'all'>('all')
   const [error, setError] = useState('')
+  const ruleSetExclusions = useStore((state) => state.ruleSetExclusions)
 
   const schemeKey = `${scheme.id}|${scheme.updatedAt ?? 0}|${scheme.groups.length}|${scheme.rules.length}|${(scheme.ruleSets ?? []).length}`
   const nodeKey = nodes.map((node) => node.id).join(',')
   const ruleSetKey = localRuleSets.map((set) => `${set.id}:${set.rules.length}:${set.paused ? 1 : 0}`).join(',')
+  const exclusionKey = JSON.stringify(ruleSetExclusions)
 
   useEffect(() => {
     let cancelled = false
@@ -268,7 +272,7 @@ function LintPanel({
     setError('')
     const timer = window.setTimeout(() => {
       try {
-        const next = lintScheme({ scheme, nodes, policySelections, localRuleSets, preferRuleSets })
+        const next = lintScheme({ scheme, nodes, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions })
         if (!cancelled) setIssues(next)
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e))
@@ -277,7 +281,7 @@ function LintPanel({
       }
     }, 120)
     return () => { cancelled = true; window.clearTimeout(timer) }
-  }, [scheme, nodes, policySelections, preferRuleSets, localRuleSets, schemeKey, nodeKey, ruleSetKey])
+  }, [scheme, nodes, policySelections, preferRuleSets, localRuleSets, ruleSetExclusions, schemeKey, nodeKey, ruleSetKey, exclusionKey])
 
   const summary = lintSummary(issues)
   const visible = issues.filter((issue) => level === 'all' || issue.level === level).slice(0, 300)

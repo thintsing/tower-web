@@ -313,6 +313,8 @@ export interface RoutingRule {
   group: string
   /** 来源规则集名称，仅用于界面区分，不写入客户端配置。 */
   sourceName?: string
+  /** 来源规则集 id，仅用于诊断定位与屏蔽，不写入客户端配置。 */
+  sourceSetId?: string
   /** 这条 RULE-SET 原始资源使用的格式；导出其他客户端时据此决定能否直接引用。 */
   ruleSetFormat?: RuleSetFormat
   /** Clash MRS provider 的 behavior（domain / ipcidr）。 */
@@ -408,7 +410,18 @@ export interface SchemeRuleSet {
   ruleSetBehavior?: string
   /** 在线规则集最近一次抓取/解析时间。 */
   updatedAt?: number
+  /**
+   * 规则已经内联在 RuleScheme.rules 里（固化快照就是这种形态）。
+   * 这类规则集只用于展示与逐条屏蔽，不再作为独立块插入，避免同一批规则出现两份。
+   */
+  inlined?: boolean
 }
+
+/**
+ * 只读规则集的本地屏蔽表：规则集 id → 被屏蔽规则的 ruleSignature。
+ * 与规则集快照分离保存，刷新规则集后仍然生效。
+ */
+export type RuleSetExclusionTable = Record<string, string[]>
 
 /** 用户保存在本机的规则集，尚未指定策略组。 */
 export interface LocalRuleSet {
@@ -424,6 +437,8 @@ export interface LocalRuleSet {
   lastError?: string
   /** 暂停自动刷新；手动刷新和加入方案仍可用。 */
   paused?: boolean
+  /** 上游规则集对应的策略组；旧快照可能没有，加载时按规则反推。 */
+  group?: string
 }
 
 export interface RuleScheme {
@@ -469,15 +484,34 @@ export interface BuiltinSchemeSource {
   ruleSetCount: number
 }
 
-/**
- * 内置方案覆盖层：固化后的方案与列表快照。
- * 原厂 `public/rulesets/*.ini` 永不改动；删除这条记录即恢复兜底快照。
- */
-export interface BuiltinSchemeOverride {
+/** 每个内置方案保留的快照数（原厂 + 当前 + 上一版 = 3 版历史）。 */
+export const MAX_BUILTIN_SCHEME_SNAPSHOTS = 2
+
+/** 固化正文：方案 + 列表快照 + 上游标识。 */
+export interface BuiltinSchemeSnapshotContent {
   scheme: RuleScheme
   ruleSets: LocalRuleSet[]
   source: BuiltinSchemeSource
 }
+
+/**
+ * 独立快照：正文连同自增 id、归属方案和固化时间一起存。
+ * scheme 只保留 snapshotId 指针，解引用后才拿到这份正文。
+ */
+export interface BuiltinSchemeSnapshot extends BuiltinSchemeSnapshotContent {
+  /** 全局单调递增，避免淘汰后 id 复用导致指针指向错版。 */
+  id: number
+  schemeID: string
+  createdAt: number
+}
+
+/** 内置方案覆盖层：只存快照指针，正文在 schemeSnapshots 里。 */
+export interface BuiltinSchemeOverrideRef {
+  snapshotId: number
+}
+
+/** 0.3.3 及以前的单版内联结构，仅用于归一化迁移。 */
+export type LegacyBuiltinSchemeOverride = BuiltinSchemeSnapshotContent
 
 // ---------- Clients ----------
 

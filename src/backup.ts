@@ -2,7 +2,9 @@
 // 恢复前由界面再次确认；备份文件本身含订阅地址与节点凭据，不能公开分享。
 import { PROXY_KIND_TITLES } from './models/types'
 import type {
-  BuiltinSchemeOverride,
+  BuiltinSchemeOverrideRef,
+  BuiltinSchemeSnapshot,
+  BuiltinSchemeSnapshotContent,
   ClientTarget,
   ExportContentMode,
   LatencyTestMode,
@@ -13,12 +15,15 @@ import type {
   ProxyNode,
   RoutingRule,
   RuleScheme,
+  RuleSetExclusionTable,
   SchemeRuleSet,
   SubscriptionSource,
   SubscriptionUsage,
   TailnetConnection,
 } from './models/types'
 import { usageFieldsFrom } from './models/types'
+import { normalizeRuleSetExclusions } from './rules/ruleSetExclusions'
+import { isBuiltinSchemeSnapshotValid, pruneBuiltinSchemeSnapshots } from './rules/schemeSnapshots'
 
 export const BACKUP_APP = 'tower-web'
 export const BACKUP_VERSION = 1
@@ -31,8 +36,14 @@ export interface PersistedData {
   policySelections: Record<string, string>
   customSchemes: RuleScheme[]
   localRuleSets: LocalRuleSet[]
-  /** 内置方案覆盖层；缺失或损坏时按空处理，加载会回落到原厂快照。 */
-  builtinSchemeOverrides?: Record<string, BuiltinSchemeOverride>
+  /** 内置方案覆盖层指针；缺失或损坏时按空处理，加载会回落原厂 / 上一版快照。 */
+  builtinSchemeOverrides?: Record<string, BuiltinSchemeOverrideRef>
+  /** 独立固化快照；单条损坏只丢这一条。 */
+  schemeSnapshots?: Record<string, BuiltinSchemeSnapshot>
+  /** 快照 id 自增序列，避免淘汰后复用 id。 */
+  snapshotSeq?: number
+  /** 只读规则集的本地屏蔽表；坏掉一条只丢一条。 */
+  ruleSetExclusions?: RuleSetExclusionTable
   checkBuiltinSchemeUpdatesOnOpen?: boolean
   autoRefreshOnOpen: boolean
   autoRefreshRuleSetsOnOpen: boolean
@@ -212,12 +223,22 @@ function validScheme(value: unknown): value is RuleScheme {
       || (Array.isArray(value.ruleSets) && value.ruleSets.every(validRuleSet)))
 }
 
+/** LocalRuleSet 的规则没有 group（加入方案时才补），不能复用 validRule 的组名要求。 */
+function validLocalRule(value: unknown): boolean {
+  return isRecord(value)
+    && isString(value.type)
+    && (value.value === undefined || isString(value.value))
+    && (value.raw === undefined || isString(value.raw))
+    && (value.options === undefined || stringArray(value.options) !== undefined)
+    && (value.noResolve === undefined || typeof value.noResolve === 'boolean')
+}
+
 function validLocalRuleSet(value: unknown): value is LocalRuleSet {
   return isRecord(value)
     && isString(value.id)
     && isString(value.name)
     && Array.isArray(value.rules)
-    && value.rules.every(validRule)
+    && value.rules.every(validLocalRule)
 }
 
 function numberOr(value: unknown, fallback: number): number {
@@ -225,42 +246,122 @@ function numberOr(value: unknown, fallback: number): number {
 }
 
 /**
- * 内置方案覆盖层容错：单条记录损坏就丢弃，而不是让整个工作区 / 备份判定为损坏。
- * 丢弃后 `loadScheme` 会自动回落到原厂快照。
+ * 固化数据容错 + 迁移：
+ * - 新结构：`schemeSnapshots[id] = { id, schemeID, scheme, ruleSets, source, createdAt }`，
+ *   覆盖层只存 `{ snapshotId }`。
+ * - 旧结构（0.3.3 及以前）：覆盖层里内联 scheme + ruleSets，这里转成 1 号…N 号快照，
+ *   不因为升级丢固化内容；迁移失败的单条只丢这一条，不牵连整个工作区。
+ * - 指针指向缺失 / 损坏快照时，只丢指针，`loadScheme` 会回落上一版或原厂。
  */
-export function normalizeBuiltinSchemeOverrides(value: unknown): Record<string, BuiltinSchemeOverride> {
-  if (!isRecord(value)) return {}
-  const out: Record<string, BuiltinSchemeOverride> = {}
-  for (const [id, item] of Object.entries(value)) {
-    if (!isRecord(item) || !validScheme(item.scheme)) continue
-    if (!Array.isArray(item.ruleSets) || !item.ruleSets.every(validLocalRuleSet)) continue
-    const source = item.source
-    if (!isRecord(source) || !isString(source.iniURL)) continue
-    if (!isString(source.commitSha) || !/^[0-9a-f]{40}$/i.test(source.commitSha)) continue
-    const files = (Array.isArray(source.files) ? source.files : [])
-      .filter((file): file is Record<string, unknown> => isRecord(file)
-        && isString(file.path)
-        && isString(file.blobSha)
-        && /^[0-9a-f]{40}$/i.test(file.blobSha))
-      .map((file) => ({
-        path: file.path as string,
-        blobSha: file.blobSha as string,
-        ...(isString(file.etag) ? { etag: file.etag } : {}),
-      }))
-    out[id] = {
-      scheme: item.scheme,
-      ruleSets: item.ruleSets,
-      source: {
-        iniURL: source.iniURL,
-        commitSha: source.commitSha.toLowerCase(),
-        files,
-        fetchedAt: numberOr(source.fetchedAt, 0),
-        ruleCount: numberOr(source.ruleCount, item.scheme.rules.length),
-        ruleSetCount: numberOr(source.ruleSetCount, item.ruleSets.length),
-      },
+export interface NormalizedBuiltinSchemes {
+  builtinSchemeOverrides: Record<string, BuiltinSchemeOverrideRef>
+  schemeSnapshots: Record<string, BuiltinSchemeSnapshot>
+  snapshotSeq: number
+}
+
+function normalizeSnapshotContent(value: Record<string, unknown>): BuiltinSchemeSnapshotContent | undefined {
+  if (!validScheme(value.scheme)) return undefined
+  if (!Array.isArray(value.ruleSets) || !value.ruleSets.every(validLocalRuleSet)) return undefined
+  const source = value.source
+  if (!isRecord(source) || !isString(source.iniURL)) return undefined
+  if (!isString(source.commitSha) || !/^[0-9a-f]{40}$/i.test(source.commitSha)) return undefined
+  const files = (Array.isArray(source.files) ? source.files : [])
+    .filter((file): file is Record<string, unknown> => isRecord(file)
+      && isString(file.path)
+      && isString(file.blobSha)
+      && /^[0-9a-f]{40}$/i.test(file.blobSha))
+    .map((file) => ({
+      path: file.path as string,
+      blobSha: file.blobSha as string,
+      ...(isString(file.etag) ? { etag: file.etag } : {}),
+    }))
+  const ruleSets = value.ruleSets as LocalRuleSet[]
+  return {
+    scheme: value.scheme as RuleScheme,
+    ruleSets,
+    source: {
+      iniURL: source.iniURL,
+      commitSha: source.commitSha.toLowerCase(),
+      files,
+      fetchedAt: numberOr(source.fetchedAt, 0),
+      // 条数直接从正文重算，旧记录里写错也不会把可用快照判成损坏。
+      ruleCount: (value.scheme as RuleScheme).rules.length,
+      ruleSetCount: ruleSets.length,
+    },
+  }
+}
+
+export function normalizeBuiltinSchemes(
+  overridesValue: unknown,
+  snapshotsValue?: unknown,
+  seqValue?: unknown,
+  protectedRuleSetIDs?: Iterable<string>,
+): NormalizedBuiltinSchemes {
+  const snapshots: Record<string, BuiltinSchemeSnapshot> = {}
+  const rawSnapshots = Array.isArray(snapshotsValue)
+    ? snapshotsValue.map((item, index) => [String(index), item] as const)
+    : isRecord(snapshotsValue)
+      ? Object.entries(snapshotsValue)
+      : []
+  for (const [key, item] of rawSnapshots) {
+    if (!isRecord(item)) continue
+    const content = normalizeSnapshotContent(item)
+    if (!content) continue
+    const id = typeof item.id === 'number' && Number.isInteger(item.id) && item.id > 0
+      ? item.id
+      : Number(key)
+    if (!Number.isInteger(id) || id <= 0) continue
+    if (snapshots[String(id)]) continue
+    const schemeID = isString(item.schemeID) ? item.schemeID : content.scheme.id
+    if (!schemeID) continue
+    const candidate: BuiltinSchemeSnapshot = {
+      ...content,
+      id,
+      schemeID,
+      createdAt: typeof item.createdAt === 'number' && Number.isFinite(item.createdAt)
+        ? item.createdAt
+        : content.source.fetchedAt,
+    }
+    if (isBuiltinSchemeSnapshotValid(candidate)) snapshots[String(id)] = candidate
+  }
+
+  let seq = typeof seqValue === 'number' && Number.isFinite(seqValue) && seqValue >= 0
+    ? Math.floor(seqValue)
+    : 0
+  for (const snapshot of Object.values(snapshots)) seq = Math.max(seq, snapshot.id)
+
+  const overrides: Record<string, BuiltinSchemeOverrideRef> = {}
+  if (isRecord(overridesValue)) {
+    for (const [schemeID, item] of Object.entries(overridesValue)) {
+      if (!isRecord(item)) continue
+      const ref = item.snapshotId
+      if (typeof ref === 'number' && Number.isInteger(ref) && ref > 0) {
+        // 新结构：快照必须存在且归属一致，否则丢指针（加载回落原厂 / 上一版）。
+        const snapshot = snapshots[String(ref)]
+        if (snapshot && snapshot.schemeID === schemeID) overrides[schemeID] = { snapshotId: ref }
+        continue
+      }
+      // 旧结构：内联正文 → 分配一个新 id 的快照。
+      const content = normalizeSnapshotContent(item)
+      if (!content) continue
+      seq += 1
+      const snapshot: BuiltinSchemeSnapshot = {
+        ...content,
+        id: seq,
+        schemeID,
+        createdAt: content.source.fetchedAt,
+      }
+      if (!isBuiltinSchemeSnapshotValid(snapshot)) continue
+      snapshots[String(seq)] = snapshot
+      overrides[schemeID] = { snapshotId: seq }
     }
   }
-  return out
+
+  return {
+    builtinSchemeOverrides: overrides,
+    schemeSnapshots: pruneBuiltinSchemeSnapshots(snapshots, overrides, protectedRuleSetIDs),
+    snapshotSeq: seq,
+  }
 }
 
 function validTailnet(value: unknown): value is TailnetConnection {
@@ -348,7 +449,13 @@ export function parseBackup(text: string): BackupFile {
       policySelections,
       customSchemes,
       localRuleSets,
-      builtinSchemeOverrides: normalizeBuiltinSchemeOverrides(data.builtinSchemeOverrides),
+      ...normalizeBuiltinSchemes(
+        data.builtinSchemeOverrides,
+        data.schemeSnapshots,
+        data.snapshotSeq,
+        customSchemes.flatMap((scheme) => (scheme.ruleSets ?? []).map((ruleSet) => ruleSet.id)),
+      ),
+      ruleSetExclusions: normalizeRuleSetExclusions(data.ruleSetExclusions),
       checkBuiltinSchemeUpdatesOnOpen: booleanOr(data.checkBuiltinSchemeUpdatesOnOpen, false),
       autoRefreshOnOpen: booleanOr(data.autoRefreshOnOpen, false),
       autoRefreshRuleSetsOnOpen: booleanOr(data.autoRefreshRuleSetsOnOpen, false),
