@@ -185,23 +185,38 @@ check('规则集上下文：没有历史时明确返回 no-history，有历史�
   assert.equal(changed?.added, 1)
 })
 
-check('修复动作：同组重复给出一键删除，跨组重复需要用户决定', () => {
+check('修复动作：同组与跨组重复都给出一键删除，前一条失效时仍需用户决定', () => {
   const sameGroup = issue({
-    id: 'dup', code: 'duplicateRuleSameGroup', message: '同组重复规则',
+    id: 'dup', code: 'duplicateRuleSameGroup', message: '同组重复规则', deletable: true,
     location: { kind: 'rule', group: '节点选择', rule: 'DOMAIN-SUFFIX,google.com', ruleIndex: 1 },
   })
   const actions = buildFixActions(sameGroup)
   assert.equal(actions[0].kind, 'delete-rule')
   assert.equal(actions[0].safe, true)
 
-  // 跨组重复删掉后一条会悄悄改变路由，不能进一键删除。
+  // 跨组重复：前一条存活且可写时，删掉后一条不会改变命中，可以一键删除。
   const crossGroup = issue({
-    id: 'cross', code: 'duplicateRule', message: '跨组重复规则',
+    id: 'cross', code: 'duplicateRule', message: '跨组重复规则', deletable: true, firstGroup: '微软Bing',
     location: { kind: 'rule', group: '国外媒体', rule: 'DOMAIN-SUFFIX,google.com', ruleIndex: 1 },
   })
   const crossActions = buildFixActions(crossGroup)
-  assert.equal(crossActions[0].kind, 'manual')
-  assert.equal(crossActions[0].safe, undefined)
+  assert.equal(crossActions[0].kind, 'delete-rule')
+  assert.equal(crossActions[0].safe, true)
+  assert.match(crossActions[0].label, /微软Bing/)
+  assert.match(crossActions[0].label, /国外媒体/)
+
+  // 前一条已失效或来自只读规则集：不放行一键删除。
+  const dead = issue({
+    id: 'dead', code: 'duplicateRuleSameGroup', message: '同组重复规则', deletable: false, firstDead: true,
+    location: { kind: 'rule', group: '节点选择', rule: 'DOMAIN-SUFFIX,google.com', ruleIndex: 1 },
+  })
+  assert.equal(buildFixActions(dead)[0].kind, 'manual')
+
+  const blocked = issue({
+    id: 'blocked', code: 'duplicateRule', message: '跨组重复规则', deletable: false, firstReadOnly: true,
+    location: { kind: 'rule', group: '国外媒体', rule: 'DOMAIN-SUFFIX,google.com', ruleIndex: 1 },
+  })
+  assert.equal(buildFixActions(blocked)[0].kind, 'manual')
 
   const missing = issue({
     id: 'missing', code: 'missingRuleTarget', message: '规则指向不存在的组',
@@ -215,7 +230,7 @@ check('修复动作：同组重复给出一键删除，跨组重复需要用户�
 check('一键修复：删除同组重复规则后方案只剩一条且其它规则不受影响', () => {
   const scheme = makeScheme()
   const duplicate = issue({
-    id: 'dup', code: 'duplicateRuleSameGroup', message: '同组重复规则',
+    id: 'dup', code: 'duplicateRuleSameGroup', message: '同组重复规则', deletable: true,
     location: { kind: 'rule', group: '节点选择', rule: 'DOMAIN-SUFFIX,google.com', ruleIndex: 1 },
   })
   const action = buildFixActions(duplicate)[0]

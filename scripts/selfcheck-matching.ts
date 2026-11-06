@@ -8,14 +8,18 @@ import {
   reorderRulesByMatchingOrder,
 } from '../src/rules/matchingOrder'
 import {
+  autoGroupReferenceWarning,
   buildNodeFilterGroup,
+  findGroupCyclePath,
   nextGroupName,
   previewNodeMatches,
   removePolicyGroup,
+  validateGroupCandidates,
   validateNodeGroupDraft,
 } from '../src/rules/groupEditing'
 import { findRuleOrderConflicts } from '../src/rules/orderConflicts'
-import { prepareSchemeForExport } from '../src/generator/groups'
+import { prepareSchemeForExport, resolveGroups } from '../src/generator/groups'
+import { generateSubscriptionFormats } from '../src/generator'
 import { explainQuery, compileScheme, explainWith, type CompiledScheme } from '../src/rules/ruleExplain'
 import { parseQuery, evaluateRule } from '../src/rules/ruleMatcher'
 import { lintScheme } from '../src/rules/schemeLint'
@@ -270,6 +274,113 @@ function main(): void {
     assert.equal(removed.removedRules, A.length)
     assert.equal(removed.removedCustomRules, 1)
     assert.equal(removed.removedRuleSets, 1)
+    assert.deepEqual(removed.referencingGroups, ['B'])
+  })
+
+  const NODES: ProxyNode[] = [
+    { id: 'n1', kind: 'ss', name: '香港 01', server: 'hk.example.com', port: 443, tls: false, skipCertificateVerification: false, rawURI: '' },
+    { id: 'n2', kind: 'ss', name: '日本 01', server: 'jp.example.com', port: 443, tls: false, skipCertificateVerification: false, rawURI: '' },
+  ]
+
+  check('新建策略组可引用其他策略组并写入候选', () => {
+    const scheme: RuleScheme = {
+      id: 'group-refs',
+      name: 'group-refs',
+      description: '',
+      groups: [
+        { name: '节点选择', type: 'select', options: ['DIRECT'] },
+        { name: '自动选择', type: 'url-test', options: [], nodeFilter: '.*' },
+      ],
+      rules: [],
+    }
+    const built = buildNodeFilterGroup({
+      name: '新组', type: 'select', pattern: '', options: ['节点选择', '自动选择', 'DIRECT'],
+    })
+    assert.deepEqual(built.options, ['节点选择', '自动选择', 'DIRECT'])
+    assert.equal(built.nodeFilter, undefined)
+    assert.equal(
+      validateNodeGroupDraft(scheme, { name: '新组', type: 'select', pattern: '', options: ['不存在'] }),
+      '候选「不存在」不是当前方案里的策略组；节点请用节点名称匹配加入',
+    )
+    const draft: RuleScheme = { ...scheme, groups: [...scheme.groups, built] }
+    const formats = generateSubscriptionFormats(NODES, draft, { contentMode: 'full' })
+    for (const format of ['yaml', 'surge', 'loon', 'quanx', 'json', 'egern'] as const) {
+      const text = formats[format]
+      const start = text.indexOf('新组')
+      assert.ok(start >= 0, `${format} 没有输出新组`)
+      assert.ok(text.indexOf('节点选择', start) > start, `${format} 的新组成员缺少节点选择`)
+      assert.ok(text.indexOf('自动选择', start) > start, `${format} 的新组成员缺少自动选择`)
+    }
+  })
+
+  check('自动组里的策略组引用会当场提示 sing-box 过滤', () => {
+    const groupNames = ['节点选择', '自动选择']
+    for (const type of ['url-test', 'fallback', 'load-balance'] as const) {
+      const warning = autoGroupReferenceWarning(type, ['自动选择', 'DIRECT'], groupNames)
+      assert.ok(warning?.includes('sing-box 导出会过滤'), type)
+      assert.ok(warning?.includes('自动选择'), type)
+    }
+    assert.equal(autoGroupReferenceWarning('select', ['自动选择'], groupNames), undefined)
+    assert.equal(autoGroupReferenceWarning('url-test', ['DIRECT'], groupNames), undefined)
+  })
+
+  check('保存前拦截策略组引用成环并指出路径', () => {
+    const scheme: RuleScheme = {
+      id: 'cycle',
+      name: 'cycle',
+      description: '',
+      groups: [
+        { name: 'A', type: 'select', options: ['B'] },
+        { name: 'B', type: 'select', options: ['C'] },
+      ],
+      rules: [],
+    }
+    assert.equal(
+      validateNodeGroupDraft(scheme, { name: 'C', type: 'select', pattern: '', options: ['A'] }),
+      '策略组循环引用：C → A → B → C',
+    )
+    // 改名时原名和现名都算“自己”，不能出现在候选里。
+    assert.equal(validateGroupCandidates(scheme, 'C', ['C'], 'A'), '策略组不能把自己加入候选')
+    assert.equal(validateGroupCandidates(scheme, 'C', ['A'], 'A'), '策略组不能把自己加入候选')
+    assert.deepEqual(
+      findGroupCyclePath([...scheme.groups, { name: 'C', type: 'select', options: ['A'] }], 'C'),
+      ['C', 'A', 'B', 'C'],
+    )
+    assert.deepEqual(
+      findGroupCyclePath([...scheme.groups, { name: 'C', type: 'select', options: ['DIRECT'] }], 'C'),
+      undefined,
+    )
+  })
+
+  check('select 组第一项候选是默认选中', () => {
+    const scheme: RuleScheme = {
+      id: 'first-candidate',
+      name: 'first-candidate',
+      description: '',
+      groups: [
+        { name: '节点选择', type: 'select', options: ['DIRECT'] },
+        { name: '新组', type: 'select', options: ['节点选择', '自动选择', 'DIRECT'] },
+        { name: '自动选择', type: 'url-test', options: [], nodeFilter: '.*' },
+      ],
+      rules: [],
+    }
+    const plain = resolveGroups(scheme, NODES, (node) => node.name)
+    assert.deepEqual(plain.find((item) => item.group.name === '新组')?.members.slice(0, 2), ['节点选择', '自动选择'])
+    const prepared = prepareSchemeForExport(scheme, { 新组: '自动选择' }, {})
+    const selected = resolveGroups(prepared, NODES, (node) => node.name)
+    assert.equal(selected.find((item) => item.group.name === '新组')?.members[0], '自动选择')
+  })
+
+  check('悬空组引用会被 lint 报 missingGroupMember', () => {
+    const scheme: RuleScheme = {
+      id: 'dangling',
+      name: 'dangling',
+      description: '',
+      groups: [{ name: 'A', type: 'select', options: ['已删除的组'] }],
+      rules: [],
+    }
+    const issues = lintScheme({ scheme, nodes: NODES })
+    assert.ok(issues.some((issue) => issue.code === 'missingGroupMember' && issue.message.includes('已删除的组')))
   })
 
   const explainWithIndex = (compiled: CompiledScheme, raw: string) => {

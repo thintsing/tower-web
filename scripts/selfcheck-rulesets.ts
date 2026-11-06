@@ -11,6 +11,7 @@ import {
   ruleSetRulesFitDialect,
 } from '../src/rules/remoteFormats'
 import {
+  describeRuleSetParse,
   detectRuleSetFormat,
   parseRuleSetText,
   RULE_SET_FORMAT_TITLES,
@@ -536,6 +537,84 @@ function main(): void {
     } finally {
       ;(globalThis as { window?: unknown }).window = original
     }
+  })
+
+  check('规则集导入：纯域名列表统一导出 DOMAIN-SUFFIX', () => {
+    const parsed = parseRuleSetText('\uFEFF +.Foo.COM\r\n.example.com\r\n  sub.domain.example  \r\n\'quoted.example\'\r\n')
+    assert.equal(parsed.format, 'classical')
+    assert.deepEqual(parsed.rules.map((rule) => `${rule.type},${rule.value}`), [
+      'DOMAIN-SUFFIX,foo.com',
+      'DOMAIN-SUFFIX,example.com',
+      'DOMAIN-SUFFIX,sub.domain.example',
+      'DOMAIN-SUFFIX,quoted.example',
+    ])
+    assert.equal(parsed.skippedLines, 0)
+  })
+
+  check('规则集导入：通配 / IP 行不写成非法 DOMAIN-SUFFIX', () => {
+    const parsed = parseRuleSetText('*.foo.com\n1.2.3.4\nfoo*bar.com\n10.0.0.1\n')
+    assert.deepEqual(parsed.rules.map((rule) => `${rule.type},${rule.value}`), [
+      'DOMAIN-SUFFIX,foo.com',
+      'IP-CIDR,1.2.3.4/32',
+      'IP-CIDR,10.0.0.1/32',
+    ])
+    assert.equal(parsed.skippedLines, 1)
+    assert.deepEqual(parsed.skippedSamples, ['foo*bar.com'])
+  })
+
+  check('规则集导入：真实 gfw 形态的 provider YAML', () => {
+    const parsed = parseRuleSetText("payload:\n  - '+.000webhost.com'\n  - '+.0rz.tw'\n  - '+.zyxel.com'\n")
+    assert.equal(parsed.format, 'yaml')
+    assert.deepEqual(parsed.rules.map((rule) => `${rule.type},${rule.value}`), [
+      'DOMAIN-SUFFIX,000webhost.com',
+      'DOMAIN-SUFFIX,0rz.tw',
+      'DOMAIN-SUFFIX,zyxel.com',
+    ])
+    assert.equal(parsed.skippedLines, 0)
+  })
+
+  check('规则集导入：单行坏行跳过并汇总，不中断整批', () => {
+    const parsed = parseRuleSetText('+.good.example\n???\n+.also-good.example\n')
+    assert.equal(parsed.rules.length, 2)
+    assert.equal(parsed.skippedLines, 1)
+    assert.deepEqual(parsed.skippedSamples, ['???'])
+    assert.match(describeRuleSetParse(parsed), /识别为「Clash 经典列表」，跳过 1 行/)
+  })
+
+  check('规则集导入：全部不可识别时报错且含格式 / 跳过 / 建议三段', () => {
+    assert.throws(
+      () => parseRuleSetText('<<<bad>>>\n???'),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error)
+        assert.match(message, /识别为/)
+        assert.match(message, /跳过 2 行/)
+        assert.match(message, /建议/)
+        return true
+      },
+    )
+  })
+
+  check('规则集导入：HTML 错误页不当作规则', () => {
+    assert.throws(
+      () => parseRuleSetText('<!DOCTYPE html><html><body><h1>404</h1></body></html>'),
+      /HTML/,
+    )
+  })
+
+  check('规则集导入：可同时解释为 text / YAML 时优先 text', () => {
+    const parsed = parseRuleSetText('- foo.example\n- bar.example')
+    assert.equal(parsed.format, 'classical')
+    assert.deepEqual(parsed.rules.map((rule) => rule.type), ['DOMAIN-SUFFIX', 'DOMAIN-SUFFIX'])
+    assert.equal(parsed.rules[0].value, 'foo.example')
+    assert.equal(parsed.skippedLines, 0)
+  })
+
+  check('规则集导入：真 YAML 仍走 YAML，且大小写与空白归一', () => {
+    assert.equal(detectRuleSetFormat('payload:\n  - DOMAIN,foo'), 'yaml')
+    const parsed = parseRuleSetText('payload:\n  - "  +.Mixed.Case.EXAMPLE  "')
+    assert.equal(parsed.format, 'yaml')
+    assert.equal(parsed.rules[0].type, 'DOMAIN-SUFFIX')
+    assert.equal(parsed.rules[0].value, 'mixed.case.example')
   })
 
   if (failures) {
