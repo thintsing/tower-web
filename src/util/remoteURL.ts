@@ -1,3 +1,29 @@
+/** 从多行 / 空格 / 逗号 / 分号混排的输入里提取规则集地址，保持顺序并去重。 */
+export function splitRemoteTextURLs(raw: string): string[] {
+  const found = String(raw ?? '').match(/https?:\/\/[^\s<>"'`，。；：！？、（）【】《》「」『』,;]+/gi) ?? []
+  const seen = new Set<string>()
+  const urls: string[] = []
+  for (const token of found) {
+    const normalized = normalizeRemoteTextURL(token)
+    if (!/^https?:\/\//i.test(normalized)) continue
+    const key = normalized.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    urls.push(normalized)
+  }
+  return urls
+}
+
+/** 在线规则集没有填名称时，用地址末段（去掉扩展名）作为默认名。 */
+export function remoteRuleSetNameFromURL(url: string): string {
+  try {
+    const parsed = new URL(url)
+    return parsed.pathname.split('/').filter(Boolean).at(-1)?.replace(/\.[^.]+$/, '') || parsed.hostname
+  } catch {
+    return '在线规则集'
+  }
+}
+
 /** GitHub / Gitee 网页文件地址 → 可供客户端直接抓取的原始文本地址。 */
 export function normalizeRemoteTextURL(raw: string): string {
   const trimmed = raw.trim()

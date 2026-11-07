@@ -16,7 +16,7 @@ import {
   parseRuleSetText,
   RULE_SET_FORMAT_TITLES,
 } from '../src/rules/ruleSets'
-import { normalizeRemoteTextURL } from '../src/util/remoteURL'
+import { normalizeRemoteTextURL, remoteRuleSetNameFromURL, splitRemoteTextURLs } from '../src/util/remoteURL'
 import { diffRules, diffTotal } from '../src/rules/ruleDiff'
 import {
   clearRuleSetHistory,
@@ -430,6 +430,29 @@ function main(): void {
       normalizeRemoteTextURL('https://raw.githubusercontent.com/acl4ssr/ACL4SSR/master/Clash/ACL4SSR_Online.ini'),
       'https://raw.githubusercontent.com/acl4ssr/ACL4SSR/master/Clash/ACL4SSR_Online.ini',
     )
+  })
+
+  check('在线规则集：多地址输入拆分、去重与命名', () => {
+    const blizzard = 'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Blizzard/Blizzard.yaml'
+    const game = 'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Game/Game.yaml'
+    // 换行 / 空格 / 逗号混排都能识别，重复地址只保留一次。
+    const mixed = splitRemoteTextURLs(`${blizzard}\n${game}  ${blizzard}，https://example.com/ads.list;`)
+    assert.deepEqual(mixed, [blizzard, game, 'https://example.com/ads.list'])
+    // GitHub 网页地址会归一成 raw 地址，并按归一后的地址去重。
+    assert.deepEqual(
+      splitRemoteTextURLs([
+        'https://github.com/blackmatrix7/ios_rule_script/blob/master/rule/Clash/Game/Game.yaml',
+        blizzard,
+        'https://github.com/blackmatrix7/ios_rule_script/blob/master/rule/Clash/Game/Game.yaml',
+      ].join(' ')),
+      ['https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Game/Game.yaml', blizzard],
+    )
+    // 非地址文本（例如粘贴时夹带的说明）直接忽略，不会拼成非法 URL 去请求。
+    assert.deepEqual(splitRemoteTextURLs('规则集在这里：见下方，暂无'), [])
+    assert.deepEqual(splitRemoteTextURLs('https://rules.example/a.list https://rules.example/b.yaml').length, 2)
+    assert.equal(remoteRuleSetNameFromURL(blizzard), 'Blizzard')
+    assert.equal(remoteRuleSetNameFromURL('https://rules.example/a.yaml?token=1'), 'a')
+    assert.equal(remoteRuleSetNameFromURL('https://rules.example/'), 'rules.example')
   })
 
   check('托管产物 URL：内置文件与在线地址', () => {

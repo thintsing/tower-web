@@ -47,7 +47,7 @@ import { copyToClipboard, newID } from './util/browser'
 import { browserStorage, clearTowerStorage, createSafeStorage, isStorageFull, onStorageFullChange } from './util/localStore'
 import { placeDetailsPanel, placeOpenDetailsPanels } from './util/menuPlacement'
 import { apiFetch, clearAPIKey, getAPIKey, setAPIKey } from './util/apiAuth'
-import { normalizeRemoteTextURL } from './util/remoteURL'
+import { normalizeRemoteTextURL, remoteRuleSetNameFromURL, splitRemoteTextURLs } from './util/remoteURL'
 import { GITHUB_REPO_URL } from './config'
 import { RouteIllustration } from './components/RouteIllustration'
 import { GroupIcon, groupDisplayName } from './components/GroupIcon'
@@ -5265,7 +5265,7 @@ function RemoteRuleSetDialog({
 }: {
   scheme: RuleScheme
   onClose: () => void
-  onSave: (set: LocalRuleSet, joinGroup?: string, notice?: string) => void
+  onSave: (sets: LocalRuleSet[], joinGroup?: string, notice?: string) => void
 }) {
   const ref = useRef<HTMLDialogElement>(null)
   const [url, setUrl] = useState('')
@@ -5275,34 +5275,48 @@ function RemoteRuleSetDialog({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const readOnly = useWorkspaceStatus().readOnly
+  const targets = splitRemoteTextURLs(url)
 
   useEffect(() => { ref.current?.showModal() }, [])
 
   const save = async () => {
-    const target = normalizeRemoteTextURL(url)
-    if (!/^https?:\/\//i.test(target)) { setError('请输入有效的 http(s) 规则集地址'); return }
+    if (!targets.length) {
+      setError('请输入有效的 http(s) 规则集地址，每行一个，也可用空格或逗号分隔')
+      return
+    }
     setBusy(true); setError('')
     try {
-      const parsed = await fetchRuleSet(target)
-      const fallback = (() => {
+      const created: { set: LocalRuleSet; notice: string }[] = []
+      const failures: string[] = []
+      for (const target of targets) {
         try {
-          const parsedURL = new URL(target)
-          return parsedURL.pathname.split('/').filter(Boolean).at(-1)?.replace(/\.[^.]+$/, '') || parsedURL.hostname
-        } catch {
-          return '在线规则集'
+          const parsed = await fetchRuleSet(target)
+          created.push({
+            set: {
+              id: newID(),
+              name: targets.length === 1 && name.trim() ? name.trim() : remoteRuleSetNameFromURL(target),
+              rules: parsed.rules,
+              updatedAt: Date.now(),
+              sourceURL: target,
+              format: parsed.format,
+            },
+            notice: describeRuleSetParse(parsed),
+          })
+        } catch (e) {
+          failures.push(`${target}：${(e as Error).message}`)
         }
-      })()
-      onSave({
-        id: newID(),
-        name: name.trim() || fallback,
-        rules: parsed.rules,
-        updatedAt: Date.now(),
-        sourceURL: target,
-        format: parsed.format,
-      }, join && group ? group : undefined, describeRuleSetParse(parsed))
+      }
+      // 一次填多个地址时要么全部保存、要么一个都不保存，避免只更新一半。
+      if (failures.length) {
+        setError(`以下地址读取失败，本次没有保存任何规则集：${failures.join('；')}`)
+        return
+      }
+      onSave(
+        created.map((item) => item.set),
+        join && group ? group : undefined,
+        created.length === 1 ? created[0].notice : undefined,
+      )
       ref.current?.close()
-    } catch (e) {
-      setError((e as Error).message)
     } finally {
       setBusy(false)
     }
@@ -5313,19 +5327,22 @@ function RemoteRuleSetDialog({
       <h3>添加在线规则集</h3>
       <form className="dialog-form" onSubmit={(e) => { e.preventDefault(); void save() }}>
         <div className="field">
-          <label>规则集地址</label>
-          <input
+          <label>规则集地址（可填多个）</label>
+          <textarea
             className="field mono"
-            type="url"
+            rows={3}
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://…/rules.list 或 .yaml / .json"
+            placeholder={'https://…/Blizzard.yaml\nhttps://…/Game.yaml'}
             autoFocus
           />
-          <div className="hint">自动识别 Clash 经典列表 / provider YAML、QuanX filter、Egern YAML 和 sing-box source JSON；GitHub / Gitee 网页文件地址会转换为 raw 地址。</div>
+          <div className="hint">每行一个地址，也可用空格或逗号分隔；每个地址会分别保存为独立规则集。自动识别 Clash 经典列表 / provider YAML、QuanX filter、Egern YAML 和 sing-box source JSON；GitHub / Gitee 网页文件地址会转换为 raw 地址。</div>
+          {targets.length > 0 && (
+            <div className="hint">已识别 {targets.length} 个地址{targets.length > 1 ? '，保存时按地址文件名命名' : ''}。</div>
+          )}
         </div>
         <div className="field">
-          <label>名称（可选）</label>
+          <label>名称（可选{targets.length > 1 ? '，多个地址时忽略' : ''}）</label>
           <input className="field" type="text" value={name} onChange={(e) => setName(e.target.value)} />
         </div>
         {scheme.groups.length > 0 && (
@@ -6326,21 +6343,32 @@ function RulesTab({
     })
   }
 
-  const saveRemoteRuleSet = (set: LocalRuleSet, joinGroup?: string, notice?: string) => {
+  const saveRemoteRuleSets = (incoming: LocalRuleSet[], joinGroup?: string, notice?: string) => {
     // 同一地址只保留一条订阅，重复添加时更新快照。
-    const existing = localRuleSets.find((item) => item.sourceURL === set.sourceURL)
-    if (existing && digestRules(existing.rules) !== digestRules(set.rules)) {
-      recordRuleSetSnapshot(existing.id, existing.rules, useStore.getState().ruleSetVersionHistory)
+    const saved: LocalRuleSet[] = []
+    for (const set of incoming) {
+      const fresh = useStore.getState()
+      const existing = fresh.localRuleSets.find((item) => item.sourceURL === set.sourceURL)
+      if (existing && digestRules(existing.rules) !== digestRules(set.rules)) {
+        recordRuleSetSnapshot(existing.id, existing.rules, fresh.ruleSetVersionHistory)
+      }
+      const savedSet = existing ? { ...set, id: existing.id, paused: existing.paused } : set
+      addLocalRuleSet(savedSet)
+      saved.push(savedSet)
     }
-    const saved = existing ? { ...set, id: existing.id, paused: existing.paused } : set
-    const detail = notice ? `；${notice}` : ''
-    addLocalRuleSet(saved)
     if (joinGroup && scheme) {
-      addLocalSetToScheme(scheme, saved, joinGroup)
-      setFlash(`已保存并加入「${saved.name}」：${saved.rules.length} 条规则${detail}。`)
-    } else {
-      setFlash(`已保存在线规则集「${saved.name}」：${saved.rules.length} 条规则${detail}。`)
+      // 多个规则集依次加入同一个方案；每次读取最新方案，避免后一次覆盖前一次。
+      for (const savedSet of saved) {
+        const freshScheme = useStore.getState().customSchemes.find((item) => item.id === scheme.id) ?? scheme
+        addLocalSetToScheme(freshScheme, savedSet, joinGroup)
+      }
     }
+    const total = saved.reduce((sum, item) => sum + item.rules.length, 0)
+    const detail = notice ? `；${notice}` : ''
+    const prefix = joinGroup && scheme ? '已保存并加入' : '已保存'
+    setFlash(saved.length === 1
+      ? `${prefix}在线规则集「${saved[0].name}」：${total} 条规则${detail}。`
+      : `${prefix} ${saved.length} 个在线规则集：共 ${total} 条规则${detail}。`)
   }
 
   const refreshLocalRuleSet = async (set: LocalRuleSet) => {
@@ -7375,8 +7403,8 @@ function RulesTab({
           key={scheme.id}
           scheme={scheme}
           onClose={() => setRemoteSetOpen(false)}
-          onSave={(set, group, notice) => {
-            saveRemoteRuleSet(set, group, notice)
+          onSave={(sets, group, notice) => {
+            saveRemoteRuleSets(sets, group, notice)
             setRemoteSetOpen(false)
           }}
         />
