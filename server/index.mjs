@@ -31,11 +31,36 @@ if (rawPort && PORT !== parsedPort) {
 // 默认监听所有网卡，手机 / 局域网其它机器才能打开订阅页与订阅链接。
 // 只想本机使用时启动加 `HOST=127.0.0.1`。
 const HOST = process.env.HOST || '0.0.0.0'
-// Docker 容器内看到的网卡地址不是宿主机地址；用这个变量覆盖导出页的局域网地址。
-const PUBLIC_URL = (() => {
-  const raw = (process.env.TOWER_PUBLIC_URL || '').trim().replace(/\/+$/, '')
-  return /^https?:\/\/\S+$/i.test(raw) ? raw : ''
-})()
+/**
+ * Docker 容器内看到的网卡地址不是宿主机地址；服务器模式下它也作为固定订阅地址前缀。
+ * 非法值不能静默丢掉，否则用户会以为已经配置成功、实际仍按访问地址生成。
+ */
+function parsePublicURL(value) {
+  const original = String(value ?? '')
+  if (!original) return { url: '', error: '' }
+  // 环境变量里的首尾空格同样视为配置错误，避免“看起来配了、实际被截断后生效”。
+  if (/[\s\x00-\x1f\x7f]/.test(original)) return { url: '', error: '不能包含空白或控制字符' }
+  const raw = original
+  let parsed
+  try {
+    parsed = new URL(raw)
+  } catch {
+    return { url: '', error: '必须是完整的 http:// 或 https:// 地址' }
+  }
+  if (!/^http:$/i.test(parsed.protocol) && !/^https:$/i.test(parsed.protocol)) {
+    return { url: '', error: '只支持 http:// 或 https://' }
+  }
+  if (!parsed.hostname) return { url: '', error: '缺少主机名' }
+  if (parsed.username || parsed.password) return { url: '', error: '不能包含用户名或密码' }
+  if (parsed.search || parsed.hash) return { url: '', error: '不能包含查询参数或片段' }
+  return { url: raw.replace(/\/+$/, ''), error: '' }
+}
+const publicURLConfig = parsePublicURL(process.env.TOWER_PUBLIC_URL)
+const PUBLIC_URL = publicURLConfig.url
+const PUBLIC_URL_ERROR = publicURLConfig.error
+if (PUBLIC_URL_ERROR) {
+  console.error(`[tower] TOWER_PUBLIC_URL 无效：${PUBLIC_URL_ERROR}（已按未配置处理）`)
+}
 const distDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist')
 const publicRulesetsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'public', 'rulesets')
 const distRulesetsDir = join(distDir, 'rulesets')
@@ -621,9 +646,17 @@ const DEFAULT_SERVER_SETTINGS = Object.freeze({
   lanSharing: true,
   /** 非空时，局域网设备必须带此密钥才能调用管理 API。 */
   apiToken: '',
+  /** 服务器模式下按工作区固定的订阅 token；本地模式不使用。 */
+  subscriptionToken: '',
 })
 
 let serverSettings = { ...DEFAULT_SERVER_SETTINGS }
+
+/** 固定订阅 token 只接受足够强的格式；迁移时不把历史弱 token 提升为规范链接。 */
+function normalizeWorkspaceSubscriptionToken(value) {
+  const token = String(value ?? '').trim()
+  return /^[A-Za-z0-9_-]{16,128}$/.test(token) ? token : ''
+}
 
 function normalizeAPIToken(value) {
   const token = String(value ?? '').trim()
@@ -641,6 +674,7 @@ function loadServerSettings() {
     serverSettings = {
       lanSharing: data?.lanSharing !== false,
       apiToken: normalizeAPIToken(data?.apiToken),
+      subscriptionToken: normalizeWorkspaceSubscriptionToken(data?.subscriptionToken),
     }
   } catch (error) {
     if (error?.code !== 'ENOENT') {
@@ -927,6 +961,33 @@ async function persistSubscriptions() {
     } while (persistAgain)
   } finally {
     persistRunning = false
+  }
+}
+
+/**
+ * 服务器模式启动时把订阅 token 固定到工作区。
+ * 迁移策略：优先沿用最近一次发布的强 token，减少客户端重新导入；找不到才新发。
+ * 旧记录一条都不删，只把规范链接指向选中的 token。
+ */
+function ensureWorkspaceSubscriptionToken() {
+  if (!SERVER_MODE || serverSettings.subscriptionToken) return
+  let newest = -1
+  let candidate = ''
+  for (const [token, record] of subscriptions) {
+    if (!normalizeWorkspaceSubscriptionToken(token)) continue
+    const updatedAt = Number(record?.updatedAt) || 0
+    if (updatedAt > newest) {
+      newest = updatedAt
+      candidate = token
+    }
+  }
+  const token = candidate || randomBytes(16).toString('base64url')
+  serverSettings.subscriptionToken = token
+  persistServerSettings()
+  if (candidate) {
+    console.log('[tower] 服务器版沿用最近发布的订阅 token 作为固定链接')
+  } else {
+    console.log('[tower] 服务器版已生成固定订阅 token')
   }
 }
 
@@ -1394,6 +1455,7 @@ async function handleUpstreamStatus(url, req, res) {
 
 loadWorkspace()
 loadSubscriptions()
+ensureWorkspaceSubscriptionToken()
 
 setInterval(() => {
   const now = Date.now()
@@ -2325,6 +2387,10 @@ const server = createServer(async (req, res) => {
         port: PORT,
         lan,
         local: `http://127.0.0.1:${PORT}`,
+        // 服务器模式下订阅地址以 publicUrl 为准；为空时前端会明确提示配置。
+        publicUrl: PUBLIC_URL,
+        publicUrlConfigured: !!PUBLIC_URL,
+        publicUrlError: PUBLIC_URL_ERROR,
         lanSharing: serverSettings.lanSharing,
         requiresAuth: !!serverSettings.apiToken,
       })
@@ -2369,12 +2435,25 @@ const server = createServer(async (req, res) => {
         // 兼容旧客户端：纯文本 body 视为 base64 节点列表
         formats = { base64: raw.toString('utf8') }
       }
-      let token = String(url.searchParams.get('token') ?? '').trim()
-      if (token && !normalizeAPIToken(token)) {
-        return json(res, 400, { error: '订阅 token 无效' })
+      let token
+      let isRefresh
+      if (SERVER_MODE) {
+        // 服务器模式只有一个规范订阅链接：忽略客户端传来的 token，
+        // 所有设备发布都写到同一个 slot，避免一个工作区散出多条地址。
+        token = serverSettings.subscriptionToken
+        if (!token) {
+          ensureWorkspaceSubscriptionToken()
+          token = serverSettings.subscriptionToken
+        }
+        isRefresh = subscriptions.has(token)
+      } else {
+        token = String(url.searchParams.get('token') ?? '').trim()
+        if (token && !normalizeAPIToken(token)) {
+          return json(res, 400, { error: '订阅 token 无效' })
+        }
+        isRefresh = !!token
+        if (!token) token = randomBytes(16).toString('base64url')
       }
-      const isRefresh = !!token
-      if (!token) token = randomBytes(16).toString('base64url')
       subscriptions.set(token, {
         formats,
         targets,
@@ -2382,9 +2461,13 @@ const server = createServer(async (req, res) => {
         title,
       })
       persistSubscriptions()
+      const path = `/api/sub/${token}?name=${encodeURIComponent(title)}`
       return json(res, 200, {
         token,
-        url: `/api/sub/${token}?name=${encodeURIComponent(title)}`,
+        // 服务器模式尽量返回绝对规范地址；未配置 TOWER_PUBLIC_URL 时退回相对路径，
+        // 由前端用当前 origin 兜底并给出明确提示。
+        url: SERVER_MODE && PUBLIC_URL ? `${PUBLIC_URL}${path}` : path,
+        ...(SERVER_MODE ? { publicUrl: PUBLIC_URL, publicUrlError: PUBLIC_URL_ERROR } : {}),
         formats: Object.keys(formats),
         refreshed: isRefresh,
       })
@@ -2431,7 +2514,10 @@ const server = createServer(async (req, res) => {
       const name = normalizeSubscriptionTitle(url.searchParams.get('name') ?? sub.title)
       // HTTP 头只接受 latin1；中文标题会触发 ERR_INVALID_CHAR，这里做 ASCII 兜底。
       const asciiName = String(name).replace(/[^\x20-\x7E]/g, '').trim() || 'tower'
-      return send(res, 200, rewriteRuleSetOrigins(payload, url.origin), {
+      // 服务器模式的规范地址固定为 TOWER_PUBLIC_URL；否则订阅正文里的规则集
+      // 地址仍会跟随请求 Host，同一个 token 从不同入口拉取会得到不同配置。
+      const ruleSetOrigin = SERVER_MODE && PUBLIC_URL ? PUBLIC_URL : url.origin
+      return send(res, 200, rewriteRuleSetOrigins(payload, ruleSetOrigin), {
         'content-type': SUB_MIME[servedFormat],
         'cache-control': 'no-store',
         'x-tower-format': servedFormat,
@@ -2444,7 +2530,33 @@ const server = createServer(async (req, res) => {
 
     const subDeleteMatch = url.pathname.match(/^\/api\/sub\/([A-Za-z0-9_-]+)$/)
     if (subDeleteMatch && req.method === 'DELETE') {
-      subscriptions.delete(subDeleteMatch[1])
+      const requested = subDeleteMatch[1]
+      if (SERVER_MODE) {
+        // 服务器模式的“撤销”是重置工作区链接：旧 canonical 立即失效，
+        // 新 token 接管同一份已发布内容，所有设备下次同步都会落到新地址。
+        // 不按路径里的 token 判断：设备本地可能还存着升级前的旧 token。
+        const previous = serverSettings.subscriptionToken
+        const current = subscriptions.get(previous)
+        const next = randomBytes(16).toString('base64url')
+        if (current) {
+          subscriptions.set(next, { ...current, updatedAt: Date.now() })
+          subscriptions.delete(previous)
+        }
+        serverSettings.subscriptionToken = next
+        persistServerSettings()
+        persistSubscriptions()
+        const title = normalizeSubscriptionTitle(current?.title)
+        const path = `/api/sub/${next}?name=${encodeURIComponent(title)}`
+        return json(res, 200, {
+          ok: true,
+          reset: true,
+          token: next,
+          url: PUBLIC_URL ? `${PUBLIC_URL}${path}` : path,
+          publicUrl: PUBLIC_URL,
+          publicUrlError: PUBLIC_URL_ERROR,
+        })
+      }
+      subscriptions.delete(requested)
       persistSubscriptions()
       return json(res, 200, { ok: true })
     }
@@ -2514,6 +2626,13 @@ server.listen(PORT, HOST, () => {
     }
     if (!serverSettings.apiToken) {
       console.warn('[tower-web] 服务器模式必须设置访问密钥（TOWER_API_TOKEN），否则 /api/workspace 会拒绝所有请求')
+    }
+    if (PUBLIC_URL) {
+      console.log(`[tower-web] 固定订阅地址前缀：${PUBLIC_URL}`)
+    } else if (PUBLIC_URL_ERROR) {
+      console.warn(`[tower-web] TOWER_PUBLIC_URL 无效（${PUBLIC_URL_ERROR}）：不同设备仍可能得到不同订阅地址`)
+    } else {
+      console.warn('[tower-web] 未配置 TOWER_PUBLIC_URL：不同设备打开时订阅地址的 host 可能不同，建议配置为对外访问地址')
     }
     // 只安排定时器；重启后至少等 TOWER_UPSTREAM_CHECK_INITIAL_DELAY_MS 才检查。
     upstreamChecker?.start()

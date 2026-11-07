@@ -7962,7 +7962,10 @@ const TAILNET_TARGET_VARIANTS: ClientTarget[] = [
 ]
 
 function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
-  const readOnly = useWorkspaceStatus().readOnly
+  const workspaceStatus = useWorkspaceStatus()
+  const readOnly = workspaceStatus.readOnly
+  // 服务器模式的订阅地址由服务端固定；本地模式仍跟随当前访问地址。
+  const serverMode = workspaceStatus.mode === 'server'
   const scheme = useScheme()
   const policySelections = useStore((s) => s.policySelections)
   const preferRuleSets = useStore((s) => s.preferRuleSets)
@@ -8053,13 +8056,23 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const [revokeError, setRevokeError] = useState('')
   const [copiedField, setCopiedField] = useState<'sub' | 'import' | 'lan' | null>(null)
   const [importNotice, setImportNotice] = useState('')
-  const [net, setNet] = useState<{ host: string; lan: string[] } | null>(null)
+  const [net, setNet] = useState<{
+    host: string
+    lan: string[]
+    publicUrl: string
+    publicUrlError: string
+  } | null>(null)
   const localHost = ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(window.location.hostname)
 
   useEffect(() => {
     apiFetch('/api/network')
       .then((r) => r.json())
-      .then((d) => setNet({ host: String(d?.host ?? ''), lan: Array.isArray(d?.lan) ? d.lan : [] }))
+      .then((d) => setNet({
+        host: String(d?.host ?? ''),
+        lan: Array.isArray(d?.lan) ? d.lan : [],
+        publicUrl: String(d?.publicUrl ?? ''),
+        publicUrlError: String(d?.publicUrlError ?? ''),
+      }))
       .catch(() => {})
   }, [])
 
@@ -8215,9 +8228,13 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const clientSubURL = useMemo(() => {
     if (!subURL) return ''
     try {
-      // 用当前页面的 origin 重建：从 127.0.0.1 发布、之后用局域网地址打开时，
-      // 链接也会自动变成局域网地址，不会把 127.0.0.1 发给手机。
-      const u = new URL(new URL(subURL, window.location.origin).pathname, window.location.origin)
+      const raw = new URL(subURL, window.location.origin)
+      // 服务器模式的地址由服务端固定（TOWER_PUBLIC_URL 或发布时的兜底 origin），
+      // 打开页面的入口不同也不能改写 host；本地模式保持原来的行为，
+      // 从 127.0.0.1 发布、之后用局域网地址打开时仍自动换成局域网地址。
+      const u = serverMode
+        ? new URL(raw.toString())
+        : new URL(raw.pathname, window.location.origin)
       u.searchParams.set('format', subFormatFor(target))
       // target 让服务端在存在客户端专属变体（如 Stash / Surge Mac）时选对写法。
       u.searchParams.set('target', target.target)
@@ -8226,7 +8243,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       // localStorage 里的旧地址被改坏时，别让整个导出页白屏。
       return ''
     }
-  }, [target, subURL])
+  }, [serverMode, target, subURL])
 
   const outputOptions = useMemo(
     () => ({
@@ -8288,21 +8305,22 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   }, [target, clientSubURL, configName, contentMode, canImport])
 
   // 本机打开的页面，手机端要用局域网地址而不是 127.0.0.1。
+  // 服务器模式的规范地址已经由 TOWER_PUBLIC_URL 决定，不能再另造一条局域网地址。
   const clientLanSubURL = useMemo(() => {
-    if (!localHost || !net?.lan[0] || !clientSubURL) return ''
+    if (serverMode || !localHost || !net?.lan[0] || !clientSubURL) return ''
     return clientSubURL.replace(window.location.origin, net.lan[0])
-  }, [localHost, net, clientSubURL])
+  }, [serverMode, localHost, net, clientSubURL])
 
   // 通用局域网地址不带 format，由服务端按客户端 User-Agent / target 自动识别。
   const lanSubURL = useMemo(() => {
-    if (!localHost || !net?.lan[0] || !subURL) return ''
+    if (serverMode || !localHost || !net?.lan[0] || !subURL) return ''
     try {
       const path = new URL(subURL, window.location.origin).pathname
       return new URL(path, window.location.origin).href.replace(window.location.origin, net.lan[0])
     } catch {
       return ''
     }
-  }, [localHost, net, subURL])
+  }, [serverMode, localHost, net, subURL])
 
   const previewText = useMemo(
     () => maskTailnetAuthKeys(generated, activeTailnets.map((item) => item.authKey)),
@@ -8556,7 +8574,9 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       setSubToken(json.token)
       setRevokeError('')
       localPrefs.setItem('tower-sub-token', json.token)
-      const abs = new URL(json.url, window.location.origin).href
+      // 服务器模式优先用服务端返回的规范前缀；未配置 TOWER_PUBLIC_URL 时才
+      // 回退到当前 origin（导出页会同时显示配置提示）。
+      const abs = new URL(json.url, serverMode && json.publicUrl ? json.publicUrl : window.location.origin).href
       setSubURL(abs)
       localPrefs.setItem('tower-sub-url', abs)
       const now = Date.now()
@@ -8642,6 +8662,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const revokeSubscription = async () => {
     if (!subToken) return
     setRevokeError('')
+    let payload: { reset?: unknown; token?: unknown; url?: unknown; publicUrl?: unknown } = {}
     try {
       const response = await apiFetch(`/api/sub/${encodeURIComponent(subToken)}`, { method: 'DELETE' })
       // 404 说明服务端已经没有这个 token，本地清掉即可；其它失败必须如实报错，
@@ -8654,8 +8675,36 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         } catch { /* 非 JSON 错误体，保留状态码 */ }
         throw new Error(detail)
       }
+      if (response.ok) {
+        try {
+          payload = await response.json() as typeof payload
+        } catch {
+          // 旧服务端可能返回空响应；本地模式仍然清空即可。
+        }
+      }
     } catch (err) {
-      setRevokeError(`撤销失败：${err instanceof Error ? err.message : String(err)}。链接仍然有效，请重试。`)
+      const action = serverMode ? '重置' : '撤销'
+      setRevokeError(`${action}失败：${err instanceof Error ? err.message : String(err)}。链接仍然有效，请重试。`)
+      return
+    }
+    // 服务器模式的重置会直接返回新 canonical；立即换成新链接，避免界面先空一片。
+    if (serverMode
+      && payload.reset === true
+      && typeof payload.token === 'string'
+      && typeof payload.url === 'string') {
+      const token = payload.token
+      const base = typeof payload.publicUrl === 'string' && payload.publicUrl
+        ? payload.publicUrl
+        : window.location.origin
+      const abs = new URL(payload.url, base).href
+      setSubToken(token)
+      localPrefs.setItem('tower-sub-token', token)
+      setSubURL(abs)
+      localPrefs.setItem('tower-sub-url', abs)
+      const now = Date.now()
+      setSubUpdatedAt(now)
+      localPrefs.setItem('tower-sub-updated-at', String(now))
+      setCheckResult({ ok: true, text: '已重置工作区订阅链接；旧链接已失效，其他设备下次同步会使用新链接。' })
       return
     }
     setSubToken(''); setSubURL(''); setSubUpdatedAt(null)
@@ -9321,6 +9370,14 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           <div className="meta" style={{ margin: 0 }}>按客户端自动分发格式</div>
         </div>
         <div className="field" style={{ marginTop: 14 }}>
+          {serverMode && net && !net.publicUrl && (
+            <div className="error" role="alert" style={{ marginBottom: 10 }}>
+              跨设备使用同一条订阅地址需要给服务端配置 <span className="mono">TOWER_PUBLIC_URL</span>。
+              {net.publicUrlError
+                ? ` 当前配置无效：${net.publicUrlError}`
+                : ' 当前已回退为访问塔台的地址，不同设备仍可能得到不同地址。'}
+            </div>
+          )}
           {subURL ? (
             <>
               {/* 客户端专属 URL（跟随 target 实时变化） */}
@@ -9376,7 +9433,9 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                   </button>
                 )}
                 <button className="btn ghost" onClick={() => setQrOpen(true)}>二维码</button>
-                <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => setPendingRevoke(true)}>撤销</button>
+                <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => setPendingRevoke(true)}>
+                  {serverMode ? '重置链接' : '撤销'}
+                </button>
               </div>
               {revokeError && (
                 <div className="error" style={{ marginTop: 8 }}>
@@ -9387,7 +9446,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                     {...writeGuard(readOnly)}
                     onClick={() => void revokeSubscription()}
                   >
-                    重试撤销
+                    {serverMode ? '重试重置' : '重试撤销'}
                   </button>
                 </div>
               )}
@@ -9440,8 +9499,11 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         <details className="link-note">
           <summary>链接存储与有效期</summary>
           <div className="link-note-body">
-            链接保存在本机 <span className="mono">server/subscriptions.json</span>，塔台重启后仍然有效；
-            server 关闭期间客户端更新会失败，重新启动即可恢复。撤销或删除订阅会让对应链接立即失效。
+            {serverMode
+              ? <>链接保存在服务端数据目录的 <span className="mono">subscriptions.json</span>，塔台重启后仍然有效；
+                  服务器模式下所有设备共用一条固定链接，重置会立即换新 token 并让旧链接失效。</>
+              : <>链接保存在本机 <span className="mono">server/subscriptions.json</span>，塔台重启后仍然有效；
+                  server 关闭期间客户端更新会失败，重新启动即可恢复。撤销或删除订阅会让对应链接立即失效。</>}
           </div>
         </details>
       </div>
@@ -9471,9 +9533,11 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       />
       <ConfirmDialog
         open={pendingRevoke}
-        title="撤销订阅链接？"
-        body={<>撤销后 <b>已经导入该链接的客户端</b> 将无法再更新订阅，需要重新生成。节点本身不会删除。</>}
-        confirmLabel="撤销链接"
+        title={serverMode ? '重置工作区订阅链接？' : '撤销订阅链接？'}
+        body={serverMode
+          ? <>重置后会立即生成新的固定链接，<b>旧链接对所有设备立即失效</b>；已导入旧链接的客户端需要重新导入。节点本身不会删除。</>
+          : <>撤销后 <b>已经导入该链接的客户端</b> 将无法再更新订阅，需要重新生成。节点本身不会删除。</>}
+        confirmLabel={serverMode ? '重置链接' : '撤销链接'}
         danger
         confirmDisabled={readOnly}
         onCancel={() => setPendingRevoke(false)}
@@ -9485,9 +9549,11 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         title={configName}
         hint={lanSubURL
           ? '手机与电脑需在同一 Wi-Fi；扫码后把订阅地址添加到客户端。'
-          : localHost
-            ? '当前二维码指向本机地址，手机扫描可能无法访问；请改用局域网地址打开塔台后再生成。'
-            : '扫码后把订阅地址添加到客户端。'}
+          : serverMode && net && !net.publicUrl
+            ? '尚未配置 TOWER_PUBLIC_URL；当前二维码可能指向本机或某台设备的访问地址，跨设备未必可用。'
+            : localHost
+              ? '当前二维码指向本机地址，手机扫描可能无法访问；请改用局域网地址打开塔台后再生成。'
+              : '扫码后把订阅地址添加到客户端。'}
         onClose={() => setQrOpen(false)}
       />
     </div>
