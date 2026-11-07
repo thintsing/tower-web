@@ -133,6 +133,8 @@ export function DiagnosisPanel({
   const [exclusionNote, setExclusionNote] = useState('')
   const [cleanupOpen, setCleanupOpen] = useState(false)
   const [cleanupNote, setCleanupNote] = useState('')
+  const [keepDirection, setKeepDirection] = useState<'first' | 'last' | 'manual'>('first')
+  const [manualKeep, setManualKeep] = useState<Record<string, 'first' | 'last'>>({})
   const cleanupBusy = useRef(false)
   const copyDialog = useRef<HTMLDialogElement>(null)
   const [error, setError] = useState('')
@@ -176,8 +178,13 @@ export function DiagnosisPanel({
     : []
   const { relevant, others } = splitRanked(ranked)
   const cleanup = useMemo(
-    () => (scheme && result ? analyzeDuplicateCleanup(scheme) : null),
-    [scheme, result],
+    () => (scheme && result
+      ? analyzeDuplicateCleanup(scheme, {
+        keep: keepDirection === 'last' ? 'last' : 'first',
+        decisions: keepDirection === 'manual' ? manualKeep : undefined,
+      })
+      : null),
+    [scheme, result, keepDirection, manualKeep],
   )
   const exclusionItems = useMemo(
     () => (scheme ? listSchemeExclusions(scheme, ruleSetExclusions) : []),
@@ -352,6 +359,24 @@ export function DiagnosisPanel({
         {error && <div className="form-error" role="alert">{error}</div>}
       </div>
 
+      {/* 诊断结果为空时（例如切到别的页签再回来）仍然保留撤销入口：
+          结果区整体在 `result &&` 里，撤销槽却跨页签存活，不放这里就点不到。 */}
+      {!result && (canUndoCleanup || cleanupNote) && (
+        <div className="diag-cleanup">
+          <div className="diag-cleanup-copy">
+            <strong>{canUndoCleanup ? '最近一次删除' : '清理结果'}</strong>
+            <span className="diag-cleanup-count">
+              {cleanupNote ?? '重复规则已删除并保存；撤销只恢复被删的条目，不会回退删除之后的其它修改。'}
+            </span>
+          </div>
+          {canUndoCleanup && (
+            <div className="diag-cleanup-actions">
+              <button className="btn ghost" disabled={readOnly} onClick={undoCleanup}>撤销上次删除</button>
+            </div>
+          )}
+        </div>
+      )}
+
       {result && (
         <>
           <section className="diag-section" aria-labelledby="diag-chain-title">
@@ -518,12 +543,12 @@ export function DiagnosisPanel({
                 {lintState.summary.error} error · {lintState.summary.warn} warn · {lintState.summary.info} info
               </span>
             </div>
-            {cleanup && cleanup.total > 0 && (
+            {cleanup && cleanup.total + cleanup.shadowedCount > 0 && (
               <div className="diag-cleanup">
                 <div className="diag-cleanup-copy">
                   <strong>重复 / 遮蔽规则</strong>
                   <span className="diag-cleanup-count">
-                    {cleanup.total} 条 · 可安全删除 {cleanup.deletions.length} 条
+                    重复 {cleanup.total} 条 · 可安全删除 {cleanup.deletions.length + cleanup.shadowed.length} 条
                     {cleanup.deletions.length > 0 && ` · 涉及 ${cleanup.groups} 个策略组`}
                   </span>
                   <div className="diag-cleanup-skip">
@@ -534,6 +559,9 @@ export function DiagnosisPanel({
                         {cleanup.droppedGroups} 组）
                       </span>
                     )}
+                    {cleanup.shadowedCount > 0 && (
+                      <span>遮蔽死规则 {cleanup.shadowedCount} 条（永远不会命中，可一并删除）</span>
+                    )}
                     {cleanup.skipped.deadPredecessor.length > 0 && (
                       <span>前置规则失效 {cleanup.skipped.deadPredecessor.length} 条需你决定</span>
                     )}
@@ -541,16 +569,80 @@ export function DiagnosisPanel({
                       <span>只读来源 {cleanup.skipped.readOnly.length} 条跳过</span>
                     )}
                   </div>
+                  {cleanup.crossGroupCount > 0 && (
+                    <div className="diag-cleanup-skip" role="radiogroup" aria-label="跨组重复保留方向">
+                      <label>
+                        <input
+                          type="radio"
+                          name="keep-direction"
+                          checked={keepDirection === 'first'}
+                          onChange={() => setKeepDirection('first')}
+                        /> 保留前一条
+                      </label>
+                      <label>
+                        <input
+                          type="radio"
+                          name="keep-direction"
+                          checked={keepDirection === 'last'}
+                          onChange={() => setKeepDirection('last')}
+                        /> 保留后一条
+                      </label>
+                      <label>
+                        <input
+                          type="radio"
+                          name="keep-direction"
+                          checked={keepDirection === 'manual'}
+                          onChange={() => setKeepDirection('manual')}
+                        /> 逐对处理
+                      </label>
+                    </div>
+                  )}
+                  {keepDirection === 'manual' && cleanup.choices.length > 0 && (
+                    <div className="diag-cleanup-choices">
+                      {cleanup.choices.map((choice) => (
+                        <div className="diag-cleanup-choice" key={choice.signature}>
+                          <span className="mono">{choice.ruleText}</span>
+                          <span className="diag-meta">{choice.groups.join(' / ')}</span>
+                          <span className="diag-cleanup-choice-actions">
+                            <button
+                              type="button"
+                              className={`btn ghost${choice.direction === 'first' ? ' is-active' : ''}`}
+                              onClick={() => setManualKeep((prev) => ({ ...prev, [choice.signature]: 'first' }))}
+                            >保留前一条</button>
+                            <button
+                              type="button"
+                              className={`btn ghost${choice.direction === 'last' ? ' is-active' : ''}`}
+                              onClick={() => setManualKeep((prev) => ({ ...prev, [choice.signature]: 'last' }))}
+                            >保留后一条</button>
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div className="diag-hint">
+                    {keepDirection === 'first'
+                      ? '保留前一条：后一条本来就被前一条接住，目标策略组不变。'
+                      : keepDirection === 'last'
+                        ? '保留后一条：原本可能接住流量的较早条目会被删除，目标策略组按下表改变。'
+                        : '逐对处理：每个重复签名单独选择保留方向；只有选「后一条」的条目会改变目标策略组。'}
+                  </div>
+                  {cleanup.directionChanges.length > 0 && (
+                    <div className="diag-hint">
+                      保留后一条后的去向变化：{cleanup.directionChanges
+                        .map((change) => `「${change.fromGroup}」→「${change.toGroup}」（${change.count} 条）`)
+                        .join('；')}
+                    </div>
+                  )}
                   {cleanupNote && <div className="diag-hint">{cleanupNote}</div>}
                 </div>
                 <div className="diag-cleanup-actions">
                   <button
                     className="btn primary"
-                    disabled={readOnly || cleanup.deletions.length === 0}
-                    title={readOnly ? READONLY_NOTE : '确认后一次性删除同组与跨组的冗余规则'}
+                    disabled={readOnly || cleanup.deletions.length + cleanup.shadowed.length === 0}
+                    title={readOnly ? READONLY_NOTE : '确认后一次性删除重复条目与遮蔽死规则'}
                     onClick={() => setCleanupOpen(true)}
                   >
-                    一键清理重复规则
+                    一键清理 {cleanup.deletions.length + cleanup.shadowed.length} 条
                   </button>
                   {canUndoCleanup && (
                     <button className="btn ghost" disabled={readOnly} onClick={undoCleanup}>撤销上次删除</button>
@@ -558,7 +650,7 @@ export function DiagnosisPanel({
                 </div>
               </div>
             )}
-            {canUndoCleanup && (!cleanup || cleanup.total === 0) && (
+            {canUndoCleanup && (!cleanup || cleanup.total + cleanup.shadowedCount === 0) && (
               // 清理干净后 total 变为 0，上面的卡片会整体隐藏；撤销入口必须独立保留，
               // 否则「删完才发现删错」时用户根本点不到撤销。
               <div className="diag-cleanup">
@@ -789,9 +881,42 @@ export function DiagnosisPanel({
         >
           <h3 id="diag-cleanup-title">清理重复规则</h3>
           <p>
-            将删除 <strong>{cleanup.deletions.length}</strong> 条规则（同组 {cleanup.sameGroupCount} 条 /
-            跨组 {cleanup.crossGroupCount} 条），涉及 <strong>{cleanup.groups}</strong> 个策略组。
+            将删除 <strong>{cleanup.deletions.length + cleanup.shadowed.length}</strong> 条规则
+            （同组 {cleanup.sameGroupCount} 条 / 跨组 {cleanup.crossGroupCount} 条 / 遮蔽死规则{' '}
+            {cleanup.shadowedCount} 条），涉及 <strong>{cleanup.groups}</strong> 个策略组。
+            {keepDirection === 'last' || keepDirection === 'manual'
+              ? ' 选「保留后一条」的重复会改变目标策略组，去向变化见下方。'
+              : ' 保留前一条不会改变目标策略组。'}
           </p>
+          {cleanup.directionChanges.length > 0 && (
+            <div className="diag-cleanup-cross">
+              <strong>保留后一条后的去向变化</strong>
+              <ul>
+                {cleanup.directionChanges.map((change) => (
+                  <li key={`${change.fromGroup}-${change.toGroup}`}>
+                    「{change.fromGroup}」→「{change.toGroup}」：{change.count} 条（{change.rules.slice(0, 3).join('、')}
+                    {change.rules.length > 3 ? '…' : ''}）
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {cleanup.shadowedCount > 0 && (
+            <div className="diag-cleanup-cross">
+              <strong>一并删除的遮蔽死规则 {cleanup.shadowedCount} 条</strong>
+              <ul>
+                {cleanup.shadowed.slice(0, 6).map((item, index) => (
+                  <li key={`shadowed-${index}-${item.ruleText}`}>
+                    <span className="mono">{item.ruleText}</span>
+                    <span className="diag-meta">{item.group || '未分组'} · {item.shadowedReason}</span>
+                  </li>
+                ))}
+              </ul>
+              {cleanup.shadowedCount > 6 && (
+                <div className="diag-meta">还有 {cleanup.shadowedCount - 6} 条，可在下方明细里查看。</div>
+              )}
+            </div>
+          )}
           {requiresCopy && (
             <p>
               当前是内置方案，清理前会先创建副本并切换过去；原内置方案不变，之后可撤销本次复制。
@@ -852,12 +977,12 @@ export function DiagnosisPanel({
             </div>
           )}
           <p className="diag-hint">
-            只删除「类型与归一化值相同、选项相同、前一条可写且确实可达」的后一条规则；同组与跨组都适用。
-            撤销会把它们按原位插回，不会影响你之后做的其它编辑。
+            删除可安全清理的重复（同组 / 跨组，按你选择的保留方向）与被前序规则遮蔽、永远不会命中的死规则。
+            只读来源的条目会跳过并建议改用「屏蔽」。撤销会把它们按原位插回，不会影响你之后做的其它编辑。
           </p>
           <div className="actions">
             <button className="btn primary" disabled={readOnly} onClick={confirmCleanup}>
-              确认删除 {cleanup.deletions.length} 条
+              确认删除 {cleanup.deletions.length + cleanup.shadowed.length} 条
             </button>
             <button className="btn ghost" autoFocus onClick={() => setCleanupOpen(false)}>取消</button>
           </div>

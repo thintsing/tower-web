@@ -3,6 +3,7 @@
 // pinned Fluent / flag-icons / Tower icon commits; nothing is rehosted here.
 import type { ClientTarget, PolicyGroup, RoutingRule, RuleScheme } from '../models/types'
 import { flagEmoji, regionForName } from '../models/region'
+import { renameRuleOrderKeys } from '../rules/ruleOrder'
 
 const FLUENT_BASE = 'https://cdn.jsdelivr.net/gh/microsoft/fluentui-emoji@1ffb34c752ecf5d402f04cfb4b392c77f57c54bc/'
 const FLAG_BASE = 'https://cdn.jsdelivr.net/gh/pengchujin/tower@425b0a7acce67b19f442d01a0722c2ae4cf8a477/Rulesets/PolicyGroupIcons/ac7e0eb3259eb62aa6100c435607e2fe03896a97/'
@@ -373,6 +374,7 @@ export function autoFillGroupEmojis(source: RuleScheme): EmojiAutofillResult {
         rules: set.rules.map((rule) => ({ ...rule, group: mapName(rule.group) })),
       })),
       matchingOrder: source.matchingOrder?.map(mapName),
+      ruleOrder: renameRuleOrderKeys(source.ruleOrder, renames),
       rawConfigurationText: undefined,
       updatedAt: Date.now(),
     },

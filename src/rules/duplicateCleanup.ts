@@ -8,7 +8,8 @@
 import type { RuleScheme, RoutingRule } from '../models/types'
 import { reorderRulesByMatchingOrder } from './matchingOrder'
 import { ruleSignature } from './ruleDiff'
-import { ruleSetInsertionIndex, sortSupplementRules, type RuleSetBlock } from './ruleOrder'
+import { applyRuleOrder, ruleSetInsertionIndex, sortSupplementRules, type RuleSetBlock } from './ruleOrder'
+import { isReadOnlyRuleSet } from './ruleSetExclusions'
 import { isTerminalRule } from './ruleKeys'
 import { shadowedRuleIndexes } from './schemeLint'
 
@@ -20,20 +21,26 @@ export interface RulePlace {
   index: number
   ruleSetId?: string
   ruleSetName?: string
+  /** 内联在 scheme.rules 里的只读规则（固化快照）：只能屏蔽，不能删除。 */
+  readOnly?: boolean
 }
 
-/** 同组重复：后一条与前一条指向同一个组；跨组重复：两份规则分流到不同组。 */
-export type DuplicateKind = 'sameGroup' | 'crossGroup'
+/** 同组重复、跨组重复，以及被前序规则遮蔽的死规则。 */
+export type DuplicateKind = 'sameGroup' | 'crossGroup' | 'shadowed'
 
 export interface DuplicateDeletion {
   place: RulePlace
   rule: RoutingRule
   ruleText: string
   group: string
-  /** 保留的前一条在扁平化后的位置（从 1 开始）。 */
+  /** 保留的前一条（或后一条）在扁平化后的位置（从 1 开始）。 */
   duplicateOfIndex: number
   duplicateOfGroup: string
   kind: DuplicateKind
+  /** 本次选择保留的方向；跨组且保留后一条时会改变目标策略组。 */
+  keptDirection?: 'first' | 'last'
+  /** shadowed 的说明。 */
+  shadowedReason?: string
 }
 
 export type SkipReason = 'readOnly' | 'deadPredecessor'
@@ -60,22 +67,55 @@ export interface CrossGroupPair {
   rules: string[]
 }
 
+/** 选择「保留后一条」时，目标策略组会从 fromGroup 改为 toGroup。 */
+export interface DirectionChange {
+  fromGroup: string
+  toGroup: string
+  count: number
+  rules: string[]
+}
+
+/** 逐对处理时，每一条重复规则的可选方向。 */
+export interface DuplicateChoice {
+  signature: string
+  ruleText: string
+  /** 出现过的策略组，按规则顺序去重。 */
+  groups: string[]
+  occurrences: number
+  direction: 'first' | 'last'
+}
+
+export interface DuplicateCleanupOptions {
+  /** 默认保留前一条；last 保留最后一条。 */
+  keep?: 'first' | 'last'
+  /** 逐对处理：按规则签名覆盖方向。 */
+  decisions?: Record<string, 'first' | 'last'>
+}
+
 export interface DuplicateCleanupPlan {
-  /** 可以无风险删除的后一条规则（含同组与跨组）。 */
+  /** 可以无风险删除的重复条目（同组 + 跨组）。 */
   deletions: DuplicateDeletion[]
+  /** 被前序更宽规则遮蔽、永远不会命中的死规则；与重复走同一套删除/撤销流程。 */
+  shadowed: DuplicateDeletion[]
   skipped: Record<SkipReason, SkippedDuplicate[]>
   /** 同组重复条数。 */
   sameGroupCount: number
   /** 跨组重复条数。 */
   crossGroupCount: number
+  /** 被前序规则遮蔽、永远不会命中的可删条数。 */
+  shadowedCount: number
   /** 跨组删除里保留的策略组数量。 */
   keptGroups: number
   /** 跨组删除里被删除条目的策略组数量。 */
   droppedGroups: number
   crossPairs: CrossGroupPair[]
+  /** 保留后一条会改变去向的组配对。 */
+  directionChanges: DirectionChange[]
+  /** 逐对处理的可选项；每项对应一个重复签名。 */
+  choices: DuplicateChoice[]
   /** 删除会涉及的策略组数量。 */
   groups: number
-  /** 命中的重复总数（可删 + 跳过）。 */
+  /** 命中的重复总数（可删 + 跳过），不含遮蔽的死规则。 */
   total: number
 }
 
@@ -100,10 +140,11 @@ function placeSource(place: RulePlace): string {
 }
 
 function placeWritable(place: RulePlace, scheme: RuleScheme): boolean {
+  if (place.readOnly) return false
   if (place.kind !== 'ruleSet') return true
   const set = scheme.ruleSets?.find((item) => item.id === place.ruleSetId)
   // 在线订阅与内置规则库是只读快照，不能在方案里删条目冒充修复。
-  return !!set && set.sourceKind !== 'url' && set.sourceKind !== 'library'
+  return !!set && !isReadOnlyRuleSet(set)
 }
 
 /**
@@ -121,11 +162,26 @@ function flattenScheme(scheme: RuleScheme): TaggedRule[] {
     .map((rule) => customByRule.get(rule))
     .filter((tag): tag is TaggedRule => !!tag)
 
-  const schemeTags: TaggedRule[] = scheme.rules.map((rule, index) => ({
-    rule: { ...rule },
-    place: { kind: 'scheme', index },
-    position: 0,
-  }))
+  const readOnlyBySetID = new Map(
+    (scheme.ruleSets ?? [])
+      .filter((set) => isReadOnlyRuleSet(set))
+      .map((set) => [set.id, set.name]),
+  )
+  const schemeTags: TaggedRule[] = scheme.rules.map((rule, index) => {
+    const sourceSet = rule.sourceSetId ? readOnlyBySetID.get(rule.sourceSetId) : undefined
+    return {
+      rule: { ...rule },
+      place: {
+        kind: 'scheme',
+        index,
+        // 固化快照把只读规则内联在 scheme.rules 里：位置可定位，但只能屏蔽不能删。
+        ...(rule.sourceSetId && sourceSet
+          ? { readOnly: true, ruleSetId: rule.sourceSetId, ruleSetName: sourceSet }
+          : {}),
+      },
+      position: 0,
+    }
+  })
   const blocks = (scheme.ruleSets ?? []).map((set) => {
     const tags: TaggedRule[] = set.rules.map((rule, index) => ({
       rule: { ...rule, group: set.group },
@@ -146,6 +202,8 @@ function flattenScheme(scheme: RuleScheme): TaggedRule[] {
   const finals = schemeTags.filter((tag) => isTerminalRule(tag.rule))
   const buckets = new Map<number, TaggedRule[]>()
   for (const { tags, block } of blocks) {
+    // 固化快照的规则已在 scheme.rules 里，块只是展示 / 屏蔽入口，不能再插一遍。
+    if (block.inlined) continue
     const index = ruleSetInsertionIndex(ordinary.map((tag) => tag.rule), block)
     buckets.set(index, [...(buckets.get(index) ?? []), ...tags])
   }
@@ -159,15 +217,22 @@ function flattenScheme(scheme: RuleScheme): TaggedRule[] {
   if (tail) merged.push(...tail)
   merged.push(...finals)
 
-  const byRule = new Map(merged.map((tag) => [tag.rule, tag]))
-  const baseOrdered = reorderRulesByMatchingOrder(
+  const baseNatural = reorderRulesByMatchingOrder(
     merged.map((tag) => tag.rule),
     scheme.matchingOrder,
+  )
+    .map((rule) => merged.find((tag) => tag.rule === rule))
+    .filter((tag): tag is TaggedRule => !!tag)
+  const allTags = [...customOrdered, ...baseNatural]
+  const byRule = new Map(allTags.map((tag) => [tag.rule, tag]))
+  const allOrdered = applyRuleOrder(
+    allTags.map((tag) => tag.rule),
+    scheme.ruleOrder,
   )
     .map((rule) => byRule.get(rule))
     .filter((tag): tag is TaggedRule => !!tag)
 
-  return [...customOrdered, ...baseOrdered].map((tag, position) => ({ ...tag, position }))
+  return allOrdered.map((tag, position) => ({ ...tag, position }))
 }
 
 /**
@@ -175,65 +240,109 @@ function flattenScheme(scheme: RuleScheme): TaggedRule[] {
  * 前一条失效（本身被更宽的规则遮蔽）时不删后一条：无法证明后一条不会命中。
  * 跨组时还要求前一条可写：前一条来自只读规则集，刷新后可能消失。
  */
-export function analyzeDuplicateCleanup(scheme: RuleScheme): DuplicateCleanupPlan {
+export function analyzeDuplicateCleanup(
+  scheme: RuleScheme,
+  options: DuplicateCleanupOptions = {},
+): DuplicateCleanupPlan {
   const tagged = flattenScheme(scheme)
   const rules = tagged.map((tag) => tag.rule)
   const dead = shadowedRuleIndexes(rules)
+  const keepMode: 'first' | 'last' = options.keep === 'last' ? 'last' : 'first'
+  const decisions = options.decisions ?? {}
 
-  const firstBySignature = new Map<string, TaggedRule>()
+  const bySignature = new Map<string, TaggedRule[]>()
+  for (const tag of tagged) {
+    if (isTerminalRule(tag.rule)) continue
+    const signature = ruleSignature(tag.rule)
+    const list = bySignature.get(signature) ?? []
+    list.push(tag)
+    bySignature.set(signature, list)
+  }
+
   const deletions: DuplicateDeletion[] = []
   const skipped: DuplicateCleanupPlan['skipped'] = {
     readOnly: [],
     deadPredecessor: [],
   }
-  let total = 0
+  const choices: DuplicateChoice[] = []
+  let duplicateTotal = 0
 
+  for (const [signature, list] of bySignature) {
+    if (list.length < 2) continue
+    duplicateTotal += list.length - 1
+    const direction = decisions[signature] ?? keepMode
+    choices.push({
+      signature,
+      ruleText: ruleText(list[0].rule),
+      groups: [...new Set(list.map((tag) => tag.rule.group.trim()))],
+      occurrences: list.length,
+      direction,
+    })
+    const kept = direction === 'last' ? list[list.length - 1] : list[0]
+    const candidates = direction === 'last' ? list.slice(0, -1) : list.slice(1)
+
+    for (const candidate of candidates) {
+      const base = {
+        ruleText: ruleText(candidate.rule),
+        group: candidate.rule.group,
+        firstGroup: kept.rule.group,
+        firstIndex: kept.position + 1,
+        index: candidate.position + 1,
+        source: placeSource(candidate.place),
+      }
+      if (!placeWritable(candidate.place, scheme)) {
+        skipped.readOnly.push({ ...base, reason: 'readOnly' })
+        continue
+      }
+      const crossGroup = !sameGroup(kept.rule.group, candidate.rule.group)
+      if (direction === 'first' && dead.has(kept.position)) {
+        // 保留的前一条本身不会命中：此时后一条可能真的生效，不能贸然删除。
+        skipped.deadPredecessor.push({ ...base, reason: 'deadPredecessor' })
+        continue
+      }
+      // 保留的条目来自在线 / 内置只读规则集：刷新后它可能消失，删掉另一条会改变路由。
+      if (crossGroup && !placeWritable(kept.place, scheme)) {
+        skipped.readOnly.push({ ...base, reason: 'readOnly', firstSource: placeSource(kept.place) })
+        continue
+      }
+      deletions.push({
+        place: candidate.place,
+        rule: candidate.rule,
+        ruleText: ruleText(candidate.rule),
+        group: candidate.rule.group,
+        duplicateOfIndex: kept.position + 1,
+        duplicateOfGroup: kept.rule.group,
+        kind: crossGroup ? 'crossGroup' : 'sameGroup',
+        keptDirection: direction,
+      })
+    }
+  }
+
+  // 被前序更宽规则遮蔽的死规则永远不会命中，可安全删除；只读来源仍需走屏蔽。
+  const shadowed: DuplicateDeletion[] = []
+  const placed = new Set(deletions.map((item) => `${item.place.kind}:${item.place.ruleSetId ?? ''}:${item.place.index}`))
   for (const tag of tagged) {
-    if (isTerminalRule(tag.rule)) continue
-    const signature = ruleSignature(tag.rule)
-    const first = firstBySignature.get(signature)
-    if (!first) {
-      firstBySignature.set(signature, tag)
-      continue
-    }
-    total += 1
-    const base = {
-      ruleText: ruleText(tag.rule),
-      group: tag.rule.group,
-      firstGroup: first.rule.group,
-      firstIndex: first.position + 1,
-      index: tag.position + 1,
-      source: placeSource(tag.place),
-    }
-    if (!placeWritable(tag.place, scheme)) {
-      skipped.readOnly.push({ ...base, reason: 'readOnly' })
-      continue
-    }
-    if (dead.has(first.position)) {
-      skipped.deadPredecessor.push({ ...base, reason: 'deadPredecessor' })
-      continue
-    }
-    const crossGroup = !sameGroup(first.rule.group, tag.rule.group)
-    // 前一条来自在线 / 内置只读规则集：刷新后它可能消失，此时后一条会重新生效，
-    // 删除就真的会改变路由，因此跨组不删。
-    if (crossGroup && !placeWritable(first.place, scheme)) {
-      skipped.readOnly.push({ ...base, reason: 'readOnly', firstSource: placeSource(first.place) })
-      continue
-    }
-    deletions.push({
+    if (!dead.has(tag.position) || isTerminalRule(tag.rule)) continue
+    const key = `${tag.place.kind}:${tag.place.ruleSetId ?? ''}:${tag.place.index}`
+    if (placed.has(key) || !placeWritable(tag.place, scheme)) continue
+    placed.add(key)
+    shadowed.push({
       place: tag.place,
       rule: tag.rule,
       ruleText: ruleText(tag.rule),
       group: tag.rule.group,
-      duplicateOfIndex: first.position + 1,
-      duplicateOfGroup: first.rule.group,
-      kind: crossGroup ? 'crossGroup' : 'sameGroup',
+      duplicateOfIndex: 0,
+      duplicateOfGroup: '',
+      kind: 'shadowed',
+      shadowedReason: '被前序更宽的规则遮蔽，永远不会命中',
     })
   }
 
   const crossDeletions = deletions.filter((item) => item.kind === 'crossGroup')
   const crossPairs: CrossGroupPair[] = []
   const pairByKey = new Map<string, CrossGroupPair>()
+  const changes: DirectionChange[] = []
+  const changeByKey = new Map<string, DirectionChange>()
   for (const item of crossDeletions) {
     const keepGroup = item.duplicateOfGroup.trim()
     const dropGroup = item.group.trim()
@@ -247,19 +356,36 @@ export function analyzeDuplicateCleanup(scheme: RuleScheme): DuplicateCleanupPla
       pairByKey.set(key, pair)
       crossPairs.push(pair)
     }
+    // 保留后一条时，原本由「前一条组」接住的流量改由「后一条组」处理。
+    if (item.keptDirection === 'last') {
+      const change = changeByKey.get(key)
+      if (change) {
+        change.count += 1
+        change.rules.push(item.ruleText)
+      } else {
+        const entry = { fromGroup: dropGroup, toGroup: keepGroup, count: 1, rules: [item.ruleText] }
+        changeByKey.set(key, entry)
+        changes.push(entry)
+      }
+    }
   }
 
-  const groups = new Set(deletions.map((item) => item.group.trim()))
+  const groups = new Set([...deletions, ...shadowed].map((item) => item.group.trim()))
+  const shadowedCount = shadowed.length
   return {
     deletions,
+    shadowed,
     skipped,
-    sameGroupCount: deletions.length - crossDeletions.length,
+    sameGroupCount: deletions.filter((item) => item.kind === 'sameGroup').length,
     crossGroupCount: crossDeletions.length,
+    shadowedCount,
     keptGroups: new Set(crossDeletions.map((item) => item.duplicateOfGroup.trim())).size,
     droppedGroups: new Set(crossDeletions.map((item) => item.group.trim())).size,
     crossPairs,
+    directionChanges: changes,
+    choices,
     groups: groups.size,
-    total,
+    total: duplicateTotal,
   }
 }
 
@@ -280,7 +406,7 @@ export function applyDuplicateCleanup(
   const bySet = new Map<string, Set<number>>()
   const applied: DuplicateDeletion[] = []
 
-  for (const deletion of plan.deletions) {
+  for (const deletion of [...plan.deletions, ...(plan.shadowed ?? [])]) {
     const place = deletion.place
     const current = place.kind === 'custom'
       ? scheme.customRules?.[place.index]
@@ -399,7 +525,7 @@ export function restoreRemovedRules(
   return {
     scheme: {
       ...scheme,
-      customRules: scheme.customRules?.length ? customResult.next : scheme.customRules,
+      customRules: scheme.customRules ? customResult.next : scheme.customRules,
       rules: baseResult.next,
       ruleSets,
     },

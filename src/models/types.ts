@@ -452,6 +452,11 @@ export interface RuleScheme {
   customRules?: RoutingRule[]
   /** 拖动策略组后调整的规则匹配顺序；缺省保持原规则顺序。 */
   matchingOrder?: string[]
+  /**
+   * 规则页逐条上移 / 下移后的顺序；键由 ruleOrderKey 生成（签名 + 策略组）。
+   * 它是在 matchingOrder、自定义规则前置之后应用的最终覆盖；分组拖动会清空它。
+   */
+  ruleOrder?: string[]
   /** 从规则库 / 本地规则集加入的整组规则，排在自定义规则之后、方案规则之前。 */
   ruleSets?: SchemeRuleSet[]
   /** 自定义方案的导入来源，用于刷新；内置方案没有这个字段。 */

@@ -17,6 +17,16 @@ export function isTerminalRule(rule: Pick<RoutingRule, 'type' | 'raw'>): boolean
   return type === 'FINAL' || type === 'MATCH'
 }
 
+/**
+ * 作为匹配兜底锚点、不参与手动逐条排序的规则：FINAL / MATCH 永远在最后，
+ * GEOIP 是地理兜底；逐条排序不能把它们挪到普通规则前面。
+ */
+export function isUnmovableRule(rule: Pick<RoutingRule, 'type' | 'raw'>): boolean {
+  if (isTerminalRule(rule)) return true
+  const type = (rule.raw?.split(',')[0] ?? rule.type ?? '').trim().toUpperCase()
+  return type === 'GEOIP'
+}
+
 /** TYPE,value 小写比较键；逻辑规则的 raw 也按前两个字段识别。 */
 export function ruleMatchKey(
   rule: Pick<RoutingRule, 'type' | 'value' | 'raw'>,

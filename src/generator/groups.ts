@@ -16,7 +16,7 @@ import {
 import { mihomoBinaryPlan, singBoxBinaryPlan, SRS_DOMAIN_TYPES } from '../rules/binaryRuleSets'
 import { inlineRuleSetMetadata } from '../rules/inlineSets'
 import { reorderRulesByMatchingOrder } from '../rules/matchingOrder'
-import { insertRuleSetBlocks, sortSupplementRules, type RuleSetBlock } from '../rules/ruleOrder'
+import { applyRuleOrder, insertRuleSetBlocks, sortSupplementRules, type RuleSetBlock } from '../rules/ruleOrder'
 import { conditionalDefaultPolicy, effectiveGroupType } from '../rules/capabilities'
 
 /** 所有客户端生成器共用的导出选项。 */
@@ -483,9 +483,12 @@ export function prepareSchemeForExport(
   return {
     ...scheme,
     groups,
-    rules: [
-      ...sortSupplementRules(customRules),
-      ...reorderRulesByMatchingOrder(mergedRules, scheme.matchingOrder),
-    ],
+    rules: applyRuleOrder(
+      [
+        ...sortSupplementRules(customRules),
+        ...reorderRulesByMatchingOrder(mergedRules, scheme.matchingOrder),
+      ],
+      scheme.ruleOrder,
+    ),
   }
 }

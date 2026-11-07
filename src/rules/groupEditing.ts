@@ -2,6 +2,7 @@
 // rules can be exercised by the self-check scripts.
 import type { PolicyGroup, ProxyNode, RuleScheme, SchemeRuleSet } from '../models/types'
 import { DEFAULT_TEST_URL } from '../models/networkSettings'
+import { dropRuleOrderKeysForGroup } from './ruleOrder'
 
 export type NodeGroupType = 'select' | 'url-test' | 'fallback'
 
@@ -201,6 +202,7 @@ export function removePolicyGroup(source: RuleScheme, name: string): RemovedGrou
   }
 
   const matchingOrder = source.matchingOrder?.filter((group) => group !== name)
+  const ruleOrder = dropRuleOrderKeysForGroup(source.ruleOrder, name)
   return {
     scheme: {
       ...source,
@@ -209,6 +211,7 @@ export function removePolicyGroup(source: RuleScheme, name: string): RemovedGrou
       customRules,
       ruleSets,
       matchingOrder,
+      ruleOrder,
       updatedAt: Date.now(),
     },
     removedRules: source.rules.length - rules.length,

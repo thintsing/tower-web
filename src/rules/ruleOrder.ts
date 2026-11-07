@@ -4,9 +4,10 @@
 // - FINAL / MATCH 永远留在最后，不参与拖动重排。
 import type { RoutingRule, RuleScheme } from '../models/types'
 import { reorderRulesByMatchingOrder } from './matchingOrder'
-import { isTerminalRule, normalizedPolicyName, ruleMatchKey } from './ruleKeys'
+import { ruleSignature } from './ruleDiff'
+import { isTerminalRule, isUnmovableRule, normalizedPolicyName, ruleMatchKey } from './ruleKeys'
 
-export { isTerminalRule, normalizedPolicyName, ruleMatchKey } from './ruleKeys'
+export { isTerminalRule, isUnmovableRule, normalizedPolicyName, ruleMatchKey } from './ruleKeys'
 
 function cidrPrefixLength(value: string | undefined): number {
   const trimmed = (value ?? '').trim()
@@ -116,10 +117,103 @@ export function orderedSchemeBaseRules(scheme: RuleScheme): RoutingRule[] {
   )
 }
 
-/** 界面展示用顺序：自定义规则（排序后）+ 规则集/模板规则 + FINAL。 */
+/**
+ * 逐条排序键：规则签名 + 策略组。签名区分 type/value/选项，组名区分同一规则的
+ * 不同去向；分隔符用 \u0000，避免与规则文本里的逗号冲突。
+ */
+export function ruleOrderKey(rule: RoutingRule): string {
+  return `${ruleSignature(rule)}\u0000${normalizedPolicyName(rule.group)}`
+}
+
+export function ruleOrderGroup(key: string): string {
+  const at = key.lastIndexOf('\u0000')
+  return at < 0 ? '' : key.slice(at + 1)
+}
+
+/** 生成“当前全部普通规则”的顺序键；兜底规则不参与。 */
+export function ruleOrderKeys(rules: RoutingRule[]): string[] {
+  return rules.filter((rule) => !isUnmovableRule(rule)).map(ruleOrderKey)
+}
+
+/** 组改名后同步逐条顺序键里的组名（键尾存的是 normalizedPolicyName）。 */
+export function renameRuleOrderKeys(
+  order: string[] | undefined,
+  renames: Iterable<[string, string]>,
+): string[] | undefined {
+  if (!order?.length) return order
+  const map = new Map<string, string>()
+  for (const [oldName, newName] of renames) {
+    map.set(normalizedPolicyName(oldName), normalizedPolicyName(newName))
+  }
+  return order.map((key) => {
+    const at = key.lastIndexOf('\u0000')
+    if (at < 0) return key
+    const next = map.get(key.slice(at + 1))
+    return next ? `${key.slice(0, at)}\u0000${next}` : key
+  })
+}
+
+/** 删除策略组后清掉指向它的逐条顺序键。 */
+export function dropRuleOrderKeysForGroup(
+  order: string[] | undefined,
+  group: string,
+): string[] | undefined {
+  if (!order?.length) return order
+  const name = normalizedPolicyName(group)
+  return order.filter((key) => ruleOrderGroup(key) !== name)
+}
+
+/**
+ * 应用逐条顺序。GEOIP / FINAL / MATCH 作为锚点留在原位置，普通规则只在
+ * 相邻锚点之间重排，因此不会把兜底规则挤到前面。
+ * 未出现在顺序键里的规则（例如刷新规则集后新增的条目）按原来的坑位插回，
+ * 避免它们被悄悄挪到末尾。
+ */
+export function applyRuleOrder(
+  rules: RoutingRule[],
+  order: string[] | undefined,
+): RoutingRule[] {
+  if (!order?.length || rules.length < 2) return rules
+  const rank = new Map<string, number>()
+  order.forEach((key, index) => {
+    if (!rank.has(key)) rank.set(key, index)
+  })
+
+  const output: RoutingRule[] = []
+  let segment: RoutingRule[] = []
+
+  const flush = () => {
+    if (!segment.length) return
+    const tagged = segment.map((rule, index) => ({ rule, index, key: ruleOrderKey(rule) }))
+    const ranked = tagged
+      .filter((item) => rank.has(item.key))
+      .sort((left, right) => rank.get(left.key)! - rank.get(right.key)! || left.index - right.index)
+    for (const item of tagged.filter((entry) => !rank.has(entry.key))) {
+      ranked.splice(Math.min(item.index, ranked.length), 0, item)
+    }
+    output.push(...ranked.map((item) => item.rule))
+    segment = []
+  }
+
+  for (const rule of rules) {
+    if (isUnmovableRule(rule)) {
+      flush()
+      output.push(rule)
+      continue
+    }
+    segment.push(rule)
+  }
+  flush()
+  return output
+}
+
+/** 界面展示用顺序：自定义规则（排序后）+ 规则集/模板规则 + FINAL，再应用逐条覆盖。 */
 export function orderedSchemeRules(scheme: RuleScheme): RoutingRule[] {
-  return [
-    ...sortSupplementRules(scheme.customRules ?? []),
-    ...orderedSchemeBaseRules(scheme),
-  ]
+  return applyRuleOrder(
+    [
+      ...sortSupplementRules(scheme.customRules ?? []),
+      ...orderedSchemeBaseRules(scheme),
+    ],
+    scheme.ruleOrder,
+  )
 }
