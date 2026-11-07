@@ -10,6 +10,16 @@
 import type { BuiltinSchemeSnapshotContent, BuiltinSchemeSource, LocalRuleSet, RoutingRule, RuleScheme } from '../models/types'
 import { apiFetch } from '../util/apiAuth'
 import {
+  ACL4SSR_API_BASE,
+  ACL4SSR_BRANCH,
+  ACL4SSR_PIN_COMMIT,
+  ACL4SSR_RAW_BASE,
+  ACL4SSR_REPO,
+  checkUpstreamBaseline,
+  fetchUpstreamTree,
+  upstreamRawURL,
+} from '../../server/upstream-check.mjs'
+import {
   parseInlineRule,
   parsePlainRulesetText,
   parseSchemeINIParts,
@@ -19,10 +29,14 @@ import {
 } from './scheme'
 import { parseRuleSetText } from './ruleSets'
 
-export const ACL4SSR_REPO = 'ACL4SSR/ACL4SSR'
-export const ACL4SSR_BRANCH = 'master'
-export const ACL4SSR_RAW_BASE = `https://raw.githubusercontent.com/${ACL4SSR_REPO}`
-export const ACL4SSR_API_BASE = `https://api.github.com/repos/${ACL4SSR_REPO}`
+export {
+  ACL4SSR_API_BASE,
+  ACL4SSR_BRANCH,
+  ACL4SSR_PIN_COMMIT,
+  ACL4SSR_RAW_BASE,
+  ACL4SSR_REPO,
+  upstreamRawURL,
+}
 export const ACL4SSR_UPSTREAM_INI_BASE = `${ACL4SSR_RAW_BASE}/${ACL4SSR_BRANCH}/Clash/config/`
 
 /** 单个上游文件大小上限：ACL4SSR 列表最大只有几百 KB，8MB 足够且能挡住异常响应。 */
@@ -32,11 +46,6 @@ export const UPSTREAM_FILE_MIN_BYTES = 16
 
 export function upstreamINIURL(file: string): string {
   return ACL4SSR_UPSTREAM_INI_BASE + encodePath(file)
-}
-
-/** 按 commit 拉某个仓库路径；不使用 branch，避免 force-push 后拼成混合版本。 */
-export function upstreamRawURL(path: string, commitSha: string): string {
-  return `${ACL4SSR_RAW_BASE}/${commitSha}/${encodePath(path)}`
 }
 
 function encodePath(path: string): string {
@@ -176,30 +185,6 @@ export function validateUpstreamText(result: UpstreamTextResult): string {
 interface UpstreamTree {
   commitSha: string
   blobs: Map<string, string>
-}
-
-/** 一次 trees API：同时拿到当前 commit SHA 与所有 blob SHA。 */
-async function fetchUpstreamTree(
-  fetchText: (url: string) => Promise<string | UpstreamTextResult>,
-): Promise<UpstreamTree> {
-  const url = `${ACL4SSR_API_BASE}/git/trees/${ACL4SSR_BRANCH}?recursive=1`
-  const { text } = textOf(await fetchText(url))
-  const data = JSON.parse(text) as { sha?: unknown; truncated?: unknown; tree?: Array<{ path?: unknown; sha?: unknown; type?: unknown }> }
-  if (typeof data.sha !== 'string' || !/^[0-9a-f]{40}$/i.test(data.sha)) {
-    throw new Error('trees API 没有返回 commit SHA')
-  }
-  if (data.truncated === true) throw new Error('trees API 返回被截断')
-  const blobs = new Map<string, string>()
-  for (const entry of data.tree ?? []) {
-    if (entry.type === 'blob' && typeof entry.path === 'string' && typeof entry.sha === 'string') {
-      blobs.set(entry.path, entry.sha)
-    }
-  }
-  return { commitSha: data.sha, blobs }
-}
-
-function shortPath(path: string): string {
-  return path.split('/').pop() ?? path
 }
 
 export async function fetchUpstreamScheme(
@@ -414,64 +399,11 @@ export async function checkUpstreamUpdate(
   stored?: { source: BuiltinSchemeSource },
   options: CheckUpstreamOptions = {},
 ): Promise<UpstreamUpdateCheck> {
-  const previous = stored?.source
-  if (!previous?.commitSha) {
-    return { checked: false, updateAvailable: false, method: 'trees', changedFiles: [] }
-  }
-  const fetchText = options.fetchText ?? defaultFetchText
-
-  try {
-    const tree = await fetchUpstreamTree(fetchText)
-    const changedFiles = previous.files
-      .filter((file) => !tree.blobs.has(file.path) || tree.blobs.get(file.path) !== file.blobSha)
-      .map((file) => file.path)
-    const updateAvailable = tree.commitSha !== previous.commitSha || changedFiles.length > 0
-    return {
-      checked: true,
-      updateAvailable,
-      method: 'trees',
-      changedFiles,
-      commitSha: tree.commitSha,
-    }
-  } catch (apiError) {
-    const fetchHeaders = options.fetchHeaders ?? defaultFetchHeaders
-    const files = previous.files.filter((file) => file.etag)
-    if (!files.length) {
-      return {
-        checked: false,
-        updateAvailable: false,
-        method: 'head',
-        changedFiles: [],
-        error: `trees API 失败（${(apiError as Error).message}），且基线没有 ETag，无法使用备用检测`,
-      }
-    }
-    const changedFiles: string[] = []
-    const errors: string[] = []
-    let changed = false
-    await mapWithConcurrency(previous.files, LIST_FETCH_CONCURRENCY, async (file) => {
-      if (!file.etag) return
-      try {
-        const head = await fetchHeaders(upstreamRawURL(file.path, ACL4SSR_BRANCH))
-        if (!head.etag) {
-          errors.push(`${shortPath(file.path)}：HEAD 没有返回 ETag`)
-          return
-        }
-        if (head.etag !== file.etag) {
-          changed = true
-          changedFiles.push(file.path)
-        }
-      } catch (e) {
-        errors.push(`${shortPath(file.path)}：${(e as Error).message}`)
-      }
-    })
-    return {
-      checked: true,
-      updateAvailable: changed,
-      method: 'head',
-      changedFiles,
-      ...(errors.length ? { error: `备用检测有 ${errors.length} 个文件未完成：${errors.join('；')}` } : {}),
-    }
-  }
+  const result = await checkUpstreamBaseline(stored?.source, {
+    fetchText: options.fetchText ?? defaultFetchText,
+    fetchHeaders: options.fetchHeaders ?? defaultFetchHeaders,
+  })
+  return result as UpstreamUpdateCheck
 }
 
 function ruleSetName(url: string): string {

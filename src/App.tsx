@@ -62,6 +62,7 @@ import { AdvancedSection } from './components/AdvancedSection'
 import { WorkspaceStatusBanner } from './components/WorkspaceStatusBanner'
 import { WorkspaceHistoryPanel } from './components/WorkspaceHistoryPanel'
 import { flushWorkspaceNow, useWorkspaceStatus } from './workspaceSync'
+import { fetchUpstreamStatus, triggerUpstreamStatusCheck, type UpstreamStatusPayload } from './upstreamStatus'
 import { READONLY_NOTE, writeGuard } from './util/readOnlyUi'
 import { buildFlow, explainNodePool, type FlowStepKey } from './flow/flow'
 import { markExported, readExportedAt } from './flow/prefs'
@@ -5439,6 +5440,16 @@ function AddRuleSetToSchemeDialog({
 type RuleOrderUndoRecord = { schemeID: string; ruleOrder?: string[]; label: string }
 let ruleOrderUndoSlot: RuleOrderUndoRecord | null = null
 
+function formatUpstreamTime(value: number | null): string {
+  if (!value) return ''
+  return new Date(value).toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
 function RulesTab({
   onGo,
   locateIssue,
@@ -5450,7 +5461,9 @@ function RulesTab({
   onLocateConsumed?: () => void
 }) {
   const selectedSchemeID = useStore((s) => s.selectedSchemeID)
-  const readOnly = useWorkspaceStatus().readOnly
+  const workspaceStatus = useWorkspaceStatus()
+  const readOnly = workspaceStatus.readOnly
+  const workspaceMode = workspaceStatus.mode
   const setScheme = useStore((s) => s.setScheme)
   const policySelections = useStore((s) => s.policySelections)
   const setPolicy = useStore((s) => s.setPolicy)
@@ -5479,6 +5492,9 @@ function RulesTab({
   const setCheckBuiltinSchemeUpdatesOnOpen = useStore((s) => s.setCheckBuiltinSchemeUpdatesOnOpen)
   const builtinSchemeUpdateNotices = useStore((s) => s.builtinSchemeUpdateNotices)
   const setBuiltinSchemeUpdateNotice = useStore((s) => s.setBuiltinSchemeUpdateNotice)
+  const [serverUpstream, setServerUpstream] = useState<UpstreamStatusPayload | null>(null)
+  const [serverUpstreamError, setServerUpstreamError] = useState('')
+  const [upstreamChecking, setUpstreamChecking] = useState(false)
   const [importingScheme, setImportingScheme] = useState(false)
   const [updatingBuiltinScheme, setUpdatingBuiltinScheme] = useState(false)
   const [pendingFreeze, setPendingFreeze] = useState<{
@@ -5536,6 +5552,52 @@ function RulesTab({
   const [refreshingScheme, setRefreshingScheme] = useState(false)
   const [schemeFileName, setSchemeFileName] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // 服务端定时检查的结果只读展示；非服务器模式完全不请求、不轮询。
+  useEffect(() => {
+    if (workspaceMode !== 'server') {
+      setServerUpstream(null)
+      setServerUpstreamError('')
+      return
+    }
+    let cancelled = false
+    const load = async () => {
+      try {
+        const next = await fetchUpstreamStatus()
+        if (cancelled) return
+        setServerUpstream(next)
+        setServerUpstreamError('')
+      } catch (error) {
+        if (!cancelled) setServerUpstreamError((error as Error).message)
+      }
+    }
+    void load()
+    const timer = window.setInterval(() => { void load() }, 5 * 60 * 1000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [workspaceMode])
+
+  const checkUpstreamNow = async () => {
+    if (upstreamChecking) return
+    setUpstreamChecking(true)
+    setServerUpstreamError('')
+    try {
+      await triggerUpstreamStatusCheck()
+      // 手动检查在服务端异步执行；这里轮询到 checking 结束，避免“点了没反应”。
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1500))
+        const next = await fetchUpstreamStatus()
+        setServerUpstream(next)
+        if (!next.checking) break
+      }
+    } catch (error) {
+      setServerUpstreamError((error as Error).message)
+    } finally {
+      setUpstreamChecking(false)
+    }
+  }
 
   const allMetas = allSchemeMetas(customSchemes)
   const selectedMeta = allMetas.find((m) => m.id === selectedSchemeID)
@@ -5712,7 +5774,7 @@ function RulesTab({
   }
 
   /** 预览确认后的实际写入；与旧流程相同的覆盖层 + 3 版环形语义。 */
-  const confirmFreeze = () => {
+  const confirmFreeze = async () => {
     if (!pendingFreeze) return
     const { meta, result } = pendingFreeze
     setPendingFreeze(null)
@@ -5724,6 +5786,12 @@ function RulesTab({
     }
     setScheme(meta.id)
     setFlash(`已更新并固化「${meta.name}」：${result.override.source.ruleCount} 条规则、${result.ruleSets.length} 个列表（快照 #${snapshotId}）；已导出的客户端配置不会自动回滚。原厂快照保留，可随时恢复或回退。`)
+    if (workspaceMode === 'server') {
+      // 固化写入工作区后，服务端状态文件里的结果已过期；等工作区落盘后
+      // 再检查一次，让提示从「有新版本」及时回到「已是最新」。
+      await flushWorkspaceNow()
+      void checkUpstreamNow()
+    }
   }
 
   // 「生成自定义副本」：分支修改用；只写自定义方案与「我的规则集」，不碰覆盖层。
@@ -6562,6 +6630,89 @@ function RulesTab({
             <div className="hint">编辑、排序或添加规则会先生成一份自定义副本。</div>
           )}
         </details>
+        {workspaceMode === 'server' && (serverUpstream || serverUpstreamError) && (
+          <div className="upstream-status">
+            <div className="upstream-status-head">
+              <span className="upstream-status-title">上游更新检查</span>
+              <span className="hint">
+                {serverUpstream
+                  ? !serverUpstream.enabled
+                    ? '服务端定时检查已关闭（TOWER_UPSTREAM_CHECK=off）'
+                    : serverUpstream.checking || upstreamChecking
+                      ? '正在检查上游…'
+                      : serverUpstream.checkedAt
+                        ? `上次检查 ${formatUpstreamTime(serverUpstream.checkedAt)}`
+                        : '尚未检查（服务端会在启动几分钟后自动检查）'
+                  : '读取失败'}
+              </span>
+              {serverUpstream?.enabled && (
+                <button
+                  type="button"
+                  className="btn ghost"
+                  disabled={upstreamChecking || serverUpstream.checking}
+                  onClick={() => void checkUpstreamNow()}
+                >
+                  {upstreamChecking || serverUpstream.checking ? '正在检查…' : '立即检查一次'}
+                </button>
+              )}
+            </div>
+            {serverUpstream?.enabled && (
+              <div className="upstream-status-lines">
+                {serverUpstream.schemes.map((item) => {
+                  if (item.status === 'update') {
+                    const meta = allMetas.find((m) => m.id === item.id && !('custom' in m))
+                    return (
+                      <div key={item.id} className="upstream-status-line update">
+                        <span>
+                          「{item.name}」上游有新版本（commit {item.commitShort}
+                          {item.behindBy ? `，落后 ${item.behindBy} 个提交` : ''}）
+                        </span>
+                        {meta && (
+                          <button
+                            type="button"
+                            className="btn ghost"
+                            {...writeGuard(readOnly)}
+                            disabled={updatingBuiltinScheme}
+                            onClick={() => void freezeBuiltinScheme(meta)}
+                          >
+                            {updatingBuiltinScheme ? '正在更新…' : '更新并固化'}
+                          </button>
+                        )}
+                      </div>
+                    )
+                  }
+                  if (item.status === 'error') {
+                    return (
+                      <div key={item.id} className="upstream-status-line error">
+                        查不到「{item.name}」的上游状态：{item.error || '请求失败'}（这不等于「没有更新」）
+                      </div>
+                    )
+                  }
+                  if (item.status === 'current') {
+                    return (
+                      <div key={item.id} className="upstream-status-line">
+                        「{item.name}」已是最新（commit {item.commitShort}）
+                      </div>
+                    )
+                  }
+                  return (
+                    <div key={item.id} className="upstream-status-line muted">
+                      「{item.name}」尚未检查
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+            {serverUpstreamError && (
+              <div className="error" style={{ marginTop: 4 }}>
+                读取服务端上游状态失败：{serverUpstreamError}
+              </div>
+            )}
+            {serverUpstream?.lastError && !serverUpstreamError && (
+              <div className="hint" style={{ marginTop: 4 }}>{serverUpstream.lastError}</div>
+            )}
+          </div>
+        )}
         {selectedMeta && !('custom' in selectedMeta) && (
           <div className="row wrap" style={{ gap: 8, marginTop: 8 }}>
             <button

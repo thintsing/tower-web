@@ -240,6 +240,7 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 - 每次写入前服务端保留上一版 `workspace.json.bak`；启动时主文件解析失败会改名为 `workspace.json.broken-<时间戳>`，优先用可解析的 `.bak` 恢复（版本可能回退一版，客户端轮询会自己拉到最新）；`.bak` 也不可用时才返回明确的 `workspace_corrupt`，不会当成空工作区。
 - 设备偏好（导出目标、隐藏客户端、排序、Emoji、测速模式、地图状态、高级区展开等）仍留在本机 localStorage，不跨设备同步；Tailscale Auth Key 属于工作区，会保存在服务端。
 - 同一个 `TOWER_DATA_DIR` 只支持一个服务进程。两个进程同时写会各自按内存里的版本号覆盖同一个 `workspace.json`，实测会静默丢失更新；需要多副本时请为每个实例使用独立数据目录。
+- 上游更新检查：服务器模式启动后按间隔检查 ACL4SSR 内置方案（已固化的比快照 commit/blob，未固化的比构建时 pin `802e3ab`）。结果只写 `TOWER_DATA_DIR/upstream-status.json`，**不写工作区**，所以检查不会让版本号 +1、也不会唤醒其他设备；只提示，不自动固化。默认每天一次，失败后至少隔 6 小时再试，重启后先等 5 分钟。可用 `TOWER_UPSTREAM_CHECK=off` 关闭，`TOWER_UPSTREAM_CHECK_INTERVAL_MS` / `TOWER_UPSTREAM_CHECK_INITIAL_DELAY_MS` 调整间隔与启动延迟；规则页也可「立即检查一次」。
 
 ## 数据存在哪里（服务端 vs 浏览器）
 
@@ -249,6 +250,7 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 | 设备偏好（导出目标、隐藏客户端、排序、Emoji、测速模式、地图状态、高级区展开等） | 浏览器 localStorage `tower-web-state` | 始终按设备保存，服务器模式也不会同步 |
 | 已发布订阅 | `server/subscriptions.json`（Docker 下 `/app/data/subscriptions.json`） | 只保存已生成好的客户端配置文本，按 token 索引；可能包含节点地址、密码、UUID、token 等凭据，但**不是订阅源/节点工作区** |
 | 服务端设置 | `server/settings.json`（Docker 下 `/app/data/settings.json`） | 只保存局域网共享开关 `lanSharing` 和管理 API 密钥 `apiToken` |
+| 上游检查结果 | `server/upstream-status.json`（Docker 下 `/app/data/upstream-status.json`） | 只保存最近检查时间与各内置方案的上游 commit 状态；与工作区隔离，损坏不影响服务启动 |
 | 管理 API 密钥 / 登录会话 | 原浏览器 localStorage `tower-web-api-key`；服务端下发的 HttpOnly `tower_key` cookie | 每浏览器独立；按可信设备/成员分发，轮换后旧密钥和会话失效 |
 | 已发布 token / 订阅地址 | 原浏览器 localStorage `tower-sub-token` / `tower-sub-url` | 服务端按 token 保存生成产物，但没有订阅列表 API；其他电脑需手动复制已发布地址，或重新发布 |
 
@@ -277,9 +279,10 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 | `npm run selfcheck:protocols` | 校验协议解析与降级 |
 | `npm run selfcheck:workspace` | 校验服务器版工作区接口、版本号、密钥与并发写 |
 | `npm run selfcheck:workspace-history` | 校验工作区历史、回滚版本号与容量淘汰 |
+| `npm run selfcheck:upstream-status` | 校验服务端上游定时检查、失败退避与工作区隔离 |
 
 <details>
-<summary>全部 28 项自检</summary>
+<summary>全部 29 项自检</summary>
 
 ```text
 selfcheck:asn         离线 IP / ASN 查询
@@ -307,12 +310,13 @@ selfcheck:rulesets    规则集方言转换
 selfcheck:rule-impact 自定义规则保存前的影响面
 selfcheck:rule-order  规则逐条排序与撤销
 selfcheck:upstream    上游方案更新：成功 / 部分失败 / 全部失败 / 空列表
+selfcheck:upstream-status 服务端上游检查：结果文件 / 已固化与 pin / 退避 / 开关 / 不写工作区
 selfcheck:workspace   服务器版工作区：版本 / 304 / 409 / 密钥 / 坏文件 / 并发
 selfcheck:workspace-history 工作区历史：备份 / 回滚 / 容量 / 损坏文件
 selfcheck:yaml        Clash YAML 结构
 ```
 
-自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 28 项自检。
+自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 29 项自检。
 
 </details>
 

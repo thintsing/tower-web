@@ -4563,3 +4563,59 @@ button:disabled:hover,
   pointer-events: none;
   user-select: none;
 }
+
+/* ---------- 服务端上游更新检查 ---------- */
+.upstream-status {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  background: var(--raised);
+}
+
+.upstream-status-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.upstream-status-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.upstream-status-head .hint {
+  flex: 1 1 auto;
+  min-width: 180px;
+}
+
+.upstream-status-lines {
+  display: grid;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.upstream-status-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-small);
+  line-height: 1.5;
+}
+
+.upstream-status-line.update {
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.upstream-status-line.error {
+  color: var(--negative);
+}
+
+.upstream-status-line.muted {
+  color: var(--muted);
+}

@@ -19,6 +19,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib'
 import { convertRuleSet, RuleSetConversionError } from './ruleset-convert.mjs'
 import { loadIPASNData, organizationForAddress } from './ip-asn.mjs'
+import { createUpstreamChecker } from './upstream-status.mjs'
 
 const rawPort = String(process.env.PORT ?? '').trim()
 const parsedPort = rawPort ? Number(rawPort) : 8787
@@ -1301,6 +1302,80 @@ async function handleWorkspaceHistory(url, req, res) {
   })
 }
 
+// ---------- 上游定时检查 ----------
+// 只读取 workspace 里的覆盖层指针与快照 source，用于和上游 commit 比对。
+// 检查结果写独立文件；绝不调用 commitWorkspace，工作区版本号不会变化。
+const UPSTREAM_CHECK_TIMEOUT_MS = 15_000
+const UPSTREAM_CHECK_MAX_BYTES = 8 * 1024 * 1024
+
+async function upstreamFetchText(url) {
+  const response = await fetch(url, {
+    headers: {
+      'user-agent': 'tower-web-upstream-check',
+      accept: 'application/json, text/plain, */*',
+    },
+    signal: AbortSignal.timeout(UPSTREAM_CHECK_TIMEOUT_MS),
+  })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  const buffer = Buffer.from(await response.arrayBuffer())
+  if (buffer.length > UPSTREAM_CHECK_MAX_BYTES) throw new Error('上游响应超过 8MB 上限')
+  return {
+    text: buffer.toString('utf8'),
+    etag: response.headers.get('etag') ?? undefined,
+    contentType: response.headers.get('content-type') ?? undefined,
+    contentLength: buffer.length,
+    status: response.status,
+  }
+}
+
+async function upstreamFetchHeaders(url) {
+  const response = await fetch(url, {
+    method: 'HEAD',
+    headers: { 'user-agent': 'tower-web-upstream-check' },
+    signal: AbortSignal.timeout(UPSTREAM_CHECK_TIMEOUT_MS),
+  })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  return { etag: response.headers.get('etag') ?? undefined }
+}
+
+const upstreamChecker = SERVER_MODE
+  ? createUpstreamChecker({
+    dataDir: DATA_DIR,
+    getWorkspaceData: () => workspace.data,
+    fetchText: upstreamFetchText,
+    fetchHeaders: upstreamFetchHeaders,
+  })
+  : null
+
+async function handleUpstreamStatus(url, req, res) {
+  if (!SERVER_MODE || !upstreamChecker) {
+    return workspaceJSON(res, 404, {
+      error: '服务器版未启用（TOWER_MODE=server）',
+      code: 'workspace_disabled',
+    })
+  }
+  if (url.pathname === '/api/upstream-status') {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      return workspaceJSON(res, 405, { error: '只支持 GET' }, { allow: 'GET' })
+    }
+    return workspaceJSON(res, 200, upstreamChecker.getPayload())
+  }
+  if (url.pathname === '/api/upstream-status/check') {
+    if (req.method !== 'POST') {
+      return workspaceJSON(res, 405, { error: '只支持 POST' }, { allow: 'POST' })
+    }
+    const result = upstreamChecker.checkNow()
+    if (result.disabled) {
+      return workspaceJSON(res, 409, {
+        error: '服务端上游定时检查已关闭（TOWER_UPSTREAM_CHECK=off）',
+        code: 'upstream_check_disabled',
+      })
+    }
+    return workspaceJSON(res, 202, { checking: true })
+  }
+  return workspaceJSON(res, 404, { error: '接口不存在', code: 'not_found' })
+}
+
 loadWorkspace()
 loadSubscriptions()
 
@@ -2057,6 +2132,9 @@ const server = createServer(async (req, res) => {
         || url.pathname === '/api/workspace/version'
         || url.pathname === '/api/workspace/history'
         || url.pathname.startsWith('/api/workspace/history/')
+        // 上游状态来自工作区快照指针，和读工作区一样需要密钥。
+        || url.pathname === '/api/upstream-status'
+        || url.pathname === '/api/upstream-status/check'
       const authExempt = apiAuthExempt(url, req.method)
       // 同一 IP 连续认证失败后先冷却，连正确密钥也会短暂被拒。
       const cooldown = authExempt ? 0 : authCooldownRemaining(req)
@@ -2119,6 +2197,10 @@ const server = createServer(async (req, res) => {
 
     if (url.pathname === '/api/workspace/history' || url.pathname.startsWith('/api/workspace/history/')) {
       return await handleWorkspaceHistory(url, req, res)
+    }
+
+    if (url.pathname === '/api/upstream-status' || url.pathname === '/api/upstream-status/check') {
+      return await handleUpstreamStatus(url, req, res)
     }
 
     if (url.pathname === '/api/auth-status') {
@@ -2449,6 +2531,8 @@ server.listen(PORT, HOST, () => {
     if (!serverSettings.apiToken) {
       console.warn('[tower-web] 服务器模式必须设置访问密钥（TOWER_API_TOKEN），否则 /api/workspace 会拒绝所有请求')
     }
+    // 只安排定时器；重启后至少等 TOWER_UPSTREAM_CHECK_INITIAL_DELAY_MS 才检查。
+    upstreamChecker?.start()
   }
   if (HOST === '0.0.0.0') {
     for (const u of lanUrls(actualPort)) console.log(`[tower-web] 局域网可访问: ${u}`)

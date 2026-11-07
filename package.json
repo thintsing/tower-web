@@ -58,6 +58,7 @@
     "selfcheck:rule-impact": "tsx scripts/selfcheck-rule-impact.ts",
     "selfcheck:freeze-preview": "tsx scripts/selfcheck-freeze-preview.ts",
     "selfcheck:upstream": "tsx scripts/selfcheck-upstream.ts",
+    "selfcheck:upstream-status": "tsx scripts/selfcheck-upstream-status.ts",
     "selfcheck:workspace": "tsx scripts/selfcheck-workspace.ts",
     "selfcheck:workspace-history": "tsx scripts/selfcheck-workspace-history.ts",
     "selfcheck:yaml": "tsx scripts/selfcheck-yaml.ts"
