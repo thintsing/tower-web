@@ -4053,7 +4053,7 @@ body.no-scroll { overflow: hidden; }
   border: 1px solid var(--border); border-radius: var(--radius-control);
 }
 .rt-step {
-  display: grid; grid-template-columns: 46px 56px minmax(160px, 1.2fr) minmax(110px, 0.8fr) 74px minmax(0, 1.4fr);
+  display: grid; grid-template-columns: 46px 64px minmax(160px, 1.2fr) minmax(110px, 0.8fr) 74px minmax(0, 1.4fr);
   gap: 8px; align-items: center; padding: 7px 10px;
   border-bottom: 1px solid var(--rule); font-size: 11.5px; line-height: 16px;
 }
@@ -4062,6 +4062,19 @@ body.no-scroll { overflow: hidden; }
 .rt-step.is-skip { opacity: 0.78; }
 .rt-step.is-break { background: var(--pill-positive-bg); opacity: 1; }
 .rt-step-no { color: var(--faint); font-size: 11px; white-space: pre; }
+.rt-certainty {
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 20px; padding: 0 6px; border-radius: 3px;
+  background: var(--pill-neutral-bg); color: var(--pill-neutral-ink);
+  font-size: 10.5px; font-weight: 600; white-space: nowrap;
+}
+.rt-certainty.is-confirmed-match { background: var(--pill-positive-bg); color: var(--pill-positive-ink); }
+.rt-certainty.is-possible-match { background: var(--pill-warning-bg); color: var(--pill-warning-ink); }
+.rt-certainty.is-undetermined { background: var(--pill-neutral-bg); color: var(--pill-neutral-ink); }
+.rt-fold { border-bottom: 1px solid var(--rule); }
+.rt-fold > summary { cursor: pointer; padding: 6px 10px; color: var(--muted); font-size: 11px; background: var(--raised); }
+.rt-fold > summary:hover { color: var(--text); }
+.rt-after-match { padding: 8px 10px; color: var(--muted); font-size: 11.5px; background: var(--raised); }
 .rt-status {
   display: inline-flex; align-items: center; justify-content: center;
   height: 20px; padding: 0 6px; border-radius: 3px;
@@ -4152,7 +4165,7 @@ body.no-scroll { overflow: hidden; }
   .rt-tabs { width: 100%; }
   .rt-tab { flex: 1; min-height: 44px; }
   .rt-chip { min-height: 44px; }
-  .rt-step { grid-template-columns: 40px 52px minmax(0, 1fr); row-gap: 2px; }
+  .rt-step { grid-template-columns: 40px 64px minmax(0, 1fr); row-gap: 2px; }
   .rt-step-origin, .rt-step-type, .rt-step-detail { grid-column: 2 / -1; }
   .rt-step-note { grid-column: 1 / -1; }
   .rt-diff-config label { min-width: 100%; }

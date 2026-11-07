@@ -14,6 +14,16 @@ import type { QueryTarget, RuleEvaluation, RuleStepStatus } from './ruleMatcher'
 
 export type RuleOriginKind = 'custom' | 'scheme' | 'local' | 'url' | 'library'
 
+/** 判定确定度：静态可判的命中 / 未命中，和依赖运行时数据的两档。 */
+export type CertaintyLevel = 'confirmed-match' | 'confirmed-miss' | 'possible-match' | 'undetermined'
+
+export function certaintyFor(evaluation: RuleEvaluation): CertaintyLevel {
+  if (evaluation.status === 'match') return 'confirmed-match'
+  if (evaluation.status === 'miss') return 'confirmed-miss'
+  if (evaluation.status === 'skip') return 'possible-match'
+  return 'undetermined'
+}
+
 export interface RuleOrigin {
   source: string
   kind: RuleOriginKind
@@ -26,6 +36,7 @@ export interface ExplainedStep {
   rule: RoutingRule
   origin: RuleOrigin
   evaluation: RuleEvaluation
+  certainty: CertaintyLevel
   ruleSetNote?: string
 }
 
@@ -200,13 +211,15 @@ function evaluateRuleSetReference(
   if (!set.rules.length) {
     return {
       evaluation: {
-        status: 'skip',
+        status: 'miss',
         matchType: '规则集引用',
-        reason: `规则集「${set.name}」是空的（0 条规则）`,
+        detail: `规则集「${set.name}」是空的（0 条规则），一定不会命中`,
       },
     }
   }
   const paused = compiled.pausedSetNames.has(set.name) || (set.sourceRef ? compiled.pausedSetNames.has(set.sourceRef) : false)
+  let unresolved = 0
+  let undetermined = 0
   for (let index = 0; index < set.rules.length; index += 1) {
     const child = set.rules[index]
     const result = evaluateRule(child, target)
@@ -219,6 +232,31 @@ function evaluateRuleSetReference(
         },
         note: paused ? '来源订阅已暂停自动刷新，使用方案内快照' : undefined,
       }
+    }
+    if (result.status === 'skip') unresolved += 1
+    if (result.status === 'unknown') undetermined += 1
+  }
+  // 规则集里混着需要 DNS / 运行时数据的规则时，不能把它们算成「全部未命中」。
+  if (unresolved > 0) {
+    return {
+      evaluation: {
+        status: 'skip',
+        matchType: '规则集引用',
+        detail: `展开「${set.name}」共 ${set.rules.length} 条，静态规则未命中，另有 ${unresolved} 条需要运行时数据`,
+        reason: `规则集「${set.name}」里有 ${unresolved} 条规则依赖 DNS / 运行状态才能判定`,
+      },
+      note: paused ? '来源订阅已暂停自动刷新，使用方案内快照' : undefined,
+    }
+  }
+  if (undetermined > 0) {
+    return {
+      evaluation: {
+        status: 'unknown',
+        matchType: '规则集引用',
+        detail: `展开「${set.name}」共 ${set.rules.length} 条，静态规则未命中，另有 ${undetermined} 条无法离线判定`,
+        reason: `规则集「${set.name}」里有 ${undetermined} 条规则缺少离线数据`,
+      },
+      note: paused ? '来源订阅已暂停自动刷新，使用方案内快照' : undefined,
     }
   }
   return {
@@ -376,6 +414,7 @@ export function explainWith(compiled: CompiledScheme, raw: string): ExplainResul
       rule,
       origin: originFor(compiled, rule),
       evaluation,
+      certainty: certaintyFor(evaluation),
       ruleSetNote,
     }
     steps.push(step)

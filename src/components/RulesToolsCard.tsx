@@ -2,7 +2,7 @@
 // 弹层只用页面内联面板，不新增浮层菜单，避免遮挡/贴底问题。
 import { useEffect, useMemo, useState } from 'react'
 import type { LocalRuleSet, ProxyNode, RuleScheme } from '../models/types'
-import { compileScheme, explainWith, type ExplainResult, type ExplainedStep } from '../rules/ruleExplain'
+import { compileScheme, explainWith, type CertaintyLevel, type ExplainResult, type ExplainedStep } from '../rules/ruleExplain'
 import { lintScheme, lintSummary, type LintLevel, type SchemeLintIssue } from '../rules/schemeLint'
 import { diffRules, diffTotal, filterDiff, type DiffKind, type RuleDiffResult } from '../rules/ruleDiff'
 import { clearRuleSetHistory, readRuleSetHistory } from '../rules/ruleSetHistory'
@@ -13,12 +13,17 @@ type ToolKey = 'explain' | 'lint' | 'diff'
 
 const LEVEL_TITLES: Record<LintLevel, string> = { error: '错误', warn: '警告', info: '提示' }
 
-const STATUS_TITLES: Record<ExplainedStep['evaluation']['status'], string> = {
-  match: '命中',
-  miss: '未命中',
-  skip: '跳过',
-  unknown: '无法判定',
+/** 判定确定度：与导出顺序一致逐条展示，避免把运行时才能定的规则说成「肯定不命中」。 */
+const CERTAINTY_TITLES: Record<CertaintyLevel, string> = {
+  'confirmed-match': '确定命中',
+  'confirmed-miss': '确定不命中',
+  'possible-match': '可能命中',
+  undetermined: '无法判定',
 }
+
+const CHAIN_FOLD_WINDOW = 3
+const CHAIN_NO_MATCH_HEAD = 12
+const CHAIN_RENDER_LIMIT = 600
 
 function originLabel(step: ExplainedStep): string {
   const kind: Record<string, string> = {
@@ -110,16 +115,44 @@ function ExplainPanel({
 
   const current = results[selected]
   const steps = current?.steps ?? []
-  const stepLimit = 300
-  const visibleSteps = showAll || steps.length <= stepLimit
-    ? steps
-    : [...steps.slice(0, 150), ...steps.slice(-150)]
-  const omitted = showAll || steps.length <= stepLimit ? 0 : steps.length - 300
+  const matchPos = current?.match ? steps.findIndex((step) => step.index === current.match?.index) : -1
+  const leadingSteps = showAll
+    ? []
+    : matchPos >= 0
+      ? steps.slice(0, Math.max(0, matchPos - CHAIN_FOLD_WINDOW))
+      : []
+  const trailingSteps = showAll
+    ? []
+    : matchPos >= 0
+      ? steps.slice(Math.min(steps.length, matchPos + CHAIN_FOLD_WINDOW + 1))
+      : steps.slice(CHAIN_NO_MATCH_HEAD)
+  const focusSteps = showAll
+    ? steps.slice(0, CHAIN_RENDER_LIMIT)
+    : matchPos >= 0
+      ? steps.slice(Math.max(0, matchPos - CHAIN_FOLD_WINDOW), Math.min(steps.length, matchPos + CHAIN_FOLD_WINDOW + 1))
+      : steps.slice(0, CHAIN_NO_MATCH_HEAD)
+  const renderCapHit = showAll && steps.length > CHAIN_RENDER_LIMIT
+  const remainingRules = current?.match ? Math.max(0, current.totalRules - steps.length) : 0
+  const renderStep = (step: ExplainedStep) => (
+    <div
+      key={step.index}
+      className={`rt-step is-${step.evaluation.status}${current.match?.index === step.index ? ' is-break' : ''}`}
+    >
+      <span className="rt-step-no mono">{String(step.index).padStart(3, ' ')}</span>
+      <span className={`rt-certainty is-${step.certainty}`}>{CERTAINTY_TITLES[step.certainty]}</span>
+      <span className="rt-step-rule mono">{ruleLine(step.rule)}</span>
+      <span className="rt-step-origin">{originLabel(step)}</span>
+      <span className="rt-step-type">{step.evaluation.matchType}</span>
+      <span className="rt-step-detail">{step.evaluation.detail ?? step.evaluation.reason ?? ''}</span>
+      {current.match?.index === step.index && <span className="rt-break">FIRST MATCH</span>}
+      {step.ruleSetNote && <span className="rt-step-note">{step.ruleSetNote}</span>}
+    </div>
+  )
 
   return (
     <div className="rt-panel">
       <div className="rt-hint">
-        解释器直接复用导出管线的规则顺序和策略组解析。导出时会按目标客户端过滤它不支持的规则，这里按完整规则集解释，个别客户端可能略有差异。域名不会解析成 IP，因此 IP-CIDR / GEOIP / IP-ASN 等 IP 规则对域名输入会标记「跳过」；IP 输入只内置中国大陆 IPv4 的 GEOIP 判断。UA / 进程规则在浏览器里无法确定，同样标记「跳过」而不是假装未命中。
+        解释器直接复用导出管线的规则顺序和策略组解析。导出时会按目标客户端过滤它不支持的规则，这里按完整规则集解释，个别客户端可能略有差异。域名不会解析成 IP，所以 IP-CIDR / GEOIP / IP-ASN 等 IP 规则对域名输入只能标「可能命中」；GEOIP 非 CN、GeoSite、无效正则等缺少离线数据时标「无法判定」；UA / 进程 / 来源地址规则同样只能标「可能命中」。第一条「确定命中」出现后停止评估，后续规则不再参与判定。
       </div>
       <div className="rt-field">
         <textarea
@@ -208,29 +241,40 @@ function ExplainPanel({
           <div className="rt-chain-head">
             <strong>判定链路</strong>
             <span className="rt-meta">共 {steps.length} 条 · first-match 在{current.match ? `第 ${current.match.index} 条` : '未触发'}</span>
-            {omitted > 0 && !showAll && (
-              <button className="btn ghost" onClick={() => setShowAll(true)}>显示全部 {steps.length} 条</button>
+            {!showAll && steps.length > CHAIN_NO_MATCH_HEAD && (
+              <button className="btn ghost" onClick={() => setShowAll(true)}>
+                {steps.length <= CHAIN_RENDER_LIMIT
+                  ? `展开全部 ${steps.length} 条`
+                  : `展开前 ${CHAIN_RENDER_LIMIT} 条`}
+              </button>
             )}
           </div>
           <div className="rt-chain">
-            {visibleSteps.map((step, index) => {
-              const skippedGap = omitted > 0 && !showAll && index === 150
-              return (
-                <div key={`${step.index}-${index}`}>
-                  {skippedGap && <div className="rt-gap">…省略中间 {omitted} 条未命中规则…</div>}
-                  <div className={`rt-step is-${step.evaluation.status}${current.match?.index === step.index ? ' is-break' : ''}`}>
-                    <span className="rt-step-no mono">{String(step.index).padStart(3, ' ')}</span>
-                    <span className={`rt-status is-${step.evaluation.status}`}>{STATUS_TITLES[step.evaluation.status]}</span>
-                    <span className="rt-step-rule mono">{ruleLine(step.rule)}</span>
-                    <span className="rt-step-origin">{originLabel(step)}</span>
-                    <span className="rt-step-type">{step.evaluation.matchType}</span>
-                    <span className="rt-step-detail">{step.evaluation.detail ?? step.evaluation.reason ?? ''}</span>
-                    {current.match?.index === step.index && <span className="rt-break">FIRST MATCH</span>}
-                    {step.ruleSetNote && <span className="rt-step-note">{step.ruleSetNote}</span>}
-                  </div>
-                </div>
-              )
-            })}
+            {leadingSteps.length > 0 && (
+              <details className="rt-fold">
+                <summary>展开前面 {leadingSteps.length} 条</summary>
+                {leadingSteps.slice(0, CHAIN_RENDER_LIMIT).map(renderStep)}
+                {leadingSteps.length > CHAIN_RENDER_LIMIT && (
+                  <div className="rt-meta">已省略 {leadingSteps.length - CHAIN_RENDER_LIMIT} 条。</div>
+                )}
+              </details>
+            )}
+            {focusSteps.map(renderStep)}
+            {trailingSteps.length > 0 && (
+              <details className="rt-fold">
+                <summary>展开其余 {trailingSteps.length} 条</summary>
+                {trailingSteps.slice(0, CHAIN_RENDER_LIMIT).map(renderStep)}
+                {trailingSteps.length > CHAIN_RENDER_LIMIT && (
+                  <div className="rt-meta">已省略 {trailingSteps.length - CHAIN_RENDER_LIMIT} 条。</div>
+                )}
+              </details>
+            )}
+            {renderCapHit && <div className="rt-meta">仅渲染前 {CHAIN_RENDER_LIMIT} 条。</div>}
+            {remainingRules > 0 && (
+              <div className="rt-after-match">
+                后续 {remainingRules} 条不再评估（第 {current.match?.index} 条确定命中后短路）
+              </div>
+            )}
           </div>
         </>
       )}

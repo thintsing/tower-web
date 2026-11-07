@@ -551,6 +551,92 @@ function main(): void {
     assert.match(skipped?.evaluation.reason ?? '', /解析|no-resolve/)
   })
 
+  const certaintyScheme: RuleScheme = {
+    id: 'certainty',
+    name: '确定度',
+    description: '',
+    groups: [
+      { name: '代理', type: 'select', options: ['DIRECT'] },
+      { name: '直连', type: 'select', options: ['DIRECT'] },
+    ],
+    rules: [
+      rule('代理', 'example.com'),
+      rule('代理', '1.2.3.0/24', 'IP-CIDR'),
+      rule('代理', 'CN', 'GEOIP'),
+      rule('代理', 'US', 'GEOIP'),
+      { type: 'RULE-SET', value: '静态集合', group: '代理' },
+      { type: 'RULE-SET', value: '混合集合', group: '直连' },
+      { type: 'MATCH', group: '代理' },
+    ],
+    ruleSets: [
+      {
+        id: 'static-set',
+        name: '静态集合',
+        group: '代理',
+        sourceKind: 'local',
+        updatedAt: 1,
+        rules: [rule('代理', 'static.example.com', 'DOMAIN-SUFFIX'), rule('代理', 'static.example.net')],
+      },
+      {
+        id: 'mixed-set',
+        name: '混合集合',
+        group: '直连',
+        sourceKind: 'local',
+        updatedAt: 1,
+        rules: [rule('直连', 'mixed.example.com'), rule('直连', '9.9.9.0/24', 'IP-CIDR')],
+      },
+    ],
+  }
+
+  check('完整轨迹：确定命中后立即短路，后续规则不再评估', () => {
+    const result = explainQuery({ scheme: certaintyScheme, nodes: explainNodes, policySelections: {} }, 'example.com')
+    assert.equal(result.steps.length, 3)
+    assert.equal(result.match?.index, 3)
+    assert.equal(result.steps[2].certainty, 'confirmed-match')
+    assert.equal(result.totalRules - result.steps.length, 8)
+    assert.equal(result.steps.some((step) => step.rule.type === 'GEOIP'), false)
+  })
+
+  check('完整轨迹：只有域名时 IP / GEOIP 规则是可能命中，静态未命中是确定不命中', () => {
+    const result = explainQuery({ scheme: certaintyScheme, nodes: explainNodes, policySelections: {} }, 'other.example.org')
+    const byType = (type: string, value?: string) => result.steps.find(
+      (step) => step.rule.type === type && (value === undefined || step.rule.value === value),
+    )
+    assert.equal(byType('DOMAIN')?.certainty, 'confirmed-miss')
+    assert.equal(byType('IP-CIDR')?.certainty, 'possible-match')
+    assert.equal(byType('GEOIP', 'CN')?.certainty, 'possible-match')
+    assert.equal(byType('GEOIP', 'US')?.certainty, 'possible-match')
+  })
+
+  check('完整轨迹：IP 输入时域名规则确定不命中，缺库 GEOIP 无法判定', () => {
+    const result = explainQuery({ scheme: certaintyScheme, nodes: explainNodes, policySelections: {} }, '8.8.8.8')
+    const us = result.steps.find((step) => step.rule.type === 'GEOIP' && step.rule.value === 'US')
+    assert.equal(us?.evaluation.status, 'unknown')
+    assert.equal(us?.certainty, 'undetermined')
+    const domain = result.steps.find((step) => step.rule.type === 'DOMAIN')
+    assert.equal(domain?.certainty, 'confirmed-miss')
+    const last = result.steps[result.steps.length - 1]
+    assert.equal(last.rule.type, 'MATCH')
+  })
+
+  check('完整轨迹：规则集内混着运行时规则时标可能命中，不误报全部未命中', () => {
+    const result = explainQuery({ scheme: certaintyScheme, nodes: explainNodes, policySelections: {} }, 'nomatch.example.org')
+    const mixed = result.steps.find((step) => step.rule.type === 'RULE-SET' && step.rule.value === '混合集合')
+    assert.equal(mixed?.evaluation.status, 'skip')
+    assert.equal(mixed?.certainty, 'possible-match')
+    assert.match(mixed?.evaluation.detail ?? '', /1 条需要运行时数据/)
+    const statics = result.steps.find((step) => step.rule.type === 'RULE-SET' && step.rule.value === '静态集合')
+    assert.equal(statics?.certainty, 'confirmed-miss')
+  })
+
+  check('完整轨迹：规则集内联规则命中按确定命中并标出来源', () => {
+    const result = explainQuery({ scheme: certaintyScheme, nodes: explainNodes, policySelections: {} }, 'static.example.com')
+    assert.equal(result.match?.index, 1)
+    assert.equal(result.steps[0].certainty, 'confirmed-match')
+    assert.equal(result.steps[0].origin.setName, '静态集合')
+    assert.match(result.steps[0].evaluation.detail ?? '', /static\.example\.com/)
+  })
+
   check('方案 lint：重复 / 死规则 / 缺失组 / 空规则集 / 类型候选', () => {
     const lintGroups: PolicyGroup[] = [
       { name: '代理', type: 'select', options: ['🇭🇰 香港 01', 'DIRECT'] },
