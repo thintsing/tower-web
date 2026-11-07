@@ -1066,14 +1066,24 @@ export const useStore = create<Store>()(
         })),
 
       addLocalRuleSet: (ruleSet) =>
-        set((s) => ({
-          localRuleSets: [...s.localRuleSets.filter((x) => x.id !== ruleSet.id), ruleSet],
-        })),
+        set((s) => {
+          const index = s.localRuleSets.findIndex((x) => x.id === ruleSet.id)
+          // 刷新已有规则集时原位替换，避免列表顺序跳到最后。
+          if (index < 0) return { localRuleSets: [...s.localRuleSets, ruleSet] }
+          const localRuleSets = s.localRuleSets.slice()
+          localRuleSets[index] = ruleSet
+          return { localRuleSets }
+        }),
 
       removeLocalRuleSet: (id) =>
-        set((s) => ({
-          localRuleSets: s.localRuleSets.filter((x) => x.id !== id),
-        })),
+        set((s) => {
+          const ruleSetExclusions = { ...s.ruleSetExclusions }
+          delete ruleSetExclusions[id]
+          return {
+            localRuleSets: s.localRuleSets.filter((x) => x.id !== id),
+            ruleSetExclusions,
+          }
+        }),
 
       addRuleSetExclusion: (ruleSetID, signature) =>
         set((s) => ({

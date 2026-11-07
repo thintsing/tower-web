@@ -61,14 +61,20 @@ jobs:
           # 用假文件验证运行数据/密钥不会被打进镜像；CI 工作区是临时的。
           printf '{"apiToken":"ci-secret"}' > server/settings.json
           printf '{"ci":"secret"}' > server/subscriptions.json
+          printf '{"version":3,"data":{}}' > server/workspace.json
+          printf '{"version":2}' > server/workspace.json.bak
+          mkdir -p server/history
+          printf '{"version":1,"data":{}}' > server/history/v1-20260101T000000000Z.json
+          printf '{"version":1}' > server/upstream-status.json
           cleanup() {
             docker rm -f tower-web-ci >/dev/null 2>&1 || true
-            rm -f server/settings.json server/subscriptions.json
+            rm -f server/settings.json server/subscriptions.json server/workspace.json server/workspace.json.bak server/upstream-status.json
+            rm -rf server/history
           }
           trap cleanup EXIT
           docker build -t tower-web:ci .
           docker run --rm tower-web:ci sh -c \
-            'test ! -e /app/server/settings.json && test ! -e /app/server/subscriptions.json'
+            'test ! -e /app/server/settings.json && test ! -e /app/server/subscriptions.json && test ! -e /app/server/workspace.json && test ! -e /app/server/workspace.json.bak && test ! -e /app/server/upstream-status.json && test ! -e /app/server/history'
           docker run -d --name tower-web-ci -p 18787:8787 tower-web:ci
           ready=0
           for attempt in $(seq 1 30); do

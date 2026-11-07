@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
+  BUILTIN_UPSTREAM_SCHEMES,
   createUpstreamChecker,
   FAILURE_BACKOFF_MS,
   readUpstreamStatusFile,
@@ -154,6 +155,21 @@ async function check(label: string, run: () => Promise<void>): Promise<void> {
 
 async function main(): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'tower-upstream-status-unit-'))
+
+  await check('内置方案清单：服务端检查列表与前端 BUILTIN_SCHEMES 完全一致', async () => {
+    const frontend = new Map(BUILTIN_SCHEMES.map((meta) => [meta.id, meta]))
+    assert.equal(BUILTIN_UPSTREAM_SCHEMES.length, BUILTIN_SCHEMES.length)
+    for (const meta of BUILTIN_UPSTREAM_SCHEMES) {
+      const local = frontend.get(meta.id)
+      assert.ok(local, `服务端多出/写错了方案 id：${meta.id}`)
+      assert.equal(local.name, meta.name, `方案 ${meta.id} 名称不一致`)
+      assert.equal(local.file, meta.file, `方案 ${meta.id} 的 INI 文件不一致`)
+      assert.ok(
+        existsSync(join(ROOT, 'public', 'rulesets', meta.file)),
+        `方案 ${meta.id} 的 INI 文件不存在：${meta.file}`,
+      )
+    }
+  })
 
   await check('结果文件读写：原子落盘并保留元数据', async () => {
     const status = {

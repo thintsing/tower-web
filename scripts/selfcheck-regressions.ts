@@ -27,6 +27,7 @@ import { iso3ForRegionCode, regionForName } from '../src/models/region'
 import { CLIENTS, type ProxyNode, type RuleScheme } from '../src/models/types'
 import { setWorkspaceReadOnly } from '../src/util/workspaceLock'
 import { READONLY_NOTE, writeGuard } from '../src/util/readOnlyUi'
+import { useStore } from '../src/store'
 
 const base = { tls: false, skipCertificateVerification: false, rawURI: '' } as const
 const SCHEME: RuleScheme = {
@@ -1260,6 +1261,30 @@ check('旧快照只有部分 networkSettings 时生成器不崩，缺失项回�
   assert.ok(settings.dnsServers.length > 0, '缺少 dnsServers 时应回落到默认值')
   assert.deepEqual(settings.encryptedDNSServers, ['https://dns.alidns.com/dns-query'])
   assert.ok(settings.remoteDNSServers.length > 0)
+})
+
+check('规则集同 id 更新保持列表顺序，删除时清理屏蔽表', () => {
+  const mk = (id: string) => ({ id, name: id, rules: [], updatedAt: 1 })
+  useStore.getState().addLocalRuleSet(mk('reg-a'))
+  useStore.getState().addLocalRuleSet(mk('reg-b'))
+  useStore.getState().addLocalRuleSet(mk('reg-c'))
+  const ids = useStore.getState().localRuleSets.map((item) => item.id)
+  assert.deepEqual(ids.slice(-3), ['reg-a', 'reg-b', 'reg-c'])
+
+  // 刷新 b：原位替换，不能跳到最后。
+  useStore.getState().addLocalRuleSet({ ...mk('reg-b'), name: 'reg-b-new' })
+  assert.deepEqual(
+    useStore.getState().localRuleSets.slice(-3).map((item) => item.id),
+    ['reg-a', 'reg-b', 'reg-c'],
+  )
+  assert.equal(useStore.getState().localRuleSets.find((item) => item.id === 'reg-b')?.name, 'reg-b-new')
+
+  useStore.getState().addRuleSetExclusion('reg-b', 'DOMAIN,example.com')
+  assert.ok(useStore.getState().ruleSetExclusions['reg-b'])
+  useStore.getState().removeLocalRuleSet('reg-b')
+  assert.equal(useStore.getState().ruleSetExclusions['reg-b'], undefined)
+  useStore.getState().removeLocalRuleSet('reg-a')
+  useStore.getState().removeLocalRuleSet('reg-c')
 })
 
 check('Clash 导入 hysteria2 / tuic / anytls 时补回隐式 TLS', () => {

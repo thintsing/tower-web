@@ -1,3 +1,6 @@
+/** 单次最多提交的规则集地址数：每个地址都会串行抓取，防止误粘贴整页文本卡住界面。 */
+export const MAX_REMOTE_RULE_SET_URLS = 20
+
 /** 从多行 / 空格 / 逗号 / 分号混排的输入里提取规则集地址，保持顺序并去重。 */
 export function splitRemoteTextURLs(raw: string): string[] {
   const found = String(raw ?? '').match(/https?:\/\/[^\s<>"'`，。；：！？、（）【】《》「」『』,;]+/gi) ?? []

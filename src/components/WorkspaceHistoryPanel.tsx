@@ -17,11 +17,12 @@ import {
 } from '../workspaceHistory'
 
 const COUNT_LABELS: Array<[keyof WorkspaceCounts, string]> = [
-  ['rules', '规则'],
+  // 规则与策略组只统计当前选中的方案，订阅/节点/方案是整份工作区。
+  ['rules', '当前方案规则'],
   ['subscriptions', '订阅'],
   ['nodes', '节点'],
   ['schemes', '方案'],
-  ['groups', '策略组'],
+  ['groups', '当前方案策略组'],
 ]
 
 function formatBytes(bytes: number): string {

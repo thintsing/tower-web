@@ -10,6 +10,12 @@ dist
 # local runtime data / secrets
 server/subscriptions.json
 server/settings.json
+server/workspace.json
+server/workspace.json.bak
+server/workspace.json.broken-*
+server/history
+server/upstream-status.json*
+server/.tower-write-probe-*
 server/*.tmp
 server/*.corrupt-*
 .env

@@ -49,7 +49,7 @@ import { copyToClipboard, newID } from './util/browser'
 import { browserStorage, clearTowerStorage, createSafeStorage, isStorageFull, onStorageFullChange } from './util/localStore'
 import { placeDetailsPanel, placeOpenDetailsPanels } from './util/menuPlacement'
 import { apiFetch, clearAPIKey, getAPIKey, setAPIKey } from './util/apiAuth'
-import { normalizeRemoteTextURL, remoteRuleSetNameFromURL, splitRemoteTextURLs } from './util/remoteURL'
+import { MAX_REMOTE_RULE_SET_URLS, normalizeRemoteTextURL, remoteRuleSetNameFromURL, splitRemoteTextURLs } from './util/remoteURL'
 import { GITHUB_REPO_URL } from './config'
 import { RouteIllustration } from './components/RouteIllustration'
 import { GroupIcon, groupDisplayName } from './components/GroupIcon'
@@ -5286,6 +5286,10 @@ function RemoteRuleSetDialog({
       setError('请输入有效的 http(s) 规则集地址，每行一个，也可用空格或逗号分隔')
       return
     }
+    if (targets.length > MAX_REMOTE_RULE_SET_URLS) {
+      setError(`一次最多添加 ${MAX_REMOTE_RULE_SET_URLS} 个地址（当前 ${targets.length} 个），请分批提交`)
+      return
+    }
     setBusy(true); setError('')
     try {
       const created: { set: LocalRuleSet; notice: string }[] = []
@@ -5373,7 +5377,7 @@ function RemoteRuleSetDialog({
   )
 }
 
-function RuleSetDiffView({ diff }: { diff: RuleSetRefreshDiff }) {
+function RuleSetDiffView({ diff, stale = false }: { diff: RuleSetRefreshDiff; stale?: boolean }) {
   const total = diff.added + diff.removed + diff.modified
   const totalSamples = diff.samples.length + diff.hidden
   const renderLine = (sample: RuleSetRefreshDiff['samples'][number], index: number) => (
@@ -5388,7 +5392,7 @@ function RuleSetDiffView({ diff }: { diff: RuleSetRefreshDiff }) {
   return (
     <div className="rs-diff">
       <div className="rs-diff-head">
-        <span className="hint">上次刷新：</span>
+        <span className="hint">{stale ? '最近一次成功刷新：' : '上次刷新：'}</span>
         <span className="rs-diff-stat added">+{diff.added}</span>
         <span className="rs-diff-stat removed">−{diff.removed}</span>
         <span className="rs-diff-stat modified">~{diff.modified}</span>
@@ -5646,7 +5650,10 @@ function RulesTab({
     try {
       await triggerUpstreamStatusCheck()
       // 手动检查在服务端异步执行；这里轮询到 checking 结束，避免“点了没反应”。
-      for (let attempt = 0; attempt < 20; attempt += 1) {
+      // 服务端要串行比对 3 个内置方案（trees 失败还会退回逐文件 HEAD），
+      // 最坏可能超过 90 秒，所以上限给到 180 秒，避免按钮一直停在“检查中”。
+      const deadline = Date.now() + 180_000
+      while (Date.now() < deadline) {
         await new Promise((resolve) => window.setTimeout(resolve, 1500))
         const next = await fetchUpstreamStatus()
         setServerUpstream(next)
@@ -7306,7 +7313,7 @@ function RulesTab({
                       {set.lastError && (
                         <span className="hint rule-set-error">上次刷新失败：{set.lastError}</span>
                       )}
-                      {set.lastDiff && <RuleSetDiffView diff={set.lastDiff} />}
+                      {set.lastDiff && <RuleSetDiffView diff={set.lastDiff} stale={!!set.lastError} />}
                     </div>
                     <div className="rs-actions">
                       {set.sourceURL && (
