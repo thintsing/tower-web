@@ -71,6 +71,24 @@ export interface BackupFile {
   version: number
   exportedAt: string
   data: PersistedData
+  /** 解析时被丢弃的坏条目；仅内存里存在，不进入导出的备份文件。 */
+  rejected?: BackupRejection[]
+}
+
+/** 备份 / 本机数据里被拒绝或丢弃的一条记录，界面上逐条展示原因。 */
+export interface BackupRejection {
+  kind: 'source' | 'node' | 'scheme' | 'ruleSet' | 'tailnet' | 'snapshot' | 'override' | 'topLevel'
+  /** 人可读的定位，例如订阅名、方案名或「第 3 个快照」。 */
+  label: string
+  reason: string
+  /** 数组里的 1-based 位置（顶层字段没有）。 */
+  index?: number
+}
+
+/** 悬空 / 损坏的快照指针与快照，供设置页「数据体检」清理。 */
+export interface SnapshotHealth {
+  dangling: Array<{ schemeID: string; snapshotId: number }>
+  corrupted: Array<{ schemeID: string; snapshotId: number; reason: string }>
 }
 
 export interface BackupCounts {
@@ -241,6 +259,74 @@ function validLocalRuleSet(value: unknown): value is LocalRuleSet {
     && value.rules.every(validLocalRule)
 }
 
+/** 指出方案具体坏在哪一条规则 / 策略组，供恢复预览逐条展示。 */
+function schemeRejectReason(value: unknown): string {
+  if (!isRecord(value)) return '不是对象'
+  if (!isString(value.id) || !isString(value.name)) return '缺少 id 或 name'
+  if (!Array.isArray(value.groups)) return 'groups 不是数组'
+  const badGroup = value.groups.findIndex((group) => !validGroup(group))
+  if (badGroup >= 0) return `groups 第 ${badGroup + 1} 条策略组字段不完整`
+  if (!Array.isArray(value.rules)) return 'rules 不是数组'
+  const badRule = value.rules.findIndex((rule) => !validRule(rule))
+  if (badRule >= 0) return `rules 第 ${badRule + 1} 条规则字段不完整`
+  if (value.customRules !== undefined) {
+    if (!Array.isArray(value.customRules)) return 'customRules 不是数组'
+    const badCustom = value.customRules.findIndex((rule) => !validRule(rule))
+    if (badCustom >= 0) return `customRules 第 ${badCustom + 1} 条规则字段不完整`
+  }
+  if (value.ruleSets !== undefined) {
+    if (!Array.isArray(value.ruleSets)) return 'ruleSets 不是数组'
+    const badSet = value.ruleSets.findIndex((set) => !validRuleSet(set))
+    if (badSet >= 0) return `ruleSets 第 ${badSet + 1} 个规则集字段不完整`
+  }
+  return '字段类型或必填项不完整'
+}
+
+function localRuleSetRejectReason(value: unknown): string {
+  if (!isRecord(value)) return '不是对象'
+  if (!isString(value.id) || !isString(value.name)) return '缺少 id 或 name'
+  if (!Array.isArray(value.rules)) return 'rules 不是数组'
+  const badRule = value.rules.findIndex((rule) => !validLocalRule(rule))
+  if (badRule >= 0) return `rules 第 ${badRule + 1} 条规则字段不完整`
+  return '字段类型或必填项不完整'
+}
+
+function labelOf(value: unknown, fallback: string): string {
+  if (!isRecord(value)) return fallback
+  for (const key of ['name', 'id', 'url']) {
+    if (isString(value[key]) && value[key].trim()) return value[key].trim().slice(0, 60)
+  }
+  return fallback
+}
+
+/**
+ * 逐条校验数组：坏条目单独记录下来，好条目继续恢复。
+ * 不再「一条坏数据整包拒绝」，但也不会静默 —— 界面上必须列出丢弃明细。
+ */
+function collectRows<T>(
+  values: unknown[],
+  valid: (value: unknown) => value is T,
+  kind: BackupRejection['kind'],
+  fallback: string,
+  reason: (value: unknown) => string,
+): { items: T[]; rejected: BackupRejection[] } {
+  const items: T[] = []
+  const rejected: BackupRejection[] = []
+  values.forEach((value, index) => {
+    if (valid(value)) {
+      items.push(value)
+      return
+    }
+    rejected.push({
+      kind,
+      index: index + 1,
+      label: labelOf(value, `${fallback}第 ${index + 1} 条`),
+      reason: reason(value),
+    })
+  })
+  return { items, rejected }
+}
+
 function numberOr(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback
 }
@@ -257,6 +343,8 @@ export interface NormalizedBuiltinSchemes {
   builtinSchemeOverrides: Record<string, BuiltinSchemeOverrideRef>
   schemeSnapshots: Record<string, BuiltinSchemeSnapshot>
   snapshotSeq: number
+  /** 被丢弃的快照 / 悬空指针明细；空数组表示数据完整。 */
+  rejections: BackupRejection[]
 }
 
 function normalizeSnapshotContent(value: Record<string, unknown>): BuiltinSchemeSnapshotContent | undefined {
@@ -298,22 +386,38 @@ export function normalizeBuiltinSchemes(
   protectedRuleSetIDs?: Iterable<string>,
 ): NormalizedBuiltinSchemes {
   const snapshots: Record<string, BuiltinSchemeSnapshot> = {}
+  const rejections: BackupRejection[] = []
   const rawSnapshots = Array.isArray(snapshotsValue)
     ? snapshotsValue.map((item, index) => [String(index), item] as const)
     : isRecord(snapshotsValue)
       ? Object.entries(snapshotsValue)
       : []
   for (const [key, item] of rawSnapshots) {
-    if (!isRecord(item)) continue
+    if (!isRecord(item)) {
+      rejections.push({ kind: 'snapshot', label: `快照 ${key}`, reason: '快照记录不是对象' })
+      continue
+    }
     const content = normalizeSnapshotContent(item)
-    if (!content) continue
+    if (!content) {
+      rejections.push({ kind: 'snapshot', label: `快照 ${key}`, reason: '快照正文校验失败（scheme / ruleSets / source 不完整）' })
+      continue
+    }
     const id = typeof item.id === 'number' && Number.isInteger(item.id) && item.id > 0
       ? item.id
       : Number(key)
-    if (!Number.isInteger(id) || id <= 0) continue
-    if (snapshots[String(id)]) continue
+    if (!Number.isInteger(id) || id <= 0) {
+      rejections.push({ kind: 'snapshot', label: `快照 ${key}`, reason: '快照 id 不是正整数' })
+      continue
+    }
+    if (snapshots[String(id)]) {
+      rejections.push({ kind: 'snapshot', label: `快照 #${id}`, reason: '快照 id 重复，后一条已跳过' })
+      continue
+    }
     const schemeID = isString(item.schemeID) ? item.schemeID : content.scheme.id
-    if (!schemeID) continue
+    if (!schemeID) {
+      rejections.push({ kind: 'snapshot', label: `快照 #${id}`, reason: '快照缺少 schemeID 且正文方案没有 id' })
+      continue
+    }
     const candidate: BuiltinSchemeSnapshot = {
       ...content,
       id,
@@ -323,6 +427,7 @@ export function normalizeBuiltinSchemes(
         : content.source.fetchedAt,
     }
     if (isBuiltinSchemeSnapshotValid(candidate)) snapshots[String(id)] = candidate
+    else rejections.push({ kind: 'snapshot', label: `快照 #${id}`, reason: '快照内容校验失败，无法用于回退' })
   }
 
   let seq = typeof seqValue === 'number' && Number.isFinite(seqValue) && seqValue >= 0
@@ -333,17 +438,32 @@ export function normalizeBuiltinSchemes(
   const overrides: Record<string, BuiltinSchemeOverrideRef> = {}
   if (isRecord(overridesValue)) {
     for (const [schemeID, item] of Object.entries(overridesValue)) {
-      if (!isRecord(item)) continue
+      if (!isRecord(item)) {
+        rejections.push({ kind: 'override', label: schemeID, reason: '覆盖层指针不是对象，已回落原厂快照' })
+        continue
+      }
       const ref = item.snapshotId
       if (typeof ref === 'number' && Number.isInteger(ref) && ref > 0) {
         // 新结构：快照必须存在且归属一致，否则丢指针（加载回落原厂 / 上一版）。
         const snapshot = snapshots[String(ref)]
         if (snapshot && snapshot.schemeID === schemeID) overrides[schemeID] = { snapshotId: ref }
+        else {
+          rejections.push({
+            kind: 'override',
+            label: schemeID,
+            reason: snapshot
+              ? `指针 #${ref} 的归属是「${snapshot.schemeID}」，与方案不符，已回落原厂 / 上一版`
+              : `指针 #${ref} 指向的快照不存在，已回落原厂 / 上一版`,
+          })
+        }
         continue
       }
       // 旧结构：内联正文 → 分配一个新 id 的快照。
       const content = normalizeSnapshotContent(item)
-      if (!content) continue
+      if (!content) {
+        rejections.push({ kind: 'override', label: schemeID, reason: '旧版内联快照正文校验失败，已回落原厂快照' })
+        continue
+      }
       seq += 1
       const snapshot: BuiltinSchemeSnapshot = {
         ...content,
@@ -351,7 +471,10 @@ export function normalizeBuiltinSchemes(
         schemeID,
         createdAt: content.source.fetchedAt,
       }
-      if (!isBuiltinSchemeSnapshotValid(snapshot)) continue
+      if (!isBuiltinSchemeSnapshotValid(snapshot)) {
+        rejections.push({ kind: 'override', label: schemeID, reason: '迁移后的快照校验失败，已回落原厂快照' })
+        continue
+      }
       snapshots[String(seq)] = snapshot
       overrides[schemeID] = { snapshotId: seq }
     }
@@ -361,7 +484,64 @@ export function normalizeBuiltinSchemes(
     builtinSchemeOverrides: overrides,
     schemeSnapshots: pruneBuiltinSchemeSnapshots(snapshots, overrides, protectedRuleSetIDs),
     snapshotSeq: seq,
+    rejections,
   }
+}
+
+/** 体检当前持久化的快照指针：悬空指针（快照不存在）与损坏快照（内容校验失败）。 */
+export function inspectSnapshotHealth(
+  overrides: Record<string, BuiltinSchemeOverrideRef>,
+  snapshots: Record<string, BuiltinSchemeSnapshot>,
+): SnapshotHealth {
+  const dangling: SnapshotHealth['dangling'] = []
+  const corrupted: SnapshotHealth['corrupted'] = []
+  for (const [schemeID, ref] of Object.entries(overrides)) {
+    const snapshot = snapshots[String(ref.snapshotId)]
+    if (!snapshot) {
+      dangling.push({ schemeID, snapshotId: ref.snapshotId })
+      continue
+    }
+    if (snapshot.schemeID !== schemeID) {
+      corrupted.push({ schemeID, snapshotId: ref.snapshotId, reason: '快照归属与方案不一致' })
+    } else if (!isBuiltinSchemeSnapshotValid(snapshot)) {
+      corrupted.push({ schemeID, snapshotId: ref.snapshotId, reason: '快照内容校验失败' })
+    }
+  }
+  for (const [key, snapshot] of Object.entries(snapshots)) {
+    if (isBuiltinSchemeSnapshotValid(snapshot)) continue
+    const damaged = snapshot as BuiltinSchemeSnapshot
+    corrupted.push({ schemeID: damaged.schemeID ?? '', snapshotId: Number(key), reason: '快照内容校验失败' })
+  }
+  return { dangling, corrupted }
+}
+
+/**
+ * 清除损坏记录：丢掉悬空指针与损坏快照，保留仍可用的历史和指针。
+ * 只处理能明确判定为坏的数据，不动正常版本。
+ */
+export function clearCorruptPersistence(
+  overrides: Record<string, BuiltinSchemeOverrideRef>,
+  snapshots: Record<string, BuiltinSchemeSnapshot>,
+): {
+  overrides: Record<string, BuiltinSchemeOverrideRef>
+  snapshots: Record<string, BuiltinSchemeSnapshot>
+  pointersCleared: number
+  snapshotsCleared: number
+} {
+  const nextSnapshots: Record<string, BuiltinSchemeSnapshot> = {}
+  let snapshotsCleared = 0
+  for (const [key, snapshot] of Object.entries(snapshots)) {
+    if (isBuiltinSchemeSnapshotValid(snapshot)) nextSnapshots[key] = snapshot
+    else snapshotsCleared += 1
+  }
+  const nextOverrides: Record<string, BuiltinSchemeOverrideRef> = {}
+  let pointersCleared = 0
+  for (const [schemeID, ref] of Object.entries(overrides)) {
+    const snapshot = nextSnapshots[String(ref.snapshotId)]
+    if (snapshot && snapshot.schemeID === schemeID) nextOverrides[schemeID] = ref
+    else pointersCleared += 1
+  }
+  return { overrides: nextOverrides, snapshots: nextSnapshots, pointersCleared, snapshotsCleared }
 }
 
 function validTailnet(value: unknown): value is TailnetConnection {
@@ -409,27 +589,56 @@ export function parseBackup(text: string): BackupFile {
   if (!isRecord(raw.data)) throw new Error('备份文件缺少 data')
 
   const data = raw.data
-  for (const key of ['sources', 'nodes', 'customSchemes', 'localRuleSets']) {
-    if (!Array.isArray(data[key])) throw new Error(`备份文件缺少 ${key}`)
-  }
-  if (!isString(data.selectedSchemeID)) throw new Error('备份文件缺少 selectedSchemeID')
 
-  const sourceValues = data.sources as unknown[]
-  const sources = sourceValues.filter(validSource).map(normalizeSource)
-  if (sources.length !== sourceValues.length) throw new Error('备份文件里的订阅数据不完整')
-  const nodeValues = data.nodes as unknown[]
-  const nodes = nodeValues.filter(validNode)
-  if (nodes.length !== nodeValues.length) throw new Error('备份文件里的节点数据不完整')
-  const schemeValues = data.customSchemes as unknown[]
-  const customSchemes = schemeValues.filter(validScheme)
-  if (customSchemes.length !== schemeValues.length) throw new Error('备份文件里的规则方案不完整')
-  const localSetValues = data.localRuleSets as unknown[]
-  const localRuleSets = localSetValues.filter(validLocalRuleSet)
-  if (localRuleSets.length !== localSetValues.length) throw new Error('备份文件里的规则集不完整')
+  // 顶层字段类型错误不再整包判坏：按空值恢复，但逐条记录在案，恢复前可见。
+  const rejected: BackupRejection[] = []
+  const readRows = <T>(
+    key: 'sources' | 'nodes' | 'customSchemes' | 'localRuleSets' | 'tailnets',
+    kind: BackupRejection['kind'],
+    fallback: string,
+    valid: (value: unknown) => value is T,
+    reason: (value: unknown) => string,
+  ): T[] => {
+    const value = data[key]
+    if (value === undefined) return []
+    if (!Array.isArray(value)) {
+      rejected.push({
+        kind: 'topLevel',
+        label: key,
+        reason: `顶层字段 ${key} 不是数组，已按空列表恢复；原始内容无法读取`,
+      })
+      return []
+    }
+    const collected = collectRows(value, valid, kind, fallback, reason)
+    rejected.push(...collected.rejected)
+    return collected.items
+  }
+
+  const sources = readRows('sources', 'source', '订阅', validSource, (value) =>
+    isRecord(value) && !isString(value.url) ? '订阅缺少 url 字段' : '订阅字段类型或必填项不完整')
+    .map(normalizeSource)
+  const nodes = readRows('nodes', 'node', '节点', validNode, (value) => {
+    if (!isRecord(value)) return '不是对象'
+    if (!isString(value.kind) || !NODE_KINDS.has(value.kind)) return '节点协议 kind 无效'
+    if (!isString(value.server) || !isString(value.name)) return '节点缺少 name / server'
+    if (typeof value.port !== 'number' || !Number.isInteger(value.port) || value.port < 1 || value.port > 65535) {
+      return `端口 ${String(value.port)} 不是 1-65535 的整数`
+    }
+    return '节点字段类型不完整'
+  })
+  const customSchemes = readRows('customSchemes', 'scheme', '规则方案', validScheme, schemeRejectReason)
+  const localRuleSets = readRows('localRuleSets', 'ruleSet', '规则集', validLocalRuleSet, localRuleSetRejectReason)
   // Tailscale 内网是较晚加入的持久化字段；旧备份没有时按空列表恢复。
-  const tailnetValues = Array.isArray(data.tailnets) ? data.tailnets as unknown[] : []
-  const tailnets = tailnetValues.filter(validTailnet)
-  if (tailnets.length !== tailnetValues.length) throw new Error('备份文件里的 Tailscale 内网数据不完整')
+  const tailnets = readRows('tailnets', 'tailnet', 'Tailscale 内网', validTailnet, () =>
+    'Tailscale 内网连接字段不完整（id / name / subnets / isEnabled）')
+
+  const selectedSchemeID = isString(data.selectedSchemeID)
+    ? data.selectedSchemeID
+    : (rejected.push({
+      kind: 'topLevel',
+      label: 'selectedSchemeID',
+      reason: '顶层字段 selectedSchemeID 不是字符串，恢复后回到默认方案',
+    }), '')
 
   const policySelections: Record<string, string> = {}
   if (isRecord(data.policySelections)) {
@@ -438,23 +647,28 @@ export function parseBackup(text: string): BackupFile {
     }
   }
 
-  return {
+  const builtin = normalizeBuiltinSchemes(
+    data.builtinSchemeOverrides,
+    data.schemeSnapshots,
+    data.snapshotSeq,
+    customSchemes.flatMap((scheme) => (scheme.ruleSets ?? []).map((ruleSet) => ruleSet.id)),
+  )
+  rejected.push(...builtin.rejections)
+
+  const result: BackupFile = {
     app: BACKUP_APP,
     version: BACKUP_VERSION,
     exportedAt: stringOr(raw.exportedAt, ''),
     data: {
       sources,
       nodes,
-      selectedSchemeID: data.selectedSchemeID,
+      selectedSchemeID,
       policySelections,
       customSchemes,
       localRuleSets,
-      ...normalizeBuiltinSchemes(
-        data.builtinSchemeOverrides,
-        data.schemeSnapshots,
-        data.snapshotSeq,
-        customSchemes.flatMap((scheme) => (scheme.ruleSets ?? []).map((ruleSet) => ruleSet.id)),
-      ),
+      builtinSchemeOverrides: builtin.builtinSchemeOverrides,
+      schemeSnapshots: builtin.schemeSnapshots,
+      snapshotSeq: builtin.snapshotSeq,
       ruleSetExclusions: normalizeRuleSetExclusions(data.ruleSetExclusions),
       checkBuiltinSchemeUpdatesOnOpen: booleanOr(data.checkBuiltinSchemeUpdatesOnOpen, false),
       autoRefreshOnOpen: booleanOr(data.autoRefreshOnOpen, false),
@@ -482,6 +696,9 @@ export function parseBackup(text: string): BackupFile {
       tailnets,
     },
   }
+  // 只有确实丢弃了数据才附带明细；完整备份的解析结果保持原样。
+  if (rejected.length) result.rejected = rejected
+  return result
 }
 
 export function createBackup(data: PersistedData, now = Date.now()): BackupFile {

@@ -8,8 +8,8 @@ import { usageFieldsFrom } from './models/types'
 import { isBuiltinSchemeSnapshotValid, writeBuiltinSchemeSnapshot } from './rules/schemeSnapshots'
 import { addRuleSetExclusion as addExclusion, normalizeRuleSetExclusions, removeRuleSetExclusion as removeExclusion } from './rules/ruleSetExclusions'
 import { loadTailnetAuthKeys, persistTailnetAuthKeys, pruneTailnetAuthKeys } from './models/tailnetAuthKeys'
-import type { PersistedData } from './backup'
-import { normalizeBuiltinSchemes, normalizeSource } from './backup'
+import type { BackupRejection, PersistedData } from './backup'
+import { clearCorruptPersistence, inspectSnapshotHealth, normalizeBuiltinSchemes, normalizeSource } from './backup'
 import { BUILTIN_SCHEMES } from './rules/scheme'
 import { prepareManualNodes, type ManualNodeImportResult } from './manualNodes'
 import { mergeUsage, parse, parseUserinfoHeader } from './parser'
@@ -85,6 +85,11 @@ export interface Store extends AppState {
   tailnets: TailnetConnection[]
   /** 本机保存的 Auth Key；不进入持久化快照，刷新前从独立 localStorage 读取。 */
   tailnetAuthKeys: Record<string, string>
+  /** 本次会话的数据体检结果：被丢弃的备份条目 / 悬空快照指针；不落盘。 */
+  persistenceWarnings: BackupRejection[]
+  /** 清除损坏记录：丢掉悬空指针与损坏快照，返回清理数量。 */
+  clearCorruptPersistence: () => { pointers: number; snapshots: number }
+  setPersistenceWarnings: (warnings: BackupRejection[]) => void
   addSourceFromURL: (url: string, options?: SubscriptionRequestOptions) => Promise<void>
   updateSource: (id: string, patch: SourcePatch) => void
   setSourceEnabled: (id: string, enabled: boolean) => void
@@ -162,6 +167,26 @@ export interface Store extends AppState {
 export interface ManualNodePatch {
   name?: string
   isEnabled?: boolean
+}
+
+/** 把「数据体检」结果转成与备份拒绝同形的提示，复用同一套展示。 */
+function inspectPersistenceWarnings(
+  overrides: Record<string, BuiltinSchemeOverrideRef>,
+  snapshots: Record<string, BuiltinSchemeSnapshot>,
+): BackupRejection[] {
+  const health = inspectSnapshotHealth(overrides, snapshots)
+  return [
+    ...health.dangling.map((item) => ({
+      kind: 'override' as const,
+      label: item.schemeID,
+      reason: `指针 #${item.snapshotId} 指向的快照不存在，已回落原厂 / 上一版`,
+    })),
+    ...health.corrupted.map((item) => ({
+      kind: 'snapshot' as const,
+      label: item.schemeID,
+      reason: `快照 #${item.snapshotId}：${item.reason}`,
+    })),
+  ]
 }
 
 /**
@@ -520,6 +545,7 @@ export const useStore = create<Store>()(
       ruleSetExclusions: {},
       checkBuiltinSchemeUpdatesOnOpen: false,
       builtinSchemeUpdateNotices: {},
+      persistenceWarnings: [],
       loadingSourceIDs: [],
       errors: {},
       latencyByNodeId: {},
@@ -1126,6 +1152,21 @@ export const useStore = create<Store>()(
         })
       },
 
+      clearCorruptPersistence: () => {
+        if (isWorkspaceReadOnly()) return { pointers: 0, snapshots: 0 }
+        const state = get()
+        const cleaned = clearCorruptPersistence(state.builtinSchemeOverrides, state.schemeSnapshots)
+        set({
+          builtinSchemeOverrides: cleaned.overrides,
+          schemeSnapshots: cleaned.snapshots,
+          // 清理后重新生成体检提示：仍悬空的指针会继续显示，直到被处理。
+          persistenceWarnings: inspectPersistenceWarnings(cleaned.overrides, cleaned.snapshots),
+        })
+        return { pointers: cleaned.pointersCleared, snapshots: cleaned.snapshotsCleared }
+      },
+
+      setPersistenceWarnings: (warnings) => set({ persistenceWarnings: warnings }),
+
       setCheckBuiltinSchemeUpdatesOnOpen: (enabled) =>
         set({ checkBuiltinSchemeUpdatesOnOpen: enabled }),
 
@@ -1251,6 +1292,8 @@ export const useStore = create<Store>()(
           ...current,
           ...(data ?? {}),
           ...builtin,
+          // 归一化丢掉的坏快照 / 悬空指针必须可见，不能静默回落。
+          persistenceWarnings: builtin.rejections,
           selectedSchemeID,
           sources: Array.isArray(data?.sources)
             ? data.sources.map(normalizeSource)
