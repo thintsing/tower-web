@@ -24,7 +24,8 @@ import {
 } from './backupHistory'
 import { BUILTIN_SCHEMES, allSchemeMetas, loadScheme, parseRuleList, type SchemeMeta } from './rules/scheme'
 import { planBuiltinSchemeFreeze, planSnapshotRollback, resolveBuiltinSchemeSnapshot, snapshotsForScheme, type BuiltinSchemeFreezePlan, type SnapshotRollbackPlan } from './rules/schemeSnapshots'
-import { checkUpstreamUpdate, fetchUpstreamScheme, type UpstreamSchemeResult } from './rules/upstreamScheme'
+import { fetchUpstreamScheme, type UpstreamSchemeResult } from './rules/upstreamScheme'
+import { runBuiltinUpdateCheckOnOpen } from './rules/upstreamOnOpen'
 import { detectRuleSchemeFormat, parseRuleSchemeText, RULE_SCHEME_FORMAT_TITLES } from './rules/importers'
 import { describeRuleSetParse, fetchRuleSet, parseRuleSetText, RULE_SET_FORMAT_TITLES, type RuleSetRule } from './rules/ruleSets'
 import { matchingGroupNames, matchingOrderAfterDragging } from './rules/matchingOrder'
@@ -6780,17 +6781,23 @@ function RulesTab({
               「更新并固化」拉取 ACL4SSR 最新 INI 与全部列表，直接替换这条内置方案（多设备同步）；任一列表失败整次放弃，原厂快照始终保留可恢复。
               「生成自定义副本」另存一份可编辑方案，不改内置方案。
             </div>
-            <div className="hint" style={{ marginTop: 4 }}>
-              <label className="row" style={{ gap: 6 }}>
-                <input
-                  type="checkbox"
-                  checked={checkBuiltinSchemeUpdatesOnOpen}
-                  onChange={(e) => setCheckBuiltinSchemeUpdatesOnOpen(e.target.checked)}
-                />
-                打开塔台时检查内置方案是否有上游更新（只提示，不自动覆盖）
-              </label>
-            </div>
-            {builtinSchemeUpdateNotices[selectedMeta.id] && (
+            {workspaceMode === 'server' ? (
+              <div className="hint" style={{ marginTop: 4 }}>
+                服务器版由服务端每天自动检查上游，结果显示在上方；为避免重复提示，本地打开时的检查在服务器模式已关闭。
+              </div>
+            ) : (
+              <div className="hint" style={{ marginTop: 4 }}>
+                <label className="row" style={{ gap: 6 }}>
+                  <input
+                    type="checkbox"
+                    checked={checkBuiltinSchemeUpdatesOnOpen}
+                    onChange={(e) => setCheckBuiltinSchemeUpdatesOnOpen(e.target.checked)}
+                  />
+                  打开塔台时检查内置方案是否有上游更新（只提示，不自动覆盖）
+                </label>
+              </div>
+            )}
+            {workspaceMode !== 'server' && builtinSchemeUpdateNotices[selectedMeta.id] && (
               <div className="row wrap" style={{ gap: 8, marginTop: 6 }}>
                 <span className="scheme-source">{builtinSchemeUpdateNotices[selectedMeta.id]}</span>
                 <button
@@ -9425,6 +9432,7 @@ export function App() {
   const builtinUpdateCheckStarted = useRef(false)
   const keysPruned = useRef(false)
   const [storageFull, setStorageFull] = useState(isStorageFull)
+  const workspaceMode = useWorkspaceStatus().mode
 
   useEffect(() => onStorageFullChange(setStorageFull), [])
 
@@ -9537,37 +9545,31 @@ export function App() {
   }, [])
 
   // 打开时只比对内置方案的上游响应头，发现变化写一条提示；绝不自动覆盖。
+  // 服务器版由服务端定时检查，这里只等模式确定后执行，server 模式直接跳过且不发请求。
   useEffect(() => {
     if (builtinUpdateCheckStarted.current) return
+    if (workspaceMode === 'unknown') return
     builtinUpdateCheckStarted.current = true
     const run = () => {
       const state = useStore.getState()
-      if (!state.checkBuiltinSchemeUpdatesOnOpen) return
-      const targets = BUILTIN_SCHEMES.filter(
-        (meta) => meta.id === state.selectedSchemeID || !!state.builtinSchemeOverrides[meta.id],
+      void runBuiltinUpdateCheckOnOpen(
+        {
+          mode: workspaceMode,
+          enabled: state.checkBuiltinSchemeUpdatesOnOpen,
+          selectedSchemeID: state.selectedSchemeID,
+          schemes: BUILTIN_SCHEMES,
+          overrides: state.builtinSchemeOverrides,
+          snapshots: state.schemeSnapshots,
+        },
+        { notify: (schemeID, message) => useStore.getState().setBuiltinSchemeUpdateNotice(schemeID, message) },
       )
-      void Promise.all(targets.map(async (meta) => {
-        // 覆盖层只存指针，比对上游需要快照正文；损坏时按原厂比对。
-        const ref = state.builtinSchemeOverrides[meta.id]
-        const stored = ref ? state.schemeSnapshots[String(ref.snapshotId)] : undefined
-        const result = await checkUpstreamUpdate(meta, stored)
-        if (!result.updateAvailable) return
-        const changed = result.changedFiles.length
-          ? `：${result.changedFiles.slice(0, 3).map((path) => path.split('/').pop()).join('、')}${
-            result.changedFiles.length > 3 ? ` 等 ${result.changedFiles.length} 个文件` : ''}`
-          : '：方案配置 / 分组有变更'
-        useStore.getState().setBuiltinSchemeUpdateNotice(
-          meta.id,
-          `${meta.name} 上游有更新${result.method === 'head' ? '（备用检测）' : ''}${changed}，可点「更新并固化」。`,
-        )
-      }))
     }
     if (useStore.persist.hasHydrated()) {
       run()
       return
     }
     return useStore.persist.onFinishHydration(run)
-  }, [])
+  }, [workspaceMode])
 
   // 在线规则集订阅的打开时刷新；只更新「我的规则集」快照，不改方案快照。
   useEffect(() => {

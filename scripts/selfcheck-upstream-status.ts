@@ -16,6 +16,8 @@ import {
   writeUpstreamStatusFile,
 } from '../server/upstream-status.mjs'
 import { ACL4SSR_API_BASE, ACL4SSR_PIN_COMMIT } from '../server/upstream-check.mjs'
+import { BUILTIN_SCHEMES } from '../src/rules/scheme'
+import { runBuiltinUpdateCheckOnOpen } from '../src/rules/upstreamOnOpen'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 
@@ -458,6 +460,42 @@ async function main(): Promise<void> {
     } finally {
       await server.stop()
     }
+  })
+
+  await check('打开时检查：服务器模式不发请求，本地模式行为不变', async () => {
+    const calls: string[] = []
+    const selected = BUILTIN_SCHEMES[0]
+    const overridden = BUILTIN_SCHEMES[1]
+    const input = {
+      enabled: true,
+      selectedSchemeID: selected.id,
+      schemes: BUILTIN_SCHEMES,
+      overrides: { [overridden.id]: { snapshotId: 7 } },
+      snapshots: {
+        7: { id: 7, schemeID: overridden.id, createdAt: NOW, scheme: {} as never, ruleSets: [], source: {} as never },
+      },
+    }
+    const deps = {
+      check: async () => {
+        calls.push('check')
+        return { checked: true, updateAvailable: false, method: 'trees' as const, changedFiles: [] }
+      },
+      notify: () => {},
+    }
+
+    // 服务器版交给服务端定时任务：模式未确定 / server 都不调用检查。
+    assert.equal(await runBuiltinUpdateCheckOnOpen({ ...input, mode: 'unknown' }, deps), 0)
+    assert.equal(await runBuiltinUpdateCheckOnOpen({ ...input, mode: 'server' }, deps), 0)
+    assert.deepEqual(calls, [])
+
+    // 本地模式：选中的方案 + 已固化过的方案各检查一次。
+    assert.equal(await runBuiltinUpdateCheckOnOpen({ ...input, mode: 'local' }, deps), 2)
+    assert.equal(calls.length, 2)
+
+    // 本地模式但用户关掉设置：同样不发请求。
+    calls.length = 0
+    assert.equal(await runBuiltinUpdateCheckOnOpen({ ...input, mode: 'local', enabled: false }, deps), 0)
+    assert.deepEqual(calls, [])
   })
 
   rmSync(dir, { recursive: true, force: true })
