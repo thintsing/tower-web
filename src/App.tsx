@@ -12,7 +12,7 @@ import {
   type NetworkSettingsDraft,
 } from './models/networkSettings'
 import { enabledNodes, isSourceEnabled, nodeExactKey, persistedSnapshot, useStore } from './store'
-import { backupCounts, backupFileName, createBackup, MAX_BACKUP_BYTES, parseBackup, type BackupFile } from './backup'
+import { backupCounts, backupFileName, createBackup, inspectSnapshotHealth, MAX_BACKUP_BYTES, parseBackup, type BackupFile, type BackupRejection } from './backup'
 import {
   backupHistoryItems,
   MAX_BACKUP_HISTORY,
@@ -23,14 +23,15 @@ import {
   type BackupHistoryItem,
 } from './backupHistory'
 import { BUILTIN_SCHEMES, allSchemeMetas, loadScheme, parseRuleList, type SchemeMeta } from './rules/scheme'
-import { planSnapshotRollback, resolveBuiltinSchemeSnapshot, snapshotsForScheme, type SnapshotRollbackPlan } from './rules/schemeSnapshots'
-import { checkUpstreamUpdate, fetchUpstreamScheme } from './rules/upstreamScheme'
+import { planBuiltinSchemeFreeze, planSnapshotRollback, resolveBuiltinSchemeSnapshot, snapshotsForScheme, type BuiltinSchemeFreezePlan, type SnapshotRollbackPlan } from './rules/schemeSnapshots'
+import { checkUpstreamUpdate, fetchUpstreamScheme, type UpstreamSchemeResult } from './rules/upstreamScheme'
 import { detectRuleSchemeFormat, parseRuleSchemeText, RULE_SCHEME_FORMAT_TITLES } from './rules/importers'
 import { describeRuleSetParse, fetchRuleSet, parseRuleSetText, RULE_SET_FORMAT_TITLES, type RuleSetRule } from './rules/ruleSets'
 import { matchingGroupNames, matchingOrderAfterDragging } from './rules/matchingOrder'
 import { findRuleOrderConflicts, type RuleOrderConflict } from './rules/orderConflicts'
 import { policyIssueText, validateSchemePolicy } from './rules/policyValidation'
-import { orderedSchemeBaseRules, orderedSchemeRules } from './rules/ruleOrder'
+import { orderedSchemeBaseRules, orderedSchemeRules, isUnmovableRule, renameRuleOrderKeys, ruleOrderKeys } from './rules/ruleOrder'
+import { analyzeRuleImpact, ruleImpactText } from './rules/ruleImpact'
 import { autoGroupReferenceWarning, buildNodeFilterGroup, findGroupCyclePath, nextGroupName, previewNodeMatches, removePolicyGroup, validateGroupCandidates, validateNodeGroupDraft, type NodeGroupDraft } from './rules/groupEditing'
 import { ONLINE_RULE_CATALOG } from './rules/ruleCatalog'
 import type { ManualNodeImportResult } from './manualNodes'
@@ -59,6 +60,7 @@ import { DiagnosisPanel, type FixOutcome } from './components/DiagnosisPanel'
 import { FlowRail } from './components/FlowRail'
 import { AdvancedSection } from './components/AdvancedSection'
 import { WorkspaceStatusBanner } from './components/WorkspaceStatusBanner'
+import { WorkspaceHistoryPanel } from './components/WorkspaceHistoryPanel'
 import { flushWorkspaceNow, useWorkspaceStatus } from './workspaceSync'
 import { READONLY_NOTE, writeGuard } from './util/readOnlyUi'
 import { buildFlow, explainNodePool, type FlowStepKey } from './flow/flow'
@@ -72,6 +74,18 @@ import { isReadOnlyRuleSet } from './rules/ruleSetExclusions'
 
 const SELF_CONFIGURATION_NAME = 'Self-Configuration'
 const SELF_CONFIGURATION_URL = 'https://raw.githubusercontent.com/ClashConnectRules/Self-Configuration/main/Clash.yaml'
+
+/** 备份 / 体检里被拒绝条目的分类名，界面上不显示内部 kind。 */
+const REJECTION_KIND_TITLES: Record<BackupRejection['kind'], string> = {
+  source: '订阅',
+  node: '节点',
+  scheme: '自定义方案',
+  ruleSet: '规则集',
+  tailnet: 'Tailscale 内网',
+  snapshot: '固化快照',
+  override: '快照指针',
+  topLevel: '顶层字段',
+}
 
 /** 发布 token / 地址是设备偏好；隐私模式或配额满时不能把导出页一起拖崩。 */
 const localPrefs = createSafeStorage(browserStorage)
@@ -191,6 +205,87 @@ function ConfirmDialog({
           onClick={onConfirm}
         >{confirmLabel}</button>
         <button className="btn ghost" autoFocus onClick={onCancel}>取消</button>
+      </div>
+    </dialog>
+  )
+}
+
+/** 固化前的变更预览：先看 +N / -M / ~K 与受影响策略组，确认后才写快照。 */
+function FreezePreviewDialog({
+  open,
+  schemeName,
+  plan,
+  confirmDisabled,
+  onConfirm,
+  onCancel,
+}: {
+  open: boolean
+  schemeName: string
+  plan: BuiltinSchemeFreezePlan
+  confirmDisabled: boolean
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  const ref = useRef<HTMLDialogElement>(null)
+  useEffect(() => {
+    if (open) ref.current?.showModal()
+    else ref.current?.close()
+  }, [open])
+  const changed = plan.added + plan.removed + plan.modified
+  return (
+    <dialog ref={ref} onClose={onCancel} className="freeze-dialog">
+      <h3>更新并固化「{schemeName}」前的变更预览</h3>
+      <div className="freeze-stats">
+        <span className="pill positive">+{plan.added}</span>
+        <span className="pill negative">−{plan.removed}</span>
+        <span className="pill">~{plan.modified}</span>
+        <span className="hint">未变 {plan.unchanged} · 规则数 {plan.oldCount} → {plan.newCount}</span>
+      </div>
+      <p className="confirm-body">
+        {changed
+          ? `上游内容与当前快照有 ${changed} 条差异；确认后才会写入新快照。`
+          : '上游内容与当前快照逐条一致，确认后仍会写入一条新快照（指针切换到这一版）。'}
+      </p>
+      <div className="freeze-section">
+        <h4>受影响的策略组（{plan.groups.length}）</h4>
+        {plan.groups.length ? (
+          <ul className="freeze-groups">
+            {plan.groups.map((group) => (
+              <li key={group.group}>
+                <span className="pill">{group.group}</span>
+                <span className="hint">
+                  {group.added ? `+${group.added} ` : ''}
+                  {group.removed ? `−${group.removed} ` : ''}
+                  {group.modified ? `~${group.modified}` : ''}
+                </span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div className="hint">没有规则归属发生变化的策略组。</div>
+        )}
+      </div>
+      <div className="freeze-section">
+        <h4>引用了旧规则集的自定义方案（{plan.affectedSchemes.length}）</h4>
+        {plan.affectedSchemes.length ? (
+          <div className="hint">{plan.affectedSchemes.join('、')}。更新后请检查它们的规则集引用是否仍然可用。</div>
+        ) : (
+          <div className="hint">没有自定义方案引用当前快照的规则集 id / 源地址。</div>
+        )}
+      </div>
+      <div className="hint">
+        确认后才写入快照；原厂快照保留，固化仍保留最近 3 版环形，可随时回退。
+        已导出的客户端配置不会自动回滚，需要重新导出或让客户端刷新订阅。
+      </div>
+      <div className="actions">
+        <button
+          type="button"
+          className="btn primary"
+          disabled={confirmDisabled}
+          title={confirmDisabled ? READONLY_NOTE : undefined}
+          onClick={onConfirm}
+        >确认更新并固化</button>
+        <button type="button" className="btn ghost" autoFocus onClick={onCancel}>取消</button>
       </div>
     </dialog>
   )
@@ -1343,6 +1438,16 @@ function SubscriptionSettingsDialog({
   const latencyTestMode = useStore((s) => s.latencyTestMode)
   const setLatencyTestMode = useStore((s) => s.setLatencyTestMode)
   const restoreBackup = useStore((s) => s.restoreBackup)
+  const persistenceWarnings = useStore((s) => s.persistenceWarnings)
+  const setPersistenceWarnings = useStore((s) => s.setPersistenceWarnings)
+  const clearCorruptPersistence = useStore((s) => s.clearCorruptPersistence)
+  const builtinSchemeOverrides = useStore((s) => s.builtinSchemeOverrides)
+  const schemeSnapshots = useStore((s) => s.schemeSnapshots)
+  // 快照健康每次实时计算：陈旧警告可能在本次会话里已被修复，不该继续吓人。
+  const snapshotHealth = useMemo(
+    () => inspectSnapshotHealth(builtinSchemeOverrides, schemeSnapshots),
+    [builtinSchemeOverrides, schemeSnapshots],
+  )
   const readOnly = useWorkspaceStatus().readOnly
   const [pendingBackup, setPendingBackup] = useState<BackupFile | null>(null)
   const [backupBusy, setBackupBusy] = useState(false)
@@ -1534,6 +1639,8 @@ function SubscriptionSettingsDialog({
       // 空间不足时仍然允许恢复，历史只是额外保障。
     }
     restoreBackup(pendingBackup.data)
+    // 被丢弃的条目挂在本次会话的体检列表里；恢复完成后再给一次可见的机会。
+    setPersistenceWarnings(pendingBackup.rejected ?? [])
     // 服务器模式下恢复 = 推送并递增版本；服务端会在覆盖前自动留一份 .bak。
     void flushWorkspaceNow()
     // 备份不含规则集历史；恢复后旧快照的 setID 可能已不存在，直接清空避免错配。
@@ -1544,6 +1651,24 @@ function SubscriptionSettingsDialog({
   }
 
   const pendingCounts = pendingBackup ? backupCounts(pendingBackup.data) : null
+  // 快照类拒绝在「数据体检」里按实时健康展示，避免同一条坏记录出现两次。
+  const backupRejections = persistenceWarnings.filter((item) => item.kind !== 'snapshot' && item.kind !== 'override')
+  const snapshotIssueTotal = snapshotHealth.dangling.length + snapshotHealth.corrupted.length
+
+  const clearDamaged = () => {
+    const dismissed = backupRejections.length
+    const result = clearCorruptPersistence()
+    // 快照类提示由 store 按清理后的真实状态重建；本次会话的备份拒绝记录只是
+    // 「导入时已经丢弃」的告知，用户确认后一并收起，避免体检区一直挂着旧记录。
+    setBackupError('')
+    const parts: string[] = []
+    if (result.pointers) parts.push(`${result.pointers} 个悬空指针`)
+    if (result.snapshots) parts.push(`${result.snapshots} 个损坏快照`)
+    if (dismissed) parts.push(`${dismissed} 条本次会话的丢弃记录`)
+    setBackupNotice(parts.length
+      ? `已清除 ${parts.join('、')}；正常版本未受影响。`
+      : '没有需要清除的损坏记录。')
+  }
 
   return (
     <dialog ref={ref} onClose={onClose}>
@@ -1811,6 +1936,67 @@ function SubscriptionSettingsDialog({
         )}
         {backupError && <div className="form-error" role="alert"><span>{backupError}</span></div>}
         {backupNotice && <div className="inline-notice" role="status">{backupNotice}</div>}
+        <WorkspaceHistoryPanel open={open} />
+        <div className="settings-divider" />
+        <div className="settings-data-head">
+          <div>
+            <strong>数据体检</strong>
+            <small>
+              列出恢复或加载时被拒绝的条目，以及指向不存在快照的悬空指针。塔台宁可拒绝也不静默丢弃；
+              确认已经看过明细后，可以清除损坏的固化快照记录，并收起本次会话的丢弃记录。
+            </small>
+          </div>
+          <button
+            type="button"
+            className="btn ghost"
+            {...writeGuard(readOnly)}
+            disabled={snapshotIssueTotal === 0 && backupRejections.length === 0}
+            title={snapshotIssueTotal === 0 && backupRejections.length === 0 ? '没有可清理的损坏记录' : undefined}
+            onClick={clearDamaged}
+          >清除损坏记录</button>
+        </div>
+        <div className="persistence-health">
+          {backupRejections.length > 0 && (
+            <div className="persistence-group">
+              <strong>恢复 / 加载时被丢弃的条目（本次会话）</strong>
+              <ul>
+                {backupRejections.map((item, index) => (
+                  <li key={`${item.kind}-${index}`}>
+                    <span className="backup-rejection-kind">
+                      {REJECTION_KIND_TITLES[item.kind]}{item.index ? ` #${item.index}` : ''}
+                    </span>
+                    <span className="backup-rejection-label">{item.label}</span>
+                    <small>{item.reason}</small>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {snapshotIssueTotal > 0 && (
+            <div className="persistence-group">
+              <strong>固化快照：{snapshotHealth.dangling.length} 个悬空指针 / {snapshotHealth.corrupted.length} 个损坏快照</strong>
+              <ul>
+                {snapshotHealth.dangling.map((item) => (
+                  <li key={`dangling-${item.schemeID}`}>
+                    <span className="backup-rejection-kind">快照指针</span>
+                    <span className="backup-rejection-label">{item.schemeID}</span>
+                    <small>指针 #{item.snapshotId} 指向的快照不存在，加载时会回落原厂 / 上一版</small>
+                  </li>
+                ))}
+                {snapshotHealth.corrupted.map((item) => (
+                  <li key={`corrupted-${item.schemeID}-${item.snapshotId}`}>
+                    <span className="backup-rejection-kind">固化快照</span>
+                    <span className="backup-rejection-label">{item.schemeID} #{item.snapshotId}</span>
+                    <small>{item.reason}</small>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {backupRejections.length === 0 && snapshotIssueTotal === 0 && (
+            <div className="hint">未发现被丢弃的数据或损坏的快照记录。</div>
+          )}
+        </div>
         <div className="settings-divider" />
         <div className="settings-data-head">
           <div>
@@ -1851,6 +2037,23 @@ function SubscriptionSettingsDialog({
                 {pendingCounts.schemes} 个自定义方案和 {pendingCounts.ruleSets} 个规则集。当前数据会被覆盖，且不可撤销。
               </small>
             </div>
+            {pendingBackup.rejected?.length ? (
+              <div className="backup-rejections">
+                <strong>以下 {pendingBackup.rejected.length} 条记录无法识别，恢复时会被丢弃</strong>
+                <ul>
+                  {pendingBackup.rejected.map((item, index) => (
+                    <li key={`${item.kind}-${index}`}>
+                      <span className="backup-rejection-kind">
+                        {REJECTION_KIND_TITLES[item.kind]}{item.index ? ` #${item.index}` : ''}
+                      </span>
+                      <span className="backup-rejection-label">{item.label}</span>
+                      <small>{item.reason}</small>
+                    </li>
+                  ))}
+                </ul>
+                <small>建议先取消，修好备份文件后重新导入；直接恢复只会丢掉上面列出的条目，其余数据不受影响。</small>
+              </div>
+            ) : null}
             <div className="row" style={{ gap: 8 }}>
               <button type="button" className="btn danger" {...writeGuard(readOnly)} onClick={applyBackup}>覆盖恢复</button>
               <button type="button" className="btn ghost" onClick={() => setPendingBackup(null)}>取消</button>
@@ -3986,6 +4189,13 @@ function AddCustomRuleDialog({
   const [error, setError] = useState('')
   const readOnly = useWorkspaceStatus().readOnly
   const typeInfo = RULE_TYPE_OPTIONS.find((t) => t.value === type) ?? RULE_TYPE_OPTIONS[0]
+  const impactPreview = value.trim()
+    ? analyzeRuleImpact(
+        scheme,
+        { type, value: value.trim(), group, ...(typeInfo.ip && noResolve ? { noResolve: true } : {}) },
+        { includeCandidate: true },
+      )
+    : null
 
   useEffect(() => { ref.current?.showModal() }, [])
 
@@ -4081,6 +4291,12 @@ function AddCustomRuleDialog({
           <i aria-hidden="true" />
           自定义规则会排在方案自带规则最前，优先匹配。
         </div>
+        {impactPreview && (
+          <div className="rule-impact" role="status">
+            <strong>影响面预览（保存后）</strong>
+            <small>{ruleImpactText(impactPreview)}</small>
+          </div>
+        )}
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="actions">
           <button type="submit" className="btn primary" {...writeGuard(readOnly)}>添加规则</button>
@@ -4304,10 +4520,11 @@ function GroupEditorDialog({
       return
     }
     const rule: RoutingRule = { type: 'DOMAIN-SUFFIX', value, group: group.name }
+    const impact = analyzeRuleImpact(scheme, rule, { includeCandidate: true })
     onAddRule(rule)
     setAddedRules((current) => [...current, rule])
     setNewDomain('')
-    setRuleNotice('已添加，会排在所有规则最前。')
+    setRuleNotice(`已添加，会排在所有规则最前。${ruleImpactText(impact)}`)
   }
 
   const save = () => {
@@ -5218,6 +5435,10 @@ function AddRuleSetToSchemeDialog({
   )
 }
 
+/** 规则逐条排序的撤销记录。RulesTab 切到别的页签会卸载，撤销入口需要跨页保留最后一次操作。 */
+type RuleOrderUndoRecord = { schemeID: string; ruleOrder?: string[]; label: string }
+let ruleOrderUndoSlot: RuleOrderUndoRecord | null = null
+
 function RulesTab({
   onGo,
   locateIssue,
@@ -5260,6 +5481,11 @@ function RulesTab({
   const setBuiltinSchemeUpdateNotice = useStore((s) => s.setBuiltinSchemeUpdateNotice)
   const [importingScheme, setImportingScheme] = useState(false)
   const [updatingBuiltinScheme, setUpdatingBuiltinScheme] = useState(false)
+  const [pendingFreeze, setPendingFreeze] = useState<{
+    meta: SchemeMeta
+    result: UpstreamSchemeResult
+    plan: BuiltinSchemeFreezePlan
+  } | null>(null)
   const [schemeName, setSchemeName] = useState('')
   const [schemeURL, setSchemeURL] = useState('')
   const [schemeText, setSchemeText] = useState('')
@@ -5287,8 +5513,15 @@ function RulesTab({
     schemeID: string
     groups: PolicyGroup[]
     matchingOrder?: string[]
+    ruleOrder?: string[]
     conflicts: RuleOrderConflict[]
   } | null>(null)
+  const [ruleOrderUndo, setRuleOrderUndoState] = useState<RuleOrderUndoRecord | null>(ruleOrderUndoSlot)
+  const setRuleOrderUndo = (next: RuleOrderUndoRecord | null) => {
+    ruleOrderUndoSlot = next
+    setRuleOrderUndoState(next)
+  }
+  const [ruleOrderSearch, setRuleOrderSearch] = useState('')
   const [libraryOpen, setLibraryOpen] = useState(false)
   const [localSetEditor, setLocalSetEditor] = useState<{ set?: LocalRuleSet } | null>(null)
   const [localSetAddTarget, setLocalSetAddTarget] = useState<LocalRuleSet | null>(null)
@@ -5327,6 +5560,15 @@ function RulesTab({
     () => scheme ? orderedSchemeRules(scheme) : [],
     [scheme],
   )
+  // 逐条顺序卡片：大方案只渲染前 300 条，搜索用来定位；顺序本身仍按全量计算。
+  const ruleOrderRows = useMemo(() => {
+    const query = ruleOrderSearch.trim().toLowerCase()
+    const rows = schemeRules
+      .map((rule, index) => ({ rule, index }))
+      .filter(({ rule }) => !query
+        || `${rule.type} ${rule.value ?? ''} ${rule.group} ${rule.sourceName ?? ''}`.toLowerCase().includes(query))
+    return { total: rows.length, rows: rows.slice(0, 300) }
+  }, [schemeRules, ruleOrderSearch])
   const enabledForRules = useMemo(() => enabledNodes({ sources, nodes }), [sources, nodes])
   // 方案卡已经显示总数；策略组卡片只补充不重复的信息。
   const groupCardMeta = useMemo(() => {
@@ -5448,26 +5690,40 @@ function RulesTab({
     return copy
   }
 
-  // 从 ACL4SSR 上游拉最新 INI + 全部列表，直接固化到内置方案覆盖层。
+  // 从 ACL4SSR 上游拉最新 INI + 全部列表；先算差异预览，用户确认后才写覆盖层。
   // 全有或全无：失败时只报错，不写覆盖层，原厂快照继续兜底。
   const freezeBuiltinScheme = async (meta: SchemeMeta) => {
     setUpdatingBuiltinScheme(true)
     setSchemeError(null)
     try {
       const result = await fetchUpstreamScheme(meta)
-      const snapshotId = saveBuiltinSchemeOverride(meta.id, result.override)
-      // 0 表示写保护生效（等待期间切到只读）或内容未通过快照校验。
-      if (snapshotId === 0) {
-        setSchemeError('未能保存固化快照：当前工作区处于只读状态，或快照内容校验失败。')
-        return
-      }
-      setScheme(meta.id)
-      setFlash(`已更新并固化「${meta.name}」：${result.override.source.ruleCount} 条规则、${result.ruleSets.length} 个列表（快照 #${snapshotId}）；已导出的客户端配置不会自动回滚。原厂快照保留，可随时恢复或回退。`)
+      const current = await loadScheme(meta, builtinSchemeOverrides, schemeSnapshots)
+      const plan = planBuiltinSchemeFreeze({
+        currentScheme: current,
+        content: result.override,
+        customSchemes,
+      })
+      setPendingFreeze({ meta, result, plan })
     } catch (e) {
       setSchemeError((e as Error).message)
     } finally {
       setUpdatingBuiltinScheme(false)
     }
+  }
+
+  /** 预览确认后的实际写入；与旧流程相同的覆盖层 + 3 版环形语义。 */
+  const confirmFreeze = () => {
+    if (!pendingFreeze) return
+    const { meta, result } = pendingFreeze
+    setPendingFreeze(null)
+    const snapshotId = saveBuiltinSchemeOverride(meta.id, result.override)
+    // 0 表示写保护生效（等待期间切到只读）或内容未通过快照校验。
+    if (snapshotId === 0) {
+      setSchemeError('未能保存固化快照：当前工作区处于只读状态，或快照内容校验失败。')
+      return
+    }
+    setScheme(meta.id)
+    setFlash(`已更新并固化「${meta.name}」：${result.override.source.ruleCount} 条规则、${result.ruleSets.length} 个列表（快照 #${snapshotId}）；已导出的客户端配置不会自动回滚。原厂快照保留，可随时恢复或回退。`)
   }
 
   // 「生成自定义副本」：分支修改用；只写自定义方案与「我的规则集」，不碰覆盖层。
@@ -5581,6 +5837,7 @@ function RulesTab({
         // 恢复初始规则时用快照重新挂回的只读规则集（inlined）；用户自己加的规则集清空。
         ruleSets: original.ruleSets ?? [],
         matchingOrder: undefined,
+        ruleOrder: undefined,
         updatedAt: Date.now(),
       })
       setScheme(customScheme.id)
@@ -5670,17 +5927,23 @@ function RulesTab({
       schemeID: editable.id,
       groups: editable.groups,
       matchingOrder: editable.matchingOrder,
+      ruleOrder: editable.ruleOrder,
       conflicts,
     })
+    const hadRuleOrder = (editable.ruleOrder?.length ?? 0) > 0
+    // 逐条顺序被清空后，旧的撤销槽已经失效；留着会让「撤销」把旧顺序重新盖回组排序之上。
+    if (hadRuleOrder) setRuleOrderUndo(null)
     addCustomScheme({
       ...editable,
       groups,
       ...(changed ? { matchingOrder: nextMatching } : {}),
+      // 组级拖动优先：它改写的是整组位置，旧的逐条顺序会与新的组顺序打架，清空避免静默覆盖。
+      ruleOrder: undefined,
       updatedAt: Date.now(),
     })
     setFlash(changed
-      ? `已调整「${moved.name}」的顺序，并把它的规则移到对应匹配位置。`
-      : `已调整「${moved.name}」的策略组顺序。`)
+      ? `已调整「${moved.name}」的顺序，并把它的规则移到对应匹配位置${hadRuleOrder ? '；逐条手动排序已重置（组排序优先）' : ''}。`
+      : `已调整「${moved.name}」的策略组顺序${hadRuleOrder ? '；逐条手动排序已重置' : ''}。`)
   }
 
   const moveGroup = (source: RuleScheme, index: number, delta: -1 | 1) => {
@@ -5695,11 +5958,46 @@ function RulesTab({
         ...fresh,
         groups: reorderUndo.groups,
         matchingOrder: reorderUndo.matchingOrder,
+        ruleOrder: reorderUndo.ruleOrder,
         updatedAt: Date.now(),
       })
       setFlash('已撤销策略组排序和匹配顺序。')
     }
     setReorderUndo(null)
+  }
+
+  /**
+   * 逐条上移 / 下移。只在相邻兜底锚点之间交换，写回 ruleOrder；
+   * 展示（orderedSchemeRules）与导出（prepareSchemeForExport）都走同一份顺序。
+   */
+  const moveRule = (source: RuleScheme, index: number, delta: -1 | 1) => {
+    if (readOnly) return
+    const editable = makeEditableScheme(source)
+    const ordered = orderedSchemeRules(editable)
+    const target = index + delta
+    if (index < 0 || index >= ordered.length || target < 0 || target >= ordered.length) return
+    if (isUnmovableRule(ordered[index]) || isUnmovableRule(ordered[target])) return
+    const next = [...ordered]
+    const [moved] = next.splice(index, 1)
+    next.splice(target, 0, moved)
+    const ruleOrder = ruleOrderKeys(next)
+    setRuleOrderUndo({
+      schemeID: editable.id,
+      ruleOrder: editable.ruleOrder,
+      label: `${moved.type} ${moved.value ?? ''}`.trim(),
+    })
+    addCustomScheme({ ...editable, ruleOrder, updatedAt: Date.now() })
+    setFlash(`${delta < 0 ? '已上移' : '已下移'}规则「${moved.type} ${moved.value ?? ''}」。`)
+  }
+
+  const undoRuleOrder = () => {
+    if (!ruleOrderUndo) return
+    const fresh = useStore.getState().customSchemes.find((scheme) => scheme.id === ruleOrderUndo.schemeID)
+    if (fresh) {
+      addCustomScheme({ ...fresh, ruleOrder: ruleOrderUndo.ruleOrder, updatedAt: Date.now() })
+      setFlash('已撤销逐条规则排序。')
+    }
+    setRuleOrderUndo(null)
   }
 
   /** 策略组名称匹配到的节点，供首选策略下拉使用。 */
@@ -5783,7 +6081,10 @@ function RulesTab({
     }))
     // 拖拽排序记录的是组名；改名后不改这里，规则会悄悄丢掉用户排好的匹配顺序。
     const matchingOrder = (fresh.matchingOrder ?? []).map((name) => name === oldName ? newName : name)
-    addCustomScheme({ ...fresh, groups, rules, customRules, ruleSets, matchingOrder, updatedAt: Date.now() })
+    const ruleOrder = oldName === newName
+      ? fresh.ruleOrder
+      : renameRuleOrderKeys(fresh.ruleOrder, [[oldName, newName]])
+    addCustomScheme({ ...fresh, groups, rules, customRules, ruleSets, matchingOrder, ruleOrder, updatedAt: Date.now() })
     if (oldName !== newName) {
       useStore.getState().renamePolicySelection(oldName, newName)
       setFlash(`策略组已改名为「${newName}」，规则和候选引用已同步更新。`)
@@ -5823,6 +6124,8 @@ function RulesTab({
         customRules,
         ruleSets,
         matchingOrder: editable.matchingOrder?.filter((group) => validGroups.has(group)),
+        // 全文重建后规则身份可能全变，逐条顺序按新内容重新开始。
+        ruleOrder: undefined,
         updatedAt: Date.now(),
       })
       setFlash('已按全文重建方案；自定义规则和规则集快照已尽量保留。')
@@ -5898,7 +6201,7 @@ function RulesTab({
       customRules: [...(fresh.customRules ?? []), rule],
       updatedAt: Date.now(),
     })
-    setFlash('已添加自定义规则，它会排在方案规则最前。')
+    setFlash(`已添加自定义规则，它会排在方案规则最前。${ruleImpactText(analyzeRuleImpact(fresh, rule, { includeCandidate: true }))}`)
   }
 
   const removeCustomRule = (target: RuleScheme, rule: RoutingRule) => {
@@ -6176,6 +6479,16 @@ function RulesTab({
             <button className="btn ghost" {...writeGuard(readOnly)} onClick={() => setImportingScheme(true)}>+ 导入方案</button>
           </div>
         </div>
+        {pendingFreeze && (
+          <FreezePreviewDialog
+            open
+            schemeName={pendingFreeze.meta.name}
+            plan={pendingFreeze.plan}
+            confirmDisabled={readOnly}
+            onConfirm={confirmFreeze}
+            onCancel={() => setPendingFreeze(null)}
+          />
+        )}
         <div className="scheme-select-row">
           <span className="scheme-select-label">切换方案</span>
           <select className="input" value={selectedSchemeID} disabled={readOnly} title={readOnly ? READONLY_NOTE : undefined} onChange={(e) => setScheme(e.target.value)}>
@@ -6562,6 +6875,88 @@ function RulesTab({
           ) : (
             <div className="hint">还没有自定义规则。添加的规则会排在方案规则最前；内置方案会先复制一份再修改。</div>
           )}
+        </div>
+      )}
+
+      {scheme && (
+        <div className="card">
+          <div className="card-head">
+            <h3>规则顺序（逐条）</h3>
+            <span className="meta">{schemeRules.length} 条 · 导出按这里的顺序匹配</span>
+          </div>
+          {schemeRules.length > 30 && (
+            <div className="search-wrap rs-search">
+              <input
+                className="input"
+                value={ruleOrderSearch}
+                onChange={(e) => setRuleOrderSearch(e.target.value)}
+                placeholder="搜索类型、域名、策略组或规则集…"
+                aria-label="搜索规则顺序"
+              />
+              {ruleOrderSearch && (
+                <button className="search-clear" aria-label="清空规则搜索" onClick={() => setRuleOrderSearch('')}>×</button>
+              )}
+            </div>
+          )}
+          {ruleOrderRows.rows.length > 0 ? (
+            <ul className="rule-list rule-order-list">
+              {ruleOrderRows.rows.map(({ rule, index }) => {
+                const movable = !isUnmovableRule(rule)
+                const previous = schemeRules[index - 1]
+                const nextRule = schemeRules[index + 1]
+                const canUp = movable && !!previous && !isUnmovableRule(previous)
+                const canDown = movable && !!nextRule && !isUnmovableRule(nextRule)
+                const disabledNote = !movable
+                  ? 'GEOIP / FINAL / MATCH 是兜底锚点，不能手动移动'
+                  : readOnly ? READONLY_NOTE : undefined
+                const upNote = disabledNote ?? (canUp ? '上移这条规则' : '上方是兜底锚点或已经是第一条')
+                const downNote = disabledNote ?? (canDown ? '下移这条规则' : '下方是兜底锚点或已经是最后一条')
+                return (
+                  <li key={`${index}-${rule.type}-${rule.value ?? ''}-${rule.group}`}>
+                    <span className="hint rule-order-position">{index + 1}</span>
+                    <span className="pill">{groupDisplayName(rule.group, showGroupEmoji)}</span>
+                    {rule.sourceName && <span className="pill rule-source">{rule.sourceName}</span>}
+                    <span className="mono rule-type">{rule.type}</span>
+                    <span className="mono rule-value">{rule.value ?? '—'}</span>
+                    {rule.noResolve && <span className="hint">no-resolve</span>}
+                    <span className="rule-order-actions">
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        disabled={!canUp || readOnly}
+                        aria-label={`上移规则 ${rule.type} ${rule.value ?? ''}`}
+                        title={upNote}
+                        onClick={() => moveRule(scheme, index, -1)}
+                      >↑</button>
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        disabled={!canDown || readOnly}
+                        aria-label={`下移规则 ${rule.type} ${rule.value ?? ''}`}
+                        title={downNote}
+                        onClick={() => moveRule(scheme, index, 1)}
+                      >↓</button>
+                    </span>
+                  </li>
+                )
+              })}
+            </ul>
+          ) : (
+            <div className="hint">{ruleOrderSearch ? '没有匹配的规则' : '当前方案没有可调整的规则。'}</div>
+          )}
+          {ruleOrderRows.total > ruleOrderRows.rows.length && (
+            <div className="hint">共 {ruleOrderRows.total} 条匹配，仅显示前 {ruleOrderRows.rows.length} 条；用搜索缩小范围后再调整。</div>
+          )}
+          {ruleOrderUndo && ruleOrderUndo.schemeID === scheme.id && (
+            <div className="inline-notice" role="status">
+              <span>已调整规则「{ruleOrderUndo.label}」顺序。</span>
+              <button type="button" className="btn ghost" {...writeGuard(readOnly)} onClick={undoRuleOrder}>撤销</button>
+            </div>
+          )}
+          <div className="hint rule-order-hint">
+            这里调整的是导出配置里真正从上到下的匹配顺序。自定义规则默认仍排在最前（最具体优先），手动移动后以这里的顺序为准；
+            调整策略组顺序会重置这里的逐条顺序（组排序优先）。GEOIP / FINAL / MATCH 是兜底锚点，按钮会明确禁用。
+          </div>
         </div>
       )}
 
@@ -7085,7 +7480,7 @@ function CheckTab({
   }
 
   const cleanDuplicates = (plan: DuplicateCleanupPlan): FixOutcome => {
-    if (!plan.deletions.length) return { ok: false, message: '没有可安全删除的重复规则。' }
+    if (!plan.deletions.length && !plan.shadowed.length) return { ok: false, message: '没有可安全删除的重复规则。' }
     if (!scheme) return { ok: false, message: '规则方案还没加载完成。' }
     // 同上：先确认计划在当前方案上仍然成立，再决定要不要复制方案。
     if (!applyDuplicateCleanup(scheme, plan).removed) {
@@ -7109,9 +7504,13 @@ function CheckTab({
     const copyNote = wasReadOnly
       ? `已创建副本「${editable.name}」，原内置方案「${scheme.name}」不变；可撤销本次复制回到原方案。`
       : ''
+    const directionNote = plan.directionChanges.length
+      ? `；保留后一条把 ${plan.directionChanges.map((change) => `「${change.fromGroup}」→「${change.toGroup}」`).join('、')}`
+      : ''
+    const shadowedNote = plan.shadowedCount ? `，其中遮蔽死规则 ${plan.shadowedCount} 条` : ''
     return {
       ok: true,
-      message: `已删除 ${result.removed} 条重复规则（同组 ${plan.sameGroupCount} 条 / 跨组 ${plan.crossGroupCount} 条），方案已保存${copyNote ? `；${copyNote}` : `；可撤销本次清理（只恢复这几条，不影响其它修改）。`}`,
+      message: `已删除 ${result.removed} 条重复 / 遮蔽规则（同组 ${plan.sameGroupCount} 条 / 跨组 ${plan.crossGroupCount} 条${shadowedNote}），方案已保存${directionNote}${copyNote ? `；${copyNote}` : `；可撤销本次清理（只恢复这几条，不影响其它修改）。`}`,
     }
   }
 
