@@ -11,6 +11,10 @@ RUN npm ci
 COPY tsconfig.json vite.config.ts index.html ./
 COPY src ./src
 COPY public ./public
+# src/rules/upstreamScheme.ts 直接 import server/upstream-check.mjs（前后端共用同一套
+# 上游比对算法），构建阶段必须一起带上，否则 tsc 报 TS2307。
+# .dockerignore 已排除 server 下的运行数据，这里只带源码。
+COPY server ./server
 RUN npm run build
 
 FROM node:22-alpine AS runtime
