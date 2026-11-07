@@ -12,7 +12,7 @@ import { execFile } from 'node:child_process'
 import { lookup } from 'node:dns/promises'
 import { networkInterfaces } from 'node:os'
 import { readFile, rename, writeFile } from 'node:fs/promises'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join, dirname, extname, normalize, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
@@ -209,6 +209,364 @@ const SERVER_MODE = String(process.env.TOWER_MODE ?? '').trim().toLowerCase() ==
 const WORKSPACE_FILE = join(DATA_DIR, 'workspace.json')
 // 工作区含节点与规则，但远小于已发布配置；16MB 足够且能挡住误传大文件。
 const WORKSPACE_MAX_BYTES = 16 * 1024 * 1024
+
+// ---------- 工作区历史 ----------
+// 每次覆盖前把即将被替换的版本存到这里。目录与工作区同级，Docker 挂载卷会一起持久化。
+const HISTORY_DIR = join(DATA_DIR, 'history')
+const HISTORY_MAX_ENTRIES = 10
+const HISTORY_MAX_BYTES = 50 * 1024 * 1024
+/** v<版本号>-<UTC 时间戳>，例如 v12-20261107T123456789Z。 */
+const HISTORY_ID_RE = /^v\d+-\d{8}T\d{9}Z$/
+
+function objectField(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+}
+
+function arrayField(value) {
+  return Array.isArray(value) ? value : []
+}
+
+function schemeRuleCount(scheme) {
+  const value = objectField(scheme)
+  let count = arrayField(value.rules).length + arrayField(value.customRules).length
+  for (const ruleSet of arrayField(value.ruleSets)) {
+    count += arrayField(objectField(ruleSet).rules).length
+  }
+  return count
+}
+
+/**
+ * 历史差异只用服务端已有的数据统计。内置方案的原厂规则在客户端代码里，
+ * 但同样打包在 public/rulesets 下；服务端按同一份 INI + 列表文件统计，
+ * 这样回滚确认里的规则数不会把「内置方案有 3529 条」误报成 0。
+ * 与 src/rules/scheme.ts 中的 BUILTIN_SCHEMES 保持同步。
+ */
+const BUILTIN_SCHEME_FILES = {
+  'acl4ssr-online': 'ACL4SSR_Online.ini',
+  'acl4ssr-mini': 'ACL4SSR_Online_Mini.ini',
+  'acl4ssr-full': 'ACL4SSR_Online_Full.ini',
+}
+const BUILTIN_SCHEME_COUNT = Object.keys(BUILTIN_SCHEME_FILES).length
+const builtinSchemeCountsCache = new Map()
+
+function readRulesetFile(name) {
+  try {
+    return readFileSync(join(publicRulesetsDir, name), 'utf8')
+  } catch {
+    try {
+      return readFileSync(join(distRulesetsDir, name), 'utf8')
+    } catch {
+      return ''
+    }
+  }
+}
+
+function countRuleListLines(text) {
+  let count = 0
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#') || line === 'payload:') continue
+    const body = line.startsWith('- ') ? line.slice(2).trim() : line
+    // 列表里每行一条规则；排除 payload 头、空行和注释即可。
+    if (/^[A-Za-z][A-Za-z0-9-]*(?:,|$)/.test(body)) count += 1
+  }
+  return count
+}
+
+/** 读取内置方案 INI 与它引用的本地列表，统计规则数 / 策略组数（进程内缓存）。 */
+function builtinSchemeCounts(id) {
+  const file = BUILTIN_SCHEME_FILES[id]
+  if (!file) return null
+  const cached = builtinSchemeCountsCache.get(id)
+  if (cached) return cached
+  let index = {}
+  try {
+    index = JSON.parse(readRulesetFile('index.json'))
+  } catch {
+    index = {}
+  }
+  const ini = readRulesetFile(file)
+  if (!ini) return null
+  let rules = 0
+  let groups = 0
+  const fileCounts = new Map()
+  for (const rawLine of ini.split('\n')) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith(';') || line.startsWith('#') || line.startsWith('[')) continue
+    if (line.startsWith('ruleset=')) {
+      const body = line.slice('ruleset='.length)
+      const comma = body.indexOf(',')
+      if (comma < 0) continue
+      const target = body.slice(comma + 1).trim()
+      if (target.startsWith('[]')) {
+        rules += 1
+        continue
+      }
+      const marker = target.indexOf('/Clash/')
+      if (marker < 0) continue
+      const localFile = index[target.slice(marker + 1)]
+      if (!localFile) continue
+      if (!fileCounts.has(localFile)) fileCounts.set(localFile, countRuleListLines(readRulesetFile(localFile)))
+      rules += fileCounts.get(localFile)
+      continue
+    }
+    if (line.startsWith('custom_proxy_group=')) groups += 1
+  }
+  const result = { rules, groups }
+  builtinSchemeCountsCache.set(id, result)
+  return result
+}
+
+function workspaceCounts(raw) {
+  const data = objectField(raw)
+  const customSchemes = arrayField(data.customSchemes)
+  const selected = typeof data.selectedSchemeID === 'string' ? data.selectedSchemeID : ''
+  const customScheme = customSchemes.find((scheme) => objectField(scheme).id === selected)
+  let rules = 0
+  let groups = 0
+  if (customScheme) {
+    rules = schemeRuleCount(customScheme)
+    groups = arrayField(objectField(customScheme).groups).length
+  } else {
+    // 内置方案：优先使用固化快照的正文，否则按打包的 INI / 列表统计。
+    const pointer = objectField(objectField(data.builtinSchemeOverrides)[selected])
+    if (Number.isInteger(pointer.snapshotId)) {
+      const snapshot = objectField(objectField(data.schemeSnapshots)[String(pointer.snapshotId)])
+      const scheme = objectField(snapshot.scheme)
+      if (Object.keys(scheme).length > 0) {
+        rules = schemeRuleCount(scheme)
+        groups = arrayField(scheme.groups).length
+      }
+    } else {
+      const builtin = builtinSchemeCounts(selected)
+      if (builtin) {
+        rules = builtin.rules
+        groups = builtin.groups
+      }
+    }
+  }
+  return {
+    subscriptions: arrayField(data.sources).length,
+    nodes: arrayField(data.nodes).length,
+    rules,
+    schemes: BUILTIN_SCHEME_COUNT + customSchemes.length,
+    groups,
+  }
+}
+
+function countDiff(before, after) {
+  const diff = {}
+  for (const key of ['rules', 'subscriptions', 'nodes', 'schemes', 'groups']) {
+    diff[key] = { before: before[key], after: after[key] }
+  }
+  return diff
+}
+
+function normalizeCounts(value) {
+  const raw = objectField(value)
+  return {
+    subscriptions: Number.isInteger(raw.subscriptions) ? raw.subscriptions : 0,
+    nodes: Number.isInteger(raw.nodes) ? raw.nodes : 0,
+    rules: Number.isInteger(raw.rules) ? raw.rules : 0,
+    schemes: Number.isInteger(raw.schemes) ? raw.schemes : 0,
+    groups: Number.isInteger(raw.groups) ? raw.groups : 0,
+  }
+}
+
+function normalizeDiff(value) {
+  if (!value || typeof value !== 'object') return null
+  const diff = {}
+  for (const key of ['rules', 'subscriptions', 'nodes', 'schemes', 'groups']) {
+    const item = value[key]
+    if (!item || !Number.isInteger(item.before) || !Number.isInteger(item.after)) return null
+    diff[key] = { before: item.before, after: item.after }
+  }
+  return diff
+}
+
+function historyTimestamp(now = Date.now()) {
+  const date = new Date(now)
+  const pad = (value, width = 2) => String(value).padStart(width, '0')
+  return `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}`
+    + `T${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}${pad(date.getUTCMilliseconds(), 3)}Z`
+}
+
+function historyBodyPath(id) {
+  return join(HISTORY_DIR, `${id}.json`)
+}
+
+function historyMetaPath(id) {
+  return join(HISTORY_DIR, `${id}.meta.json`)
+}
+
+function historyIdVersion(id) {
+  const match = /^v(\d+)-/.exec(id)
+  return match ? Number(match[1]) : -1
+}
+
+/** 最多 10 个元数据文件，同步读取不会拖慢正常写入路径。 */
+function listHistoryMetadata() {
+  let names
+  try {
+    names = readdirSync(HISTORY_DIR)
+  } catch {
+    return []
+  }
+  const entries = []
+  for (const name of names) {
+    if (!name.endsWith('.json') || name.endsWith('.meta.json')) continue
+    const id = name.slice(0, -'.json'.length)
+    if (!HISTORY_ID_RE.test(id)) continue
+    const entry = readHistoryMetadata(id)
+    if (entry) entries.push(entry)
+  }
+  entries.sort((a, b) => b.version - a.version || b.archivedAt - a.archivedAt)
+  return entries
+}
+
+function readHistoryMetadata(id) {
+  let size
+  try {
+    size = statSync(historyBodyPath(id)).size
+  } catch {
+    return null
+  }
+  let meta = {}
+  try {
+    meta = JSON.parse(readFileSync(historyMetaPath(id), 'utf8'))
+  } catch {
+    // 元数据损坏或缺失时仍能列出正文；回滚所需的正文不受影响。
+    meta = {}
+  }
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) meta = {}
+  return {
+    id,
+    version: Number.isInteger(meta.version) && meta.version >= 0 ? meta.version : historyIdVersion(id),
+    updatedAt: Number(meta.updatedAt) || 0,
+    archivedAt: Number(meta.archivedAt) || 0,
+    bytes: Number.isInteger(meta.bytes) && meta.bytes >= 0 ? meta.bytes : size,
+    trigger: meta.trigger === 'restore' ? 'restore' : 'write',
+    source: {
+      ip: typeof meta.source?.ip === 'string' ? meta.source.ip : '',
+      ua: typeof meta.source?.ua === 'string' ? meta.source.ua : '',
+    },
+    counts: normalizeCounts(meta.counts),
+    diff: normalizeDiff(meta.diff),
+  }
+}
+
+function findHistoryByVersion(version) {
+  try {
+    const name = readdirSync(HISTORY_DIR).find((item) => item.startsWith(`v${version}-`)
+      && item.endsWith('.json') && !item.endsWith('.meta.json'))
+    if (!name) return null
+    const id = name.slice(0, -'.json'.length)
+    return { id, version, bytes: statSync(historyBodyPath(id)).size }
+  } catch {
+    return null
+  }
+}
+
+/** 历史文件损坏 / 目录不可写只记日志，绝不阻断当前工作区写入。 */
+async function archiveWorkspace(snapshot, afterData, source, trigger, restoredFrom) {
+  if (!SERVER_MODE || snapshot.version <= 0) return null
+  try {
+    mkdirSync(HISTORY_DIR, { recursive: true })
+    // 同版本只留一份：上一次写入失败后重试时不再重复归档。
+    const existing = findHistoryByVersion(snapshot.version)
+    if (existing) return existing
+    const id = `v${snapshot.version}-${historyTimestamp()}`
+    const body = JSON.stringify(snapshot)
+    const bytes = Buffer.byteLength(body)
+    const counts = workspaceCounts(snapshot.data)
+    const meta = {
+      id,
+      version: snapshot.version,
+      updatedAt: snapshot.updatedAt,
+      archivedAt: Date.now(),
+      bytes,
+      trigger,
+      source,
+      counts,
+      diff: countDiff(counts, workspaceCounts(afterData)),
+      ...(restoredFrom ? { restoredFrom } : {}),
+    }
+    const bodyPath = historyBodyPath(id)
+    const metaPath = historyMetaPath(id)
+    await writeFile(`${bodyPath}.tmp`, body, 'utf8')
+    await rename(`${bodyPath}.tmp`, bodyPath)
+    await writeFile(`${metaPath}.tmp`, JSON.stringify(meta), 'utf8')
+    await rename(`${metaPath}.tmp`, metaPath)
+    return { id, version: snapshot.version, bytes }
+  } catch (error) {
+    console.warn('[tower] 工作区历史备份失败（已跳过，不影响本次写入）:', error?.message ?? error)
+    return null
+  }
+}
+
+/**
+ * 保留最近 10 版、总量不超过 50MB。当前版的前一版永远不删，
+ * 否则刚发生误覆盖时最需要的那一份会被容量策略先清掉。
+ */
+function pruneWorkspaceHistory(protectedVersion) {
+  let entries
+  try {
+    entries = listHistoryMetadata()
+  } catch (error) {
+    console.warn('[tower] 工作区历史清理读取失败:', error?.message ?? error)
+    return
+  }
+  let total = entries.reduce((sum, entry) => sum + entry.bytes, 0)
+  let count = entries.length
+  if (count <= HISTORY_MAX_ENTRIES && total <= HISTORY_MAX_BYTES) return
+  const oldestFirst = [...entries].sort((a, b) => a.version - b.version || a.archivedAt - b.archivedAt)
+  for (const entry of oldestFirst) {
+    if (count <= HISTORY_MAX_ENTRIES && total <= HISTORY_MAX_BYTES) break
+    if (entry.version === protectedVersion) continue
+    try {
+      unlinkSync(historyBodyPath(entry.id))
+      try {
+        unlinkSync(historyMetaPath(entry.id))
+      } catch {
+        // 元数据缺失不影响正文删除。
+      }
+      count -= 1
+      total -= entry.bytes
+    } catch (error) {
+      console.warn(`[tower] 删除旧工作区历史 ${entry.id} 失败:`, error?.message ?? error)
+    }
+  }
+}
+
+async function readHistoryBody(id) {
+  const parsed = parseWorkspaceFile(await readFile(historyBodyPath(id), 'utf8'))
+  if (parsed.version !== historyIdVersion(id)) {
+    throw new Error('历史版本的版本号与文件名不一致')
+  }
+  return parsed
+}
+
+function requestSource(req) {
+  return {
+    ip: normalizedRemoteAddress(req),
+    ua: String(req.headers['user-agent'] ?? '').slice(0, 200),
+  }
+}
+
+function expectedRestoreVersion(req, payload) {
+  const header = req.headers['if-match']
+  if (header) {
+    for (const part of String(header).split(',')) {
+      const token = part.trim()
+      if (token === '*') return workspace.version
+      const match = /^(?:W\/)?"?v(\d+)"?$/.exec(token)
+      if (match) return Number(match[1])
+    }
+    return null
+  }
+  if (Number.isInteger(payload?.version) && payload.version >= 0) return payload.version
+  return null
+}
 
 /**
  * 数据目录是否可写。Docker 里 bind mount 的宿主机目录常由 root 创建，
@@ -603,7 +961,7 @@ async function writeWorkspaceFile(next) {
   await replaceFile(temp, WORKSPACE_FILE)
 }
 
-function commitWorkspace(payload) {
+function commitWorkspace(payload, options = {}) {
   // 版本比较、落盘和内存更新都排在同一条 Promise 链上，避免并发写同一文件。
   const run = workspaceQueue.then(async () => {
     if (workspaceCorrupt) return { corrupt: true }
@@ -611,6 +969,14 @@ function commitWorkspace(payload) {
     // version=0 只用于「服务端还没有任何工作区」时的首次创建；
     // 已有数据时客户端必须显式按当前版本覆盖，不能静默回到 0。
     if (payload.version === 0 && workspaceHasData()) return { conflict: true }
+    // 先归档即将被替换的这一版，再写新文件；归档失败不阻断写入。
+    const previous = await archiveWorkspace(
+      { version: workspace.version, updatedAt: workspace.updatedAt, data: workspace.data },
+      payload.data,
+      options.source ?? { ip: '', ua: '' },
+      options.trigger === 'restore' ? 'restore' : 'write',
+      options.restoredFrom,
+    )
     const next = {
       version: workspace.version + 1,
       updatedAt: Date.now(),
@@ -622,7 +988,9 @@ function commitWorkspace(payload) {
       return { failure: String(error?.message ?? error) }
     }
     workspace = next
-    return { version: next.version, updatedAt: next.updatedAt }
+    // 当前版的前一版（next.version - 1）受保护，容量策略不能删它。
+    pruneWorkspaceHistory(next.version - 1)
+    return { version: next.version, updatedAt: next.updatedAt, previous }
   })
   workspaceQueue = run.then(() => undefined, () => undefined)
   return run
@@ -769,7 +1137,7 @@ async function handleWorkspace(url, req, res) {
         code: 'bad_payload',
       })
     }
-    const result = await commitWorkspace(payload)
+    const result = await commitWorkspace(payload, { source: requestSource(req) })
     if (result.corrupt) {
       return workspaceJSON(res, 500, { error: workspaceCorrupt, code: 'workspace_corrupt' })
     }
@@ -793,6 +1161,144 @@ async function handleWorkspace(url, req, res) {
     }, { etag: `"v${result.version}"` })
   }
   return workspaceJSON(res, 405, { error: '只支持 GET / PUT' }, { allow: 'GET, PUT' })
+}
+
+/** 列表不带正文；当前版单独给出，历史里只放已被替换的版本。 */
+function workspaceHistoryPayload() {
+  const entries = listHistoryMetadata()
+  let bytes = 0
+  try {
+    bytes = statSync(WORKSPACE_FILE).size
+  } catch {
+    // 工作区尚未创建时没有文件；体积记为 0。
+  }
+  return {
+    current: {
+      version: workspace.version,
+      updatedAt: workspace.updatedAt,
+      bytes,
+      counts: workspaceCounts(workspace.data),
+    },
+    entries,
+    totalBytes: entries.reduce((sum, entry) => sum + entry.bytes, 0),
+    limits: { entries: HISTORY_MAX_ENTRIES, bytes: HISTORY_MAX_BYTES },
+  }
+}
+
+async function restoreHistoryEntry(id, req, res) {
+  const raw = await readBody(req)
+  let payload = {}
+  if (raw.length > 0) {
+    try {
+      payload = JSON.parse(raw.toString('utf8'))
+    } catch {
+      return workspaceJSON(res, 400, { error: '请求内容不是 JSON', code: 'bad_json' })
+    }
+  }
+  const expected = expectedRestoreVersion(req, payload)
+  if (expected === null) {
+    return workspaceJSON(res, 400, {
+      error: '回滚请求必须带 If-Match 或当前 version',
+      code: 'missing_version',
+    })
+  }
+  if (expected !== workspace.version) {
+    return workspaceJSON(res, 409, {
+      error: '工作区已被其他设备修改，请先拉取最新版本',
+      code: 'version_conflict',
+      version: workspace.version,
+    })
+  }
+  let parsed
+  try {
+    parsed = await readHistoryBody(id)
+  } catch (error) {
+    return workspaceJSON(res, 422, {
+      error: `历史版本无法读取：${error?.message ?? error}`,
+      code: 'history_corrupt',
+    })
+  }
+  const result = await commitWorkspace(
+    { version: expected, data: parsed.data },
+    {
+      source: requestSource(req),
+      trigger: 'restore',
+      restoredFrom: { id, version: parsed.version },
+    },
+  )
+  if (result.corrupt) {
+    return workspaceJSON(res, 500, { error: workspaceCorrupt, code: 'workspace_corrupt' })
+  }
+  if (result.conflict) {
+    return workspaceJSON(res, 409, {
+      error: '工作区已被其他设备修改，请先拉取最新版本',
+      code: 'version_conflict',
+      version: workspace.version,
+    })
+  }
+  if (result.failure) {
+    return workspaceJSON(res, 500, {
+      error: `工作区写入失败：${result.failure}`,
+      code: 'workspace_write_failed',
+      version: workspace.version,
+    })
+  }
+  return workspaceJSON(res, 200, {
+    version: result.version,
+    updatedAt: result.updatedAt,
+    restoredFrom: { id, version: parsed.version },
+    // 回滚前已自动归档当前版；客户端可直接用它提供「撤销回滚」。
+    previous: result.previous,
+  }, { etag: `"v${result.version}"` })
+}
+
+async function handleWorkspaceHistory(url, req, res) {
+  if (workspaceCorrupt) {
+    return workspaceJSON(res, 500, { error: workspaceCorrupt, code: 'workspace_corrupt' })
+  }
+  if (url.pathname === '/api/workspace/history') {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      return workspaceJSON(res, 405, { error: '只支持 GET' }, { allow: 'GET' })
+    }
+    return workspaceJSON(res, 200, workspaceHistoryPayload(), { etag: workspaceETag() })
+  }
+  const match = /^\/api\/workspace\/history\/([^/]+)(?:\/(restore))?$/.exec(url.pathname)
+  let id = ''
+  try {
+    id = match ? decodeURIComponent(match[1]) : ''
+  } catch {
+    return workspaceJSON(res, 404, { error: '历史版本不存在', code: 'history_not_found' })
+  }
+  if (!HISTORY_ID_RE.test(id)) {
+    return workspaceJSON(res, 404, { error: '历史版本不存在', code: 'history_not_found' })
+  }
+  if (match?.[2] === 'restore') {
+    if (req.method !== 'POST') {
+      return workspaceJSON(res, 405, { error: '只支持 POST' }, { allow: 'POST' })
+    }
+    return restoreHistoryEntry(id, req, res)
+  }
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    return workspaceJSON(res, 405, { error: '只支持 GET' }, { allow: 'GET' })
+  }
+  let parsed
+  try {
+    parsed = await readHistoryBody(id)
+  } catch (error) {
+    return workspaceJSON(res, 422, {
+      error: `历史版本无法读取：${error?.message ?? error}`,
+      code: 'history_corrupt',
+    })
+  }
+  return workspaceJSON(res, 200, {
+    ...(readHistoryMetadata(id) ?? { id }),
+    id,
+    version: parsed.version,
+    updatedAt: parsed.updatedAt,
+    // 元数据损坏时仍然用正文重算，回滚确认里的数量不会变成 0。
+    counts: workspaceCounts(parsed.data),
+    data: parsed.data,
+  })
 }
 
 loadWorkspace()
@@ -1549,6 +2055,8 @@ const server = createServer(async (req, res) => {
       // 否则局域网客户端伪造 Host 就能读写整份工作区。
       const workspacePath = url.pathname === '/api/workspace'
         || url.pathname === '/api/workspace/version'
+        || url.pathname === '/api/workspace/history'
+        || url.pathname.startsWith('/api/workspace/history/')
       const authExempt = apiAuthExempt(url, req.method)
       // 同一 IP 连续认证失败后先冷却，连正确密钥也会短暂被拒。
       const cooldown = authExempt ? 0 : authCooldownRemaining(req)
@@ -1607,6 +2115,10 @@ const server = createServer(async (req, res) => {
 
     if (url.pathname === '/api/workspace' || url.pathname === '/api/workspace/version') {
       return await handleWorkspace(url, req, res)
+    }
+
+    if (url.pathname === '/api/workspace/history' || url.pathname.startsWith('/api/workspace/history/')) {
+      return await handleWorkspaceHistory(url, req, res)
     }
 
     if (url.pathname === '/api/auth-status') {

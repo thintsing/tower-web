@@ -708,6 +708,12 @@ export async function flushWorkspaceNow(): Promise<void> {
   await flushWrite()
 }
 
+/** 服务端刚发生一次带外写入（例如历史回滚）后，强制拉取最新工作区。 */
+export async function reloadWorkspaceFromServer(options: { notice?: string } = {}): Promise<boolean> {
+  if (!serverMode) return false
+  return await fetchFull(options)
+}
+
 /** 测试与调试用：读取当前已知的服务端版本号。 */
 export function workspaceServerVersion(): number {
   return serverVersion
