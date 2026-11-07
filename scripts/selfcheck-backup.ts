@@ -6,10 +6,13 @@ import {
   BACKUP_VERSION,
   backupCounts,
   backupFileName,
+  clearCorruptPersistence,
   createBackup,
+  inspectSnapshotHealth,
   parseBackup,
   type PersistedData,
 } from '../src/backup'
+import type { BuiltinSchemeOverrideRef, BuiltinSchemeSnapshot } from '../src/models/types'
 import {
   BACKUP_HISTORY_KEY,
   MAX_BACKUP_HISTORY,
@@ -157,39 +160,118 @@ function main(): void {
     assert.throws(() => parseBackup(JSON.stringify({ app: BACKUP_APP, version: 99, data: {} })), /版本/)
   })
 
-  check('损坏的节点或订阅数据会被拒绝，不会恢复成空配置', () => {
-    const badNode = { ...DATA, nodes: [{ id: 'x', kind: 'ss', name: '坏节点', server: 'x', port: 0 }] }
-    assert.throws(() => parseBackup(wrap(badNode)), /节点数据/)
-    const badSource = { ...DATA, sources: [{ id: 1, name: '坏订阅', url: '' }] }
-    assert.throws(() => parseBackup(wrap(badSource)), /订阅数据/)
+  check('单条坏数据只丢这一条，其余条目照常恢复并逐条记录原因', () => {
+    const badNode = { ...DATA, nodes: [{ ...DATA.nodes[0], port: 0 }, DATA.nodes[1]] }
+    const parsedNode = parseBackup(wrap(badNode))
+    assert.equal(parsedNode.data.nodes.length, 1)
+    assert.equal(parsedNode.data.nodes[0].id, 'node-2')
+    assert.equal(parsedNode.rejected?.[0].kind, 'node')
+    assert.equal(parsedNode.rejected?.[0].index, 1)
+    assert.match(parsedNode.rejected?.[0].reason ?? '', /端口/)
+
+    const badSource = { ...DATA, sources: [DATA.sources[0], { id: 1, name: '坏订阅', url: '' }] }
+    const parsedSource = parseBackup(wrap(badSource))
+    assert.equal(parsedSource.data.sources.length, 1)
+    assert.equal(parsedSource.rejected?.[0].kind, 'source')
+    assert.equal(parsedSource.rejected?.[0].index, 2)
+
     const badEnabled = { ...DATA, sources: [{ ...DATA.sources[0], isEnabled: 0 }] }
-    assert.throws(() => parseBackup(wrap(badEnabled)), /订阅数据/)
+    const parsedEnabled = parseBackup(wrap(badEnabled))
+    assert.equal(parsedEnabled.data.sources.length, 0)
+    assert.equal(parsedEnabled.rejected?.[0].kind, 'source')
   })
 
-  check('备份会拒绝损坏的方案组、规则、规则集与节点类型', () => {
+  check('备份只丢弃损坏的方案组、规则、规则集与节点类型', () => {
+    const goodScheme = {
+      id: 'scheme-good', name: '正常方案', description: '', groups: [], rules: [], ruleSets: [],
+    }
     const badGroup = {
       ...DATA,
-      customSchemes: [{ id: 'scheme-1', name: '坏方案', groups: [null], rules: [] }],
+      customSchemes: [{ id: 'scheme-1', name: '坏方案', groups: [null], rules: [] }, goodScheme],
     }
-    assert.throws(() => parseBackup(wrap(badGroup)), /规则方案/)
+    const parsedGroup = parseBackup(wrap(badGroup))
+    assert.equal(parsedGroup.data.customSchemes.length, 1)
+    assert.equal(parsedGroup.data.customSchemes[0].id, 'scheme-good')
+    assert.equal(parsedGroup.rejected?.[0].kind, 'scheme')
+    assert.match(parsedGroup.rejected?.[0].label, /坏方案/)
 
     const badRule = {
       ...DATA,
       customSchemes: [{
-        id: 'scheme-2', name: '坏规则', groups: [],
-        rules: [{ type: 'DOMAIN', value: 'example.com' }],
+        id: 'scheme-2', name: '坏规则', description: '', groups: [],
+        rules: [{ type: 'DOMAIN', value: 'example.com' }], ruleSets: [],
       }],
     }
-    assert.throws(() => parseBackup(wrap(badRule)), /规则方案/)
+    assert.equal(parseBackup(wrap(badRule)).data.customSchemes.length, 0)
+    assert.equal(parseBackup(wrap(badRule)).rejected?.[0].kind, 'scheme')
 
     const badRuleSet = {
       ...DATA,
       localRuleSets: [{ id: 'set-1', name: '坏规则集', rules: [null] }],
     }
-    assert.throws(() => parseBackup(wrap(badRuleSet)), /规则集/)
+    const parsedRuleSet = parseBackup(wrap(badRuleSet))
+    assert.equal(parsedRuleSet.data.localRuleSets.length, 0)
+    assert.equal(parsedRuleSet.rejected?.[0].kind, 'ruleSet')
 
     const badKind = { ...DATA, nodes: [{ ...DATA.nodes[0], kind: 'not-a-real-kind' }] }
-    assert.throws(() => parseBackup(wrap(badKind)), /节点数据/)
+    const parsedKind = parseBackup(wrap(badKind))
+    assert.equal(parsedKind.data.nodes.length, 0)
+    assert.match(parsedKind.rejected?.[0].reason ?? '', /协议 kind/)
+  })
+
+  check('顶层字段类型错误按空恢复并记录，不再整包拒绝', () => {
+    const parsed = parseBackup(wrap({
+      ...DATA,
+      sources: 'not-an-array',
+      selectedSchemeID: 42,
+    }))
+    assert.equal(parsed.data.sources.length, 0)
+    assert.equal(parsed.data.selectedSchemeID, '')
+    assert.ok(parsed.rejected?.some((item) => item.kind === 'topLevel' && item.label === 'sources'))
+    assert.ok(parsed.rejected?.some((item) => item.kind === 'topLevel' && item.label === 'selectedSchemeID'))
+    // 其余用户数据照常恢复。
+    assert.equal(parsed.data.nodes.length, 2)
+  })
+
+  check('悬空快照指针被记录为拒绝项，并可从数据体检里清除', () => {
+    const dangling: Record<string, BuiltinSchemeOverrideRef> = { 'acl4ssr-online': { snapshotId: 99 } }
+    const parsed = parseBackup(wrap({ ...DATA, builtinSchemeOverrides: dangling, schemeSnapshots: {} }))
+    assert.equal(parsed.rejected?.[0].kind, 'override')
+    assert.match(parsed.rejected?.[0].reason ?? '', /不存在/)
+
+    const health = inspectSnapshotHealth(dangling, {})
+    assert.equal(health.dangling.length, 1)
+    const cleaned = clearCorruptPersistence(dangling, {})
+    assert.equal(cleaned.pointersCleared, 1)
+    assert.deepEqual(cleaned.overrides, {})
+    assert.equal(inspectSnapshotHealth(cleaned.overrides, cleaned.snapshots).dangling.length, 0)
+  })
+
+  check('损坏快照只丢这一条，可用快照与指针保留', () => {
+    const snapshot: BuiltinSchemeSnapshot = {
+      id: 1,
+      schemeID: 'acl4ssr-online',
+      createdAt: 1000,
+      scheme: {
+        id: 'acl4ssr-online', name: '示例方案', description: '', groups: [], rules: [], ruleSets: [],
+      },
+      ruleSets: [],
+      source: {
+        iniURL: 'https://example.com/demo.ini',
+        commitSha: '0123456789abcdef0123456789abcdef01234567',
+        files: [],
+        fetchedAt: 1000,
+        ruleCount: 0,
+        ruleSetCount: 0,
+      },
+    }
+    const damaged = { '1': snapshot, '2': { ...snapshot, id: 2, scheme: undefined } } as unknown as Record<string, BuiltinSchemeSnapshot>
+    const overrides: Record<string, BuiltinSchemeOverrideRef> = { 'acl4ssr-online': { snapshotId: 1 } }
+    const cleaned = clearCorruptPersistence(overrides, damaged)
+    assert.equal(cleaned.snapshotsCleared, 1)
+    assert.equal(cleaned.pointersCleared, 0)
+    assert.deepEqual(Object.keys(cleaned.snapshots), ['1'])
+    assert.deepEqual(cleaned.overrides, overrides)
   })
 
   check('备份不保留未知密钥字段', () => {

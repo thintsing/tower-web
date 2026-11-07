@@ -320,6 +320,24 @@ function main(): void {
     assert.equal(restored.scheme.rules.length, 2)
   })
 
+  check('撤销边界：自定义规则全部被删光后仍能恢复', () => {
+    const input = scheme([
+      rule('DOMAIN-SUFFIX', 'CUSTOM.EXAMPLE', 'A'),
+      rule('FINAL', '', 'DIRECT'),
+    ], {
+      customRules: [rule('DOMAIN-SUFFIX', 'custom.example', 'A')],
+      groups: selectGroups('A'),
+    })
+    const plan = analyzeDuplicateCleanup(input, { keep: 'last' })
+    const applied = applyDuplicateCleanup(input, plan)
+    assert.equal(applied.removed, 1)
+    assert.equal(applied.applied[0].place.kind, 'custom')
+    assert.equal(applied.scheme.customRules?.length, 0)
+    const restored = restoreRemovedRules(applied.scheme, applied.applied)
+    assert.equal(restored.restored, 1)
+    assert.deepEqual(restored.scheme.customRules?.map((item) => item.value), ['custom.example'])
+  })
+
   check('撤销边界：规则集被替换成只读来源时跳过并计数', () => {
     const set: SchemeRuleSet = {
       id: 'set-local',
@@ -796,6 +814,74 @@ function main(): void {
     assert.equal(dead!.firstDead, true)
     assert.equal(buildFixActions(dead!)[0].kind, 'manual')
     assert.match(buildFixActions(dead!)[0].label, /不可动/)
+  })
+
+  check('跨组重复：保留后一条会删除前一条，并说明目标组变化', () => {
+    const input = scheme([
+      rule('DOMAIN-SUFFIX', 'shared.example', 'A'),
+      rule('DOMAIN-SUFFIX', 'shared.example', 'B'),
+      rule('FINAL', '', 'DIRECT'),
+    ], { groups: selectGroups('A', 'B', 'DIRECT') })
+    const plan = analyzeDuplicateCleanup(input, { keep: 'last' })
+    assert.equal(plan.deletions.length, 1)
+    assert.equal(plan.deletions[0].group, 'A')
+    assert.equal(plan.deletions[0].duplicateOfGroup, 'B')
+    assert.equal(plan.deletions[0].kind, 'crossGroup')
+    assert.deepEqual(plan.directionChanges, [{ fromGroup: 'A', toGroup: 'B', count: 1, rules: ['DOMAIN-SUFFIX,shared.example'] }])
+    const applied = applyDuplicateCleanup(input, plan)
+    assert.equal(applied.removed, 1)
+    assert.equal(applied.scheme.rules.filter((item) => item.value === 'shared.example').length, 1)
+    assert.equal(applied.scheme.rules.find((item) => item.value === 'shared.example')?.group, 'B')
+  })
+
+  check('逐对处理：按签名覆盖保留方向', () => {
+    const shared = rule('DOMAIN-SUFFIX', 'shared.example', 'A')
+    const twin = rule('DOMAIN-SUFFIX', 'shared.example', 'B')
+    const input = scheme([shared, twin, rule('FINAL', '', 'DIRECT')], { groups: selectGroups('A', 'B', 'DIRECT') })
+    const signature = ruleSignature(shared)
+    const keepFirst = analyzeDuplicateCleanup(input, { keep: 'first', decisions: { [signature]: 'first' } })
+    assert.equal(keepFirst.deletions[0].duplicateOfGroup, 'A')
+    assert.deepEqual(keepFirst.directionChanges, [])
+    const keepLast = analyzeDuplicateCleanup(input, { keep: 'first', decisions: { [signature]: 'last' } })
+    assert.equal(keepLast.deletions[0].duplicateOfGroup, 'B')
+    assert.equal(keepLast.choices[0].direction, 'last')
+  })
+
+  check('遮蔽死规则纳入同一套删除 / 撤销流程', () => {
+    const input = scheme([
+      rule('DOMAIN-SUFFIX', 'example.com', 'A'),
+      rule('DOMAIN-SUFFIX', 'ads.example.com', 'B'),
+      rule('FINAL', '', 'DIRECT'),
+    ], { groups: selectGroups('A', 'B', 'DIRECT') })
+    const plan = analyzeDuplicateCleanup(input)
+    assert.equal(plan.deletions.length, 0)
+    assert.equal(plan.shadowed.length, 1)
+    assert.equal(plan.shadowed[0].kind, 'shadowed')
+    assert.match(plan.shadowed[0].shadowedReason ?? '', /永远不会命中/)
+    const applied = applyDuplicateCleanup(input, plan)
+    assert.equal(applied.removed, 1)
+    assert.equal(applied.scheme.rules.some((item) => item.value === 'ads.example.com'), false)
+    const restored = restoreRemovedRules(applied.scheme, applied.applied)
+    assert.equal(restored.restored, 1)
+    assert.equal(restored.scheme.rules.some((item) => item.value === 'ads.example.com'), true)
+  })
+
+  check('保留后一条时，只读来源的前一条不可删', () => {
+    const set: SchemeRuleSet = {
+      id: 'set-url',
+      name: '在线规则集',
+      group: 'A',
+      sourceKind: 'url',
+      sourceRef: 'https://example.com/rules.list',
+      rules: [rule('DOMAIN-SUFFIX', 'shared.example', 'A')],
+    }
+    const input = scheme([
+      rule('DOMAIN-SUFFIX', 'shared.example', 'B'),
+      rule('FINAL', '', 'DIRECT'),
+    ], { groups: selectGroups('A', 'B', 'DIRECT'), ruleSets: [set] })
+    const plan = analyzeDuplicateCleanup(input, { keep: 'last' })
+    assert.equal(plan.deletions.length, 0)
+    assert.equal(plan.skipped.readOnly.length, 1)
   })
 
   console.log(failures === 0 ? '\n全部重复规则清理自检通过' : `\n${failures} 项重复规则清理自检失败`)

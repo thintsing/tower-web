@@ -276,9 +276,10 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 | `npm run selfcheck:importers` | 校验规则方案导入 |
 | `npm run selfcheck:protocols` | 校验协议解析与降级 |
 | `npm run selfcheck:workspace` | 校验服务器版工作区接口、版本号、密钥与并发写 |
+| `npm run selfcheck:workspace-history` | 校验工作区历史、回滚版本号与容量淘汰 |
 
 <details>
-<summary>全部 24 项自检</summary>
+<summary>全部 28 项自检</summary>
 
 ```text
 selfcheck:asn         离线 IP / ASN 查询
@@ -290,6 +291,7 @@ selfcheck:clients     客户端配置结构
 selfcheck:dns         DNS 投影 / 纯节点组 / ECS
 selfcheck:duplicates  重复规则清理：同组 / 跨组 / 前置失效 / 只读来源
 selfcheck:flow        四步状态推导与诊断
+selfcheck:freeze-preview 固化前影响预览与取消
 selfcheck:importers   Clash / Surge / Egern / sing-box / INI 导入
 selfcheck:icons       策略组图标与能力矩阵
 selfcheck:manual      自有节点导入与去重
@@ -302,12 +304,15 @@ selfcheck:quota       订阅用量响应头 / Clash 方言探测 / 只取头
 selfcheck:regressions 审计回归：解析 / 命名 / 备份兼容 / 存储配额 / 隐式 TLS
 selfcheck:remote      代理集合与远程规则集
 selfcheck:rulesets    规则集方言转换
+selfcheck:rule-impact 自定义规则保存前的影响面
+selfcheck:rule-order  规则逐条排序与撤销
 selfcheck:upstream    上游方案更新：成功 / 部分失败 / 全部失败 / 空列表
 selfcheck:workspace   服务器版工作区：版本 / 304 / 409 / 密钥 / 坏文件 / 并发
+selfcheck:workspace-history 工作区历史：备份 / 回滚 / 容量 / 损坏文件
 selfcheck:yaml        Clash YAML 结构
 ```
 
-自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 24 项自检。
+自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 28 项自检。
 
 </details>
 
