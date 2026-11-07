@@ -5,11 +5,12 @@ import type {
   BuiltinSchemeSnapshot,
   BuiltinSchemeSnapshotContent,
   LocalRuleSet,
+  RoutingRule,
   RuleScheme,
   SchemeRuleSet,
 } from '../models/types'
 import { MAX_BUILTIN_SCHEME_SNAPSHOTS } from '../models/types'
-import { ruleSignature } from './ruleDiff'
+import { diffRules, ruleSignature, type DiffLine } from './ruleDiff'
 
 const COMMIT_SHA = /^[0-9a-f]{40}$/i
 
@@ -195,6 +196,78 @@ export interface SnapshotWriteResult {
   snapshots: Record<string, BuiltinSchemeSnapshot>
   overrides: Record<string, BuiltinSchemeOverrideRef>
   snapshotSeq: number
+}
+
+export interface FreezeGroupImpact {
+  group: string
+  added: number
+  removed: number
+  modified: number
+}
+
+export interface BuiltinSchemeFreezePlan {
+  added: number
+  removed: number
+  modified: number
+  unchanged: number
+  oldCount: number
+  newCount: number
+  /** 受影响的策略组，按变更条数从多到少。 */
+  groups: FreezeGroupImpact[]
+  /** 引用了当前（旧）规则集 id / 源地址的自定义方案名。 */
+  affectedSchemes: string[]
+}
+
+/**
+ * 固化前的变更预览：复用 ruleDiff 逐条比对，再按策略组汇总。
+ * 同时找出「引用了旧规则集 id / 源地址」的自定义方案，避免更新后它们悄悄失效。
+ */
+export function planBuiltinSchemeFreeze(args: {
+  currentScheme: Pick<RuleScheme, 'rules' | 'ruleSets'>
+  content: BuiltinSchemeSnapshotContent
+  customSchemes: Array<Pick<RuleScheme, 'name' | 'ruleSets'>>
+}): BuiltinSchemeFreezePlan {
+  const diff = diffRules(args.currentScheme.rules, args.content.scheme.rules)
+  const counts = new Map<string, FreezeGroupImpact>()
+  const bump = (line: DiffLine, kind: 'added' | 'removed' | 'modified') => {
+    const rule = (line.after ?? line.before) as RoutingRule | undefined
+    const group = rule?.group?.trim() || '未分组'
+    const entry = counts.get(group) ?? { group, added: 0, removed: 0, modified: 0 }
+    entry[kind] += 1
+    counts.set(group, entry)
+  }
+  for (const line of diff.added) bump(line, 'added')
+  for (const line of diff.removed) bump(line, 'removed')
+  for (const line of diff.modified) bump(line, 'modified')
+  const groups = [...counts.values()].sort((left, right) =>
+    (right.added + right.removed + right.modified)
+    - (left.added + left.removed + left.modified)
+    || left.group.localeCompare(right.group))
+
+  const oldIDs = new Set((args.currentScheme.ruleSets ?? []).map((set) => set.id))
+  const oldRefs = new Set(
+    (args.currentScheme.ruleSets ?? [])
+      .map((set) => set.sourceRef)
+      .filter((ref): ref is string => typeof ref === 'string' && ref.length > 0),
+  )
+  const affectedSchemes = args.customSchemes
+    .filter((scheme) => (scheme.ruleSets ?? []).some((set) => {
+      if (oldIDs.has(set.id)) return true
+      return typeof set.sourceRef === 'string' && set.sourceRef.length > 0
+        && (oldRefs.has(set.sourceRef) || oldIDs.has(set.sourceRef))
+    }))
+    .map((scheme) => scheme.name)
+
+  return {
+    added: diff.added.length,
+    removed: diff.removed.length,
+    modified: diff.modified.length,
+    unchanged: diff.unchanged,
+    oldCount: diff.oldCount,
+    newCount: diff.newCount,
+    groups,
+    affectedSchemes,
+  }
 }
 
 /** 固化一次：写快照、改指针、淘汰旧版。 */
