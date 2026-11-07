@@ -14,7 +14,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { mergeUsage, parse, parseUserinfoHeader } from '../src/parser'
 import { QUOTA_PROBE_MISS_TTL_MS, quotaProbeMissFresh, quotaProbeURLs, rememberQuotaProbeMiss, usageIsUsable } from '../src/store'
 import { subscriptionUsageSummary, usageFieldsFrom } from '../src/models/types'
-import { formatBytes, SourceUsage, shouldShowSourceUsage } from '../src/components/SourceUsage'
+import { formatBytes, SourceUsage, UsageHealthBadge, shouldShowSourceUsage } from '../src/components/SourceUsage'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 const GB = 1024 ** 3
@@ -506,6 +506,71 @@ async function main(): Promise<void> {
       assert.equal(main.header, null)
       const compat = await fetchThroughTower(tower, upstream.base, '/gate-ua', 'clash.meta')
       assert.equal(compat.header, HEADERS.seconds)
+    })
+
+    await check('健康度阈值边界：到期 3/4/7/8 天', async () => {
+      const now = Date.UTC(2026, 0, 1)
+      const DAY = 86_400_000
+      // 流量保持充足，只看到期档位；边界日含当天。
+      const at = (days: number) => subscriptionUsageSummary(
+        { expireAt: now + days * DAY, totalBytes: 10, usedBytes: 1 },
+        now,
+      )
+      assert.equal(at(3).health, 'urgent', '正好 3 天应为紧急')
+      assert.equal(at(4).health, 'attention', '4 天应为注意')
+      assert.equal(at(7).health, 'attention', '正好 7 天应为注意')
+      assert.equal(at(8).health, 'normal', '8 天应为正常')
+    })
+
+    await check('健康度阈值边界：流量剩余 10%/20%/21%', async () => {
+      const now = Date.UTC(2026, 0, 1)
+      const withTraffic = (total: number, used: number) => subscriptionUsageSummary(
+        { expireAt: now + 30 * 86_400_000, totalBytes: total, usedBytes: used },
+        now,
+      )
+      // total=10 便于构造精确的 10% / 20% 边界。
+      assert.equal(withTraffic(10, 9).health, 'urgent', '剩余正好 10% 应为紧急')
+      assert.equal(withTraffic(10, 8).health, 'attention', '剩余正好 20% 应为注意')
+      assert.equal(withTraffic(100, 79).health, 'normal', '剩余 21% 应为正常')
+    })
+
+    await check('未知数据保持中性，不误报', async () => {
+      const now = Date.UTC(2026, 0, 1)
+      assert.equal(subscriptionUsageSummary({}, now).health, 'unknown', '三无数据应保持中性')
+      assert.equal(subscriptionUsageSummary({ totalBytes: 1000 }, now).health, 'unknown', '只有总量、已用未知应保持中性')
+      assert.equal(subscriptionUsageSummary({ usedBytes: 100 }, now).health, 'unknown', '只有已用、总量未知应保持中性')
+      assert.equal(subscriptionUsageSummary({ unlimited: true }, now).health, 'unknown', '不限量但到期未知应保持中性')
+      assert.equal(
+        subscriptionUsageSummary({ unlimited: true, expireAt: now + 30 * 86_400_000 }, now).health,
+        'normal',
+        '不限量 + 到期已知且充足应为正常',
+      )
+    })
+
+    await check('已过期单独归类，不混进紧急', async () => {
+      const now = Date.UTC(2026, 0, 1)
+      const summary = subscriptionUsageSummary(
+        { expireAt: now - 86_400_000, totalBytes: 10, usedBytes: 10 },
+        now,
+      )
+      assert.equal(summary.health, 'expired')
+      assert.equal(summary.health !== 'urgent', true)
+      const html = renderToStaticMarkup(UsageHealthBadge({ summary }))
+      assert.ok(html.includes('已过期'), `应显示已过期文案：${html}`)
+      assert.ok(html.includes('usage-health expired'), `应使用 expired 样式：${html}`)
+    })
+
+    await check('健康徽标不只靠颜色区分', async () => {
+      const now = Date.UTC(2026, 0, 1)
+      const urgent = subscriptionUsageSummary({ expireAt: now + 86_400_000 }, now)
+      const attention = subscriptionUsageSummary({ expireAt: now + 5 * 86_400_000 }, now)
+      const normal = subscriptionUsageSummary({ expireAt: now + 30 * 86_400_000, totalBytes: 10, usedBytes: 1 }, now)
+      const urgentHtml = renderToStaticMarkup(UsageHealthBadge({ summary: urgent }))
+      const attentionHtml = renderToStaticMarkup(UsageHealthBadge({ summary: attention }))
+      const normalHtml = renderToStaticMarkup(UsageHealthBadge({ summary: normal }))
+      assert.ok(urgentHtml.includes('▲') && urgentHtml.includes('紧急'))
+      assert.ok(attentionHtml.includes('△') && attentionHtml.includes('注意'))
+      assert.ok(normalHtml.includes('✓') && normalHtml.includes('正常'))
     })
   } finally {
     await tower.stop()

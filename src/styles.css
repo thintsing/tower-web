@@ -1215,6 +1215,62 @@ dialog.freeze-dialog { width: min(560px, 94vw); }
   font-size: 11px;
   opacity: 0.9;
 }
+/* 订阅健康度：颜色 + 符号 + 文字三重区分，不单靠色相。 */
+.usage-health {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: var(--fs-small);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.usage-health.normal {
+  color: var(--pill-positive-ink);
+  background: var(--pill-positive-bg);
+}
+.usage-health.attention {
+  color: var(--pill-warning-ink);
+  background: var(--pill-warning-bg);
+}
+.usage-health.urgent {
+  color: var(--pill-negative-ink);
+  background: var(--pill-negative-bg);
+  border-color: var(--pill-negative-ink);
+}
+.usage-health.expired {
+  color: var(--pill-negative-ink);
+  background: var(--pill-negative-bg);
+  border-style: dashed;
+}
+.usage-health.unknown {
+  color: var(--muted);
+  background: transparent;
+}
+.subscription-health-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.subscription-health-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.subscription-health-name {
+  font-size: var(--fs-small);
+  font-weight: 500;
+}
+.subscription-health-reason {
+  color: var(--muted);
+  font-size: var(--fs-small);
+}
 .source-notices {
   margin-top: 7px;
   padding-left: 9px;
@@ -4631,6 +4687,71 @@ button:disabled:hover,
 
 .upstream-status-line.muted {
   color: var(--muted);
+}
+
+/* 上游漂移提示：列表行下方的可展开 diff，不自动应用。 */
+.upstream-status-block {
+  display: grid;
+  gap: 5px;
+}
+.drift-note {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: var(--fs-small);
+  display: grid;
+  gap: 6px;
+  background: var(--surface-soft, transparent);
+}
+.drift-note.drift-error {
+  color: var(--muted);
+}
+.drift-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+.drift-counts {
+  font-family: var(--mono, monospace);
+  font-weight: 600;
+}
+.drift-samples summary {
+  cursor: pointer;
+}
+.drift-samples ul {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+  max-height: 220px;
+  overflow: auto;
+}
+.drift-samples li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+.drift-samples code {
+  font-size: var(--fs-small);
+  word-break: break-all;
+}
+.drift-kind {
+  flex: 0 0 auto;
+  font-weight: 600;
+}
+.drift-samples li[data-kind='added'] .drift-kind { color: var(--pill-positive-ink); }
+.drift-samples li[data-kind='removed'] .drift-kind { color: var(--pill-negative-ink); }
+.drift-samples li[data-kind='modified'] .drift-kind { color: var(--pill-warning-ink); }
+.drift-previous {
+  color: var(--muted);
+  word-break: break-all;
+}
+.drift-actions {
+  display: flex;
+  gap: 8px;
 }
 
 .rs-diff {

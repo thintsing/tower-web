@@ -55,9 +55,10 @@ import { RouteIllustration } from './components/RouteIllustration'
 import { GroupIcon, groupDisplayName } from './components/GroupIcon'
 import { TailnetIllustration } from './components/TailnetIllustration'
 import { ManualNodeEditorDialog } from './components/ManualNodeEditorDialog'
-import { SourceUsage, shouldShowSourceUsage } from './components/SourceUsage'
+import { SourceUsage, UsageHealthBadge, shouldShowSourceUsage } from './components/SourceUsage'
 import { UserAgentField } from './components/UserAgentField'
 import { RulesToolsCard } from './components/RulesToolsCard'
+import { SchemeDriftNotice } from './components/SchemeDriftNotice'
 import { DiagnosisPanel, type FixOutcome } from './components/DiagnosisPanel'
 import { FlowRail } from './components/FlowRail'
 import { AdvancedSection } from './components/AdvancedSection'
@@ -1434,6 +1435,14 @@ function SubscriptionSettingsDialog({
   const setFilterSubscriptionInfoNodes = useStore((s) => s.setFilterSubscriptionInfoNodes)
   const renewalRemindersEnabled = useStore((s) => s.renewalRemindersEnabled)
   const setRenewalRemindersEnabled = useStore((s) => s.setRenewalRemindersEnabled)
+  const sources = useStore((s) => s.sources)
+  // 订阅健康与首页订阅卡同一套判定，设置页只做汇总展示。
+  const subscriptionHealthRows = useMemo(
+    () => sources
+      .filter(isSourceEnabled)
+      .map((source) => ({ source, summary: subscriptionUsageSummary(source) })),
+    [sources],
+  )
   const showGroupEmoji = useStore((s) => s.showGroupEmoji)
   const setShowGroupEmoji = useStore((s) => s.setShowGroupEmoji)
   const ruleSetVersionHistory = useStore((s) => s.ruleSetVersionHistory)
@@ -1731,6 +1740,31 @@ function SubscriptionSettingsDialog({
             <small>订阅即将到期或流量接近上限时，在订阅页提示；允许通知后，塔台打开期间还会发系统通知。</small>
           </span>
         </label>
+        <div className="settings-divider" />
+        <div className="settings-data-head">
+          <div>
+            <strong>订阅健康</strong>
+            <small>
+              到期 ≤7 天为注意、≤3 天为紧急；流量余量 ≤20% 为注意、≤10% 为紧急。
+              已过期单独标出；机场没返回数据时保持中性，不做预警。
+            </small>
+          </div>
+        </div>
+        {subscriptionHealthRows.length === 0 ? (
+          <div className="hint">还没有已启用的订阅。</div>
+        ) : (
+          <ul className="subscription-health-list">
+            {subscriptionHealthRows.map(({ source, summary }) => (
+              <li key={source.id}>
+                <span className="subscription-health-name">{source.name}</span>
+                <UsageHealthBadge summary={summary} />
+                {summary.healthReasons.length > 0 && (
+                  <span className="subscription-health-reason">{summary.healthReasons.join('；')}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
         <label className="setting-toggle">
           <input
             type="checkbox"
@@ -6735,21 +6769,23 @@ function RulesTab({
                   if (item.status === 'update') {
                     const meta = allMetas.find((m) => m.id === item.id && !('custom' in m))
                     return (
-                      <div key={item.id} className="upstream-status-line update">
-                        <span>
-                          「{item.name}」上游有新版本（commit {item.commitShort}
-                          {item.behindBy ? `，落后 ${item.behindBy} 个提交` : ''}）
-                        </span>
+                      <div key={item.id} className="upstream-status-block">
+                        <div className="upstream-status-line update">
+                          <span>
+                            「{item.name}」上游有新版本（commit {item.commitShort}
+                            {item.behindBy ? `，落后 ${item.behindBy} 个提交` : ''}）
+                          </span>
+                        </div>
                         {meta && (
-                          <button
-                            type="button"
-                            className="btn ghost"
-                            {...writeGuard(readOnly)}
-                            disabled={updatingBuiltinScheme}
-                            onClick={() => void freezeBuiltinScheme(meta)}
-                          >
-                            {updatingBuiltinScheme ? '正在更新…' : '更新并固化'}
-                          </button>
+                          <SchemeDriftNotice
+                            meta={meta}
+                            version={item.commit || item.commitShort || ''}
+                            overrides={builtinSchemeOverrides}
+                            snapshots={schemeSnapshots}
+                            readOnly={readOnly}
+                            busy={updatingBuiltinScheme}
+                            onAbsorb={() => void freezeBuiltinScheme(meta)}
+                          />
                         )}
                       </div>
                     )

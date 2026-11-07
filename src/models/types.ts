@@ -224,6 +224,19 @@ export function usageFieldsFrom(usage?: SubscriptionUsage): SubscriptionUsageFie
   return fields
 }
 
+/**
+ * 订阅健康度：正常 / 注意 / 紧急 / 已过期，数据不足时保持中性（unknown）。
+ * 已过期单独成档，不混进「紧急」。
+ */
+export type SubscriptionHealthLevel = 'unknown' | 'normal' | 'attention' | 'urgent' | 'expired'
+
+/** 到期预警：≤3 天紧急，≤7 天注意（含边界）。 */
+export const EXPIRY_URGENT_DAYS = 3
+export const EXPIRY_ATTENTION_DAYS = 7
+/** 流量余量：≤10% 紧急，≤20% 注意（含边界）。 */
+export const TRAFFIC_URGENT_RATIO = 0.1
+export const TRAFFIC_ATTENTION_RATIO = 0.2
+
 export interface SubscriptionUsageSummary extends SubscriptionUsageFields {
   remainingBytes?: number
   /** 剩余比例 0..1，仅在总量和已用都已知时存在。 */
@@ -233,6 +246,10 @@ export interface SubscriptionUsageSummary extends SubscriptionUsageFields {
   expired: boolean
   longTerm: boolean
   lowTraffic: boolean
+  /** 订阅健康度；只有到期与流量都拿得到时才判「正常」，否则保持中性。 */
+  health: SubscriptionHealthLevel
+  /** 触发注意 / 紧急 / 已过期的具体原因，供 UI 展示与读屏器使用。 */
+  healthReasons: string[]
 }
 
 /** 兼容旧快照：新字段缺失时回退到 usage 推导。 */
@@ -271,7 +288,43 @@ export function subscriptionUsageSummary(
     : undefined
   // Math.ceil(-0.0001) 会得到 -0，统一成 0 避免比较/展示异常。
   const daysUntilExpiry = rawDays === 0 ? 0 : rawDays
-  const lowTraffic = remainingRatio !== undefined && remainingRatio < 0.1
+  // 旧的 renewalAlerts 仍按「严格低于 10%」；健康度用另一套含边界的档位。
+  const lowTraffic = remainingRatio !== undefined && remainingRatio < TRAFFIC_URGENT_RATIO
+  // 到期与流量分别评估；两条都拿不到时才保持中性，避免拿不到数据就误报。
+  const healthReasons: string[] = []
+  let health: SubscriptionHealthLevel
+  let urgent = false
+  let attention = false
+  if (expired) {
+    healthReasons.push('订阅已过期')
+    health = 'expired'
+  } else {
+    if (daysUntilExpiry !== undefined && !longTerm) {
+      if (daysUntilExpiry <= EXPIRY_URGENT_DAYS) {
+        urgent = true
+        healthReasons.push(daysUntilExpiry <= 0 ? '今天到期' : `还有 ${daysUntilExpiry} 天到期`)
+      } else if (daysUntilExpiry <= EXPIRY_ATTENTION_DAYS) {
+        attention = true
+        healthReasons.push(`还有 ${daysUntilExpiry} 天到期`)
+      }
+    }
+    const remainingPercent = remainingRatio !== undefined
+      ? Math.max(0, Math.round(remainingRatio * 100))
+      : undefined
+    if (remainingRatio !== undefined) {
+      if (remainingRatio <= TRAFFIC_URGENT_RATIO) {
+        urgent = true
+        healthReasons.push(remainingPercent === 0 ? '流量已用尽' : `剩余流量 ${remainingPercent}%`)
+      } else if (remainingRatio <= TRAFFIC_ATTENTION_RATIO) {
+        attention = true
+        healthReasons.push(`剩余流量 ${remainingPercent}%`)
+      }
+    }
+    // 到期已知（含长期有效）且流量可评估，才算「正常」；任一维度未知都保持中性。
+    const expiryKnown = expireAt !== undefined
+    const trafficKnown = unlimited || remainingRatio !== undefined
+    health = urgent ? 'urgent' : attention ? 'attention' : expiryKnown && trafficKnown ? 'normal' : 'unknown'
+  }
   return {
     totalBytes,
     usedBytes,
@@ -283,6 +336,8 @@ export function subscriptionUsageSummary(
     expired,
     longTerm,
     lowTraffic,
+    health,
+    healthReasons,
   }
 }
 

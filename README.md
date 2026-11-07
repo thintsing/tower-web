@@ -282,7 +282,7 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 | `npm run selfcheck:upstream-status` | 校验服务端上游定时检查、失败退避与工作区隔离 |
 
 <details>
-<summary>全部 29 项自检</summary>
+<summary>全部 31 项自检</summary>
 
 ```text
 selfcheck:asn         离线 IP / ASN 查询
@@ -292,7 +292,9 @@ selfcheck:batch       批量订阅导入
 selfcheck:catalog     在线规则目录
 selfcheck:clients     客户端配置结构
 selfcheck:dns         DNS 投影 / 纯节点组 / ECS
+selfcheck:drift       上游漂移：diff 计数 / 忽略记忆 / 未知不冒充已最新
 selfcheck:duplicates  重复规则清理：同组 / 跨组 / 前置失效 / 只读来源
+selfcheck:fetch-guard 订阅抓取重定向守卫：302 / 相对地址 / 元数据 / 跳数 / 用量头
 selfcheck:flow        四步状态推导与诊断
 selfcheck:freeze-preview 固化前影响预览与取消
 selfcheck:importers   Clash / Surge / Egern / sing-box / INI 导入
@@ -316,7 +318,7 @@ selfcheck:workspace-history 工作区历史：备份 / 回滚 / 容量 / 损坏�
 selfcheck:yaml        Clash YAML 结构
 ```
 
-自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 29 项自检。
+自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 31 项自检。
 
 </details>
 

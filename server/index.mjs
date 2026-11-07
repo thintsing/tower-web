@@ -43,6 +43,9 @@ const distRulesetsDir = join(distDir, 'rulesets')
 // 单次订阅响应的上限（解压后）。没有上限时一个超大响应就能把进程内存吃光。
 const MAX_FETCH_BYTES = 32 * 1024 * 1024
 const MAX_FETCH_LABEL = '32MB'
+// 订阅抓取与规则集抓取共用同一个跳数上限：机场 / CDN 的正常重定向通常 1–2 跳，
+// 5 跳足够；再多基本是循环或恶意链。
+const MAX_REDIRECT_HOPS = 5
 
 /** 虚拟网卡（VMware / VirtualBox / Hyper-V / Tailscale …）排在真实网卡之后。 */
 const VIRTUAL_IFACE = /(vmware|virtualbox|vethernet|hyper-v|wsl|docker|tailscale|zerotier|loopback)/i
@@ -99,10 +102,11 @@ function ruleSetCacheKey(query) {
 }
 
 /**
- * 云元数据 / 链路本地地址不可能是合法规则集来源。
- * `/api/ruleset?url=` 是免密钥的公开端点（客户端要直接拉取），因此在这里
- * 挡掉最常见的 SSRF 探测目标；局域网 NAS 等私有地址仍然允许。
+ * 云元数据 / 链路本地 / 组播 / 保留地址不可能是合法订阅或规则集来源。
+ * `/api/ruleset` 与 `/api/fetch` 是免密钥端点（客户端要直接拉取），因此在这里
+ * 共用同一套判断；局域网 NAS 等私网地址仍然允许。
  */
+const BLOCKED_TARGET_MESSAGE = '地址不能指向链路本地、云元数据、组播或保留地址'
 const BLOCKED_RULESET_HOSTS = new Set([
   '169.254.169.254',
   '100.100.100.200',
@@ -119,14 +123,30 @@ function isBlockedRuleSetTarget(target) {
     || host.endsWith('.metadata.google.internal')
 }
 
-/** 解析结果也要校验：只按域名挡，A 记录指向 169.254.169.254 的域名仍能绕过。 */
+/** 初始地址和每一跳跳转都走这里：命中直接抛错，调用方负责带上第几跳。 */
+function assertAllowedTarget(target) {
+  if (isBlockedRuleSetTarget(target)) throw new Error(BLOCKED_TARGET_MESSAGE)
+}
+
+/**
+ * 解析结果也要校验：只按域名挡，A 记录指向 169.254.169.254 的域名仍能绕过。
+ * 私网（10/8、172.16/12、192.168/16）与回环地址按原有设计放行，
+ * 只拦截链路本地、云元数据、组播和保留地址。
+ */
 function blockedRuleSetAddress(address) {
   const ip = String(address).trim().toLowerCase()
   const mapped = ip.startsWith('::ffff:') ? ip.slice('::ffff:'.length) : ip
-  return /^169\.254\.\d{1,3}\.\d{1,3}$/.test(mapped)
-    || mapped === '100.100.100.200'
-    || /^fe80:/.test(ip)
-    || /^fd00:ec2::/.test(ip)
+  if (isIP(mapped) === 4) {
+    const [first, second] = mapped.split('.').map(Number)
+    return (first === 169 && second === 254)   // 169.254.0.0/16 链路本地
+      || mapped === '100.100.100.200'          // 阿里云元数据
+      || first === 0                            // 0.0.0.0/8 本网络
+      || first >= 224                          // 224.0.0.0/4 组播 + 240.0.0.0/4 保留（含广播）
+  }
+  return /^fe80:/.test(ip)                     // IPv6 链路本地
+    || ip === '::'                             // IPv6 未指定地址
+    || /^ff[0-9a-f]{2}:/.test(ip)              // IPv6 组播
+    || /^fd00:ec2::/.test(ip)                  // AWS 元数据
 }
 
 /** 读取内置规则文件或抓取远程列表，再转换成目标客户端方言。 */
@@ -169,15 +189,11 @@ async function buildRuleSetArtifact(query) {
       throw new RuleSetConversionError('只支持 http/https 规则集地址', 400)
     }
     if (isBlockedRuleSetTarget(target)) {
-      throw new RuleSetConversionError('规则集地址不能指向链路本地或云元数据服务', 400)
+      throw new RuleSetConversionError(`规则集地址被拦截：${BLOCKED_TARGET_MESSAGE}`, 400)
     }
     let response
     try {
-      response = await fetchWithDoH(target, 'clash-verge/v2.4.2', undefined, false, (next) => {
-        if (isBlockedRuleSetTarget(next)) {
-          throw new Error('规则集地址不能指向链路本地或云元数据服务')
-        }
-      })
+      response = await fetchWithDoH(target, 'clash-verge/v2.4.2', undefined, false, assertAllowedTarget)
     } catch (error) {
       throw new RuleSetConversionError(`规则集抓取失败：${error.message}`, 502)
     }
@@ -1862,52 +1878,42 @@ function requestOnce(target, userAgent, dohEndpoint, headersOnly = false, guard 
   })
 }
 
-/** 流式读取并限制体积；fetch 会在读取时解压，因此上限作用于解压后的内容。 */
-async function readLimitedBody(response) {
-  const declared = Number(headerValue(response.headers, 'content-length') ?? 0)
-  if (Number.isFinite(declared) && declared > MAX_FETCH_BYTES) {
-    throw new Error(`订阅内容超过 ${MAX_FETCH_LABEL} 上限`)
-  }
-  if (!response.body) return Buffer.alloc(0)
-  const reader = response.body.getReader()
-  const chunks = []
-  let size = 0
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      size += value.byteLength
-      if (size > MAX_FETCH_BYTES) {
-        await reader.cancel().catch(() => {})
-        throw new Error(`订阅内容超过 ${MAX_FETCH_LABEL} 上限`)
-      }
-      chunks.push(Buffer.from(value))
-    }
-  } finally {
-    reader.releaseLock()
-  }
-  return Buffer.concat(chunks, size)
-}
-
+/**
+ * 手工跟随重定向：每一跳都校验 hostname 与 DNS 解析结果，避免 302 指向
+ * 链路本地 / 云元数据。相对 Location 按当前地址解析；最多 5 跳。
+ * 返回的是最终那一跳的响应，`subscription-userinfo` 等头自然来自最终响应。
+ */
 async function fetchWithDoH(target, userAgent, dohEndpoint, headersOnly = false, guard = undefined) {
   let current = target
-  for (let hop = 0; hop < 6; hop++) {
-    const result = await requestOnce(current, userAgent, dohEndpoint, headersOnly, guard)
-    const location = headerValue(result.headers, 'location')
-    if ([301, 302, 303, 307, 308].includes(result.status) && location) {
-      const next = new URL(location, current)
-      if (next.protocol !== 'http:' && next.protocol !== 'https:') {
-        throw new Error('订阅地址重定向到了不支持的协议')
-      }
-      // 免密钥的 /api/ruleset 必须逐跳校验：只挡住初始地址的话，
-      // 一个 302 指向 169.254.169.254 就能绕过元数据拦截。
-      if (guard) guard(next)
-      current = next
-      continue
+  for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
+    let result
+    try {
+      result = await requestOnce(current, userAgent, dohEndpoint, headersOnly, guard)
+    } catch (error) {
+      if (hop === 0) throw error
+      throw new Error(`第 ${hop} 次跳转（${current.href}）失败：${error?.message ?? '网络错误'}`)
     }
-    return result
+    const location = headerValue(result.headers, 'location')
+    if (![301, 302, 303, 307, 308].includes(result.status) || !location) {
+      return result
+    }
+    let next
+    try {
+      next = new URL(location, current)
+    } catch {
+      throw new Error(`第 ${hop + 1} 跳的 Location 无效：${location}`)
+    }
+    if (next.protocol !== 'http:' && next.protocol !== 'https:') {
+      throw new Error(`第 ${hop + 1} 跳重定向到了不支持的协议（${next.protocol}）：${location}`)
+    }
+    try {
+      guard?.(next)
+    } catch (error) {
+      throw new Error(`第 ${hop + 1} 跳（${next.href}）被拦截：${error?.message ?? '目标地址不被允许'}`)
+    }
+    current = next
   }
-  throw new Error('订阅地址重定向次数过多')
+  throw new Error(`订阅地址重定向超过 ${MAX_REDIRECT_HOPS} 跳，已停止`)
 }
 
 async function handleFetch(url, options, res) {
@@ -1919,6 +1925,11 @@ async function handleFetch(url, options, res) {
   }
   if (target.protocol !== 'http:' && target.protocol !== 'https:') {
     return json(res, 400, { error: '只支持 http/https 订阅地址' })
+  }
+  try {
+    assertAllowedTarget(target)
+  } catch (error) {
+    return json(res, 400, { error: `订阅地址被拦截：${error?.message ?? BLOCKED_TARGET_MESSAGE}` })
   }
 
   const userAgent = sanitizeUserAgent(options?.userAgent) || 'clash-verge/v2.4.2'
@@ -1932,39 +1943,12 @@ async function handleFetch(url, options, res) {
   }
 
   let upstream
-  if (dohEndpoint) {
-    // Node 的 fetch 不暴露自定义 DNS，使用 http(s).request + lookup 才能
-    // 真正按 DoH 返回的地址连接，同时保留原域名的 TLS 校验。
-    try {
-      upstream = await fetchWithDoH(target, userAgent, dohEndpoint, headersOnly)
-    } catch (error) {
-      return json(res, 502, { error: `订阅服务器无法访问：${error?.message ?? '网络错误'}` })
-    }
-  } else {
-    const response = await fetch(target, {
-      headers: { 'user-agent': userAgent, accept: '*/*' },
-      redirect: 'follow',
-      signal: AbortSignal.timeout(30_000),
-    }).catch((error) => ({ error }))
-    if ('error' in response) {
-      return json(res, 502, { error: `订阅服务器无法访问：${response.error?.message ?? '网络错误'}` })
-    }
-    if (headersOnly) {
-      await response.body?.cancel().catch(() => {})
-      upstream = { status: response.status, headers: response.headers, body: Buffer.alloc(0) }
-    } else {
-      let body
-      try {
-        body = await readLimitedBody(response)
-      } catch (error) {
-        return json(res, 502, { error: `订阅内容读取失败：${error?.message ?? '网络错误'}` })
-      }
-      upstream = {
-        status: response.status,
-        headers: response.headers,
-        body,
-      }
-    }
+  // 有 DoH 时用 http(s).request + 自定义 lookup（Node 的 fetch 不暴露 DNS）；
+  // 没有 DoH 也走同一条路径，这样重定向策略、逐跳守卫和体积上限只有一份实现。
+  try {
+    upstream = await fetchWithDoH(target, userAgent, dohEndpoint, headersOnly, assertAllowedTarget)
+  } catch (error) {
+    return json(res, 502, { error: `订阅服务器无法访问：${error?.message ?? '网络错误'}` })
   }
 
   if (upstream.status < 200 || upstream.status >= 300) {

@@ -1,6 +1,46 @@
 // 订阅套餐行。机场不给配套信息时也必须占位，否则用户分不清“机场没返回”
 // 和“塔台没有这个功能”。
-import type { SubscriptionUsageSummary } from '../models/types'
+import type { SubscriptionHealthLevel, SubscriptionUsageSummary } from '../models/types'
+
+const HEALTH_TITLES: Record<SubscriptionHealthLevel, string> = {
+  unknown: '数据未知',
+  normal: '正常',
+  attention: '注意',
+  urgent: '紧急',
+  expired: '已过期',
+}
+
+/** 颜色之外再用不同符号：色盲用户也能区分档位。 */
+const HEALTH_ICONS: Record<SubscriptionHealthLevel, string> = {
+  unknown: '—',
+  normal: '✓',
+  attention: '△',
+  urgent: '▲',
+  expired: '✕',
+}
+
+const HEALTH_TIPS: Record<SubscriptionHealthLevel, string> = {
+  unknown: '机场没有返回足够数据，不做预警',
+  normal: '到期时间与流量余量都正常',
+  attention: '接近到期或流量余量偏低',
+  urgent: '很快到期或流量即将用尽',
+  expired: '订阅已过期，需要续费',
+}
+
+/** 订阅健康度徽标：首页订阅卡与订阅设置共用。 */
+export function UsageHealthBadge({ summary }: { summary: SubscriptionUsageSummary }) {
+  const level = summary.health
+  return (
+    <span
+      className={`usage-health ${level}`}
+      data-health={level}
+      title={summary.healthReasons.length ? summary.healthReasons.join('；') : HEALTH_TIPS[level]}
+    >
+      <span aria-hidden="true">{HEALTH_ICONS[level]}</span>
+      {HEALTH_TITLES[level]}
+    </span>
+  )
+}
 
 /** 流量未知时显示「—」，不要用 0 冒充真实值。 */
 export function formatBytes(bytes?: number): string {
@@ -60,6 +100,7 @@ export function SourceUsage({ summary }: { summary: SubscriptionUsageSummary }) 
 
   return (
     <div className="usage" data-usage={allUnknown ? 'unknown' : 'known'}>
+      <UsageHealthBadge summary={summary} />
       {/* 不限量与有上限都属于“已知”，只有真正三无时才提示机场没返回。 */}
       {unlimited ? (
         <span
