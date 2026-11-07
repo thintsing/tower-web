@@ -18,6 +18,7 @@ import {
 } from '../src/rules/ruleSets'
 import { normalizeRemoteTextURL, remoteRuleSetNameFromURL, splitRemoteTextURLs } from '../src/util/remoteURL'
 import { diffRules, diffTotal } from '../src/rules/ruleDiff'
+import { ruleSetRefreshFailure, ruleSetRefreshSuccess, sumRuleSetDiffs, summarizeRuleSetRefresh } from '../src/rules/ruleSetRefresh'
 import {
   clearRuleSetHistory,
   digestRules,
@@ -71,6 +72,8 @@ const rule = (type: string, value?: string, extra: Partial<RoutingRule> = {}): R
   group: '节点选择',
   ...extra,
 })
+
+const AT = 1_700_000_000_000
 
 /** 读取 MRS / SRS 的 succinct set，还原其中的域名模式，便于验证编码结果。 */
 function decodeSuccinct(
@@ -517,6 +520,79 @@ function main(): void {
   check('规则集摘要与顺序无关', () => {
     const rules = [rule('DOMAIN', 'b.example'), rule('DOMAIN', 'a.example'), rule('DOMAIN-SUFFIX', 'example.com')]
     assert.equal(digestRules(rules), digestRules([...rules].reverse()))
+  })
+
+  check('在线规则集刷新摘要：无变化时三个数都是 0（按归一化口径）', () => {
+    const before = [
+      rule('DOMAIN-SUFFIX', 'Example.COM'),
+      rule('IP-CIDR', '1.2.3.0/24', { noResolve: true }),
+    ]
+    const after = [
+      rule('IP-CIDR', '1.2.3.0/24', { options: ['no-resolve'] }),
+      rule('DOMAIN-SUFFIX', '.example.com.'),
+    ]
+    const diff = summarizeRuleSetRefresh(before, after, AT)
+    assert.deepEqual({ added: diff.added, removed: diff.removed, modified: diff.modified }, { added: 0, removed: 0, modified: 0 })
+    assert.deepEqual(diff.samples, [])
+    assert.equal(diff.hidden, 0)
+    assert.equal(diff.checkedAt, AT)
+  })
+
+  check('在线规则集刷新摘要：只有新增 / 只有删除 / 只有修改', () => {
+    const base = [rule('DOMAIN', 'a.example'), rule('DOMAIN', 'b.example')]
+    const added = summarizeRuleSetRefresh(base, [...base, rule('DOMAIN', 'c.example')], AT)
+    assert.deepEqual({ added: added.added, removed: added.removed, modified: added.modified }, { added: 1, removed: 0, modified: 0 })
+    assert.equal(added.samples[0]?.kind, 'added')
+    assert.equal(added.samples[0]?.text, 'DOMAIN,c.example')
+
+    const removed = summarizeRuleSetRefresh(base, [rule('DOMAIN', 'a.example')], AT)
+    assert.deepEqual({ added: removed.added, removed: removed.removed, modified: removed.modified }, { added: 0, removed: 1, modified: 0 })
+    assert.equal(removed.samples[0]?.kind, 'removed')
+
+    // 同值同选项但大小写不同算未变化；类型变化才算修改，并保留修改前的值。
+    const unchanged = summarizeRuleSetRefresh([rule('DOMAIN', 'Case.Example')], [rule('DOMAIN', 'case.example')], AT)
+    assert.equal(unchanged.modified, 0)
+    const modified = summarizeRuleSetRefresh([rule('DOMAIN', 'x.example')], [rule('DOMAIN-SUFFIX', 'x.example')], AT)
+    assert.deepEqual({ added: modified.added, removed: modified.removed, modified: modified.modified }, { added: 0, removed: 0, modified: 1 })
+    assert.equal(modified.samples[0]?.kind, 'modified')
+    assert.equal(modified.samples[0]?.previous, 'DOMAIN,x.example')
+    assert.equal(modified.samples[0]?.text, 'DOMAIN-SUFFIX,x.example')
+  })
+
+  check('在线规则集刷新摘要：超过上限折叠，刷新全部可汇总', () => {
+    const many = Array.from({ length: 20 }, (_, index) => rule('DOMAIN', `d${index}.example`))
+    const one = summarizeRuleSetRefresh([], many, AT)
+    assert.equal(one.added, 20)
+    assert.equal(one.samples.length, 12)
+    assert.equal(one.hidden, 8)
+    const totals = sumRuleSetDiffs([
+      one,
+      summarizeRuleSetRefresh([rule('DOMAIN', 'gone.example')], [], AT),
+      undefined,
+    ])
+    assert.deepEqual(totals, { added: 20, removed: 1, modified: 0 })
+  })
+
+  check('在线规则集刷新：成功清错误并记录摘要，失败保留旧摘要', () => {
+    const oldSummary = summarizeRuleSetRefresh([rule('DOMAIN', 'a.example')], [rule('DOMAIN', 'a.example'), rule('DOMAIN', 'b.example')], AT - 1000)
+    const existing = {
+      id: 'set-1',
+      name: '示例',
+      rules: [rule('DOMAIN', 'a.example')],
+      updatedAt: AT - 1000,
+      lastError: '旧错误',
+      lastDiff: oldSummary,
+    }
+    const failed = ruleSetRefreshFailure(existing, 'HTTP 500')
+    assert.equal(failed.lastError, 'HTTP 500')
+    assert.deepEqual(failed.lastDiff, oldSummary)
+    assert.deepEqual(failed.rules, existing.rules)
+
+    const success = ruleSetRefreshSuccess(existing, [rule('DOMAIN', 'a.example'), rule('DOMAIN', 'b.example')], AT)
+    assert.equal(success.lastError, undefined)
+    assert.equal(success.updatedAt, AT)
+    assert.equal(success.lastDiff?.added, 1)
+    assert.equal(success.lastDiff?.checkedAt, AT)
   })
 
   check('规则集历史：特殊 setID 可保存、清理，损坏明细退化为摘要', () => {

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, lazy, Suspense, type ReactNode, type SyntheticEvent } from 'react'
 import { renderSVG } from 'uqr'
-import { CLIENTS, PROXY_KIND_TITLES, clientSupportsImport, subFormatFor, subscriptionUsageSummary, type ClientInfo, type ClientTarget, type ExportContentMode, type LatencyTestMode, type LocalRuleSet, type NodeNameFilterSettings, type PolicyGroup, type ProxyKind, type ProxyNode, type RemoteSubscriptionEntry, type RoutingRule, type RuleScheme, type RuleSetFormat, type SchemeRuleSet, type SubFormat, type SubscriptionSource, type TailnetConnection, type TailnetExport } from './models/types'
+import { CLIENTS, PROXY_KIND_TITLES, clientSupportsImport, subFormatFor, subscriptionUsageSummary, type ClientInfo, type ClientTarget, type ExportContentMode, type LatencyTestMode, type LocalRuleSet, type NodeNameFilterSettings, type PolicyGroup, type ProxyKind, type ProxyNode, type RemoteSubscriptionEntry, type RoutingRule, type RuleScheme, type RuleSetFormat, type RuleSetRefreshDiff, type SchemeRuleSet, type SubFormat, type SubscriptionSource, type TailnetConnection, type TailnetExport } from './models/types'
 import { allRegions, filterNodesByRegionCodes, regionForName, regionForNode } from './models/region'
 import { defaultTailnetConnection, normalizeTailnetAuthKey, normalizeTailnetControlURL, normalizeTailnetDeviceName, normalizeTailnetMagicDNSSuffix, normalizeTailnetSubnets, tailnetPolicyName, TailnetValidationError } from './models/tailnet'
 import {
@@ -26,6 +26,7 @@ import { BUILTIN_SCHEMES, allSchemeMetas, loadScheme, parseRuleList, type Scheme
 import { planBuiltinSchemeFreeze, planSnapshotRollback, resolveBuiltinSchemeSnapshot, snapshotsForScheme, type BuiltinSchemeFreezePlan, type SnapshotRollbackPlan } from './rules/schemeSnapshots'
 import { fetchUpstreamScheme, type UpstreamSchemeResult } from './rules/upstreamScheme'
 import { runBuiltinUpdateCheckOnOpen } from './rules/upstreamOnOpen'
+import { ruleSetRefreshFailure, ruleSetRefreshSuccess, sumRuleSetDiffs } from './rules/ruleSetRefresh'
 import { detectRuleSchemeFormat, parseRuleSchemeText, RULE_SCHEME_FORMAT_TITLES } from './rules/importers'
 import { describeRuleSetParse, fetchRuleSet, parseRuleSetText, RULE_SET_FORMAT_TITLES, type RuleSetRule } from './rules/ruleSets'
 import { matchingGroupNames, matchingOrderAfterDragging } from './rules/matchingOrder'
@@ -5372,6 +5373,47 @@ function RemoteRuleSetDialog({
   )
 }
 
+function RuleSetDiffView({ diff }: { diff: RuleSetRefreshDiff }) {
+  const total = diff.added + diff.removed + diff.modified
+  const totalSamples = diff.samples.length + diff.hidden
+  const renderLine = (sample: RuleSetRefreshDiff['samples'][number], index: number) => (
+    <div key={`${sample.kind}-${index}`} className={`rs-diff-line ${sample.kind}`}>
+      <span className="rs-diff-mark">{sample.kind === 'added' ? '+' : sample.kind === 'removed' ? '−' : '~'}</span>
+      {' '}
+      {sample.kind === 'modified' && sample.previous
+        ? `${sample.previous} → ${sample.text}`
+        : sample.text}
+    </div>
+  )
+  return (
+    <div className="rs-diff">
+      <div className="rs-diff-head">
+        <span className="hint">上次刷新：</span>
+        <span className="rs-diff-stat added">+{diff.added}</span>
+        <span className="rs-diff-stat removed">−{diff.removed}</span>
+        <span className="rs-diff-stat modified">~{diff.modified}</span>
+        <span className="hint"> · {formatDate(diff.checkedAt)}</span>
+        {total === 0 && <span className="hint"> · 没有变化</span>}
+      </div>
+      {diff.samples.length > 0 && (
+        <div className="rs-diff-lines">
+          {diff.samples.slice(0, 3).map(renderLine)}
+          {totalSamples > 3 && (
+            <details>
+              <summary className="hint">展开其余 {totalSamples - 3} 条</summary>
+              {diff.samples.slice(3).map((sample, index) => renderLine(sample, index + 3))}
+              {diff.hidden > 0 && <div className="hint">另有 {diff.hidden} 条变化未列出。</div>}
+            </details>
+          )}
+        </div>
+      )}
+      {total > 0 && diff.samples.length === 0 && (
+        <div className="hint">共 {total} 条变化，未保留具体条目。</div>
+      )}
+    </div>
+  )
+}
+
 function RenameRuleSetDialog({
   set,
   onClose,
@@ -6382,17 +6424,13 @@ function RulesTab({
       if (digestRules(parsed.rules) !== digestRules(set.rules)) {
         recordRuleSetSnapshot(set.id, set.rules, useStore.getState().ruleSetVersionHistory)
       }
-      addLocalRuleSet({
-        ...set,
-        rules: parsed.rules,
-        format: parsed.format,
-        updatedAt: Date.now(),
-        lastError: undefined,
-      })
-      setFlash(`已刷新「${set.name}」：${parsed.rules.length} 条规则；${describeRuleSetParse(parsed)}。`)
+      const updated = ruleSetRefreshSuccess(set, parsed.rules)
+      addLocalRuleSet({ ...updated, format: parsed.format })
+      const diff = updated.lastDiff
+      setFlash(`已刷新「${set.name}」：${parsed.rules.length} 条规则（+${diff?.added ?? 0} −${diff?.removed ?? 0} ~${diff?.modified ?? 0}）；${describeRuleSetParse(parsed)}。`)
     } catch (e) {
       const message = (e as Error).message
-      addLocalRuleSet({ ...set, lastError: message })
+      addLocalRuleSet(ruleSetRefreshFailure(set, message))
       setRuleSetError(`「${set.name}」刷新失败：${message}`)
     } finally {
       setRefreshingRuleSetID(null)
@@ -6406,6 +6444,7 @@ function RulesTab({
     setRuleSetError(null)
     let ok = 0
     let skippedTotal = 0
+    const diffs: (RuleSetRefreshDiff | undefined)[] = []
     const errors: string[] = []
     for (const set of sets) {
       try {
@@ -6414,22 +6453,20 @@ function RulesTab({
         if (digestRules(parsed.rules) !== digestRules(set.rules)) {
           recordRuleSetSnapshot(set.id, set.rules, useStore.getState().ruleSetVersionHistory)
         }
-        addLocalRuleSet({
-          ...set,
-          rules: parsed.rules,
-          format: parsed.format,
-          updatedAt: Date.now(),
-          lastError: undefined,
-        })
+        const updated = ruleSetRefreshSuccess(set, parsed.rules)
+        addLocalRuleSet({ ...updated, format: parsed.format })
+        diffs.push(updated.lastDiff)
         ok += 1
       } catch (error) {
         const message = (error as Error).message
-        addLocalRuleSet({ ...set, lastError: message })
+        addLocalRuleSet(ruleSetRefreshFailure(set, message))
         errors.push(`「${set.name}」${message}`)
       }
     }
     setRefreshingRuleSetID(null)
-    setFlash(`已刷新 ${ok} 个在线规则集${errors.length ? `，${errors.length} 个失败` : ''}${skippedTotal ? `，跳过 ${skippedTotal} 行` : ''}。`)
+    const changed = sumRuleSetDiffs(diffs)
+    const totals = ok ? `：+${changed.added} −${changed.removed} ~${changed.modified}` : ''
+    setFlash(`已刷新 ${ok} 个在线规则集${totals}${errors.length ? `，${errors.length} 个失败` : ''}${skippedTotal ? `，跳过 ${skippedTotal} 行` : ''}。`)
     if (errors.length) setRuleSetError(errors.join('；'))
   }
 
@@ -6505,14 +6542,14 @@ function RulesTab({
         group: set.group,
         sourceName: set.name,
       }))
+      const updated = { ...ruleSetRefreshSuccess(set, rules), format: parsed.format }
       addCustomScheme({
         ...fresh,
-        ruleSets: (fresh.ruleSets ?? []).map((item) => item.id === set.id
-          ? { ...item, rules, format: parsed.format, updatedAt: Date.now() }
-          : item),
+        ruleSets: (fresh.ruleSets ?? []).map((item) => item.id === set.id ? updated : item),
         updatedAt: Date.now(),
       })
-      setFlash(`已刷新「${set.name}」：${parsed.rules.length} 条规则；${describeRuleSetParse(parsed)}。`)
+      const diff = updated.lastDiff
+      setFlash(`已刷新「${set.name}」：${parsed.rules.length} 条规则（+${diff?.added ?? 0} −${diff?.removed ?? 0} ~${diff?.modified ?? 0}）；${describeRuleSetParse(parsed)}。`)
     } catch (e) {
       setRuleSetError(`「${set.name}」刷新失败：${(e as Error).message}`)
     } finally {
@@ -7196,6 +7233,7 @@ function RulesTab({
                           {set.format ? ` · ${RULE_SET_FORMAT_TITLES[set.format]}` : ''}
                           {set.updatedAt ? ` · 更新于 ${formatDate(set.updatedAt)}` : ''}
                         </span>
+                        {set.lastDiff && <RuleSetDiffView diff={set.lastDiff} />}
                       </div>
                       <div className="rs-actions">
                         {!set.inlined && set.sourceKind === 'url' && (
@@ -7268,6 +7306,7 @@ function RulesTab({
                       {set.lastError && (
                         <span className="hint rule-set-error">上次刷新失败：{set.lastError}</span>
                       )}
+                      {set.lastDiff && <RuleSetDiffView diff={set.lastDiff} />}
                     </div>
                     <div className="rs-actions">
                       {set.sourceURL && (
@@ -9588,20 +9627,12 @@ export function App() {
           if (digestRules(parsed.rules) !== digestRules(set.rules)) {
             recordRuleSetSnapshot(set.id, set.rules, useStore.getState().ruleSetVersionHistory)
           }
-          useStore.getState().addLocalRuleSet({
-            ...current,
-            rules: parsed.rules,
-            format: parsed.format,
-            updatedAt: Date.now(),
-            lastError: undefined,
-          })
+          const updated = ruleSetRefreshSuccess(current, parsed.rules)
+          useStore.getState().addLocalRuleSet({ ...updated, format: parsed.format })
         } catch (error) {
           const current = useStore.getState().localRuleSets.find((item) => item.id === set.id)
           if (!current) return
-          useStore.getState().addLocalRuleSet({
-            ...current,
-            lastError: (error as Error).message,
-          })
+          useStore.getState().addLocalRuleSet(ruleSetRefreshFailure(current, (error as Error).message))
         }
       }))
     }

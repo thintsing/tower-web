@@ -395,6 +395,29 @@ export type RuleSchemeSource = 'url' | 'paste' | 'file' | 'copy'
 export type RuleSchemeFormat = 'ini' | 'clash' | 'surge' | 'egern' | 'singbox'
 export type RuleSetSource = 'library' | 'local' | 'url'
 
+export type RuleSetDiffKind = 'added' | 'removed' | 'modified'
+
+/** 刷新前后的一条具体变化，供界面展示。 */
+export interface RuleSetDiffSample {
+  kind: RuleSetDiffKind
+  /** 刷新后的规则值；删除项为刷新前的值。 */
+  text: string
+  /** 修改项刷新前的值。 */
+  previous?: string
+}
+
+/** 刷新在线规则集后保留在规则集上的变化摘要。 */
+export interface RuleSetRefreshDiff {
+  added: number
+  removed: number
+  modified: number
+  /** 变化规则的前若干条（截断到固定上限）。 */
+  samples: RuleSetDiffSample[]
+  /** 未列进 samples 的变化条数。 */
+  hidden: number
+  checkedAt: number
+}
+
 /** 已加入方案的规则集快照；修改本地规则集不会回头改动已加入的方案。 */
 export interface SchemeRuleSet {
   id: string
@@ -410,6 +433,8 @@ export interface SchemeRuleSet {
   ruleSetBehavior?: string
   /** 在线规则集最近一次抓取/解析时间。 */
   updatedAt?: number
+  /** 最近一次刷新的变化摘要；刷新失败时保留旧值。 */
+  lastDiff?: RuleSetRefreshDiff
   /**
    * 规则已经内联在 RuleScheme.rules 里（固化快照就是这种形态）。
    * 这类规则集只用于展示与逐条屏蔽，不再作为独立块插入，避免同一批规则出现两份。
@@ -435,6 +460,8 @@ export interface LocalRuleSet {
   format?: RuleSetFormat
   /** 最近一次自动/手动刷新的错误，成功后清空。 */
   lastError?: string
+  /** 最近一次刷新的变化摘要；刷新失败时保留旧值。 */
+  lastDiff?: RuleSetRefreshDiff
   /** 暂停自动刷新；手动刷新和加入方案仍可用。 */
   paused?: boolean
   /** 上游规则集对应的策略组；旧快照可能没有，加载时按规则反推。 */
