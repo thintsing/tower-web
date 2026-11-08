@@ -156,18 +156,27 @@ async function check(label: string, run: () => Promise<void>): Promise<void> {
 async function main(): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'tower-upstream-status-unit-'))
 
-  await check('内置方案清单：服务端检查列表与前端 BUILTIN_SCHEMES 完全一致', async () => {
+  await check('内置方案清单：每个上游方案都必须存在于前端；前端可以多出无上游方案', async () => {
     const frontend = new Map(BUILTIN_SCHEMES.map((meta) => [meta.id, meta]))
-    assert.equal(BUILTIN_UPSTREAM_SCHEMES.length, BUILTIN_SCHEMES.length)
     for (const meta of BUILTIN_UPSTREAM_SCHEMES) {
       const local = frontend.get(meta.id)
       assert.ok(local, `服务端多出/写错了方案 id：${meta.id}`)
       assert.equal(local.name, meta.name, `方案 ${meta.id} 名称不一致`)
       assert.equal(local.file, meta.file, `方案 ${meta.id} 的 INI 文件不一致`)
+      // 空 file 会 join 到 rulesets 目录本身，existsSync 命中目录返回 true，是假阳性。
+      if (!meta.file) continue
       assert.ok(
         existsSync(join(ROOT, 'public', 'rulesets', meta.file)),
         `方案 ${meta.id} 的 INI 文件不存在：${meta.file}`,
       )
+    }
+    // 前端新增的程序化方案（如 Loyalsoldier provider 引用）没有上游 INI，
+    // 不能出现在服务端检查列表里，也不应该有自己的 INI 文件。
+    const upstreamIDs = new Set(BUILTIN_UPSTREAM_SCHEMES.map((meta) => meta.id))
+    for (const meta of BUILTIN_SCHEMES) {
+      if (upstreamIDs.has(meta.id)) continue
+      assert.equal(meta.programmatic, true, `方案 ${meta.id} 既没有上游，也不是程序化方案`)
+      assert.equal(meta.file, '', `程序化方案 ${meta.id} 不应指向 INI 文件`)
     }
   })
 
@@ -511,6 +520,17 @@ async function main(): Promise<void> {
     // 本地模式但用户关掉设置：同样不发请求。
     calls.length = 0
     assert.equal(await runBuiltinUpdateCheckOnOpen({ ...input, mode: 'local', enabled: false }, deps), 0)
+    assert.deepEqual(calls, [])
+
+    // 选中程序化方案（没有上游 INI）：不能白跑一次请求。
+    const programmatic = BUILTIN_SCHEMES.find((meta) => meta.programmatic)
+    assert.ok(programmatic, '缺少程序化内置方案')
+    assert.equal(await runBuiltinUpdateCheckOnOpen({
+      ...input,
+      selectedSchemeID: programmatic.id,
+      overrides: {},
+      mode: 'local',
+    }, deps), 0)
     assert.deepEqual(calls, [])
   })
 

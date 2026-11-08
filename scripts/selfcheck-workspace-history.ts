@@ -7,6 +7,8 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+// @ts-expect-error server metadata is plain ESM and not part of the src tsconfig
+import { BUILTIN_SCHEME_COUNT } from '../server/builtin-scheme-counts.mjs'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 const MAX_HISTORY_BYTES = 50 * 1024 * 1024
@@ -198,7 +200,8 @@ async function main(): Promise<void> {
       assert.equal(entry.counts.rules, 5)
       assert.equal(entry.counts.nodes, 3)
       assert.equal(entry.counts.subscriptions, 2)
-      assert.equal(entry.counts.schemes, 4)
+      // 内置方案数量随内置方案增删变化，不能写死；这里只加 1 个自检自定义方案。
+      assert.equal(entry.counts.schemes, BUILTIN_SCHEME_COUNT + 1)
       assert.equal(entry.counts.groups, 2)
       assert.equal(entry.diff?.rules.before, 5)
       assert.equal(entry.diff?.rules.after, 2)

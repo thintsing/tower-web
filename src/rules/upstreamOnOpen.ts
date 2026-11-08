@@ -31,8 +31,10 @@ export async function runBuiltinUpdateCheckOnOpen(
 ): Promise<number> {
   if (input.mode !== 'local' || !input.enabled) return 0
   const check = deps.check ?? checkUpstreamUpdate
+  // 程序化方案（如 Loyalsoldier provider 引用）没有上游 INI，检查只会白跑一次请求。
   const targets = input.schemes.filter(
-    (meta) => meta.id === input.selectedSchemeID || !!input.overrides[meta.id],
+    (meta) => !meta.programmatic
+      && (meta.id === input.selectedSchemeID || !!input.overrides[meta.id]),
   )
   await Promise.all(targets.map(async (meta) => {
     // 覆盖层只存指针，比对上游需要快照正文；损坏时按原厂比对。
