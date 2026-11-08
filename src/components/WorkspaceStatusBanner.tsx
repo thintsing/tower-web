@@ -1,8 +1,9 @@
 // 服务器版状态横幅：离线 / 密钥无效 / 文件损坏时提示只读；同步成功时
-// 短暂提示「已上传本机工作区」「另一台设备刚改过」等结果。
+// 短暂提示「已上传本机工作区」等结果；409 冲突时让用户明确选择保留哪一边。
 // 服务端工作区有字段损坏或旧结构升级时，逐条列出键名和原因，不能只说「数据有误」。
 import { useEffect, useState } from 'react'
-import { getWorkspaceStatus, subscribeWorkspaceStatus } from '../workspaceSync'
+import { getWorkspaceStatus, resolveWorkspaceConflict, subscribeWorkspaceStatus } from '../workspaceSync'
+import { CONFLICT_CLEAR_LOCAL_LABEL, CONFLICT_KEEP_LOCAL_LABEL, CONFLICT_USE_SERVER_LABEL } from '../workspaceConflict'
 import type { WorkspaceIssue } from '../workspaceValidation'
 
 function titleFor(state: string): string {
@@ -52,6 +53,49 @@ export function WorkspaceStatusBanner() {
 
   // local 模式不提示；unknown（首次探测失败）必须提示，否则空白页面看起来像数据丢了。
   if (status.mode === 'local') return null
+
+  if (status.conflict) {
+    // 409 不自动合并：先把本机草稿留住，让用户明确选择保留哪一边。
+    return (
+      <div className="workspace-alert conflict" role="alert">
+        <div className="workspace-alert-head">
+          <strong>工作区冲突：请选择保留哪一边</strong>
+          <span>{status.message}</span>
+        </div>
+        <small className="workspace-issue-help">
+          本机未保存的改动仍完整保留在内存中，刷新页面后也会恢复；未选择前不会自动覆盖服务端，也不会拉取服务端覆盖本机。
+        </small>
+        <div className="workspace-conflict-actions">
+          <button
+            className="btn"
+            type="button"
+            disabled={status.readOnly}
+            onClick={() => { void resolveWorkspaceConflict('local') }}
+          >{CONFLICT_KEEP_LOCAL_LABEL}</button>
+          {status.conflict.serverEmpty ? (
+            <button
+              className="btn danger"
+              type="button"
+              disabled={status.readOnly}
+              onClick={() => { void resolveWorkspaceConflict('clear-local') }}
+            >{CONFLICT_CLEAR_LOCAL_LABEL}</button>
+          ) : (
+            <button
+              className="btn ghost"
+              type="button"
+              disabled={status.readOnly}
+              onClick={() => { void resolveWorkspaceConflict('server') }}
+            >{CONFLICT_USE_SERVER_LABEL}</button>
+          )}
+        </div>
+        {status.readOnly && (
+          <small className="workspace-issue-help">
+            当前只读，无法写入服务端；恢复连接后这两个选择会重新可用。
+          </small>
+        )}
+      </div>
+    )
+  }
 
   if (status.state === 'unsaved') {
     // 保存失败不能用「知道了」压掉：改动仍在内存里，刷新就会丢。
