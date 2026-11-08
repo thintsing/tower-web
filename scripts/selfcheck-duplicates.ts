@@ -884,6 +884,43 @@ function main(): void {
     assert.equal(plan.skipped.readOnly.length, 1)
   })
 
+  check('固化快照：规则集块不重复插入，重复计数与位置编号不偏移', () => {
+    const snap = rule('DOMAIN-SUFFIX', 'snap.example', '🚀 节点选择')
+    const local = rule('DOMAIN-SUFFIX', 'local.example', '🚀 节点选择')
+    // 内置方案的固化快照：规则同时存在于 scheme.rules 和 ruleSets[].rules。
+    const set: SchemeRuleSet = {
+      id: 'set-frozen',
+      name: '固化规则集',
+      group: '🚀 节点选择',
+      sourceKind: 'url',
+      sourceRef: 'https://example.com/frozen.yaml',
+      inlined: true,
+      rules: [snap],
+    }
+    const input = scheme([
+      { ...snap, sourceSetId: 'set-frozen', sourceName: '固化规则集' },
+      { ...snap, sourceSetId: 'set-frozen', sourceName: '固化规则集' },
+      local,
+      { ...local },
+    ], { ruleSets: [set] })
+
+    const plan = analyzeDuplicateCleanup(input)
+    // 修复前：固化规则被当作「规则集块」再插一遍，snap 有 3 份 → total 3、readOnly 2。
+    assert.equal(plan.total, 2)
+    assert.equal(plan.choices.find((choice) => choice.ruleText.includes('snap.example'))!.occurrences, 2)
+    assert.equal(plan.skipped.readOnly.length, 1)
+    // 固化快照内的重复项仍按「只读来源」归类，且不会指向规则集块。
+    const readOnly = plan.skipped.readOnly[0]
+    assert.equal(readOnly.index, 2)
+    assert.equal(readOnly.firstIndex, 1)
+    assert.equal(/固化规则集/.test(readOnly.source), false)
+    // 可写的同组重复仍能正常删除，且位置不再被多插的块顶偏。
+    assert.equal(plan.deletions.length, 1)
+    assert.equal(plan.deletions[0].rule.value, 'local.example')
+    assert.equal(plan.deletions[0].place.index + 1, 4)
+    assert.equal(plan.deletions[0].duplicateOfIndex, 3)
+  })
+
   console.log(failures === 0 ? '\n全部重复规则清理自检通过' : `\n${failures} 项重复规则清理自检失败`)
   process.exit(failures === 0 ? 0 : 1)
 }

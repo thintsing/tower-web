@@ -193,6 +193,7 @@ function flattenScheme(scheme: RuleScheme): TaggedRule[] {
       matchRules: set.rules,
       sourceURL: set.sourceRef,
       rules: tags.map((tag) => tag.rule),
+      inlined: set.inlined,
     }
     return { tags, block }
   })
