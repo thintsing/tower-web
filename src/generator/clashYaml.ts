@@ -628,9 +628,12 @@ export function generateClashYAML(
     const filteredRules = filterRulesForTarget(scheme.rules, options.target)
     const remoteRuleSets = new Map<string, {
       key: string
+      /** provider-only 的键名直接来自方案；其余仍按序号生成。 */
+      named: boolean
       format: RuleSetFormat
       behavior: string
       extension: string
+      interval: number
     }>()
     for (const rule of filteredRules) {
       if (rule.type !== 'RULE-SET' || !rule.value || !/^https?:\/\//i.test(rule.value)) continue
@@ -642,11 +645,14 @@ export function generateClashYAML(
         : (rule.ruleSetBehavior || 'classical')
       if (format === 'mrs' && !['domain', 'ipcidr'].includes(behavior)) continue
       if (remoteRuleSets.has(rule.value)) continue
+      const named = !!rule.ruleSetProviderKey
       remoteRuleSets.set(rule.value, {
-        key: `tower-rule-set-${remoteRuleSets.size + 1}`,
+        key: named ? rule.ruleSetProviderKey! : `tower-rule-set-${remoteRuleSets.size + 1}`,
+        named,
         format,
         behavior,
         extension: format === 'mrs' ? 'mrs' : format === 'yaml' ? 'yaml' : 'list',
+        interval: rule.ruleSetInterval ?? 86400,
       })
     }
     const inlineRuleSets = new Map<string, {
@@ -679,8 +685,8 @@ export function generateClashYAML(
         out.push(`    behavior: ${provider.behavior}`)
         out.push(`    format: ${provider.format === 'mrs' ? 'mrs' : provider.format === 'yaml' ? 'yaml' : 'text'}`)
         out.push(`    url: ${yaml(url)}`)
-        out.push(`    path: ${yaml(`./rules/${provider.key}.${provider.extension}`)}`)
-        out.push('    interval: 86400')
+        out.push(`    path: ${yaml(`./${provider.named ? 'ruleset' : 'rules'}/${provider.key}.${provider.extension}`)}`)
+        out.push(`    interval: ${provider.interval}`)
       }
       for (const provider of inlineRuleSets.values()) {
         out.push(`  ${provider.key}:`)

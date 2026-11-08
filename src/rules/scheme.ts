@@ -6,12 +6,15 @@ import type { BuiltinSchemeOverrideRef, BuiltinSchemeSnapshot, PolicyGroup, Poli
 import { resolveBuiltinSchemeSnapshot, attachSnapshotRuleSets } from './schemeSnapshots'
 import { apiFetch } from '../util/apiAuth'
 import { ALL_RULE_TYPES } from './capabilities'
+import { buildLoyalsoldierScheme, LOYALSONDIER_SCHEME_ID } from './loyalsoldierScheme'
 
 export interface SchemeMeta {
   id: string
   name: string
   description: string
   file: string
+  /** 由前端代码直接构建，不读取 public/rulesets 下的 INI，也没有上游可检查。 */
+  programmatic?: boolean
   sourceKind?: RuleSchemeSource
   sourceFormat?: RuleSchemeFormat
   sourceURL?: string
@@ -36,6 +39,13 @@ export const BUILTIN_SCHEMES: SchemeMeta[] = [
     name: 'ACL4SSR 全分组版',
     description: '全部媒体/厂商分组，适合精细分流',
     file: 'ACL4SSR_Online_Full.ini',
+  },
+  {
+    id: LOYALSONDIER_SCHEME_ID,
+    name: 'Loyalsoldier 规则集',
+    description: '只存 Clash provider 引用，客户端按地址自行更新；Clash 系直接引用，其他客户端走塔台服务托管转换',
+    file: '',
+    programmatic: true,
   },
 ]
 
@@ -92,6 +102,15 @@ export async function loadScheme(
   overrides?: Record<string, BuiltinSchemeOverrideRef>,
   snapshots?: Record<string, BuiltinSchemeSnapshot>,
 ): Promise<RuleScheme> {
+  // 程序化方案没有 INI 正文、也没有可固化的上游；覆盖层 / 快照一律忽略，
+  // 避免 attachSnapshotRuleSets 把空的 provider 规则集整批丢掉。
+  if (meta.programmatic) {
+    const cached = schemeLoadCache.get(meta.id)
+    if (cached) return cached
+    const promise = Promise.resolve(buildLoyalsoldierScheme(meta))
+    schemeLoadCache.set(meta.id, promise)
+    return promise
+  }
   // 覆盖层只存指针：解引用成功才用快照；缺失 / 损坏回落到上一版，再回落到原厂。
   // 原厂 `public/rulesets/*.ini` 永不改动，保证离线也能加载。
   const resolution = resolveBuiltinSchemeSnapshot(meta.id, overrides, snapshots)

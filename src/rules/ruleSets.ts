@@ -207,6 +207,31 @@ function providerLines(root: unknown): string[] {
   return []
 }
 
+const DOMAIN_SET_TYPES = new Set(['DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD', 'DOMAIN-REGEX', 'DOMAIN-WILDCARD'])
+const IP_SET_TYPES = new Set(['IP-CIDR', 'IP-CIDR6', 'IP6-CIDR'])
+
+/**
+ * provider YAML 本身不声明 behavior，只能按内容推断：
+ * 全是域名类 → domain，全是 IP 类 → ipcidr，其余（含混合）→ classical。
+ * 推断不出来时返回 undefined，导出会按 classical 处理（这才是 mihomo 的默认）。
+ */
+export function inferRuleSetBehavior(
+  rules: RuleSetRule[],
+): 'domain' | 'ipcidr' | 'classical' | undefined {
+  if (!rules.length) return undefined
+  let sawDomain = false
+  let sawIP = false
+  for (const rule of rules) {
+    const type = rule.type.toUpperCase()
+    if (DOMAIN_SET_TYPES.has(type)) sawDomain = true
+    else if (IP_SET_TYPES.has(type)) sawIP = true
+    else return 'classical'
+  }
+  if (sawDomain && !sawIP) return 'domain'
+  if (sawIP && !sawDomain) return 'ipcidr'
+  return 'classical'
+}
+
 function parseProviderYAML(textBody: string): ParsedRuleSet {
   let root: unknown
   try {

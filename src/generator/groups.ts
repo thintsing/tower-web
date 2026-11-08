@@ -7,6 +7,7 @@ import {
   classicalRulesFitTarget,
   hostedDialectForFormat,
   hostedRuleSetURL,
+  providerOnlyCanReference,
   ruleSetFormatForDialect,
   ruleSetFormatOfSet,
   ruleSetRulesFitDialect,
@@ -34,6 +35,11 @@ export interface OutputOptions {
   tailnets?: TailnetExport[]
   /** Surge 自更新首行 `#!MANAGED-CONFIG` 的目标地址；留空则不写。 */
   managedConfigURL?: string
+  /**
+   * 服务端托管规则集的对外基础地址（例如 TOWER_PUBLIC_URL）。
+   * 空字符串表示明确没有可达地址：provider 引用不能退回 localhost。
+   */
+  hostedBaseURL?: string
 }
 
 export interface ResolvedGroup {
@@ -261,6 +267,8 @@ export interface PrepareSchemeOptions {
   target?: ClientTarget
   /** 只读规则集的本地屏蔽表；编译、检查与导出都必须带上。 */
   ruleSetExclusions?: RuleSetExclusionTable
+  /** 托管规则集的对外基础地址；空字符串表示不可用。 */
+  hostedBaseURL?: string
 }
 
 export interface RemoteRuleSetReference {
@@ -280,6 +288,12 @@ export interface RemoteRuleSetCandidate {
   format?: RuleSetFormat
   /** 一个规则集拆成多个二进制引用（MRS domain + ipcidr）。 */
   references?: RemoteRuleSetReference[]
+  /**
+   * 写在 RULE-SET 行上的参数（例如 no-resolve）。
+   * provider-only 的托管路径只在该方言的引用行确实支持时才给出；
+   * QuanX / Egern / sing-box 的远程列表没有对应字段，宁可不写也不假装无损。
+   */
+  ruleLineOptions?: string[]
   /** 远程引用无法覆盖、需要逐条内联的规则。 */
   residual?: RoutingRule[]
   /** 格式兼容且匹配顺序安全，可以直接写成远程引用。 */
@@ -289,8 +303,9 @@ export interface RemoteRuleSetCandidate {
 function hostedReference(
   set: SchemeRuleSet,
   dialect: 'mrs-domain' | 'mrs-ipcidr' | 'srs' | 'srs-domain',
+  hostedBaseURL?: string,
 ): RemoteRuleSetReference | undefined {
-  const url = hostedRuleSetURL(set, dialect)
+  const url = hostedRuleSetURL(set, dialect, hostedBaseURL)
   if (!url) return undefined
   return {
     url,
@@ -310,12 +325,47 @@ export function remoteRuleSetCandidates(
   // 否则同一批规则会出现两份、并打乱匹配顺序。
   const sets = (scheme.ruleSets ?? []).filter((set) => !set.inlined)
   const hostedDialect = hostedDialectForFormat(options.format)
-  const candidates = sets.map((set) => {
+  // classic 方言是给 provider-only 新增的；普通 YAML 规则集在 Surge / Loon
+  // 仍按旧行为展开，不能因为这次新增而悄悄改成远程引用（会改变匹配顺序）。
+  const legacyHostedDialect = hostedDialect === 'classic' ? undefined : hostedDialect
+  const candidates = sets.map((set): Omit<RemoteRuleSetCandidate, 'remote'> => {
+    // provider-only 规则集没有正文可展开，必须原样写成远程引用；
+    // 也不能参与「逐条屏蔽」，否则会退化成一条空配置。
+    const providerOnly = !!set.providerOnly
     // 有屏蔽条目时必须内联：远程 RULE-SET 引用会把被屏蔽的规则一起带回来。
-    if (options.ruleSetExclusions?.[set.id]?.length) return { set, url: undefined, format: undefined }
-    if (!options.preferRuleSets || !options.format) return { set, url: undefined, format: undefined }
+    if (!providerOnly && options.ruleSetExclusions?.[set.id]?.length) return { set, url: undefined, format: undefined }
+    // provider-only 不受「优先引用远程规则集」开关影响：它只有引用这一种形态。
+    // 但导出格式仍必须已知（lint 的预检查不传 format，只做空规则集检查）。
+    if (!options.format) return { set, url: undefined, format: undefined }
+    if (!providerOnly && !options.preferRuleSets) return { set, url: undefined, format: undefined }
     const originalURL = remoteRuleSetURL(set)
     const originalFormat = ruleSetFormatOfSet(set, originalURL)
+
+    // provider-only：Clash 系直接引用原 YAML provider；其他载体交给塔台服务托管转换。
+    // 没有正文可以展开，因此这里绝不能退回「内联为空」。
+    if (providerOnly) {
+      const kind = providerOnlyCanReference(set, options.format, options.target, options.hostedBaseURL)
+      if (kind === 'native') {
+        return { set, url: originalURL, format: 'yaml', ruleLineOptions: set.ruleSetOptions }
+      }
+      const dialect = hostedDialectForFormat(options.format)
+      if (kind === 'hosted' && dialect) {
+        const hosted = hostedRuleSetURL(set, dialect, options.hostedBaseURL)
+        if (hosted) {
+          // Surge 手册明确 RULE-SET 行接受 no-resolve 参数；Loon 的
+          // [Remote Rule] 行只认 policy/tag 等键值参数，QuanX / Egern /
+          // sing-box 的列表同样没有逐条参数位，因此这些载体不写。
+          const surgy = options.target === 'surge' || options.target === 'surge-mac'
+          return {
+            set,
+            url: hosted,
+            format: ruleSetFormatForDialect(dialect),
+            ruleLineOptions: dialect === 'classic' && surgy ? set.ruleSetOptions : undefined,
+          }
+        }
+      }
+      return { set, url: undefined, format: undefined }
+    }
 
     // 经典列表优先压成二进制：mihomo / Stash 用 MRS，sing-box / Hiddify 用 SRS。
     // 表达不了的类型留在 residual 里逐条内联，顺序与原规则集一致。
@@ -327,11 +377,11 @@ export function remoteRuleSetCandidates(
         if (plan) {
           const references: RemoteRuleSetReference[] = []
           if (plan.domain.length) {
-            const reference = hostedReference(set, 'mrs-domain')
+            const reference = hostedReference(set, 'mrs-domain', options.hostedBaseURL)
             if (reference) references.push(reference)
           }
           if (plan.ipcidr.length) {
-            const reference = hostedReference(set, 'mrs-ipcidr')
+            const reference = hostedReference(set, 'mrs-ipcidr', options.hostedBaseURL)
             if (reference) {
               references.push({
                 ...reference,
@@ -375,6 +425,7 @@ export function remoteRuleSetCandidates(
     }
 
     const originalSupported = !!originalURL && !!originalFormat
+      && (!providerOnly || !!set.ruleSetBehavior)
       && (originalFormat !== 'mrs' || ['domain', 'ipcidr'].includes(set.ruleSetBehavior ?? ''))
       && (originalFormat !== 'classical' || classicalRulesFitTarget(set.rules, options.target, options.format))
       && (options.target
@@ -384,12 +435,12 @@ export function remoteRuleSetCandidates(
       return { set, url: originalURL, format: originalFormat }
     }
     // 经典 Clash 文本可以交给塔台服务转换成 QuanX / Egern / sing-box source。
-    if (hostedDialect
+    if (legacyHostedDialect
       && (originalFormat === 'classical' || originalFormat === 'yaml')
-      && ruleSetRulesFitDialect(set.rules, hostedDialect)) {
-      const hosted = hostedRuleSetURL(set, hostedDialect)
+      && ruleSetRulesFitDialect(set.rules, legacyHostedDialect)) {
+      const hosted = hostedRuleSetURL(set, legacyHostedDialect, options.hostedBaseURL)
       if (hosted) {
-        return { set, url: hosted, format: ruleSetFormatForDialect(hostedDialect) }
+        return { set, url: hosted, format: ruleSetFormatForDialect(legacyHostedDialect) }
       }
     }
     return { set, url: undefined, format: undefined }
@@ -399,7 +450,8 @@ export function remoteRuleSetCandidates(
   const orderSensitive = options.format === 'loon' || options.format === 'quanx'
   const canKeepOrder = !orderSensitive
     || (scheme.rules.every((rule) => rule.type === 'FINAL')
-      && candidates.every((item) => item.url || item.references?.length))
+      // provider-only 未解析时不会贡献本地规则，只是少一组列表，不影响其余引用的顺序。
+      && candidates.every((item) => item.url || item.references?.length || item.set.providerOnly))
   return candidates.map((item) => ({
     ...item,
     remote: (!!item.url || !!item.references?.length) && canKeepOrder,
@@ -434,7 +486,7 @@ export function prepareSchemeForExport(
   })
   const customRules = scheme.customRules ?? []
   const remoteCandidates = remoteRuleSetCandidates(scheme, options)
-  const ruleSetBlocks: RuleSetBlock[] = remoteCandidates.map(({ set, url, format, remote, references, residual }) => {
+  const ruleSetBlocks: RuleSetBlock[] = remoteCandidates.map(({ set, url, format, remote, references, residual, ruleLineOptions }) => {
     let rules: RoutingRule[]
     if (remote && references?.length) {
       const remoteRules: RoutingRule[] = references.map((reference) => ({
@@ -462,6 +514,10 @@ export function prepareSchemeForExport(
         sourceName: set.name,
         ruleSetFormat: format,
         ruleSetBehavior: set.ruleSetBehavior,
+        // provider-only：键名 / 路径 / 更新间隔随引用一起写出。
+        ruleSetProviderKey: set.providerOnly ? set.providerName : undefined,
+        ruleSetInterval: set.providerOnly ? set.interval : undefined,
+        options: ruleLineOptions,
       }]
     } else {
       const inline = options.format

@@ -374,6 +374,10 @@ export interface RoutingRule {
   ruleSetFormat?: RuleSetFormat
   /** Clash MRS provider 的 behavior（domain / ipcidr）。 */
   ruleSetBehavior?: string
+  /** Clash rule-provider 的键名；仅只存引用的方案使用，缺省按序号生成。 */
+  ruleSetProviderKey?: string
+  /** rule-provider 的更新间隔（秒）；缺省 86400。 */
+  ruleSetInterval?: number
   /** sing-box 远程 SRS 配套的 domain-only SRS，只用于 DNS 投影。 */
   ruleSetDNSURL?: string
   /** 本地规则集写成客户端内联规则集时的元数据；只存在于导出准备结果。 */
@@ -486,6 +490,17 @@ export interface SchemeRuleSet {
   format?: RuleSetFormat
   /** Clash MRS provider 的 behavior（domain / ipcidr）。 */
   ruleSetBehavior?: string
+  /**
+   * 只保存远程 provider 引用、不在本机保存正文。
+   * 这类规则集 `rules` 恒为空，导出 Clash 系时写成 rule-providers + RULE-SET。
+   */
+  providerOnly?: boolean
+  /** provider 的键名与文件路径使用的名字（例如 reject）。 */
+  providerName?: string
+  /** RULE-SET 行附加选项，例如 no-resolve。 */
+  ruleSetOptions?: string[]
+  /** provider 的更新间隔（秒）；缺省 86400。 */
+  interval?: number
   /** 在线规则集最近一次抓取/解析时间。 */
   updatedAt?: number
   /** 最近一次刷新的变化摘要；刷新失败时保留旧值。 */
@@ -513,6 +528,8 @@ export interface LocalRuleSet {
   sourceURL?: string
   /** 在线资源方言，刷新时随内容更新。 */
   format?: RuleSetFormat
+  /** provider YAML 的 behavior；按规则内容推断，导出时不能退回 classical。 */
+  ruleSetBehavior?: string
   /** 最近一次自动/手动刷新的错误，成功后清空。 */
   lastError?: string
   /** 最近一次刷新的变化摘要；刷新失败时保留旧值。 */

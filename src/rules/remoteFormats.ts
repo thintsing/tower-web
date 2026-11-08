@@ -155,6 +155,7 @@ const CONVERTIBLE_IP_TYPES = new Set(['IP-CIDR', 'IP-CIDR6', 'IP6-CIDR'])
 const EGERN_IP_TYPES = new Set([...CONVERTIBLE_IP_TYPES, 'GEOIP', 'IP-ASN'])
 
 export type HostedRuleSetDialect =
+  | 'classic'
   | 'quanx'
   | 'egern'
   | 'singbox'
@@ -164,6 +165,8 @@ export type HostedRuleSetDialect =
   | 'mrs-ipcidr'
 
 export function hostedDialectForFormat(format: SubFormat | undefined): HostedRuleSetDialect | undefined {
+  // Surge / Loon 直接读经典文本列表，服务端会把 provider YAML 拍平成经典行。
+  if (format === 'surge' || format === 'loon') return 'classic'
   if (format === 'quanx') return 'quanx'
   if (format === 'egern') return 'egern'
   if (format === 'json') return 'singbox'
@@ -176,6 +179,7 @@ export function ruleSetFormatForDialect(dialect: HostedRuleSetDialect): RuleSetF
     case 'srs-domain': return 'singbox-binary'
     case 'mrs-domain':
     case 'mrs-ipcidr': return 'mrs'
+    case 'classic': return 'classical'
     default: return dialect
   }
 }
@@ -217,20 +221,24 @@ export function ruleSetRulesFitDialect(rules: RoutingRule[], dialect: HostedRule
   return true
 }
 
-/** 塔台服务托管的转换产物；浏览器里用当前站点绝对地址。 */
+/** 塔台服务托管的转换产物；baseURL 缺省时退回当前站点地址。 */
 export function hostedRuleSetURL(
   set: SchemeRuleSet,
   dialect: HostedRuleSetDialect,
+  baseURL?: string,
 ): string | undefined {
   if (!set.sourceRef) return undefined
   const params = new URLSearchParams()
   if (dialect === 'mrs-domain' || dialect === 'mrs-ipcidr') {
     params.set('format', 'mrs')
     params.set('behavior', dialect === 'mrs-domain' ? 'domain' : 'ipcidr')
-  } else if (dialect === 'srs' || dialect === 'srs-domain') {
-    params.set('format', dialect)
   } else {
     params.set('format', dialect)
+  }
+  // provider 引用需要服务端先解开 YAML payload，再拍平 / 转换成目标方言。
+  if (set.providerOnly) {
+    params.set('provider', 'yaml')
+    if (set.ruleSetBehavior) params.set('behavior', set.ruleSetBehavior)
   }
   if (set.sourceKind === 'library') {
     if (!/^[A-Za-z0-9_.-]+\.list$/.test(set.sourceRef) || set.sourceRef.includes('..')) {
@@ -243,8 +251,73 @@ export function hostedRuleSetURL(
   } else {
     return undefined
   }
-  const origin = typeof location !== 'undefined' && location.origin ? location.origin : ''
+  // baseURL 缺省时沿用旧行为：返回站点相对地址（浏览器里由 location.origin 补全；
+  // 纯 Node 自检里就是 `/api/ruleset?...`）。显式空字符串才表示「没有对外地址」。
+  const origin = baseURL !== undefined
+    ? baseURL.replace(/\/+$/, '')
+    : (typeof location !== 'undefined' && location.origin ? location.origin : '')
+  if (baseURL !== undefined && !origin) return undefined
   return `${origin}/api/ruleset?${params.toString()}`
+}
+
+/** PROCESS-NAME 这类 classic provider 只有 Surge 的远程列表能直接读。 */
+export function providerOnlyClassicalHostedSupported(target?: ClientTarget): boolean {
+  return !target || target === 'surge' || target === 'surge-mac'
+}
+
+/**
+ * provider-only 规则集能否在当前载体上变成一条远程引用：
+ * Clash 系直接引用原 YAML provider；其余载体交给塔台服务托管转换。
+ * hostedBaseURL === '' 表示调用方明确判定「没有对外地址」，此时不允许托管引用。
+ */
+export function providerOnlyCanReference(
+  set: SchemeRuleSet,
+  format: SubFormat | undefined,
+  target: ClientTarget | undefined,
+  hostedBaseURL: string | undefined,
+): 'native' | 'hosted' | undefined {
+  if (!set.ruleSetBehavior) return undefined
+  if (format === 'yaml' && (!target || targetSupportsRuleSetFormat(target, 'yaml'))) {
+    // Shadowrocket 的 Clash YAML 变体按经典文本口径判断规则类型（见
+    // classicalRulesFitTarget），不读 classic provider 的 PROCESS-NAME 等条目；
+    // 这里对 classic 引用保持同样的口径，避免同一个列表在两条导出路径上结论相反。
+    // 被跳过的列表会在兼容性提示里点名，不会静默丢弃。
+    if (set.ruleSetBehavior === 'classical' && target === 'shadowrocket') return undefined
+    return 'native'
+  }
+  const dialect = hostedDialectForFormat(format)
+  if (!dialect) return undefined
+  if (set.ruleSetBehavior === 'classical') {
+    // classic 列表按原样拍平；QuanX / Egern / sing-box 的规则集都不认识 PROCESS-NAME。
+    if (dialect !== 'classic') return undefined
+    if (!providerOnlyClassicalHostedSupported(target)) return undefined
+  }
+  if (hostedBaseURL === '') return undefined
+  return 'hosted'
+}
+
+/**
+ * 托管转换对对外地址的要求：托管规则集由手机或其他设备直接拉取，地址必须可达。
+ * - 只有 provider-only 方案需要托管地址，其余方案返回 undefined（不参与判断）；
+ * - `/api/network` 能响应就说明伴生服务（本地模式）或服务器服务存活，
+ *   `/api/ruleset` 在同一服务上；serverMode 只表示是否启用服务端工作区，不能当作判据；
+ * - 优先级：TOWER_PUBLIC_URL → 非回环的当前地址 → 本机打开时用局域网地址 → 置空。
+ */
+export function resolveHostedBaseURL(input: {
+  providerOnly: boolean
+  net: { publicUrl?: string; lan?: readonly string[] } | null
+  loopback: boolean
+  origin: string
+}): string | undefined {
+  if (!input.providerOnly) return undefined
+  // 拿不到 /api/network 说明根本没有可用的服务端端点，给出地址也是假的。
+  if (!input.net) return ''
+  const trim = (value: string) => value.replace(/\/+$/, '')
+  if (input.net.publicUrl) return trim(input.net.publicUrl)
+  if (!input.loopback && input.origin) return trim(input.origin)
+  // 本机打开时手机只能用局域网地址；`/api/network` 已过滤回环，取第一个即可。
+  const lan = input.net.lan?.[0]
+  return lan ? trim(lan) : ''
 }
 
 /** 载体是否有可能引用至少一种原生规则集。 */
