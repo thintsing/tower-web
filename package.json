@@ -58,6 +58,7 @@
     "selfcheck:rulesets": "tsx scripts/selfcheck-rulesets.ts",
     "selfcheck:rule-order": "tsx scripts/selfcheck-rule-order.ts",
     "selfcheck:rule-impact": "tsx scripts/selfcheck-rule-impact.ts",
+    "selfcheck:sub-token": "tsx scripts/selfcheck-sub-token.ts",
     "selfcheck:freeze-preview": "tsx scripts/selfcheck-freeze-preview.ts",
     "selfcheck:upstream": "tsx scripts/selfcheck-upstream.ts",
     "selfcheck:upstream-status": "tsx scripts/selfcheck-upstream-status.ts",
