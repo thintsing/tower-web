@@ -71,6 +71,8 @@
     "selfcheck:ruleset-exclusions": "tsx scripts/selfcheck-ruleset-exclusions.ts",
     "selfcheck:sub-formats": "tsx scripts/selfcheck-sub-formats.ts",
     "selfcheck:workspace-conflict": "tsx scripts/selfcheck-workspace-conflict.ts",
+    "selfcheck:workspace-impact": "tsx scripts/selfcheck-workspace-impact.ts",
+    "selfcheck:workspace-restore": "tsx scripts/selfcheck-workspace-restore.ts",
     "selfcheck:yaml": "tsx scripts/selfcheck-yaml.ts"
   },
   "dependencies": {

@@ -1,10 +1,10 @@
 // 「订阅设置 → 工作区历史」：服务器模式下列出每次覆盖前自动保留的版本，
 // 支持回滚（以旧版为基础生成新版本），当前版单独标注。
 import { useEffect, useState } from 'react'
-import { BUILTIN_SCHEMES } from '../rules/scheme'
 import { useStore } from '../store'
-import { flushWorkspaceNow, reloadWorkspaceFromServer, useWorkspaceStatus, workspaceServerVersion, workspaceSnapshot, type WorkspaceData } from '../workspaceSync'
-import { normalizeWorkspaceDataDetailed } from '../workspaceValidation'
+import { flushWorkspaceNow, reloadWorkspaceFromServer, useWorkspaceStatus, workspaceServerVersion, workspaceSnapshot } from '../workspaceSync'
+import { describeWorkspaceImpact } from '../workspaceImpact'
+import { restoreAbortReason, restoreBlockedReason } from '../workspaceRestore'
 import {
   fetchWorkspaceHistory,
   fetchWorkspaceHistoryEntry,
@@ -64,69 +64,10 @@ function countChangeLines(before: WorkspaceCounts, after: WorkspaceCounts): stri
   return changed.length > 0 ? changed : ['各项数量没有变化']
 }
 
-function builtinName(id: string): string {
-  return BUILTIN_SCHEMES.find((meta) => meta.id === id)?.name ?? id
-}
-
-function schemeName(scheme: { id?: unknown; name?: unknown }): string {
-  const name = typeof scheme.name === 'string' ? scheme.name.trim() : ''
-  if (name) return name
-  return typeof scheme.id === 'string' && scheme.id ? scheme.id : '未命名方案'
-}
-
-function selectedSchemeName(data: WorkspaceData): string {
-  const custom = data.customSchemes.find((scheme) => scheme.id === data.selectedSchemeID)
-  return custom ? schemeName(custom) : builtinName(data.selectedSchemeID)
-}
-
-function resolvedOverride(data: WorkspaceData, id: string): string {
-  const pointer = data.builtinSchemeOverrides[id]
-  if (!pointer) return ''
-  return JSON.stringify(data.schemeSnapshots[String(pointer.snapshotId)] ?? null)
-}
-
-/** 对比当前工作区与目标版本，列出会被改动的方案名。 */
-export function describeSchemeImpact(currentRaw: WorkspaceData, targetRaw: unknown): string[] {
-  // 逐键容错不再抛错，必须看 dropped 明细，否则坏版本会被当成「少了很多方案」。
-  const normalized = normalizeWorkspaceDataDetailed(targetRaw)
-  const dropped = normalized.issues.filter((item) => item.severity === 'dropped')
-  if (dropped.length > 0) {
-    const labels = [...new Set(dropped.map((item) => item.keyLabel))]
-    const shown = labels.slice(0, 3).join('、') + (labels.length > 3 ? '…' : '')
-    return [`目标版本数据不完整（${shown}无法读取），无法逐项列出受影响的方案`]
-  }
-  const target: WorkspaceData = normalized.data
-  const impacts: string[] = []
-  const currentSchemes = new Map(currentRaw.customSchemes.map((scheme) => [scheme.id, scheme]))
-  const targetSchemes = new Map(target.customSchemes.map((scheme) => [scheme.id, scheme]))
-  for (const [id, scheme] of targetSchemes) {
-    const before = currentSchemes.get(id)
-    if (!before) impacts.push(`新增自定义方案「${schemeName(scheme)}」`)
-    else if (JSON.stringify(before) !== JSON.stringify(scheme)) {
-      impacts.push(`自定义方案「${schemeName(scheme)}」的规则或策略组有变化`)
-    }
-  }
-  for (const [id, scheme] of currentSchemes) {
-    if (!targetSchemes.has(id)) impacts.push(`移除自定义方案「${schemeName(scheme)}」`)
-  }
-  const builtinIDs = new Set([
-    ...Object.keys(currentRaw.builtinSchemeOverrides),
-    ...Object.keys(target.builtinSchemeOverrides),
-  ])
-  for (const id of builtinIDs) {
-    if (resolvedOverride(currentRaw, id) !== resolvedOverride(target, id)) {
-      impacts.push(`内置方案「${builtinName(id)}」的固化内容有变化`)
-    }
-  }
-  if (currentRaw.selectedSchemeID !== target.selectedSchemeID) {
-    impacts.push(`当前方案 ${selectedSchemeName(currentRaw)} → ${selectedSchemeName(target)}`)
-  }
-  return [...new Set(impacts)]
-}
-
 interface PendingRestore {
   detail: WorkspaceHistoryDetail
-  impact: string[]
+  schemes: string[]
+  dataImpact: string[]
   undoing: boolean
 }
 
@@ -169,13 +110,17 @@ export function WorkspaceHistoryPanel({ open }: { open: boolean }) {
   if (status.mode !== 'server') return null
 
   const beginRestore = async (entry: WorkspaceHistoryEntry, undoing = false) => {
+    if (status.conflict) {
+      setError('工作区冲突尚未解决：请先选择保留本机或改用服务端，再回滚历史版本。')
+      return
+    }
     setBusy(true)
     setError('')
     setNotice('')
     try {
       const detail = await fetchWorkspaceHistoryEntry(entry.id)
-      const impact = describeSchemeImpact(workspaceSnapshot(useStore.getState()), detail.data)
-      setPending({ detail, impact, undoing })
+      const impact = describeWorkspaceImpact(workspaceSnapshot(useStore.getState()), detail.data)
+      setPending({ detail, schemes: impact.schemes, dataImpact: impact.data, undoing })
     } catch (e) {
       setError(e instanceof WorkspaceHistoryError ? e.message : '无法读取这一版')
     } finally {
@@ -190,8 +135,13 @@ export function WorkspaceHistoryPanel({ open }: { open: boolean }) {
     setError('')
     setNotice('')
     try {
-      // 先把本机尚未推送的改动写回服务端，再用最新版本号做乐观锁。
-      await flushWorkspaceNow()
+      // 先把本机尚未推送的改动写回服务端；写不进去就中止，绝不让服务端覆盖本机改动。
+      const flushed = await flushWorkspaceNow()
+      const abort = restoreAbortReason(flushed)
+      if (abort) {
+        setError(abort)
+        return
+      }
       const expected = workspaceServerVersion()
       const result = await restoreWorkspaceHistoryEntry(target.id, expected)
       setPending(null)
@@ -200,7 +150,11 @@ export function WorkspaceHistoryPanel({ open }: { open: boolean }) {
         version: result.previous.version,
         createdVersion: result.version,
       } : null)
-      await reloadWorkspaceFromServer({ notice: `已回滚到 v${target.version}。` })
+      const reloaded = await reloadWorkspaceFromServer({ notice: `已回滚到 v${target.version}。` })
+      if (!reloaded) {
+        setError('回滚已提交，但重新载入服务端工作区失败；请刷新页面或稍后点「刷新」。')
+        return
+      }
       setNotice(`已回滚到 v${target.version}，服务器生成新版本 v${result.version}。回滚本身也是一次写入；如果点错了，可以撤销这次回滚。`)
       await load(true)
     } catch (e) {
@@ -215,13 +169,13 @@ export function WorkspaceHistoryPanel({ open }: { open: boolean }) {
     }
   }
 
-  const restoreDisabledReason = status.readOnly
-    ? '工作区当前只读，无法回滚'
-    : status.state !== 'online'
-      ? '服务端未连接，无法回滚'
-      : busy
-        ? '正在处理上一次操作'
-        : ''
+  const restoreDisabledReason = restoreBlockedReason({
+    mode: status.mode,
+    state: status.state,
+    readOnly: status.readOnly,
+    conflict: !!status.conflict,
+    busy,
+  })
 
   return (
     <>
@@ -294,7 +248,7 @@ export function WorkspaceHistoryPanel({ open }: { open: boolean }) {
                 <button
                   type="button"
                   className="btn ghost"
-                  disabled={busy || status.readOnly || status.state !== 'online'}
+                  disabled={busy || status.readOnly || status.state !== 'online' || !!status.conflict}
                   title={restoreDisabledReason || undefined}
                   onClick={() => void beginRestore(entry)}
                 >回滚到此版</button>
@@ -319,14 +273,25 @@ export function WorkspaceHistoryPanel({ open }: { open: boolean }) {
               {countChangeLines(list?.current.counts ?? pending.detail.counts, pending.detail.counts).join(' · ')}
             </small>
             <small className="workspace-history-change">
-              受影响的方案：{pending.impact.length > 0 ? pending.impact.join('、') : '无'}
+              受影响的方案：{pending.schemes.length > 0 ? pending.schemes.join('、') : '无'}
             </small>
+            {pending.dataImpact.length > 0 && (
+              <small className="workspace-history-change">
+                工作区数据：{pending.dataImpact.join('；')}
+              </small>
+            )}
             <small>
               已导出的客户端配置和已发布的订阅链接不会自动更新，需要重新导出或让客户端刷新。
             </small>
           </div>
           <div className="row" style={{ gap: 8 }}>
-            <button type="button" className="btn danger" disabled={busy} onClick={() => void executeRestore()}>
+            <button
+              type="button"
+              className="btn danger"
+              disabled={busy || status.readOnly || !!status.conflict}
+              title={restoreDisabledReason || undefined}
+              onClick={() => void executeRestore()}
+            >
               {busy ? '回滚中…' : '确认回滚'}
             </button>
             <button type="button" className="btn ghost" disabled={busy} onClick={() => setPending(null)}>取消</button>
