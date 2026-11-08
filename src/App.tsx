@@ -28,7 +28,7 @@ import { fetchUpstreamScheme, type UpstreamSchemeResult } from './rules/upstream
 import { runBuiltinUpdateCheckOnOpen } from './rules/upstreamOnOpen'
 import { ruleSetRefreshFailure, ruleSetRefreshSuccess, sumRuleSetDiffs } from './rules/ruleSetRefresh'
 import { detectRuleSchemeFormat, parseRuleSchemeText, RULE_SCHEME_FORMAT_TITLES } from './rules/importers'
-import { describeRuleSetParse, fetchRuleSet, parseRuleSetText, RULE_SET_FORMAT_TITLES, type RuleSetRule } from './rules/ruleSets'
+import { describeRuleSetParse, fetchRuleSet, inferRuleSetBehavior, parseRuleSetText, RULE_SET_FORMAT_TITLES, type RuleSetRule } from './rules/ruleSets'
 import { matchingGroupNames, matchingOrderAfterDragging } from './rules/matchingOrder'
 import { findRuleOrderConflicts, type RuleOrderConflict } from './rules/orderConflicts'
 import { policyIssueText, validateSchemePolicy } from './rules/policyValidation'
@@ -42,6 +42,7 @@ import { describeSubscriptionFormatFailures, generateConfig, generateSubscriptio
 import { nodeShareText } from './generator/shareLink'
 import { nodeTransportCapability } from './generator/nodeCapabilities'
 import { analyzeRuleCompatibility } from './generator/compatibility'
+import { resolveHostedBaseURL } from './rules/remoteFormats'
 import { formatSupportsProxyCollections, prepareSchemeForExport } from './generator/groups'
 import { autoFillGroupEmojis } from './generator/groupIcons'
 import { maskTailnetAuthKeys, tailnetSupports } from './generator/tailnet'
@@ -5065,6 +5066,8 @@ interface RuleSetPayload {
   sourceKind: 'library' | 'local' | 'url'
   sourceRef?: string
   format?: RuleSetFormat
+  /** provider YAML 的 behavior；按内容推断，避免导出时退化成 classical。 */
+  ruleSetBehavior?: string
 }
 
 function RuleLibraryDialog({
@@ -5140,6 +5143,7 @@ function RuleLibraryDialog({
         sourceKind: entry.sourceURL ? 'url' : 'library',
         sourceRef: entry.sourceURL ?? entry.file ?? entry.id,
         format,
+        ruleSetBehavior: format === 'yaml' ? inferRuleSetBehavior(rules) : undefined,
       })
       onClose()
     } catch (e) {
@@ -5395,6 +5399,7 @@ function RemoteRuleSetDialog({
               updatedAt: Date.now(),
               sourceURL: target,
               format: parsed.format,
+              ruleSetBehavior: parsed.format === 'yaml' ? inferRuleSetBehavior(parsed.rules) : undefined,
             },
             notice: describeRuleSetParse(parsed),
           })
@@ -6475,6 +6480,8 @@ function RulesTab({
       sourceKind: payload.sourceKind,
       sourceRef: payload.sourceRef,
       format: payload.format,
+      ruleSetBehavior: payload.ruleSetBehavior
+        ?? (payload.format === 'yaml' ? inferRuleSetBehavior(payload.rules) : undefined),
       updatedAt: Date.now(),
     }
     const ruleSets = existingIndex >= 0
@@ -6494,6 +6501,9 @@ function RulesTab({
       sourceKind: set.sourceURL ? 'url' : 'local',
       sourceRef: set.sourceURL ?? set.id,
       format: set.sourceURL ? set.format : undefined,
+      // 透传 provider behavior：漏掉会让 YAML 规则集在导出时退回 classical。
+      ruleSetBehavior: set.ruleSetBehavior
+        ?? (set.format === 'yaml' ? inferRuleSetBehavior(set.rules) : undefined),
     })
   }
 
@@ -6536,7 +6546,11 @@ function RulesTab({
         recordRuleSetSnapshot(set.id, set.rules, useStore.getState().ruleSetVersionHistory)
       }
       const updated = ruleSetRefreshSuccess(set, parsed.rules)
-      addLocalRuleSet({ ...updated, format: parsed.format })
+      addLocalRuleSet({
+        ...updated,
+        format: parsed.format,
+        ruleSetBehavior: parsed.format === 'yaml' ? inferRuleSetBehavior(parsed.rules) : undefined,
+      })
       const diff = updated.lastDiff
       setFlash(`已刷新「${set.name}」：${parsed.rules.length} 条规则（+${diff?.added ?? 0} −${diff?.removed ?? 0} ~${diff?.modified ?? 0}）；${describeRuleSetParse(parsed)}。`)
     } catch (e) {
@@ -6565,7 +6579,11 @@ function RulesTab({
           recordRuleSetSnapshot(set.id, set.rules, useStore.getState().ruleSetVersionHistory)
         }
         const updated = ruleSetRefreshSuccess(set, parsed.rules)
-        addLocalRuleSet({ ...updated, format: parsed.format })
+        addLocalRuleSet({
+          ...updated,
+          format: parsed.format,
+          ruleSetBehavior: parsed.format === 'yaml' ? inferRuleSetBehavior(parsed.rules) : undefined,
+        })
         diffs.push(updated.lastDiff)
         ok += 1
       } catch (error) {
@@ -6622,6 +6640,7 @@ function RulesTab({
           rules: parsed.rules,
           updatedAt: Date.now(),
           format: parsed.format,
+          ruleSetBehavior: parsed.format === 'yaml' ? inferRuleSetBehavior(parsed.rules) : undefined,
         })
       } catch (error) {
         errors.push(`${file.name}：${(error as Error).message}`)
@@ -6653,7 +6672,11 @@ function RulesTab({
         group: set.group,
         sourceName: set.name,
       }))
-      const updated = { ...ruleSetRefreshSuccess(set, rules), format: parsed.format }
+      const updated = {
+        ...ruleSetRefreshSuccess(set, rules),
+        format: parsed.format,
+        ruleSetBehavior: parsed.format === 'yaml' ? inferRuleSetBehavior(rules) : undefined,
+      }
       addCustomScheme({
         ...fresh,
         ruleSets: (fresh.ruleSets ?? []).map((item) => item.id === set.id ? updated : item),
@@ -6905,7 +6928,7 @@ function RulesTab({
             )}
           </div>
         )}
-        {selectedMeta && !('custom' in selectedMeta) && (
+        {selectedMeta && !('custom' in selectedMeta) && !selectedMeta.programmatic && (
           <div className="row wrap" style={{ gap: 8, marginTop: 8 }}>
             <button
               type="button"
@@ -6938,7 +6961,7 @@ function RulesTab({
             )}
           </div>
         )}
-        {selectedMeta && !('custom' in selectedMeta) && (
+        {selectedMeta && !('custom' in selectedMeta) && !selectedMeta.programmatic && (
           <div style={{ marginTop: 8 }}>
             <div className="hint">
               「更新并固化」拉取 ACL4SSR 最新 INI 与全部列表，直接替换这条内置方案（多设备同步）；任一列表失败整次放弃，原厂快照始终保留可恢复。
@@ -7362,20 +7385,25 @@ function RulesTab({
                         <strong>{set.name}</strong>
                         <span className="pill">{groupDisplayName(set.group, showGroupEmoji)}</span>
                         {set.inlined && <span className="pill" title="来自固化快照，不能删除或刷新；可按签名逐条屏蔽">只读</span>}
+                        {set.providerOnly && (
+                          <span className="pill" title="只保存 provider 地址 / behavior / 间隔，不保存正文；导出 Clash 时写成 rule-providers + RULE-SET">
+                            远程引用
+                          </span>
+                        )}
                         {blockedCount > 0 && (
                           <span className="pill warn" title="原始规则集与快照不变；只在编译与导出时排除">
                             已屏蔽 {blockedCount} 条 · 仅编译期生效
                           </span>
                         )}
                         <span className="hint">
-                          {set.rules.length} 条 · {set.inlined ? '固化快照（只读）' : set.sourceKind === 'library' ? '内置规则库' : set.sourceKind === 'url' ? '在线订阅' : '我的规则集'}
+                          {set.providerOnly ? '远程引用（不保存正文）' : `${set.rules.length} 条`} · {set.providerOnly ? 'Clash provider YAML' : set.inlined ? '固化快照（只读）' : set.sourceKind === 'library' ? '内置规则库' : set.sourceKind === 'url' ? '在线订阅' : '我的规则集'}
                           {set.format ? ` · ${RULE_SET_FORMAT_TITLES[set.format]}` : ''}
                           {set.updatedAt ? ` · 更新于 ${formatDate(set.updatedAt)}` : ''}
                         </span>
                         {set.lastDiff && <RuleSetDiffView diff={set.lastDiff} />}
                       </div>
                       <div className="rs-actions">
-                        {!set.inlined && set.sourceKind === 'url' && (
+                        {!set.inlined && !set.providerOnly && set.sourceKind === 'url' && (
                           <button
                             className="btn ghost"
                             disabled={refreshingRuleSetID !== null}
@@ -7692,7 +7720,14 @@ function RulesTab({
         title="从当前方案移除规则集？"
         body={(
           <>
-            将移除 <b>「{pendingRuleSetRemove?.name}」</b>的 {pendingRuleSetRemove?.rules.length ?? 0} 条规则。
+            {pendingRuleSetRemove?.providerOnly ? (
+              <>
+                将移除 <b>「{pendingRuleSetRemove.name}」</b>的远程 provider 引用（不保存正文），
+                方案里引用它的 RULE-SET 会一并删除。
+              </>
+            ) : (
+              <>将移除 <b>「{pendingRuleSetRemove?.name}」</b>的 {pendingRuleSetRemove?.rules.length ?? 0} 条规则。</>
+            )}
             {describeRuleSetRemovalImpact(pendingRuleSetRemove
               ? ruleSetExclusions[pendingRuleSetRemove.id]?.length ?? 0
               : 0)}
@@ -8118,6 +8153,26 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     // 旧数据若把所有客户端都隐藏了，退回显示全部，避免导出页没有可选客户端。
     return shown.length ? shown : orderedClients
   }, [orderedClients, hiddenClients])
+  const [net, setNet] = useState<{
+    host: string
+    lan: string[]
+    publicUrl: string
+    publicUrlError: string
+  } | null>(null)
+  const localHost = ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(window.location.hostname)
+  // provider 引用 / 托管转换地址必须是对手机可达的绝对地址。
+  // 判据不是 serverMode（它只表示是否启用服务端工作区），而是 /api/network
+  // 是否可用；本地伴生服务同样提供 /api/ruleset。取不到局域网地址时才置空，
+  // 由导出侧硬阻断，而不是退回 localhost 产出不可达配置。
+  const hostedBaseURL = useMemo(
+    () => resolveHostedBaseURL({
+      providerOnly: (scheme?.ruleSets ?? []).some((set) => set.providerOnly && !set.inlined),
+      net,
+      loopback: localHost,
+      origin: window.location.origin,
+    }),
+    [scheme, net, localHost],
+  )
   // 预览与下载按当前客户端载体准备方案；发布时由 generateSubscriptionFormats
   // 再按各载体分别准备，避免这里提前合并导致规则重复。
   const exportScheme = useMemo(
@@ -8126,12 +8181,15 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       format: targetFormat,
       target: target.target,
       ruleSetExclusions,
+      hostedBaseURL,
     }) : undefined,
-    [scheme, policySelections, preferRuleSets, targetFormat, target.target, ruleSetExclusions],
+    [scheme, policySelections, preferRuleSets, targetFormat, target.target, ruleSetExclusions, hostedBaseURL],
   )
   const compatibility = useMemo(
-    () => scheme ? analyzeRuleCompatibility(target, scheme, { preferRuleSets, contentMode, ruleSetExclusions }) : undefined,
-    [target, scheme, preferRuleSets, contentMode, ruleSetExclusions],
+    () => scheme ? analyzeRuleCompatibility(target, scheme, {
+      preferRuleSets, contentMode, ruleSetExclusions, hostedBaseURL,
+    }) : undefined,
+    [target, scheme, preferRuleSets, contentMode, ruleSetExclusions, hostedBaseURL],
   )
   const [clientQuery, setClientQuery] = useState('')
   const [manageClients, setManageClients] = useState(false)
@@ -8169,13 +8227,6 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const [revokeError, setRevokeError] = useState('')
   const [copiedField, setCopiedField] = useState<'sub' | 'import' | 'lan' | null>(null)
   const [importNotice, setImportNotice] = useState('')
-  const [net, setNet] = useState<{
-    host: string
-    lan: string[]
-    publicUrl: string
-    publicUrlError: string
-  } | null>(null)
-  const localHost = ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(window.location.hostname)
 
   useEffect(() => {
     apiFetch('/api/network')
@@ -8219,8 +8270,8 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
 
   const enabled = useMemo(() => enabledNodes({ sources, nodes }), [sources, nodes])
   const lintIssues = useMemo(
-    () => (scheme ? lintScheme({ scheme, nodes: enabled, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions, clients: [target] }) : []),
-    [scheme, enabled, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions, target],
+    () => (scheme ? lintScheme({ scheme, nodes: enabled, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions, clients: [target], hostedBaseURL }) : []),
+    [scheme, enabled, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions, target, hostedBaseURL],
   )
   const lintState = lintSummary(lintIssues)
   // key 里带上具体 error 的 id：同样数量的 error 换成另一批问题时，不能沿用上一次的「继续导出」确认。
@@ -8367,8 +8418,9 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       // Surge 自更新首行只指向已发布的链接；尚未发布（subURL 为空）时不写，
       // 避免生成一个指向不存在地址的 #!MANAGED-CONFIG。
       managedConfigURL: targetFormat === 'surge' && contentMode === 'full' ? clientSubURL : '',
+      hostedBaseURL,
     }),
-    [contentMode, nameForNode, previewRemoteSubscriptions, activeTailnets, targetFormat, clientSubURL],
+    [contentMode, nameForNode, previewRemoteSubscriptions, activeTailnets, targetFormat, clientSubURL, hostedBaseURL],
   )
 
   const configName = exportConfigName.trim() || 'tower'
@@ -8394,7 +8446,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   }, [visibleClients, target])
 
   useEffect(() => {
-    if (!exportScheme) {
+    if (!exportScheme || compatibility?.providerOnlyBlocked) {
       setGenerated('')
       setSkipped(0)
       setExportedNodeCount(0)
@@ -8408,7 +8460,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     setExportedNodeCount(out.exportedNodeCount)
     setRemoteSourceCount(out.remoteSourceCount)
     setTailnetNotes(out.notes)
-  }, [target, usable, exportScheme, outputOptions])
+  }, [target, usable, exportScheme, outputOptions, compatibility?.providerOnlyBlocked])
 
   // importScheme 可用时包装成客户端 deep link，否则直接给订阅地址。
   const clientImportURL = useMemo(() => {
@@ -8575,6 +8627,16 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       setCheckResult({ ok: false, text: '规则方案尚未加载完成，请稍后重试' })
       return null
     }
+    // 发布链接会同时生成 Surge / Loon / QuanX / Egern / sing-box 载体；
+    // 只存 provider 引用的方案需要服务端托管转换，且托管地址必须对手机可达。
+    const providerOnlyCount = (scheme.ruleSets ?? []).filter((set) => set.providerOnly && !set.inlined).length
+    if (providerOnlyCount > 0 && hostedBaseURL === '') {
+      setCheckResult({
+        ok: false,
+        text: '当前方案使用 Clash provider 引用，其他客户端依赖塔台服务托管转换；未能获取手机可达的托管地址（塔台服务未响应，或没有可用局域网地址）。请启动塔台服务 / 配置 TOWER_PUBLIC_URL 后重试。',
+      })
+      return null
+    }
     if (!hasExportable) {
       setCheckResult({ ok: false, text: emptyReason })
       return null
@@ -8592,6 +8654,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         nameForNode,
         remoteSubscriptions,
         tailnets: activeTailnets,
+        hostedBaseURL,
       })
       const formats = generated.formats
       // 订阅链接对所有客户端共用；任何目标载体缺失都意味着对应客户端会收到
@@ -8615,6 +8678,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           format: 'yaml',
           target: 'shadowrocket',
           ruleSetExclusions,
+          hostedBaseURL,
         })
         const mode = effectiveContentMode(shadowrocket, exportContentModes, exportContentMode)
         targets.shadowrocket = generateConfig(shadowrocket, usable, prepared, {
@@ -8622,6 +8686,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           nameForNode,
           remoteSubscriptions: [],
           tailnets: [],
+          hostedBaseURL,
         }).text
       }
       // Karing 与 Clash 共用 YAML，但核心不读 MRS；发布时单独去掉。
@@ -8632,6 +8697,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           format: 'yaml',
           target: 'karing',
           ruleSetExclusions,
+          hostedBaseURL,
         })
         const mode = effectiveContentMode(karing, exportContentModes, exportContentMode)
         targets.karing = generateConfig(karing, usable, prepared, {
@@ -8639,6 +8705,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           nameForNode,
           remoteSubscriptions,
           tailnets: [],
+          hostedBaseURL,
         }).text
       }
       // sing-box 1.14 的远程规则集需要 http_clients，Hiddify 内嵌 1.13 不接受；
@@ -8652,12 +8719,14 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           format: 'json',
           target: targetKey,
           ruleSetExclusions,
+          hostedBaseURL,
         })
         targets[targetKey] = generateConfig(client, usable, prepared, {
           contentMode: mode,
           nameForNode,
           remoteSubscriptions,
           tailnets: [],
+          hostedBaseURL,
         }).text
       }
       if (activeTailnets.length > 0) {
@@ -8672,12 +8741,14 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
             format,
             target: targetKey,
             ruleSetExclusions,
+            hostedBaseURL,
           })
           targets[targetKey] = generateConfig(client, usable, prepared, {
             contentMode: mode,
             nameForNode,
             remoteSubscriptions,
             tailnets: mode === 'full' ? activeTailnets : [],
+            hostedBaseURL,
           }).text
         }
       }
@@ -9289,8 +9360,13 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
             <strong>优先引用远程规则集</strong>
             <small>
               客户端能读取规则集原始格式时直接写远程引用：Clash / mihomo、Stash、Shadowrocket、
-              Surge 和 Loon 可读经典列表；经典列表还会由塔台服务无损转换并托管为
-              QuanX / Egern / sing-box 方言。托管地址跟随当前访问的塔台地址，手机导入请使用局域网地址或局域网订阅链接；
+              Surge 和 Loon 可读经典列表；经典列表还会由塔台服务托管转换并转成
+              QuanX / Egern / sing-box 方言。转换只做格式映射：QuanX / sing-box 的远程列表
+              没有 no-resolve 参数，带该参数的 IP 规则会退化成普通 IP 规则（可能触发解析）；
+              Loon 的托管正文与 Surge 共用，按 Surge 口径也不带参数，同样退化为普通 IP 规则
+              （Surge 把 no-resolve 写在 RULE-SET 行）。托管地址优先使用服务端
+              <span className="mono">TOWER_PUBLIC_URL</span>，其次当前访问地址；本机
+              <span className="mono">localhost</span> 打开时退回局域网地址，都拿不到则停止导出。
               无法转换的格式和「我的规则集」会展开写入；节点订阅客户端不包含规则。
             </small>
           </span>
@@ -9320,20 +9396,26 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                 <span>{compatibility.note}</span>
               </div>
             ) : (
-              <div className="hint rule-export-note">
-                {compatibility.supportsRemoteRuleSets
-                  ? preferRuleSets
-                    ? compatibility.ruleSetCount === 0
-                      ? '当前方案没有加入规则集，自定义规则与方案规则会直接写入配置。'
-                      : compatibility.remoteRuleSets > 0
-                        ? `当前会把 ${compatibility.remoteRuleSets} 组规则集写成远程引用${compatibility.inlineRuleSets > 0 ? `，${compatibility.inlineRuleSets} 组规则集继续展开` : ''}。客户端需要能访问规则集的远程地址。`
-                        : compatibility.ruleSetNote ?? '这些规则集当前会展开写入。'
-                    : compatibility.ruleSetCount > 0
-                      ? `已加入 ${compatibility.ruleSetCount} 组规则集；开启后会优先写成 ${target.name} 能直接读取的远程格式，其余继续展开。`
-                      : '当前方案没有加入规则集，自定义规则与方案规则会直接写入配置。'
-                  : compatibility.ruleSetCount > 0
-                    ? `${target.name} 不能直接引用远程规则集，${compatibility.ruleSetCount} 组规则集会展开为单条规则写入。`
-                    : `${target.name} 不能直接引用远程规则集，规则会逐条写入。`}
+              <div className={`hint rule-export-note${compatibility.providerOnlyBlocked ? ' warn' : ''}`}>
+                {compatibility.providerOnlyBlocked
+                  ? compatibility.providerOnlyNote
+                  : compatibility.providerOnlyCount > 0
+                    ? compatibility.providerOnlyNote ?? (targetFormat === 'yaml'
+                      ? `这个方案只保存 ${compatibility.providerOnlyCount} 组 Clash provider 引用（不保存正文），会直接写成 rule-providers + RULE-SET，不受「优先引用」开关影响；客户端需要能访问这些地址。`
+                      : `这个方案只保存 ${compatibility.providerOnlyCount} 组 Clash provider 引用（不保存正文），会由塔台服务托管转换并写成 ${target.name} 的远程规则集；客户端需要能访问塔台的对外地址。`)
+                    : compatibility.supportsRemoteRuleSets
+                      ? preferRuleSets
+                        ? compatibility.ruleSetCount === 0
+                          ? '当前方案没有加入规则集，自定义规则与方案规则会直接写入配置。'
+                          : compatibility.remoteRuleSets > 0
+                            ? `当前会把 ${compatibility.remoteRuleSets} 组规则集写成远程引用${compatibility.inlineRuleSets > 0 ? `，${compatibility.inlineRuleSets} 组规则集继续展开` : ''}。客户端需要能访问规则集的远程地址。`
+                            : compatibility.ruleSetNote ?? '这些规则集当前会展开写入。'
+                        : compatibility.ruleSetCount > 0
+                          ? `已加入 ${compatibility.ruleSetCount} 组规则集；开启后会优先写成 ${target.name} 能直接读取的远程格式，其余继续展开。`
+                          : '当前方案没有加入规则集，自定义规则与方案规则会直接写入配置。'
+                      : compatibility.ruleSetCount > 0
+                        ? `${target.name} 不能直接引用远程规则集，${compatibility.ruleSetCount} 组规则集会展开为单条规则写入。`
+                        : `${target.name} 不能直接引用远程规则集，规则会逐条写入。`}
               </div>
             )}
             {compatibility.skipped > 0 && (
@@ -9405,14 +9487,20 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           </div>
         )}
         <div className="row" style={{ gap: 8, marginBottom: 14 }}>
-          <button className="btn" disabled={!scheme || !hasExportable} onClick={download}>{downloaded ? '已下载' : '下载文件'}</button>
-          <button className="btn ghost" disabled={!hasExportable || !generated} onClick={copy}>{copied ? '已复制' : '复制'}</button>
+          <button className="btn" disabled={!scheme || !hasExportable || compatibility?.providerOnlyBlocked} onClick={download}>{downloaded ? '已下载' : '下载文件'}</button>
+          <button className="btn ghost" disabled={!hasExportable || !generated || compatibility?.providerOnlyBlocked} onClick={copy}>{copied ? '已复制' : '复制'}</button>
           {canImport && (
-            <button className="btn ghost" disabled={importing || !hasExportable || readOnly} title={readOnly ? READONLY_NOTE : undefined} onClick={importIntoClient}>
+            <button className="btn ghost" disabled={importing || !hasExportable || readOnly || compatibility?.providerOnlyBlocked} title={readOnly ? READONLY_NOTE : undefined} onClick={importIntoClient}>
               {importing ? '生成链接…' : `导入到 ${target.name}`}
             </button>
           )}
         </div>
+        {compatibility?.providerOnlyBlocked && (
+          <div className="inline-notice error" style={{ marginBottom: 10 }}>
+            <span>{compatibility.providerOnlyNote}</span>
+            <button className="btn ghost" onClick={() => onGo?.('check')}>查看检查结果</button>
+          </div>
+        )}
         {importNotice && <div className="hint" style={{ marginBottom: 10 }}>{importNotice}</div>}
         {skipped > 0 && hasExportable && (
           <div className="inline-notice">
@@ -9895,7 +9983,11 @@ export function App() {
             recordRuleSetSnapshot(set.id, set.rules, useStore.getState().ruleSetVersionHistory)
           }
           const updated = ruleSetRefreshSuccess(current, parsed.rules)
-          useStore.getState().addLocalRuleSet({ ...updated, format: parsed.format })
+          useStore.getState().addLocalRuleSet({
+            ...updated,
+            format: parsed.format,
+            ruleSetBehavior: parsed.format === 'yaml' ? inferRuleSetBehavior(parsed.rules) : undefined,
+          })
         } catch (error) {
           const current = useStore.getState().localRuleSets.find((item) => item.id === set.id)
           if (!current) return

@@ -111,9 +111,17 @@ export function generateSubscriptionFormatsDetailed(
     egern: '',
   }
   const failures: SubscriptionFormatFailure[] = []
+  // 只存 provider 引用的方案没有正文可展开；除 Clash YAML / 纯节点载体外一律硬阻断，
+  // 绝不静默产出只有 FINAL 的「看似成功」配置。
+  const providerOnlyCount = (scheme.ruleSets ?? []).filter((set) => set.providerOnly && !set.inlined).length
   // 失败必须留下原因：服务端只保存非空载体，静默留空会让部分客户端在拉取时 406。
   const build = (format: SubFormat, run: () => string): void => {
     try {
+      if (providerOnlyCount > 0 && format !== 'yaml' && format !== 'base64') {
+        if (options.hostedBaseURL === '') {
+          throw new Error('托管转换地址不可用：塔台服务未响应，或没有手机可访问的地址')
+        }
+      }
       const text = run()
       if (!text.trim()) {
         failures.push({ format, reason: '生成的配置内容为空' })
@@ -142,6 +150,7 @@ export function generateSubscriptionFormatsDetailed(
       format,
       target: options.target ?? targetByFormat[format],
       ruleSetExclusions: options.ruleSetExclusions,
+      hostedBaseURL: options.hostedBaseURL,
     })
   // 通用载体没有 target；选一个有代表性的图标写法，避免发布出去的订阅丢图标。
   const iconTargetByFormat: Partial<Record<SubFormat, ClientTarget>> = {
@@ -197,6 +206,11 @@ export function generateConfig(
 ): GeneratedConfig {
   const format: SubFormat = subFormatFor(client)
   const contentMode = options.contentMode ?? (client.contentMode === 'nodes' ? 'nodes' : 'full')
+  const providerOnlyCount = (scheme.ruleSets ?? []).filter((set) => set.providerOnly && !set.inlined).length
+  if (providerOnlyCount > 0 && contentMode !== 'nodes' && format !== 'yaml' && format !== 'base64'
+    && options.hostedBaseURL === '') {
+    throw new Error('托管转换地址不可用：塔台服务未响应，或没有手机可访问的地址。')
+  }
   const remoteSources = formatSupportsProxyCollections(format)
     && contentMode !== 'nodes'
     && client.target !== 'shadowrocket'

@@ -58,6 +58,8 @@ export interface SchemeLintOptions {
   clients?: ClientInfo[]
   /** 只读规则集的本地屏蔽表；被屏蔽的条目不再参与检查。 */
   ruleSetExclusions?: RuleSetExclusionTable
+  /** provider 引用的托管对外地址；空字符串表示不可用。 */
+  hostedBaseURL?: string
 }
 
 export interface SchemeLintSummary {
@@ -427,7 +429,19 @@ function findRuleSetIssues(options: SchemeLintOptions, prepared: RuleScheme): Sc
   const declared = new Set(prepared.groups.map((group) => group.name))
   const localSets = new Map((options.localRuleSets ?? []).map((set) => [set.id, set]))
   for (const set of prepared.ruleSets ?? []) {
-    if (!set.rules.length) {
+    // provider-only 规则集本来就不保存正文，rules 为空是预期状态，不能报空。
+    if (set.providerOnly) {
+      if (!set.sourceRef || !set.ruleSetBehavior) {
+        issues.push({
+          id: `ruleset:provider:${set.id}`,
+          level: 'error',
+          code: 'providerOnlyMissingReference',
+          message: `规则集「${set.name}」缺少 provider 地址或 behavior，无法写成 rule-providers 引用`,
+          hint: '重新加入该在线规则集，或改回普通规则集',
+          location: { kind: 'ruleSet', ruleSet: set.name, group: set.group },
+        })
+      }
+    } else if (!set.rules.length) {
       issues.push({
         id: `ruleset:empty:${set.id}`,
         level: 'warn',
@@ -473,13 +487,31 @@ function findRuleSetIssues(options: SchemeLintOptions, prepared: RuleScheme): Sc
 function findCompatibilityIssues(options: SchemeLintOptions): SchemeLintIssue[] {
   const clients = options.clients ?? CLIENTS
   const issues: SchemeLintIssue[] = []
+  let providerOnlyReported = false
   for (const client of clients) {
     if (client.contentMode === 'nodes') continue
     const compatibility = analyzeRuleCompatibility(client, options.scheme, {
       preferRuleSets: options.preferRuleSets,
       ruleSetExclusions: options.ruleSetExclusions,
+      hostedBaseURL: options.hostedBaseURL,
     })
-    if (compatibility.nodeOnly || compatibility.skipped === 0) continue
+    if (compatibility.nodeOnly) continue
+    if (compatibility.providerOnlyBlocked) {
+      // 同一原因只报一次，避免每个非 Clash 客户端各来一条。
+      if (!providerOnlyReported) {
+        issues.push({
+          id: 'target:providerOnly',
+          level: 'warn',
+          code: 'providerOnlyUnsupported',
+          message: `方案只保存 Clash provider 引用（不保存正文），${client.name} 等非 Clash 系客户端无法导出，已硬阻断`,
+          hint: '改用 Clash / mihomo 系客户端导出',
+          location: { kind: 'target', target: client.name },
+        })
+        providerOnlyReported = true
+      }
+      continue
+    }
+    if (compatibility.skipped === 0) continue
     const types = compatibility.unsupportedTypes.slice(0, 4).join('、')
     issues.push({
       id: `target:${client.target}`,
