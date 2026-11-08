@@ -109,8 +109,9 @@ async function waitFor(
 
 async function runWorker(): Promise<void> {
   const listeners = installEnvironment()
-  const { useStore } = await import('file:///e:/DEV/%E5%A1%94%E5%8F%B0/tower-web/src/store.ts')
-  const sync = await import('file:///e:/DEV/%E5%A1%94%E5%8F%B0/tower-web/src/workspaceSync.ts')
+  // 按脚本自身位置解析，Linux runner 与本地 Windows 都能找到同一份源码。
+  const { useStore } = await import(new URL('../src/store.ts', import.meta.url).href)
+  const sync = await import(new URL('../src/workspaceSync.ts', import.meta.url).href)
   const status = () => sync.getWorkspaceStatus()
 
   if (scenario === 'p01-focus') {

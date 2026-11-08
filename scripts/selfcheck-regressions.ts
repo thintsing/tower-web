@@ -3,7 +3,7 @@
 // 用法：npm run selfcheck:regressions
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { readFileSync, mkdtempSync, rmSync } from 'node:fs'
+import { readFileSync, readdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { connect } from 'node:net'
 import { networkInterfaces, tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -63,6 +63,39 @@ async function checkAsync(label: string, run: () => Promise<void>): Promise<void
     console.error(`  ${error instanceof Error ? error.message : String(error)}`)
   }
 }
+
+/**
+ * 只能在 Windows 跑的自检会让 Linux CI 变红，而且本地不一定能发现。
+ * 这里扫 scripts/ 与 .github/workflows/，拦截盘符路径、file:/// + 盘符、
+ * URL 编码中文路径和反斜杠路径分隔符。
+ */
+check('自检脚本与工作流不包含 Windows 专用绝对路径', () => {
+  const root = fileURLToPath(new URL('..', import.meta.url))
+  const files = [
+    ...readdirSync(join(root, 'scripts'))
+      .filter((name) => /\.(ts|mjs|js)$/.test(name))
+      .map((name) => join(root, 'scripts', name)),
+    ...readdirSync(join(root, '.github', 'workflows'))
+      .filter((name) => /\.(yml|yaml)$/.test(name))
+      .map((name) => join(root, '.github', 'workflows', name)),
+  ]
+  const patterns: Array<[RegExp, string]> = [
+    [/file:\/\/\/[A-Za-z]:/, 'file:/// + 盘符'],
+    [/(?<![\w-])[A-Za-z]:[\\/](?![\\/])/, 'Windows 盘符路径'],
+    [/\/%E[4-9A-F][0-9A-F]/, 'URL 编码中文路径'],
+    [/['"][^'"\n]*(?:src|scripts|server|public|\.github)[\\][^'"\n]*['"]/, '反斜杠路径分隔符'],
+  ]
+  const hits: string[] = []
+  for (const file of files) {
+    const lines = readFileSync(file, 'utf8').split(/\r?\n/)
+    lines.forEach((line, index) => {
+      for (const [pattern, label] of patterns) {
+        if (pattern.test(line)) hits.push(`${label}：${file}:${index + 1} ${line.trim()}`)
+      }
+    })
+  }
+  assert.equal(hits.length, 0, `发现只能在 Windows 成立的写法：\n${hits.join('\n')}`)
+})
 
 function parseOne(text: string): ProxyNode {
   const node = parse(text).nodes[0]
