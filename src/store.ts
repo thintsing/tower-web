@@ -18,6 +18,7 @@ import { nodeTransportCapability } from './generator/nodeCapabilities'
 import { newID } from './util/browser'
 import { browserStorage, createSafeStorage } from './util/localStore'
 import { isWorkspaceReadOnly } from './util/workspaceLock'
+import { WORKSPACE_STATE_KEYS } from './workspaceKeys'
 
 export interface Store extends AppState {
   loadingSourceIDs: string[]
@@ -504,10 +505,7 @@ export function persistedSnapshot(s: Store): PersistedData {
 }
 
 /** 服务器版工作区里会落盘的字段；只读时只拦这些，设备偏好不受影响。 */
-const WORKSPACE_STATE_KEYS = new Set<string>([
-  'sources', 'nodes', 'customSchemes', 'localRuleSets', 'builtinSchemeOverrides', 'schemeSnapshots', 'snapshotSeq', 'ruleSetExclusions', 'selectedSchemeID',
-  'policySelections', 'exportConfigName', 'tailnets', 'tailnetAuthKeys',
-])
+const WORKSPACE_STATE_KEY_SET = new Set<string>(WORKSPACE_STATE_KEYS)
 
 export const useStore = create<Store>()(
   persist(
@@ -526,7 +524,7 @@ export const useStore = create<Store>()(
         if (!resolved || typeof resolved !== 'object') return
         const allowed = Object.fromEntries(
           Object.entries(resolved as Record<string, unknown>)
-            .filter(([key]) => !WORKSPACE_STATE_KEYS.has(key)),
+            .filter(([key]) => !WORKSPACE_STATE_KEY_SET.has(key)),
         )
         if (Object.keys(allowed).length === 0) return
         rawSet(allowed, false)

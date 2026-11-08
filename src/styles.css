@@ -3089,6 +3089,62 @@ dialog h3 { font-family: var(--font-display); font-size: 20px; font-weight: 600;
   background: var(--pill-positive-bg);
   color: var(--pill-positive-ink);
 }
+/* 字段级问题明细：横幅改为纵向列表，过长时自身滚动，不遮住整页。 */
+.workspace-alert.issues {
+  flex-direction: column;
+  align-items: stretch;
+  max-height: min(70vh, 460px);
+  overflow-y: auto;
+}
+.workspace-alert-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.workspace-alert-head span { flex: 1; line-height: 1.5; }
+.workspace-issue-list {
+  list-style: none;
+  margin: 0;
+  padding: 8px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-top: 1px solid rgba(0, 0, 0, 0.08);
+}
+.workspace-issue-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  line-height: 1.45;
+}
+.workspace-issue-list small {
+  flex-basis: 100%;
+  opacity: 0.85;
+}
+.workspace-issue-badge {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: rgba(0, 0, 0, 0.08);
+}
+.workspace-issue-badge.dropped {
+  background: rgba(192, 57, 43, 0.14);
+  color: #8c2f1f;
+}
+.workspace-issue-badge.fallback {
+  background: rgba(176, 110, 0, 0.16);
+  color: #8a5a00;
+}
+.workspace-issue-badge.migrated {
+  background: rgba(31, 122, 70, 0.14);
+  color: #1f6b3d;
+}
+.workspace-issue-key { flex: none; font-weight: 600; }
+.workspace-issue-label { flex: none; opacity: 0.9; }
+.workspace-issue-help { flex: none; line-height: 1.5; opacity: 0.85; }
 .storage-alert-close {
   flex: none;
   border: 0;

@@ -2,34 +2,21 @@
 // 只同步「多设备应该一致」的数据；导出目标、隐藏客户端、排序、Emoji、
 // 测速模式、地图与高级区展开等设备偏好仍留在 localStorage。
 import { useSyncExternalStore } from 'react'
-import type { BuiltinSchemeOverrideRef, BuiltinSchemeSnapshot, LocalRuleSet, ProxyNode, RuleScheme, RuleSetExclusionTable, SubscriptionSource, TailnetConnection } from './models/types'
-import { normalizeBuiltinSchemes, normalizeSource } from './backup'
-import { BUILTIN_SCHEMES } from './rules/scheme'
-import { normalizeRuleSetExclusions } from './rules/ruleSetExclusions'
 import { persistTailnetAuthKeys } from './models/tailnetAuthKeys'
 import { useStore, type Store } from './store'
+import {
+  describeWorkspaceIssues,
+  normalizeWorkspaceData,
+  normalizeWorkspaceDataDetailed,
+  WorkspaceDataError,
+  type WorkspaceData,
+  type WorkspaceIssue,
+} from './workspaceValidation'
 import { apiFetch, getAPIKey } from './util/apiAuth'
 import { isWorkspaceReadOnly, setWorkspaceReadOnly } from './util/workspaceLock'
 
-export interface WorkspaceData {
-  sources: SubscriptionSource[]
-  nodes: ProxyNode[]
-  customSchemes: RuleScheme[]
-  localRuleSets: LocalRuleSet[]
-  builtinSchemeOverrides: Record<string, BuiltinSchemeOverrideRef>
-  /** 独立固化快照；与覆盖层指针一起同步，才能解引用。 */
-  schemeSnapshots: Record<string, BuiltinSchemeSnapshot>
-  snapshotSeq: number
-  /** 只读规则集的本地屏蔽表；必须跟工作区一起同步。 */
-  ruleSetExclusions: RuleSetExclusionTable
-  selectedSchemeID: string
-  policySelections: Record<string, string>
-  exportConfigName: string
-  tailnets: TailnetConnection[]
-  tailnetAuthKeys: Record<string, string>
-}
-
-export class WorkspaceDataError extends Error {}
+export { normalizeWorkspaceData, WorkspaceDataError }
+export type { WorkspaceData, WorkspaceIssue }
 
 export type WorkspaceState =
   | 'checking'
@@ -48,6 +35,8 @@ export interface WorkspaceStatus {
   readOnly: boolean
   version: number
   message: string
+  /** 本次从服务端载入时被丢弃 / 回退 / 升级的字段明细；界面必须逐条展示。 */
+  issues: WorkspaceIssue[]
 }
 
 let status: WorkspaceStatus = {
@@ -56,6 +45,7 @@ let status: WorkspaceStatus = {
   readOnly: false,
   version: 0,
   message: '',
+  issues: [],
 }
 const listeners = new Set<() => void>()
 
@@ -78,62 +68,8 @@ function updateStatus(patch: Partial<WorkspaceStatus>): void {
   for (const listener of listeners) listener()
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function stringRecord(value: unknown, field: string): Record<string, string> {
-  if (value === undefined) return {}
-  if (!isRecord(value)) throw new WorkspaceDataError(`工作区字段 ${field} 不是对象`)
-  const out: Record<string, string> = {}
-  for (const [key, item] of Object.entries(value)) {
-    if (typeof item === 'string') out[key] = item
-  }
-  return out
-}
-
-function arrayField<T>(raw: Record<string, unknown>, field: string): T[] {
-  const value = raw[field]
-  if (value === undefined) return []
-  if (!Array.isArray(value)) throw new WorkspaceDataError(`工作区字段 ${field} 不是数组`)
-  return value as T[]
-}
-
-/** 校验并规范化服务端数据；缺字段按空处理，类型错误直接拒绝。 */
-export function normalizeWorkspaceData(raw: unknown): WorkspaceData {
-  if (!isRecord(raw)) throw new WorkspaceDataError('工作区数据不是对象')
-  const sources = arrayField<SubscriptionSource>(raw, 'sources').map(normalizeSource)
-  const customSchemes = arrayField<RuleScheme>(raw, 'customSchemes')
-  const builtinSchemes = normalizeBuiltinSchemes(
-    raw.builtinSchemeOverrides,
-    raw.schemeSnapshots,
-    raw.snapshotSeq,
-    // 旧数据 / 手工改坏的数据里 ruleSets 可能不是数组；这里只读 id，
-    // 不能因为一个方案的脏字段让整个工作区加载失败。
-    customSchemes.flatMap((scheme) => Array.isArray(scheme?.ruleSets) ? scheme.ruleSets.map((ruleSet) => ruleSet.id) : []),
-  )
-  return {
-    sources,
-    nodes: arrayField<ProxyNode>(raw, 'nodes'),
-    customSchemes,
-    localRuleSets: arrayField<LocalRuleSet>(raw, 'localRuleSets'),
-    ...builtinSchemes,
-    ruleSetExclusions: normalizeRuleSetExclusions(raw.ruleSetExclusions),
-    // useScheme 对未知 id 会静默显示第一个内置方案，但选择器 / 方案卡仍按未知
-    // id 找不到对象，出现「内容有、标题和快照面板空」的半空状态。
-    selectedSchemeID: typeof raw.selectedSchemeID === 'string'
-      && (BUILTIN_SCHEMES.some((meta) => meta.id === raw.selectedSchemeID)
-        || customSchemes.some((scheme) => scheme.id === raw.selectedSchemeID))
-      ? raw.selectedSchemeID
-      : BUILTIN_SCHEMES[0].id,
-    policySelections: stringRecord(raw.policySelections, 'policySelections'),
-    exportConfigName: typeof raw.exportConfigName === 'string'
-      ? raw.exportConfigName.replace(/[\r\n]/g, '').slice(0, 48) || 'tower'
-      : 'tower',
-    tailnets: arrayField<TailnetConnection>(raw, 'tailnets'),
-    tailnetAuthKeys: stringRecord(raw.tailnetAuthKeys, 'tailnetAuthKeys'),
-  }
-}
+/** 服务端数据里客户端不认识的顶层字段；每次推送原样带回。 */
+let preservedUnknownFields: Record<string, unknown> = {}
 
 /** 当前内存状态里属于工作区的字段。 */
 export function workspaceSnapshot(state: Store): WorkspaceData {
@@ -467,12 +403,21 @@ async function fetchFull(options: { notice?: string } = {}): Promise<boolean> {
     return false
   }
   let data: WorkspaceData
+  let issues: WorkspaceIssue[]
   try {
-    data = normalizeWorkspaceData(payload.data)
+    const normalized = normalizeWorkspaceDataDetailed(payload.data)
+    data = normalized.data
+    issues = normalized.issues
+    // 未知顶层字段必须跟着工作区走，否则旧版本打开新数据一次就会永久丢字段。
+    preservedUnknownFields = normalized.unknown
   } catch (error) {
     goReadOnly('corrupt', error instanceof Error ? error.message : '工作区数据不完整')
     return false
   }
+
+  const dropped = issues.filter((item) => item.severity === 'dropped')
+  // 整块损坏的字段会保留本机原值，不会被当成空数组写回服务端。
+  const affectedLabels = [...new Set(dropped.map((item) => item.keyLabel))]
 
   if (payload.version === 0 && !hasContent(data)) {
     // 服务端还没有工作区：首次迁移，把本机缓存推上去创建。
@@ -499,23 +444,36 @@ async function fetchFull(options: { notice?: string } = {}): Promise<boolean> {
     return false
   }
 
+  if (payload.version > 0 && !hasContent(data) && dropped.length > 0) {
+    // 服务端有版本但关键内容全坏：绝不能当成「本机为空」继续，
+    // 否则一刷新就把本机缓存清掉，用户看到的是空工作区而不是损坏提示。
+    goReadOnly(
+      'corrupt',
+      `服务端工作区 v${payload.version} 存在，但${affectedLabels.join('、')}无法读取；已保留本机当前数据，没有当作空工作区覆盖。`,
+      issues,
+    )
+    return false
+  }
+
   // 本地完全没有数据、服务端有数据：多半是新设备 / 新访问地址，
   // 明确说明这是从服务端载入，避免用户把正常同步误认为数据丢失。
   const localWasEmpty = !hasContent(workspaceSnapshot(useStore.getState()))
   applyServerData(data)
   serverVersion = payload.version
   lastSignature = signature(workspaceSnapshot(useStore.getState()))
-  markOnline(payload.version, options.notice
-    ?? (localWasEmpty ? '这是新设备或新地址：已从服务端载入工作区。' : ''))
+  const summary = describeWorkspaceIssues(issues)
+  const notice = options.notice
+    ?? (!summary && localWasEmpty ? '这是新设备或新地址：已从服务端载入工作区。' : '')
+  markOnline(payload.version, [notice, summary].filter(Boolean).join(' '), issues)
   return true
 }
 
-function markOnline(version: number, message: string): void {
+function markOnline(version: number, message: string, issues: WorkspaceIssue[] = []): void {
   ready = true
   failureCount = 0
   pollFailures = 0
   setWorkspaceReadOnly(false)
-  updateStatus({ mode: 'server', state: 'online', readOnly: false, version, message })
+  updateStatus({ mode: 'server', state: 'online', readOnly: false, version, message, issues })
 }
 
 export function applyServerData(data: WorkspaceData): void {
@@ -557,7 +515,8 @@ async function putWorkspace(version: number, data: WorkspaceData): Promise<PutRe
     res = await apiFetch('/api/workspace', {
       method: 'PUT',
       headers: { 'content-type': 'application/json; charset=utf-8' },
-      body: JSON.stringify({ version, data }),
+      // 服务端不认识的顶层字段原样带回，避免旧版本一次编辑就丢新字段。
+      body: JSON.stringify({ version, data: { ...preservedUnknownFields, ...data } }),
     })
   } catch {
     return 'offline'
@@ -616,7 +575,7 @@ async function flushWrite(): Promise<boolean> {
     if (typeof result === 'number') {
       serverVersion = result
       lastSignature = nextSignature
-      markOnline(result, '')
+      markOnline(result, '', status.issues)
       return true
     }
     if (result === 'conflict') {
@@ -685,11 +644,17 @@ function goOffline(detail?: string): void {
     readOnly: true,
     version: serverVersion,
     message: detail ?? '',
+    // 上一次载入的「已跳过 N 项」不能继续挂在离线横幅上。
+    issues: [],
   })
   scheduleRetry()
 }
 
-function goReadOnly(kind: 'unauthorized' | 'corrupt' | 'blocked', message: string): void {
+function goReadOnly(
+  kind: 'unauthorized' | 'corrupt' | 'blocked',
+  message: string,
+  issues: WorkspaceIssue[] = [],
+): void {
   ready = false
   setWorkspaceReadOnly(true)
   updateStatus({
@@ -698,6 +663,7 @@ function goReadOnly(kind: 'unauthorized' | 'corrupt' | 'blocked', message: strin
     readOnly: true,
     version: serverVersion,
     message,
+    issues,
   })
   scheduleRetry()
 }

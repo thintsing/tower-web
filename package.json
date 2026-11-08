@@ -63,6 +63,7 @@
     "selfcheck:upstream-status": "tsx scripts/selfcheck-upstream-status.ts",
     "selfcheck:workspace": "tsx scripts/selfcheck-workspace.ts",
     "selfcheck:workspace-history": "tsx scripts/selfcheck-workspace-history.ts",
+    "selfcheck:workspace-validation": "tsx scripts/selfcheck-workspace-validation.ts",
     "selfcheck:yaml": "tsx scripts/selfcheck-yaml.ts"
   },
   "dependencies": {

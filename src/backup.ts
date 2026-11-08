@@ -159,7 +159,7 @@ function validRuleSet(value: unknown): value is SchemeRuleSet {
     && value.rules.every(validRule)
 }
 
-function validSource(value: unknown): value is SubscriptionSource {
+export function validSource(value: unknown): value is SubscriptionSource {
   return isRecord(value)
     && isString(value.id)
     && isString(value.name)
@@ -209,7 +209,7 @@ export function normalizeSource(value: SubscriptionSource): SubscriptionSource {
   }
 }
 
-function validNode(value: unknown): value is ProxyNode {
+export function validNode(value: unknown): value is ProxyNode {
   return isRecord(value)
     && isString(value.id)
     && isString(value.kind)
@@ -227,7 +227,7 @@ function validNode(value: unknown): value is ProxyNode {
     && (value.skipCertificateVerification === undefined || typeof value.skipCertificateVerification === 'boolean')
 }
 
-function validScheme(value: unknown): value is RuleScheme {
+export function validScheme(value: unknown): value is RuleScheme {
   return isRecord(value)
     && isString(value.id)
     && isString(value.name)
@@ -251,7 +251,7 @@ function validLocalRule(value: unknown): boolean {
     && (value.noResolve === undefined || typeof value.noResolve === 'boolean')
 }
 
-function validLocalRuleSet(value: unknown): value is LocalRuleSet {
+export function validLocalRuleSet(value: unknown): value is LocalRuleSet {
   return isRecord(value)
     && isString(value.id)
     && isString(value.name)
@@ -260,7 +260,7 @@ function validLocalRuleSet(value: unknown): value is LocalRuleSet {
 }
 
 /** 指出方案具体坏在哪一条规则 / 策略组，供恢复预览逐条展示。 */
-function schemeRejectReason(value: unknown): string {
+export function schemeRejectReason(value: unknown): string {
   if (!isRecord(value)) return '不是对象'
   if (!isString(value.id) || !isString(value.name)) return '缺少 id 或 name'
   if (!Array.isArray(value.groups)) return 'groups 不是数组'
@@ -282,7 +282,7 @@ function schemeRejectReason(value: unknown): string {
   return '字段类型或必填项不完整'
 }
 
-function localRuleSetRejectReason(value: unknown): string {
+export function localRuleSetRejectReason(value: unknown): string {
   if (!isRecord(value)) return '不是对象'
   if (!isString(value.id) || !isString(value.name)) return '缺少 id 或 name'
   if (!Array.isArray(value.rules)) return 'rules 不是数组'
@@ -544,7 +544,7 @@ export function clearCorruptPersistence(
   return { overrides: nextOverrides, snapshots: nextSnapshots, pointersCleared, snapshotsCleared }
 }
 
-function validTailnet(value: unknown): value is TailnetConnection {
+export function validTailnet(value: unknown): value is TailnetConnection {
   return isRecord(value)
     && isString(value.id)
     && isString(value.name)

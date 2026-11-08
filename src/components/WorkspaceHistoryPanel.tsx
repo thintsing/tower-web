@@ -3,7 +3,8 @@
 import { useEffect, useState } from 'react'
 import { BUILTIN_SCHEMES } from '../rules/scheme'
 import { useStore } from '../store'
-import { flushWorkspaceNow, normalizeWorkspaceData, reloadWorkspaceFromServer, useWorkspaceStatus, workspaceServerVersion, workspaceSnapshot, type WorkspaceData } from '../workspaceSync'
+import { flushWorkspaceNow, reloadWorkspaceFromServer, useWorkspaceStatus, workspaceServerVersion, workspaceSnapshot, type WorkspaceData } from '../workspaceSync'
+import { normalizeWorkspaceDataDetailed } from '../workspaceValidation'
 import {
   fetchWorkspaceHistory,
   fetchWorkspaceHistoryEntry,
@@ -86,12 +87,15 @@ function resolvedOverride(data: WorkspaceData, id: string): string {
 
 /** 对比当前工作区与目标版本，列出会被改动的方案名。 */
 export function describeSchemeImpact(currentRaw: WorkspaceData, targetRaw: unknown): string[] {
-  let target: WorkspaceData
-  try {
-    target = normalizeWorkspaceData(targetRaw)
-  } catch {
-    return ['目标版本数据不完整，无法逐项列出受影响的方案']
+  // 逐键容错不再抛错，必须看 dropped 明细，否则坏版本会被当成「少了很多方案」。
+  const normalized = normalizeWorkspaceDataDetailed(targetRaw)
+  const dropped = normalized.issues.filter((item) => item.severity === 'dropped')
+  if (dropped.length > 0) {
+    const labels = [...new Set(dropped.map((item) => item.keyLabel))]
+    const shown = labels.slice(0, 3).join('、') + (labels.length > 3 ? '…' : '')
+    return [`目标版本数据不完整（${shown}无法读取），无法逐项列出受影响的方案`]
   }
+  const target: WorkspaceData = normalized.data
   const impacts: string[] = []
   const currentSchemes = new Map(currentRaw.customSchemes.map((scheme) => [scheme.id, scheme]))
   const targetSchemes = new Map(target.customSchemes.map((scheme) => [scheme.id, scheme]))

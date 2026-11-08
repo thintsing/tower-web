@@ -1461,6 +1461,7 @@ function SubscriptionSettingsDialog({
     [builtinSchemeOverrides, schemeSnapshots],
   )
   const readOnly = useWorkspaceStatus().readOnly
+  const workspaceIssues = useWorkspaceStatus().issues
   const [pendingBackup, setPendingBackup] = useState<BackupFile | null>(null)
   const [backupBusy, setBackupBusy] = useState(false)
   const [backupError, setBackupError] = useState('')
@@ -1993,6 +1994,27 @@ function SubscriptionSettingsDialog({
           >清除损坏记录</button>
         </div>
         <div className="persistence-health">
+          {workspaceIssues.length > 0 && (
+            <div className="persistence-group">
+              <strong>服务端工作区字段问题（本次加载）</strong>
+              <ul>
+                {workspaceIssues.map((item, index) => (
+                  <li key={`${item.key}-${item.label}-${index}`}>
+                    <span className="backup-rejection-kind">
+                      {item.severity === 'dropped' ? '已跳过' : item.severity === 'fallback' ? '已回退' : '已升级'}
+                      {' · '}{item.keyLabel}
+                    </span>
+                    <span className="backup-rejection-label">{item.label}</span>
+                    <small>{item.reason}</small>
+                  </li>
+                ))}
+              </ul>
+              <small className="hint">
+                整块损坏的字段会保留本机原值；被丢弃的条目可尝试在「工作区历史」恢复上一版，
+                服务端整体无法解析时会保留 .broken-* 原始文件。
+              </small>
+            </div>
+          )}
           {backupRejections.length > 0 && (
             <div className="persistence-group">
               <strong>恢复 / 加载时被丢弃的条目（本次会话）</strong>
@@ -2030,8 +2052,8 @@ function SubscriptionSettingsDialog({
               </ul>
             </div>
           )}
-          {backupRejections.length === 0 && snapshotIssueTotal === 0 && (
-            <div className="hint">未发现被丢弃的数据或损坏的快照记录。</div>
+          {backupRejections.length === 0 && snapshotIssueTotal === 0 && workspaceIssues.length === 0 && (
+            <div className="hint">未发现被丢弃的数据、服务端工作区字段问题或损坏的快照记录。</div>
           )}
         </div>
         <div className="settings-divider" />
