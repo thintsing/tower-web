@@ -46,7 +46,7 @@ jobs:
           # 让 selfcheck:yaml 的发布/分发 E2E 也指向隔离的临时服务端，
           # 不依赖开发者本机 8787，也不写仓库里的 subscriptions.json。
           export TOWER_BASE="http://127.0.0.1:8787"
-          for check in asn auth backup batch catalog clients dns drift duplicates fetch-guard flow importers icons manual manual-form map matching protocols qr quota regressions remote rulesets rule-order rule-impact freeze-preview upstream upstream-status workspace workspace-history workspace-validation yaml; do
+          for check in asn auth backup batch catalog clients dns drift duplicates fetch-guard flow importers icons manual manual-form map matching protocols qr quota regressions remote rulesets rule-order rule-impact freeze-preview upstream upstream-status workspace workspace-history workspace-validation workspace-save workspace-overwrite yaml; do
             echo "::group::selfcheck:$check"
             npm run "selfcheck:$check"
             echo "::endgroup::"

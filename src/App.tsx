@@ -46,7 +46,7 @@ import { formatSupportsProxyCollections, prepareSchemeForExport } from './genera
 import { autoFillGroupEmojis } from './generator/groupIcons'
 import { maskTailnetAuthKeys, tailnetSupports } from './generator/tailnet'
 import { copyToClipboard, newID } from './util/browser'
-import { browserStorage, clearTowerStorage, createSafeStorage, isStorageFull, onStorageFullChange } from './util/localStore'
+import { browserStorage, clearTowerStorage, createSafeStorage, describeStorageFull, getStorageFullSerial, isStorageFull, measureStorage, onStorageFullChange } from './util/localStore'
 import { placeDetailsPanel, placeOpenDetailsPanels } from './util/menuPlacement'
 import { apiFetch, clearAPIKey, getAPIKey, setAPIKey } from './util/apiAuth'
 import { MAX_REMOTE_RULE_SET_URLS, normalizeRemoteTextURL, remoteRuleSetNameFromURL, splitRemoteTextURLs } from './util/remoteURL'
@@ -9601,10 +9601,29 @@ export function App() {
   const ruleSetAutoRefreshStarted = useRef(false)
   const builtinUpdateCheckStarted = useRef(false)
   const keysPruned = useRef(false)
-  const [storageFull, setStorageFull] = useState(isStorageFull)
-  const workspaceMode = useWorkspaceStatus().mode
+  const [storageState, setStorageState] = useState(() => ({
+    full: isStorageFull(),
+    serial: getStorageFullSerial(),
+  }))
+  const [storageDismissedSerial, setStorageDismissedSerial] = useState(0)
+  const workspaceStatus = useWorkspaceStatus()
+  const workspaceMode = workspaceStatus.mode
 
-  useEffect(() => onStorageFullChange(setStorageFull), [])
+  useEffect(() => onStorageFullChange((full) => {
+    // 每次容量失败都会带上新的 serial；用户点掉上一次提示后，下一次失败仍会重新出现。
+    setStorageState({ full, serial: getStorageFullSerial() })
+  }), [])
+
+  const showStorageFull = storageState.full && storageState.serial > storageDismissedSerial
+  const storageNotice = useMemo(
+    () => (showStorageFull
+      ? describeStorageFull(
+          { mode: workspaceStatus.mode, state: workspaceStatus.state },
+          measureStorage(),
+        )
+      : ''),
+    [showStorageFull, workspaceStatus.mode, workspaceStatus.state, storageState.serial],
+  )
 
   // 四步主线需要跨页读取同一份数据；方案本身仍然走缓存加载。
   const scheme = useScheme()
@@ -9824,11 +9843,15 @@ export function App() {
     <div className="app-shell">
       <LANAccessGate />
       <WorkspaceStatusBanner />
-      {storageFull && (
+      {showStorageFull && (
         <div className="storage-alert" role="alert">
           <strong>浏览器存储已满</strong>
-          <span>当前修改只保留在内存中，刷新后会丢失。请到「导出」页保存备份，再清理不需要的订阅或规则方案。</span>
-          <button className="storage-alert-close" type="button" onClick={() => setStorageFull(false)}>
+          <span>{storageNotice}</span>
+          <button
+            className="storage-alert-close"
+            type="button"
+            onClick={() => setStorageDismissedSerial(storageState.serial)}
+          >
             知道了
           </button>
         </div>

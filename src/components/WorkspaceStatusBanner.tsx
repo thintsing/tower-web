@@ -53,6 +53,22 @@ export function WorkspaceStatusBanner() {
   // local 模式不提示；unknown（首次探测失败）必须提示，否则空白页面看起来像数据丢了。
   if (status.mode === 'local') return null
 
+  if (status.state === 'unsaved') {
+    // 保存失败不能用「知道了」压掉：改动仍在内存里，刷新就会丢。
+    // 同一错误再次出现时继续显示，直到重试成功或用户真的离开页面。
+    return (
+      <div className="workspace-alert issues" role="alert">
+        <div className="workspace-alert-head">
+          <strong>工作区未保存</strong>
+          <span>{status.message}</span>
+        </div>
+        <small className="workspace-issue-help">
+          本地改动仍在内存中，正在自动重试保存；离开页面前会再次确认。
+        </small>
+      </div>
+    )
+  }
+
   const issues = status.issues
   const dropped = issues.filter((item) => item.severity === 'dropped')
   const fallback = issues.filter((item) => item.severity === 'fallback')
@@ -84,7 +100,7 @@ export function WorkspaceStatusBanner() {
       ? `服务端工作区有 ${dropped.length} 项内容无法读取`
       : `服务端工作区有 ${fallback.length} 项内容已回退`
     const sub = dropped.some((item) => item.wholeKey)
-      ? '整块损坏的字段已保留本机原值，不会用空值覆盖；其余字段正常加载，明细如下。'
+      ? '整块损坏的字段已保留本机原值，保存时会把服务端原内容原样写回，不会用空值覆盖；其余字段正常加载，明细如下。'
       : '已跳过损坏的条目，其余内容正常加载；明细如下。'
     return (
       <div className="workspace-alert issues" role="alert">

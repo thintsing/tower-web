@@ -12,6 +12,13 @@ import {
   type WorkspaceData,
   type WorkspaceIssue,
 } from './workspaceValidation'
+import { describeWorkspaceTooLarge, WORKSPACE_MAX_BYTES } from './workspaceSize'
+import {
+  initialSaveState,
+  nextSaveFailure,
+  nextSaveSuccess,
+  saveRetryDelay,
+} from './workspaceSaveNotice'
 import { apiFetch, getAPIKey } from './util/apiAuth'
 import { isWorkspaceReadOnly, setWorkspaceReadOnly } from './util/workspaceLock'
 
@@ -23,6 +30,8 @@ export type WorkspaceState =
   | 'local'
   | 'connecting'
   | 'online'
+  /** 有本地改动没能写进服务端；与离线不同，用户仍可继续编辑并自动重试。 */
+  | 'unsaved'
   | 'offline'
   | 'unauthorized'
   | 'corrupt'
@@ -71,6 +80,12 @@ function updateStatus(patch: Partial<WorkspaceStatus>): void {
 /** 服务端数据里客户端不认识的顶层字段；每次推送原样带回。 */
 let preservedUnknownFields: Record<string, unknown> = {}
 
+/**
+ * 整块无法读取、但服务端仍持有的顶层字段原始 JSON。
+ * 本机不能把它当空值推回去，否则新设备一编辑就覆盖服务端原内容。
+ */
+let preservedWholeKeys: Record<string, unknown> = {}
+
 /** 当前内存状态里属于工作区的字段。 */
 export function workspaceSnapshot(state: Store): WorkspaceData {
   return normalizeWorkspaceData({
@@ -116,6 +131,18 @@ function currentSignature(): string {
   return signature(workspaceSnapshot(useStore.getState()))
 }
 
+function rawRecord(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+}
+
+/** 有本机改动尚未得到服务端确认；首次载入前的缓存不算。 */
+function hasPendingLocalChanges(): boolean {
+  if (status.state === 'unsaved') return true
+  return lastSignature !== '' && currentSignature() !== lastSignature
+}
+
 const WATCHED_KEYS = [
   'sources',
   'nodes',
@@ -142,6 +169,8 @@ let initialized: Promise<void> | null = null
 let writing = false
 let pendingWrite = false
 let failureCount = 0
+let saveState = initialSaveState()
+let unsavedRetryTimer: number | undefined
 // 版本探针连续失败两次才判定离线：一次网络抖动不打断正在编辑的页面，
 // 又能在服务端停掉后约 16 秒内进入只读，而不是等到用户真的改东西才发现。
 let pollFailures = 0
@@ -249,6 +278,20 @@ function bindWindowListeners(): void {
   windowListenersBound = true
   window.addEventListener('focus', refreshNow)
   document.addEventListener('visibilitychange', refreshNow)
+  window.addEventListener('beforeunload', warnBeforeUnload)
+}
+
+/** 离开页面前仍有未推送改动时让浏览器弹确认，避免整段编辑被静默丢掉。 */
+function warnBeforeUnload(event: BeforeUnloadEvent): void {
+  if (!serverMode) return
+  if (status.state !== 'unsaved') {
+    // lastSignature 为空时页面刚载入、还没确认过服务端版本：
+    // 此时本机缓存不算「本次编辑」，不能无端弹离开确认。
+    if (lastSignature === '' || currentSignature() === lastSignature) return
+  }
+  event.preventDefault()
+  // 旧浏览器要求设置 returnValue 才会弹确认。
+  event.returnValue = ''
 }
 
 function setupPolling(): void {
@@ -263,6 +306,11 @@ function setupPolling(): void {
 function refreshNow(): void {
   if (!serverMode) return
   if (document.visibilityState !== 'visible') return
+  // 有未保存改动时只重试保存；即使处于离线只读，也不能先拉远端覆盖本机编辑。
+  if (hasPendingLocalChanges()) {
+    void flushWrite(!ready)
+    return
+  }
   if (isWorkspaceReadOnly()) {
     // 离线 / 密钥错误时给一次立即重连的机会。
     if (status.state !== 'unauthorized') void fetchFull()
@@ -299,21 +347,61 @@ function scheduleRetry(): void {
   }, delay)
 }
 
+function scheduleUnsavedRetry(): void {
+  if (unsavedRetryTimer !== undefined || typeof window === 'undefined') return
+  const delay = saveRetryDelay(saveState.failures)
+  unsavedRetryTimer = window.setTimeout(() => {
+    unsavedRetryTimer = undefined
+    void retryUnsaved()
+  }, delay)
+}
+
+async function retryUnsaved(): Promise<void> {
+  if (!serverMode || !ready || isWorkspaceReadOnly()) return
+  if (status.state !== 'unsaved') return
+  await flushWrite()
+}
+
+/** 保存失败：进入持久可见的「未保存」，并按退避自动重试。 */
+function markUnsaved(message: string): void {
+  // 服务端已经有过响应（413 / HTTP 错误 / 创建失败），后续退避重试可以直接发请求。
+  ready = true
+  saveState = nextSaveFailure(saveState, message)
+  updateStatus({
+    mode: 'server',
+    state: 'unsaved',
+    readOnly: false,
+    version: serverVersion,
+    message: saveState.message,
+    // 上一次载入的「已跳过 N 项」不能继续挂在未保存横幅上。
+    issues: [],
+  })
+  scheduleUnsavedRetry()
+}
+
 async function reconnect(): Promise<void> {
   if (!serverMode) {
     await detectMode()
     return
   }
-  // 网络恢复后先把尚未保存的改动推一次；版本冲突会在 flushWrite 内拉最新。
-  if (ready && currentSignature() !== lastSignature) {
-    await flushWrite()
-    if (status.state === 'online') return
+  // 网络恢复后先把尚未保存的改动推一次；推不进去就保持原状，
+  // 绝不落到 fetchFull 用服务端数据覆盖本机编辑。
+  if (hasPendingLocalChanges()) {
+    await flushWrite(!ready)
+    return
   }
   await fetchFull()
 }
 
 async function pollVersion(): Promise<void> {
   if (writing || debounceTimer !== undefined) return
+  // 有未保存改动时先写回，避免版本探针看到远端变化后拉全量、
+  // 把当前编辑静默覆盖；写回成功再继续比对版本。
+  if (hasPendingLocalChanges()) {
+    await flushWrite()
+    if (hasPendingLocalChanges() || isWorkspaceReadOnly()) return
+    if (writing) return
+  }
   let version: number
   try {
     const res = await apiFetch('/api/workspace/version', { cache: 'no-store' })
@@ -359,7 +447,13 @@ function notePollFailure(): void {
   if (pollFailures >= 2) goOffline('无法连接服务端')
 }
 
-async function fetchFull(options: { notice?: string } = {}): Promise<boolean> {
+async function fetchFull(options: { notice?: string; force?: boolean } = {}): Promise<boolean> {
+  // 有未推送的本地改动时，非显式强制拉取一律先尝试写回；
+  // 写不进去就直接返回，避免「服务端数据覆盖本机编辑 + 界面显示已同步」。
+  if (!options.force && hasPendingLocalChanges()) {
+    await flushWrite(!ready)
+    if (hasPendingLocalChanges()) return false
+  }
   let res: Response
   try {
     res = await apiFetch('/api/workspace', { cache: 'no-store' })
@@ -416,8 +510,14 @@ async function fetchFull(options: { notice?: string } = {}): Promise<boolean> {
   }
 
   const dropped = issues.filter((item) => item.severity === 'dropped')
-  // 整块损坏的字段会保留本机原值，不会被当成空数组写回服务端。
+  // 整字段无法读取时保留本机原值，不能把它写成空数组后推回服务端。
+  const droppedKeys = dropped.filter((item) => item.wholeKey).map((item) => item.key)
   const affectedLabels = [...new Set(dropped.map((item) => item.keyLabel))]
+  // 记住服务端这些键的原始 JSON：后续任意编辑触发推送时原样带回，
+  // 本机空值不会覆盖服务端原内容（单字段坏掉时也能保住数据）。
+  const serverRaw = rawRecord(payload.data)
+  preservedWholeKeys = {}
+  for (const key of droppedKeys) preservedWholeKeys[key] = serverRaw[key]
 
   if (payload.version === 0 && !hasContent(data)) {
     // 服务端还没有工作区：首次迁移，把本机缓存推上去创建。
@@ -437,9 +537,18 @@ async function fetchFull(options: { notice?: string } = {}): Promise<boolean> {
       markOnline(created, '已上传本机工作区')
       return true
     }
+    if (typeof created === 'object') {
+      // 413 / 服务端明确失败：必须进入「未保存」，不能停在 connecting 且无声。
+      markUnsaved(created.message)
+      return false
+    }
     if (created === 'conflict') {
       // 其他设备抢先创建：重新拉最新，不覆盖对方。
-      return await fetchFull({ notice: '另一台设备已先创建工作区，已载入最新数据。' })
+      return await fetchFull({ notice: '另一台设备已先创建工作区，已载入最新数据。', force: true })
+    }
+    if (created === 'offline') {
+      goOffline()
+      return false
     }
     return false
   }
@@ -458,7 +567,7 @@ async function fetchFull(options: { notice?: string } = {}): Promise<boolean> {
   // 本地完全没有数据、服务端有数据：多半是新设备 / 新访问地址，
   // 明确说明这是从服务端载入，避免用户把正常同步误认为数据丢失。
   const localWasEmpty = !hasContent(workspaceSnapshot(useStore.getState()))
-  applyServerData(data)
+  applyServerData(data, droppedKeys)
   serverVersion = payload.version
   lastSignature = signature(workspaceSnapshot(useStore.getState()))
   const summary = describeWorkspaceIssues(issues)
@@ -472,14 +581,23 @@ function markOnline(version: number, message: string, issues: WorkspaceIssue[] =
   ready = true
   failureCount = 0
   pollFailures = 0
+  saveState = nextSaveSuccess()
+  if (unsavedRetryTimer !== undefined) {
+    window.clearTimeout(unsavedRetryTimer)
+    unsavedRetryTimer = undefined
+  }
   setWorkspaceReadOnly(false)
   updateStatus({ mode: 'server', state: 'online', readOnly: false, version, message, issues })
 }
 
-export function applyServerData(data: WorkspaceData): void {
+/**
+ * 应用服务端数据。`keepKeys` 是整块损坏的顶层字段：这些键保留本机原值，
+ * 其它已通过校验的键正常落地；避免一个坏字段把本地可用数据一起清空。
+ */
+export function applyServerData(data: WorkspaceData, keepKeys: string[] = []): void {
   const previous = useStore.getState()
   // 服务端是这些字段的唯一事实来源；运行时测速结果按节点 id 绑定，重新拉取后清空。
-  useStore.setState({
+  const patch = {
     sources: data.sources,
     nodes: data.nodes,
     customSchemes: data.customSchemes,
@@ -502,12 +620,22 @@ export function applyServerData(data: WorkspaceData): void {
     probeErrorByNodeId: {},
     testingNodeIds: [],
     testingGeneration: previous.testingGeneration + 1,
-  })
-  persistTailnetAuthKeys(data.tailnetAuthKeys)
+  }
+  for (const key of keepKeys) {
+    delete (patch as Record<string, unknown>)[key]
+  }
+  useStore.setState(patch)
+  // 密钥表整块损坏时保留本机已保存的 Key，不能顺手把 localStorage 也清空。
+  if (!keepKeys.includes('tailnetAuthKeys')) persistTailnetAuthKeys(data.tailnetAuthKeys)
   watchedState = useStore.getState()
 }
 
-type PutResult = number | 'conflict' | 'unauthorized' | 'offline' | 'corrupt' | 'failed'
+interface SaveFailure {
+  kind: 'unsaved'
+  message: string
+}
+
+type PutResult = number | SaveFailure | 'conflict' | 'unauthorized' | 'offline' | 'corrupt' | 'failed'
 
 async function putWorkspace(version: number, data: WorkspaceData): Promise<PutResult> {
   let res: Response
@@ -515,8 +643,8 @@ async function putWorkspace(version: number, data: WorkspaceData): Promise<PutRe
     res = await apiFetch('/api/workspace', {
       method: 'PUT',
       headers: { 'content-type': 'application/json; charset=utf-8' },
-      // 服务端不认识的顶层字段原样带回，避免旧版本一次编辑就丢新字段。
-      body: JSON.stringify({ version, data: { ...preservedUnknownFields, ...data } }),
+      // 整块损坏字段原样写回：必须放在最后，否则会被本机快照里的空值覆盖。
+      body: JSON.stringify({ version, data: { ...preservedUnknownFields, ...data, ...preservedWholeKeys } }),
     })
   } catch {
     return 'offline'
@@ -537,8 +665,8 @@ async function putWorkspace(version: number, data: WorkspaceData): Promise<PutRe
   }
   if (res.status === 409) return 'conflict'
   if (res.status === 413) {
-    updateStatus({ message: '工作区超过 16MB 上限，本次改动没有保存' })
-    return 'failed'
+    const report = describeWorkspaceTooLarge(data, preservedUnknownFields, WORKSPACE_MAX_BYTES)
+    return { kind: 'unsaved', message: report.message }
   }
   if (res.status === 500) {
     const body = await res.json().catch(() => ({})) as { error?: string; code?: string }
@@ -549,14 +677,25 @@ async function putWorkspace(version: number, data: WorkspaceData): Promise<PutRe
     goReadOnly('corrupt', body.error ?? '服务端工作区不可用')
     return 'corrupt'
   }
-  if (!res.ok) return 'failed'
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({})) as { error?: string }
+    return {
+      kind: 'unsaved',
+      message: `服务端保存失败（HTTP ${res.status}）${body.error ? `：${body.error}` : ''}；本地改动会保留并自动重试。`,
+    }
+  }
   const body = await res.json().catch(() => ({})) as { version?: unknown }
-  if (typeof body.version !== 'number' || !Number.isInteger(body.version)) return 'failed'
+  if (typeof body.version !== 'number' || !Number.isInteger(body.version)) {
+    return {
+      kind: 'unsaved',
+      message: '服务端返回了无法识别的保存结果（HTTP 200），本次改动尚未确认保存；本地改动会保留并自动重试。',
+    }
+  }
   return body.version
 }
 
-async function flushWrite(): Promise<boolean> {
-  if (!ready) return false
+async function flushWrite(allowNotReady = false): Promise<boolean> {
+  if (!ready && !allowNotReady) return false
   if (writing) {
     pendingWrite = true
     return false
@@ -567,7 +706,12 @@ async function flushWrite(): Promise<boolean> {
   }
   const data = workspaceSnapshot(useStore.getState())
   const nextSignature = signature(data)
-  if (nextSignature === lastSignature && status.state === 'online') return true
+  if (nextSignature === lastSignature) {
+    // 用户把改动改回服务端已确认的版本，或者在未保存状态下重新对齐；
+    // 没有内容要写，直接收回「未保存」。
+    if (status.state === 'unsaved') markOnline(serverVersion, '', status.issues)
+    return true
+  }
 
   writing = true
   try {
@@ -575,20 +719,28 @@ async function flushWrite(): Promise<boolean> {
     if (typeof result === 'number') {
       serverVersion = result
       lastSignature = nextSignature
+      // 保存成功只收「未保存」，本次载入丢字段的明细保留到下一次 fetchFull。
       markOnline(result, '', status.issues)
       return true
     }
     if (result === 'conflict') {
       // 不做自动合并：直接拉最新并替换，提示用户另一台设备改过。
-      await fetchFull({ notice: '另一台设备刚改过工作区，已载入最新数据。' })
+      await fetchFull({ notice: '另一台设备刚改过工作区，已载入最新数据。', force: true })
       return false
     }
     if (result === 'offline') {
       goOffline()
       return false
     }
+    if (typeof result === 'object') {
+      markUnsaved(result.message)
+      return false
+    }
     if (result === 'failed') {
-      updateStatus({ message: status.message || '工作区保存失败，请稍后重试' })
+      // 403 / 429 / 404 已经进入只读或本地模式，不要再用「未保存」覆盖。
+      if (serverMode && !isWorkspaceReadOnly()) {
+        markUnsaved('工作区保存失败，本地改动尚未写入服务端。')
+      }
       return false
     }
     return false
@@ -620,6 +772,12 @@ function stopServerSync(): void {
   unsubscribeStore?.()
   unsubscribeStore = undefined
   watchedState = null
+  if (unsavedRetryTimer !== undefined) {
+    window.clearTimeout(unsavedRetryTimer)
+    unsavedRetryTimer = undefined
+  }
+  saveState = initialSaveState()
+  preservedWholeKeys = {}
   if (pollTimer !== undefined) {
     window.clearInterval(pollTimer)
     pollTimer = undefined
@@ -637,6 +795,7 @@ function stopServerSync(): void {
 
 function goOffline(detail?: string): void {
   failureCount += 1
+  ready = false
   setWorkspaceReadOnly(true)
   updateStatus({
     mode: 'server',
@@ -656,6 +815,10 @@ function goReadOnly(
   issues: WorkspaceIssue[] = [],
 ): void {
   ready = false
+  if (unsavedRetryTimer !== undefined) {
+    window.clearTimeout(unsavedRetryTimer)
+    unsavedRetryTimer = undefined
+  }
   setWorkspaceReadOnly(true)
   updateStatus({
     mode: 'server',
@@ -677,7 +840,8 @@ export async function flushWorkspaceNow(): Promise<void> {
 /** 服务端刚发生一次带外写入（例如历史回滚）后，强制拉取最新工作区。 */
 export async function reloadWorkspaceFromServer(options: { notice?: string } = {}): Promise<boolean> {
   if (!serverMode) return false
-  return await fetchFull(options)
+  // 历史回滚等显式操作：调用方已先 flushWorkspaceNow，这里强制以服务端为准。
+  return await fetchFull({ ...options, force: true })
 }
 
 /** 测试与调试用：读取当前已知的服务端版本号。 */
