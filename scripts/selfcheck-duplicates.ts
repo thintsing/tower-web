@@ -3,18 +3,21 @@
 // 是否走兜底必须完全一致——这是「删了等于没删」的直接证据。
 // 用法：npm run selfcheck:duplicates
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import type { PolicyGroup, ProxyNode, RoutingRule, RuleScheme, SchemeRuleSet } from '../src/models/types'
+import { CLIENTS } from '../src/models/types'
 import { analyzeDuplicateCleanup, applyDuplicateCleanup, restoreRemovedRules } from '../src/rules/duplicateCleanup'
 import { applyFixAction, buildFixActions } from '../src/rules/diagnosis'
 import { compileScheme, explainWith } from '../src/rules/ruleExplain'
-import { lintScheme } from '../src/rules/schemeLint'
+import { lintScheme, lintSummary } from '../src/rules/schemeLint'
 import { ruleSignature } from '../src/rules/ruleDiff'
 import { prepareSchemeForExport } from '../src/generator/groups'
 import { generateSubscriptionFormats } from '../src/generator'
 import { addRuleSetExclusion, filterExcludedRuleSets, normalizeRuleSetExclusions, removeRuleSetExclusion } from '../src/rules/ruleSetExclusions'
 import { createEditableSchemeCopy, undoEditableSchemeCopy } from '../src/rules/schemeCopy'
 import { useStore } from '../src/store'
-import { applyServerData, normalizeWorkspaceData, workspaceSnapshot } from '../src/workspaceSync'
+import { applyServerData, workspaceSnapshot } from '../src/workspaceSync'
+import { normalizeWorkspaceData } from '../src/workspaceValidation'
 
 let failures = 0
 function check(label: string, run: () => void): void {
@@ -54,6 +57,30 @@ function summary(plan: ReturnType<typeof analyzeDuplicateCleanup>): string {
     dead: plan.skipped.deadPredecessor.length,
     groups: plan.groups,
   })
+}
+
+/** 取出源码里每个 lintScheme(...) 的实参文本，用来确认调用方真的传了屏蔽表。 */
+function lintCallArgs(source: string): string[] {
+  const calls: string[] = []
+  const marker = 'lintScheme('
+  let index = source.indexOf(marker)
+  while (index >= 0) {
+    let depth = 0
+    let end = source.length
+    for (let cursor = index + marker.length - 1; cursor < source.length; cursor += 1) {
+      if (source[cursor] === '(') depth += 1
+      if (source[cursor] === ')') {
+        depth -= 1
+        if (depth === 0) {
+          end = cursor
+          break
+        }
+      }
+    }
+    calls.push(source.slice(index + marker.length, end))
+    index = source.indexOf(marker, end)
+  }
+  return calls
 }
 
 function selectGroups(...names: string[]): PolicyGroup[] {
@@ -919,6 +946,41 @@ function main(): void {
     assert.equal(plan.deletions[0].rule.value, 'local.example')
     assert.equal(plan.deletions[0].place.index + 1, 4)
     assert.equal(plan.deletions[0].duplicateOfIndex, 3)
+  })
+
+  check('同一方案 + 同一屏蔽表：诊断页与导出页 lint error 计数一致', () => {
+    // 只读规则集里有一条指向不存在策略组的规则 → 屏蔽前必定报 error。
+    const bad = rule('DOMAIN-SUFFIX', 'bad.example', '不存在的组')
+    const set: SchemeRuleSet = {
+      id: 'set-lint',
+      name: '在线分流',
+      group: '节点选择',
+      sourceKind: 'url',
+      sourceRef: 'https://example.com/lint.yaml',
+      rules: [bad],
+    }
+    const input = scheme([], { groups: selectGroups('节点选择'), ruleSets: [set] })
+    const exclusions = addRuleSetExclusion({}, 'set-lint', ruleSignature(bad))
+    const base = { scheme: input, nodes: [nodeFixture()], localRuleSets: [] }
+    const clash = CLIENTS.find((client) => client.target === 'clash-verge')!
+    const withoutExclusions = lintSummary(lintScheme(base))
+
+    assert.ok(withoutExclusions.error > 0, '屏蔽前应报出 error')
+    const diagnosis = lintSummary(lintScheme({ ...base, ruleSetExclusions: exclusions }))
+    const exportPage = lintSummary(lintScheme({ ...base, ruleSetExclusions: exclusions, clients: [clash] }))
+    assert.equal(diagnosis.error, 0, '屏蔽后诊断页不应再报 error')
+    assert.equal(exportPage.error, diagnosis.error, '诊断页与导出页的 error 计数必须一致')
+    // 防止参数空转：不传屏蔽表时导出页仍要报错。
+    assert.equal(lintSummary(lintScheme({ ...base, clients: [clash] })).error, withoutExclusions.error)
+
+    const restored = removeRuleSetExclusion(exclusions, 'set-lint', ruleSignature(bad))
+    assert.equal(lintSummary(lintScheme({ ...base, ruleSetExclusions: restored })).error, withoutExclusions.error)
+  })
+
+  check('App 的两处 lintScheme 调用都传了 ruleSetExclusions', () => {
+    const calls = lintCallArgs(readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8'))
+    assert.ok(calls.length >= 2, `应至少找到 2 处 lintScheme 调用，实际 ${calls.length} 处`)
+    for (const call of calls) assert.match(call, /ruleSetExclusions/)
   })
 
   console.log(failures === 0 ? '\n全部重复规则清理自检通过' : `\n${failures} 项重复规则清理自检失败`)

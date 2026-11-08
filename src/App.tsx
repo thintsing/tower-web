@@ -8128,8 +8128,8 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
 
   const enabled = useMemo(() => enabledNodes({ sources, nodes }), [sources, nodes])
   const lintIssues = useMemo(
-    () => (scheme ? lintScheme({ scheme, nodes: enabled, policySelections, localRuleSets, preferRuleSets, clients: [target] }) : []),
-    [scheme, enabled, policySelections, localRuleSets, preferRuleSets, target],
+    () => (scheme ? lintScheme({ scheme, nodes: enabled, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions, clients: [target] }) : []),
+    [scheme, enabled, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions, target],
   )
   const lintState = lintSummary(lintIssues)
   // key 里带上具体 error 的 id：同样数量的 error 换成另一批问题时，不能沿用上一次的「继续导出」确认。
@@ -9615,17 +9615,18 @@ export function App() {
   const localRuleSets = useStore((s) => s.localRuleSets)
   const preferRuleSets = useStore((s) => s.preferRuleSets)
   const customSchemes = useStore((s) => s.customSchemes)
+  const ruleSetExclusions = useStore((s) => s.ruleSetExclusions)
   const enabled = useMemo(() => enabledNodes({ sources, nodes }), [sources, nodes])
 
   const flowLint = useMemo(() => {
     if (!scheme) return { error: 0, warn: 0 }
     try {
-      const issues = lintScheme({ scheme, nodes: enabled, policySelections, localRuleSets, preferRuleSets })
+      const issues = lintScheme({ scheme, nodes: enabled, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions })
       return lintSummary(issues)
     } catch {
       return { error: 0, warn: 0 }
     }
-  }, [scheme, enabled, policySelections, localRuleSets, preferRuleSets])
+  }, [scheme, enabled, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions])
 
   const sourceErrors = useMemo(
     () => sources.map((source) => errors[source.id]?.trim()).filter((value): value is string => !!value),
