@@ -43,9 +43,10 @@
 - **自有节点**：可从链接、配置文本、文件导入，也可逐协议手动新建 / 编辑；MASQUE 支持 mihomo 密钥 CONNECT-IP 与 sing-box basic CONNECT-IP 两套方言。节点不随订阅刷新，可单独启用、停用、改名、删除和标记地区。
 - **测速与健康**：本机 TCP / ICMP 测速；订阅页汇总正常、异常、未测节点，可重测失败节点，并在节点详情显示来源、地区、ASN 网络组织和 TLS 信息。
 - **分布地图**：按四档延迟（≤100 / ≤200 / ≤350 / >350ms）给国家着色；支持按钮 / Ctrl+滚轮缩放、放大后拖动、低倍率地区聚合圆点、地区清单、地图上的全部测速按钮，以及选中地区节点列表内的一键分享。
-- **规则方案**：内置 ACL4SSR；支持粘贴、文件或 URL 导入 INI、Clash / mihomo、Surge、Egern 和 sing-box 方案，也可一键导入 Self-Configuration 预设。策略组可新建、删除、改名、按节点名正则建组、改类型、编辑候选、调整匹配顺序；导入来源方案支持全文编辑，复制自内置方案后还可恢复初始规则。条件组（Surge `subnet` / Egern `conditional`）和同方言标量参数会原样写回，其他客户端退回默认策略。
+- **规则方案**：内置 ACL4SSR 与 Loyalsoldier 规则集；支持粘贴、文件或 URL 导入 INI、Clash / mihomo、Surge、Egern 和 sing-box 方案，也可一键导入 Self-Configuration 预设。策略组可新建、删除、改名、按节点名正则建组、改类型、编辑候选、调整匹配顺序；导入来源方案支持全文编辑，复制自内置方案后还可恢复初始规则。条件组（Surge `subnet` / Egern `conditional`）和同方言标量参数会原样写回，其他客户端退回默认策略。
+- **Loyalsoldier 内置方案**：13 个 provider 只保存 URL / behavior / interval，**不保存规则正文**。Clash / mihomo 系写成原生 `rule-providers` + `RULE-SET`，客户端按地址自行更新；其他客户端经塔台服务 `/api/ruleset` 托管转换为目标方言，因此需要一个手机可达的对外地址（`TOWER_PUBLIC_URL`、当前非回环地址或局域网地址）。
 - **策略组展示**：可按组名识别并自动补全 Emoji，规则页可切换显示或隐藏；拖动组改变匹配顺序时，会提示哪些域名从原组改走新组，避免分流被悄悄改变。补充规则按最具体优先排序，规则集插到第一条冲突规则之前，FINAL 不参与拖动。
-- **规则集**：内置 ACL4SSR 快照与 871 个在线列表；支持本地 / 在线规则集、刷新、暂停、跨客户端引用或无损展开。开启「优先引用规则集」后，经典列表会自动压成 mihomo / Stash 的 MRS 与 sing-box / Hiddify 的 SRS 二进制规则集，表达不了的类型保持逐条内联；sing-box DNS 投影会额外引用同一列表的 domain-only SRS。
+- **规则集**：内置 ACL4SSR 快照与 871 个在线列表；支持本地 / 在线规则集、刷新、暂停、跨客户端引用或展开。开启「优先引用规则集」后，经典列表会自动压成 mihomo / Stash 的 MRS 与 sing-box / Hiddify 的 SRS 二进制规则集，表达不了的类型保持逐条内联；sing-box DNS 投影会额外引用同一列表的 domain-only SRS。
 - **固化与屏蔽**：内置 ACL4SSR 方案可「更新并固化」到上游同一 commit 的 INI 与全部列表（任一列表失败整次放弃，原厂快照始终保留）；固化历史保留原厂 + 最近 2 版，可在方案页「回退至此版」，只改本机与同步工作区，不会回滚已导出的客户端配置。固化后的内置方案在规则页显示为「只读」规则集，可按条目「屏蔽 / 解除屏蔽」并「撤销上次屏蔽 / 解除」；被屏蔽条目标记为「已屏蔽 N 条 · 仅编译期生效」，刷新或回退快照后屏蔽仍生效。
 - **DNS 与 ECS**：普通 / 国内 / 远程 DNS，跟随方案 / 标准保护 / 严格保护；mihomo 和 sing-box 使用纯节点解析组、DNS 投影与中国子网（ECS）。GEOIP / Surge IP 规则会补 `no-resolve`，仅在 DNS 已走代理时释放末尾 GEOIP 的该选项。
 - **导出与分享**：一次生成 7 种载体，按客户端设置完整配置 / 仅节点、地区 / 协议筛选、排序和命名；支持代理集合、Tailscale 内网、二维码和 `clash://` / `surge://` 一键导入。
@@ -175,8 +176,8 @@ docker run -d --name tower-web \
 推送 `v*.*.*` tag 后，GitHub Actions 会自动构建双架构镜像、推送 GHCR 并创建 Release：
 
 ```bash
-git tag v0.3.6
-git push origin v0.3.6
+git tag -a v0.3.7 -m "塔台 Tower Web v0.3.7"
+git push origin v0.3.7
 ```
 
 > 镜像默认允许局域网访问，可以在「订阅设置 → 局域网与访问密钥」关闭共享或生成 API 密钥；Docker 下生成首个密钥建议用 `TOWER_API_TOKEN`。`-p 8787:8787` 会把端口暴露到局域网，只建议在可信网络使用。
@@ -277,12 +278,13 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 | `npm run selfcheck:dns` | 校验 DNS 投影、纯节点组与 ECS |
 | `npm run selfcheck:importers` | 校验规则方案导入 |
 | `npm run selfcheck:protocols` | 校验协议解析与降级 |
+| `npm run selfcheck:provider-rulesets` | 校验 Loyalsoldier provider 方案、托管转换与本地模式导出 |
 | `npm run selfcheck:workspace` | 校验服务器版工作区接口、版本号、密钥与并发写 |
 | `npm run selfcheck:workspace-history` | 校验工作区历史、回滚版本号与容量淘汰 |
 | `npm run selfcheck:upstream-status` | 校验服务端上游定时检查、失败退避与工作区隔离 |
 
 <details>
-<summary>全部 31 项自检</summary>
+<summary>全部 42 项自检</summary>
 
 ```text
 selfcheck:asn         离线 IP / ASN 查询
@@ -304,21 +306,32 @@ selfcheck:manual-form 手动节点表单
 selfcheck:map         地图地区聚合
 selfcheck:matching    策略组拖动后的规则顺序
 selfcheck:protocols   协议解析与客户端降级
+selfcheck:provider-rulesets Loyalsoldier provider 方案 / 托管转换 / 缓存 / 回环地址
 selfcheck:qr          二维码生成与解码
 selfcheck:quota       订阅用量响应头 / Clash 方言探测 / 只取头
+selfcheck:refresh-report 批量刷新与自动刷新的成功 / 失败汇总
 selfcheck:regressions 审计回归：解析 / 命名 / 备份兼容 / 存储配额 / 隐式 TLS
 selfcheck:remote      代理集合与远程规则集
+selfcheck:ruleset-exclusions 规则集屏蔽记录：孤儿清理与移除影响
 selfcheck:rulesets    规则集方言转换
 selfcheck:rule-impact 自定义规则保存前的影响面
 selfcheck:rule-order  规则逐条排序与撤销
+selfcheck:sub-formats 订阅载体格式：单载体失败不留空
+selfcheck:sub-token   固定订阅 token / 地址规范 / 重置语义
 selfcheck:upstream    上游方案更新：成功 / 部分失败 / 全部失败 / 空列表
 selfcheck:upstream-status 服务端上游检查：结果文件 / 已固化与 pin / 退避 / 开关 / 不写工作区
 selfcheck:workspace   服务器版工作区：版本 / 304 / 409 / 密钥 / 坏文件 / 并发
+selfcheck:workspace-conflict 409 冲突：草稿保留与来源文案
 selfcheck:workspace-history 工作区历史：备份 / 回滚 / 容量 / 损坏文件
+selfcheck:workspace-impact 回滚前受影响订阅 / 节点 / 规则数量
+selfcheck:workspace-restore 回滚冲突 / 只读 / 离线时禁用
+selfcheck:workspace-validation 工作区逐字段校验与旧结构迁移
+selfcheck:workspace-save 保存失败 / 退避重试 / 413 文案
+selfcheck:workspace-overwrite 覆盖恢复不丢未保存改动
 selfcheck:yaml        Clash YAML 结构
 ```
 
-自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 31 项自检。
+自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 42 项自检；`package.json` 与 `.github/workflows/ci.yml` 的清单逐条对齐。
 
 </details>
 
@@ -335,6 +348,8 @@ selfcheck:yaml        Clash YAML 结构
 - 手动编辑 SSH 节点时表单只保留密码登录；导入时携带的私钥和口令不会回填到表单，保存后会丢失，请重新导入。
 - SSR、部分协议和部分规则类型只在支持它的客户端保留，导出页会列出跳过项。
 - 规则兼容性、协议能力、Tailscale 和 DNS / ECS 的具体限制随客户端不同，导出前请查看页面提示。
+- **Loon 会丢 `no-resolve`（行为降级，不是 bug）**：托管转换的 classic 正文按 Surge 手册「每行是一条不带策略的规则声明」产出，不带参数；Loon 的 `[Remote Rule]` 行也没有 `no-resolve` 参数位。因此 `lancidr` / `cncidr` / `telegramcidr` 在 Loon 上会多一次 DNS 解析，规则本身不会丢。
+- **Shadowrocket 会跳过 `applications`（行为降级，不是 bug）**：Shadowrocket 的经典文本口径不含 `PROCESS-NAME`，与它同一套口径的 Clash YAML 路径也不引用 `applications`；其余 12 个 provider 正常引用，导出页会点名被省略的列表。
 - 数据备份是覆盖恢复，不提供合并；备份不含 Tailscale Auth Key、测速结果和已发布 token。
 - 方案全文编辑依赖导入时保留的原始文本；内置 ACL4SSR 和旧版导入的自定义方案没有原文，需要重新导入或继续用表单编辑。
 - 闭源客户端无法自动化导入测试，当前以配置结构、规则白名单和引用完整性自检覆盖。

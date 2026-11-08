@@ -1,7 +1,7 @@
 {
   "name": "tower-web",
   "private": true,
-  "version": "0.3.6",
+  "version": "0.3.7",
   "license": "MIT",
   "description": "本地优先的代理订阅管理、测速与多客户端配置导出工具",
   "repository": {
@@ -56,6 +56,7 @@
     "selfcheck:regressions": "tsx scripts/selfcheck-regressions.ts",
     "selfcheck:remote": "tsx scripts/selfcheck-remote.ts",
     "selfcheck:rulesets": "tsx scripts/selfcheck-rulesets.ts",
+    "selfcheck:provider-rulesets": "tsx scripts/selfcheck-provider-rulesets.ts",
     "selfcheck:rule-order": "tsx scripts/selfcheck-rule-order.ts",
     "selfcheck:rule-impact": "tsx scripts/selfcheck-rule-impact.ts",
     "selfcheck:sub-token": "tsx scripts/selfcheck-sub-token.ts",
