@@ -2,7 +2,7 @@
 // 弹层只用页面内联面板，不新增浮层菜单，避免遮挡/贴底问题。
 import { useEffect, useMemo, useState } from 'react'
 import type { LocalRuleSet, ProxyNode, RuleScheme } from '../models/types'
-import { compileScheme, explainWith, type CertaintyLevel, type ExplainResult, type ExplainedStep } from '../rules/ruleExplain'
+import { compileScheme, explainWith, foldPossibleMatches, POSSIBLE_PREVIEW, type CertaintyLevel, type ExplainResult, type ExplainedStep } from '../rules/ruleExplain'
 import { lintScheme, lintSummary, type LintLevel, type SchemeLintIssue } from '../rules/schemeLint'
 import { diffRules, diffTotal, filterDiff, type DiffKind, type RuleDiffResult } from '../rules/ruleDiff'
 import { clearRuleSetHistory, readRuleSetHistory } from '../rules/ruleSetHistory'
@@ -41,8 +41,12 @@ function formatTime(value?: number): string {
   return new Date(value).toLocaleString('zh-CN', { hour12: false })
 }
 
-function ruleLine(rule: { type?: string; value?: string; raw?: string }): string {
+function ruleLine(rule: { type?: string; value?: string; raw?: string; ruleSetProviderKey?: string }): string {
   if (rule.raw) return rule.raw
+  // providerOnly 导出时使用 provider key（RULE-SET,google）；引用 URL 太长，不适合进表格。
+  if ((rule.type ?? '').toUpperCase() === 'RULE-SET' && rule.ruleSetProviderKey) {
+    return `RULE-SET,${rule.ruleSetProviderKey}`
+  }
   return `${rule.type ?? ''}${rule.value ? `,${rule.value}` : ''}`
 }
 
@@ -70,6 +74,7 @@ function ExplainPanel({
   const [results, setResults] = useState<ExplainResult[]>([])
   const [selected, setSelected] = useState(0)
   const [showAll, setShowAll] = useState(false)
+  const [showAllPossible, setShowAllPossible] = useState(false)
   const [error, setError] = useState('')
   const ruleSetExclusions = useStore((state) => state.ruleSetExclusions)
 
@@ -82,6 +87,7 @@ function ExplainPanel({
   useEffect(() => {
     setResults([])
     setSelected(0)
+    setShowAllPossible(false)
     setError('')
   }, [compiledKey])
 
@@ -98,6 +104,7 @@ function ExplainPanel({
     setError('')
     setSelected(0)
     setShowAll(false)
+    setShowAllPossible(false)
     // 5000+ 条规则时 50 行同步解释会阻塞主线程 0.3~0.5s，这里分帧计算并逐步展示。
     const compiledNow = compiled
     const first = explainWith(compiledNow, lines[0])
@@ -115,6 +122,8 @@ function ExplainPanel({
 
   const current = results[selected]
   const steps = current?.steps ?? []
+  const possibleMatches = current?.possibleMatches ?? []
+  const possibleFold = foldPossibleMatches(possibleMatches, showAllPossible)
   const matchPos = current?.match ? steps.findIndex((step) => step.index === current.match?.index) : -1
   const leadingSteps = showAll
     ? []
@@ -152,7 +161,7 @@ function ExplainPanel({
   return (
     <div className="rt-panel">
       <div className="rt-hint">
-        解释器直接复用导出管线的规则顺序和策略组解析。导出时会按目标客户端过滤它不支持的规则，这里按完整规则集解释，个别客户端可能略有差异。域名不会解析成 IP，所以 IP-CIDR / GEOIP / IP-ASN 等 IP 规则对域名输入只能标「可能命中」；GEOIP 非 CN、GeoSite、无效正则等缺少离线数据时标「无法判定」；UA / 进程 / 来源地址规则同样只能标「可能命中」。第一条「确定命中」出现后停止评估，后续规则不再参与判定。
+        解释器直接复用导出管线的规则顺序和策略组解析。导出时会按目标客户端过滤它不支持的规则，这里按完整规则集解释，个别客户端可能略有差异。域名不会解析成 IP，所以 IP-CIDR / GEOIP / IP-ASN 等 IP 规则对域名输入只能标「可能命中」；GEOIP 非 CN、GeoSite、无效正则等缺少离线数据时标「无法判定」；UA / 进程 / 来源地址规则同样只能标「可能命中」。第一条「确定命中」出现后停止评估；停止前出现的全部「可能命中」会单独列出，远程引用没有本地正文，客户端会按清单顺序取第一条真正命中的。
       </div>
       <div className="rt-field">
         <textarea
@@ -190,25 +199,36 @@ function ExplainPanel({
                     role="button"
                     aria-pressed={index === selected}
                     aria-label={`查看 ${displayInput(result.target.raw)} 的判定链路`}
-                    onClick={() => { setSelected(index); setShowAll(false) }}
+                    onClick={() => { setSelected(index); setShowAll(false); setShowAllPossible(false) }}
                     onKeyDown={(event) => {
                       if (event.key !== 'Enter' && event.key !== ' ') return
                       event.preventDefault()
                       setSelected(index)
                       setShowAll(false)
+                      setShowAllPossible(false)
                     }}
                   >
                     <td className="mono" title={result.target.raw}>{displayInput(result.target.raw)}</td>
                     <td className="mono">
-                      {result.match
+                      {result.match && !result.final.isFallback
                         ? `#${result.match.index} ${ruleLine(result.match.rule)}`
-                        : result.target.kind === 'unknown'
-                          ? '输入无法解析'
-                          : '无命中 / 无兜底'}
+                        : result.possibleMatches.length > 0
+                          ? `可能命中 ${result.possibleMatches.length} 条`
+                          : result.match
+                            ? `#${result.match.index} ${ruleLine(result.match.rule)}`
+                            : result.target.kind === 'unknown'
+                              ? '输入无法解析'
+                              : '无命中 / 无兜底'}
                     </td>
-                    <td>{result.final.group ? groupDisplayName(result.final.group, showGroupEmoji) : '—'}</td>
-                    <td>{result.final.node ?? '—'}</td>
-                    <td>{result.final.isFallback ? '是' : '否'}</td>
+                    <td>{result.match && !result.final.isFallback
+                      ? result.final.group ? groupDisplayName(result.final.group, showGroupEmoji) : '—'
+                      : result.possibleMatches.length > 0
+                        ? '见清单'
+                        : result.final.group
+                          ? groupDisplayName(result.final.group, showGroupEmoji)
+                          : '—'}</td>
+                    <td>{result.match && !result.final.isFallback ? result.final.node ?? '—' : '—'}</td>
+                    <td>{result.match ? (result.final.isFallback ? '是（最后）' : '否') : '—'}</td>
                   </tr>
                 ))}
               </tbody>
@@ -216,7 +236,27 @@ function ExplainPanel({
           </div>
 
           <div className="rt-summary">
-            {current.match ? (
+            {current.match && !current.final.isFallback ? (
+              <>
+                <strong>确定命中</strong>
+                <span>第 {current.match.index} / {current.totalRules} 条 · {current.match.evaluation.matchType}</span>
+                <span>策略组 {current.final.group ? groupDisplayName(current.final.group, showGroupEmoji) : '—'}{current.final.groupType ? `（${current.final.groupType}）` : ''}</span>
+                <span>候选节点 {current.final.candidates}</span>
+                {current.final.node && <span>预计走 <b className="mono">{current.final.node}</b></span>}
+                {possibleMatches.length > 0 && (
+                  <span>前面 {possibleMatches.length} 条可能命中在本地无法完全判定，可能抢先命中，见下方清单</span>
+                )}
+              </>
+            ) : possibleMatches.length > 0 ? (
+              <>
+                <strong>可能命中 {possibleMatches.length} 条</strong>
+                <span>本地无法完全判定这些条目，无法确定哪一条先命中</span>
+                <span>
+                  客户端会在这些条目中按顺序取第一条真正命中的
+                  {current.match ? `；若都不命中，走第 ${current.match.index} 条 ${ruleLine(current.match.rule)} 兜底` : ''}
+                </span>
+              </>
+            ) : current.match ? (
               <>
                 <strong>{current.final.isFallback ? '兜底命中' : '命中'}</strong>
                 <span>第 {current.match.index} / {current.totalRules} 条 · {current.match.evaluation.matchType}</span>
@@ -231,7 +271,38 @@ function ExplainPanel({
               </>
             )}
           </div>
-          {current.final.note && current.match && <div className="rt-hint">{current.final.note}</div>}
+          {possibleMatches.length > 0 && (
+            <div className="rt-possible">
+              <div className="rt-possible-head">
+                <strong>可能命中（按顺序，{possibleFold.total} 条）</strong>
+                <span className="rt-meta">本地缺少正文或运行时数据；客户端按此顺序匹配，先命中者生效</span>
+              </div>
+              <ul className="rt-possible-list">
+                {possibleFold.visible.map((step) => (
+                  <li key={step.index} className="rt-possible-row">
+                    <span className="rt-possible-no mono">#{step.index}</span>
+                    <span className="rt-possible-rule mono">{ruleLine(step.rule)}</span>
+                    <span className="rt-possible-group">{groupDisplayName(step.rule.group, showGroupEmoji)}</span>
+                    <span className="rt-possible-why">{step.evaluation.detail ?? step.evaluation.reason ?? ''}</span>
+                  </li>
+                ))}
+              </ul>
+              {possibleFold.hidden > 0 && (
+                <button className="btn ghost" onClick={() => setShowAllPossible(true)}>
+                  展开其余 {possibleFold.hidden} 条（共 {possibleFold.total} 条）
+                </button>
+              )}
+              {showAllPossible && possibleFold.total > POSSIBLE_PREVIEW && (
+                <button className="btn ghost" onClick={() => setShowAllPossible(false)}>收起清单</button>
+              )}
+              {current.match && current.final.isFallback && (
+                <div className="rt-possible-fallback">
+                  以上引用都不命中时，才走 #{current.match.index} {ruleLine(current.match.rule)} / {current.final.group ? groupDisplayName(current.final.group, showGroupEmoji) : '—'}
+                </div>
+              )}
+            </div>
+          )}
+          {current.final.note && current.match && !current.final.isFallback && <div className="rt-hint">{current.final.note}</div>}
           {current.notes.length > 0 && (
             <ul className="rt-notes">
               {current.notes.map((note) => <li key={note}>{note}</li>)}
@@ -272,7 +343,7 @@ function ExplainPanel({
             {renderCapHit && <div className="rt-meta">仅渲染前 {CHAIN_RENDER_LIMIT} 条。</div>}
             {remainingRules > 0 && (
               <div className="rt-after-match">
-                后续 {remainingRules} 条不再评估（第 {current.match?.index} 条确定命中后短路）
+                后续 {remainingRules} 条不再评估（第 {current.match?.index} 条{current.final.isFallback ? '兜底' : '确定命中'}后短路）
               </div>
             )}
           </div>

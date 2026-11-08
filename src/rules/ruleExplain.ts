@@ -1,6 +1,7 @@
 // 命中解释器：规则顺序、规则来源和策略组解析都走导出管线，保证解释结果与客户端收到的配置一致。
 import type {
   LocalRuleSet,
+  ProviderEntryType,
   ProxyNode,
   RuleScheme,
   RuleSetExclusionTable,
@@ -62,6 +63,11 @@ export interface ExplainResult {
   target: QueryTarget
   steps: ExplainedStep[]
   match?: ExplainedStep
+  /**
+   * 停止评估前出现的全部「可能命中」，按匹配顺序排列。
+   * 远程引用没有本地正文，这些条目都可能先于兜底或确定命中生效。
+   */
+  possibleMatches: ExplainedStep[]
   final: ExplainFinal
   notes: string[]
   totalRules: number
@@ -103,6 +109,10 @@ export function compileScheme(options: CompileExplainOptions): CompiledScheme {
   const prepared = prepareSchemeForExport(scheme, policySelections, {
     preferRuleSets: false,
     ruleSetExclusions: options.ruleSetExclusions,
+    // providerOnly 规则集只有在格式已知时才会写成 RULE-SET 引用。命中解释
+    // 固定按 YAML（provider 的原生载体）展开，否则 13 条引用会被当成空规则集，
+    // 整条链路退化成 FINAL。普通规则集仍按 preferRuleSets: false 逐条内联。
+    format: 'yaml',
   })
   const displayNameByNodeID = uniqueDisplayNames(options.nodes, (value) => value)
   const nodeByDisplayName = new Map<string, ProxyNode>()
@@ -142,8 +152,17 @@ export function compileScheme(options: CompileExplainOptions): CompiledScheme {
   const isPaused = (set: SchemeRuleSet): boolean =>
     pausedSetNames.has(set.name) || (set.sourceRef ? pausedSetNames.has(set.sourceRef) : false)
   const notes: string[] = []
+  const remoteOnlySets = (scheme.ruleSets ?? []).filter((set) => set.providerOnly && !set.rules.length)
+  if (remoteOnlySets.length) {
+    const names = remoteOnlySets.slice(0, 3).map((set) => `「${set.name}」`).join('、')
+    notes.push(
+      `${remoteOnlySets.length} 个规则集是远程引用（${names}${remoteOnlySets.length > 3 ? '等' : ''}）：本地没有正文，无法离线展开；客户端会按 RULE-SET 命中，本解释中只能标可能命中。`,
+    )
+  }
   for (const set of scheme.ruleSets ?? []) {
-    if (set.rules.length === 0) notes.push(`规则集「${set.name}」当前没有生效规则，不会参与匹配。`)
+    if (set.rules.length === 0 && !set.providerOnly) {
+      notes.push(`规则集「${set.name}」当前没有生效规则，不会参与匹配。`)
+    }
     if (isPaused(set)) notes.push(`规则集「${set.name}」的来源订阅已暂停自动刷新，当前仍使用已加入方案的快照。`)
   }
   const declaredGroups = new Set(scheme.groups.map((group) => group.name))
@@ -205,6 +224,63 @@ function evaluateRuleSetReference(
         status: 'unknown',
         matchType: '规则集引用',
         reason: `找不到规则集「${rule.sourceName ?? value}」，无法展开判断`,
+      },
+    }
+  }
+  // providerOnly 只保存 URL / behavior，本地没有正文；它仍然会以 RULE-SET 的身份
+  // 参与客户端匹配，不能当成空规则集判死。只有 behavior 能离线排除的情况才判未命中。
+  if (set.providerOnly && !set.rules.length) {
+    const key = set.providerName ?? set.name
+    const hostInput = target.kind === 'domain' || target.kind === 'url'
+    const ipInput = target.kind === 'ipv4' || target.kind === 'ipv6'
+    const noResolve = (set.ruleSetOptions ?? []).some((option) => option.toLowerCase() === 'no-resolve')
+    // 条目类型来自 provider 元数据；旧快照没有元数据时按 behavior 推断，行为保持不变。
+    const entry: ProviderEntryType = set.providerEntryType
+      ?? (set.ruleSetBehavior === 'ipcidr' ? 'ip' : set.ruleSetBehavior === 'classical' ? 'process' : 'domain')
+    // IP 前留一个空格，避免「是IP 列表」这种中英混排。
+    const entryLabel = entry === 'process' ? '进程名列表（PROCESS-NAME）' : entry === 'ip' ? ' IP 列表' : '域名列表'
+    if (hostInput && entry === 'process') {
+      return {
+        evaluation: {
+          status: 'miss',
+          matchType: '规则集引用',
+          detail: `RULE-SET,${key} 是进程名列表（PROCESS-NAME）：域名请求不携带进程名，一定不会命中`,
+        },
+      }
+    }
+    if (hostInput && entry === 'ip' && noResolve) {
+      return {
+        evaluation: {
+          status: 'miss',
+          matchType: '规则集引用',
+          detail: `RULE-SET,${key} 是 IP 列表并带 no-resolve：域名请求不会解析 IP，一定不会命中`,
+        },
+      }
+    }
+    if (ipInput && entry === 'process') {
+      return {
+        evaluation: {
+          status: 'miss',
+          matchType: '规则集引用',
+          detail: `RULE-SET,${key} 是进程名列表（PROCESS-NAME）：IP 输入不携带进程名，一定不会命中`,
+        },
+      }
+    }
+    if (ipInput && entry === 'domain') {
+      return {
+        evaluation: {
+          status: 'miss',
+          matchType: '规则集引用',
+          detail: `RULE-SET,${key} 是域名列表：输入是 IP，一定不会命中`,
+        },
+      }
+    }
+    return {
+      evaluation: {
+        status: 'skip',
+        matchType: '规则集引用',
+        detail: `RULE-SET,${key} 是${entryLabel}的远程引用：本地没有正文，无法离线展开；客户端会按规则集命中，因此本条只能标可能命中`,
+        reason: `规则集「${set.name}」的正文由客户端下载后参与匹配`,
       },
     }
   }
@@ -427,6 +503,9 @@ export function explainWith(compiled: CompiledScheme, raw: string): ExplainResul
   const matchedRule = matchStep?.rule
   const matchedType = (matchedRule?.type ?? '').toUpperCase()
   const isFallback = !!matchedRule && (matchedType === 'FINAL' || matchedType === 'MATCH')
+  // 远程引用没有本地正文，任何一条「可能命中」都可能先于兜底或确定命中生效。
+  // 这里保留停止评估前的全部可能命中，而不是只挑一条，避免把猜测当成结论。
+  const possibleMatches = steps.filter((step) => step.certainty === 'possible-match')
   const groupName = matchedRule?.group
   const group = groupName ? compiled.groupsByName.get(groupName) : undefined
   let final: ExplainFinal
@@ -470,7 +549,8 @@ export function explainWith(compiled: CompiledScheme, raw: string): ExplainResul
     }
   }
 
-  if (matchStep) {
+  // 兜底命中时，前面的不确定条目由 possibleMatches 完整列出，不再重复一句概括。
+  if (matchStep && !isFallback) {
     let uncertain = 0
     for (const step of steps) {
       if (step === matchStep) break
@@ -485,10 +565,25 @@ export function explainWith(compiled: CompiledScheme, raw: string): ExplainResul
     target,
     steps,
     match: matchStep,
+    possibleMatches,
     final,
     notes: compiled.notes,
     totalRules: compiled.scheme.rules.length,
   }
+}
+
+/** 可能命中清单默认展示的条数；其余折叠，避免十几条引用撑爆结果区。 */
+export const POSSIBLE_PREVIEW = 5
+
+/** 可能命中清单的折叠计算，界面与自检共用。 */
+export function foldPossibleMatches(
+  matches: readonly ExplainedStep[],
+  expanded: boolean,
+  limit = POSSIBLE_PREVIEW,
+): { visible: ExplainedStep[]; hidden: number; total: number } {
+  const visible = expanded ? [...matches] : [...matches.slice(0, Math.max(0, limit))]
+  const total = matches.length
+  return { visible, hidden: Math.max(0, total - visible.length), total }
 }
 
 export function explainQuery(options: CompileExplainOptions, raw: string): ExplainResult {

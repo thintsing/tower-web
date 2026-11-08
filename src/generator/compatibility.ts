@@ -1,11 +1,11 @@
 // Per-client rule capability summary. The result describes what the current
 // generators can actually express, so the export page never promises a
 // fully-compatible config when a client will drop rules.
-import { subFormatFor, type ClientInfo, type ExportContentMode, type RuleScheme, type RuleSetExclusionTable } from '../models/types'
+import { subFormatFor, type ClientInfo, type ExportContentMode, type ProxyNode, type RuleScheme, type RuleSetExclusionTable } from '../models/types'
 import { targetSupportsRule } from '../rules/capabilities'
 import { targetSupportsInlineRuleSets } from '../rules/inlineSets'
 import { formatSupportsRemoteRuleSets, providerOnlyCanReference, supportsRuleSetReference } from '../rules/remoteFormats'
-import { prepareSchemeForExport, remoteRuleSetCandidates, remoteRuleSetURL } from './groups'
+import { prepareSchemeForExport, remoteRuleSetCandidates, remoteRuleSetURL, resolveGroups } from './groups'
 
 export interface RuleCompatibility {
   /** The destination only imports node subscriptions. */
@@ -32,6 +32,13 @@ export interface RuleCompatibility {
   providerOnlyNote?: string
   /** 只存 provider 引用的规则集数量（不需要开关也会写成远程引用）。 */
   providerOnlyCount: number
+  /**
+   * 解析后没有任何成员的策略组。客户端（尤其 mihomo）会拒绝加载这类空组，
+   * 导出必须硬阻断，不能产出看似成功但无法加载的配置。
+   */
+  emptyGroups: string[]
+  emptyGroupsBlocked: boolean
+  emptyGroupsNote?: string
 }
 
 export interface AnalyzeRuleOptions {
@@ -42,6 +49,11 @@ export interface AnalyzeRuleOptions {
   ruleSetExclusions?: RuleSetExclusionTable
   /** 托管规则集的对外基础地址；空字符串表示明确不可用。 */
   hostedBaseURL?: string
+  /**
+   * 实际参与导出的节点；用于检测解析后为空的策略组。
+   * 缺省时跳过该检测（方案检查等不涉及导出的调用保持原行为）。
+   */
+  nodes?: ProxyNode[]
 }
 
 /**
@@ -86,11 +98,27 @@ export function analyzeRuleCompatibility(
       inlineRuleSets: 0,
       providerOnlyBlocked: false,
       providerOnlyCount,
+      emptyGroups: [],
+      emptyGroupsBlocked: false,
       note: format === 'base64'
         ? `${client.name} 只接收节点订阅，策略组和规则不会写入。`
         : '当前为「仅节点」模式，策略组和规则不会写入配置。',
     }
   }
+
+  // 空策略组：客户端会拒绝加载整份配置。这里用与生成器相同的分组解析，
+  // 在导出入口一次性阻断，避免每个生成器各弹一次重复提示。
+  const emptyGroups = options.nodes === undefined
+    ? []
+    : resolveGroups(scheme, options.nodes, (item) => item.name)
+        .filter((resolved) => resolved.members.length === 0)
+        .map((resolved) => resolved.group.name)
+  const emptyGroupsBlocked = emptyGroups.length > 0
+  const emptyGroupsNote = emptyGroupsBlocked
+    ? `${emptyGroups.length === 1
+        ? `策略组「${emptyGroups[0]}」`
+        : `${emptyGroups.length} 个策略组（${emptyGroups.slice(0, 3).join('、')}）`}在导出时没有任何成员${options.nodes?.length === 0 ? '（当前导出没有可用节点）' : ''}；客户端会拒绝加载这份配置。请先启用节点，或给这些组添加候选策略后再导出。`
+    : undefined
 
   const supportsRemoteRuleSets = formatSupportsRemoteRuleSets(format)
   const candidates = remoteRuleSetCandidates(scheme, {
@@ -154,5 +182,8 @@ export function analyzeRuleCompatibility(
     providerOnlyBlocked,
     providerOnlyNote,
     providerOnlyCount,
+    emptyGroups,
+    emptyGroupsBlocked,
+    emptyGroupsNote,
   }
 }

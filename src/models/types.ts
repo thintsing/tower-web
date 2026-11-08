@@ -477,6 +477,13 @@ export interface RuleSetRefreshDiff {
   checkedAt: number
 }
 
+/**
+ * provider 文件的条目类型：进程名（PROCESS-NAME）、域名（+.域 / 裸域）、IP 段（CIDR）。
+ * 只用于命中解释与诊断，帮助跳过「输入形态与条目形态不可能匹配」的引用；
+ * 导出时的 behavior / format / path 仍由 ruleSetBehavior 等字段决定，与此无关。
+ */
+export type ProviderEntryType = 'process' | 'domain' | 'ip'
+
 /** 已加入方案的规则集快照；修改本地规则集不会回头改动已加入的方案。 */
 export interface SchemeRuleSet {
   id: string
@@ -497,6 +504,8 @@ export interface SchemeRuleSet {
   providerOnly?: boolean
   /** provider 的键名与文件路径使用的名字（例如 reject）。 */
   providerName?: string
+  /** provider 的条目类型；仅 providerOnly 方案使用，只参与解释，不参与导出。 */
+  providerEntryType?: ProviderEntryType
   /** RULE-SET 行附加选项，例如 no-resolve。 */
   ruleSetOptions?: string[]
   /** provider 的更新间隔（秒）；缺省 86400。 */

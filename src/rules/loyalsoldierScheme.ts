@@ -2,7 +2,7 @@
 // 不保存任何规则正文。导出 Clash / mihomo 系时写成 rule-providers + RULE-SET，
 // 客户端按 URL 自行下载；其他客户端由塔台服务的 /api/ruleset 托管转换，
 // 拿不到对外地址时该载体硬阻断。
-import type { PolicyGroup, RuleScheme, SchemeRuleSet } from '../models/types'
+import type { PolicyGroup, ProviderEntryType, RuleScheme, SchemeRuleSet } from '../models/types'
 import type { SchemeMeta } from './scheme'
 
 export const LOYALSONDIER_SCHEME_ID = 'loyalsoldier-clash-rules'
@@ -34,8 +34,9 @@ function groups(): PolicyGroup[] {
     },
     { name: GROUP.direct, type: 'select', options: ['DIRECT', GROUP.proxy, GROUP.auto] },
     { name: GROUP.reject, type: 'select', options: ['REJECT', 'DIRECT'] },
-    { name: GROUP.apple, type: 'select', options: [GROUP.proxy, GROUP.direct, 'DIRECT'] },
-    { name: GROUP.telegram, type: 'select', options: [GROUP.proxy, GROUP.direct] },
+    // 与 ACL4SSR 的「🚀, 🎯, .*」对齐：组引用在前，全部节点跟在后面。
+    { name: GROUP.apple, type: 'select', options: [GROUP.proxy, GROUP.direct, 'DIRECT'], nodeFilter: '.*' },
+    { name: GROUP.telegram, type: 'select', options: [GROUP.proxy, GROUP.direct], nodeFilter: '.*' },
     { name: GROUP.final, type: 'select', options: [GROUP.proxy, GROUP.direct, GROUP.auto], nodeFilter: '.*' },
   ]
 }
@@ -45,6 +46,8 @@ interface ProviderSpec {
   label: string
   group: string
   behavior: 'domain' | 'ipcidr' | 'classical'
+  /** 文件里的条目类型：进程名 / 域名 / IP 段。只用于解释，不影响导出。 */
+  entryType: ProviderEntryType
   /** 需要随 RULE-SET 写出 no-resolve 的 IP 列表。 */
   noResolve?: boolean
 }
@@ -56,19 +59,20 @@ interface ProviderSpec {
  * tld-not-cn 在 gfw 之后；telegramcidr 最后；FINAL 永远兜底。
  */
 const PROVIDERS: ProviderSpec[] = [
-  { name: 'applications', label: '应用分流（applications）', group: GROUP.direct, behavior: 'classical' },
-  { name: 'private', label: '私有网络（private）', group: GROUP.direct, behavior: 'domain' },
-  { name: 'lancidr', label: '局域网 IP（lancidr）', group: GROUP.direct, behavior: 'ipcidr', noResolve: true },
-  { name: 'reject', label: '全球拦截（reject）', group: GROUP.reject, behavior: 'domain' },
-  { name: 'icloud', label: 'iCloud（icloud）', group: GROUP.apple, behavior: 'domain' },
-  { name: 'apple', label: 'Apple（apple）', group: GROUP.apple, behavior: 'domain' },
-  { name: 'google', label: 'Google（google）', group: GROUP.proxy, behavior: 'domain' },
-  { name: 'proxy', label: '代理域名（proxy）', group: GROUP.proxy, behavior: 'domain' },
-  { name: 'direct', label: '直连域名（direct）', group: GROUP.direct, behavior: 'domain' },
-  { name: 'cncidr', label: '国内 IP（cncidr）', group: GROUP.direct, behavior: 'ipcidr', noResolve: true },
-  { name: 'gfw', label: 'GFW（gfw）', group: GROUP.proxy, behavior: 'domain' },
-  { name: 'tld-not-cn', label: '非中国 TLD（tld-not-cn）', group: GROUP.proxy, behavior: 'domain' },
-  { name: 'telegramcidr', label: '电报 IP（telegramcidr）', group: GROUP.telegram, behavior: 'ipcidr', noResolve: true },
+  // applications.txt 是 PROCESS-NAME 列表，和域名 / IP 输入永远不会相交。
+  { name: 'applications', label: '应用分流（applications）', group: GROUP.direct, behavior: 'classical', entryType: 'process' },
+  { name: 'private', label: '私有网络（private）', group: GROUP.direct, behavior: 'domain', entryType: 'domain' },
+  { name: 'lancidr', label: '局域网 IP（lancidr）', group: GROUP.direct, behavior: 'ipcidr', entryType: 'ip', noResolve: true },
+  { name: 'reject', label: '全球拦截（reject）', group: GROUP.reject, behavior: 'domain', entryType: 'domain' },
+  { name: 'icloud', label: 'iCloud（icloud）', group: GROUP.apple, behavior: 'domain', entryType: 'domain' },
+  { name: 'apple', label: 'Apple（apple）', group: GROUP.apple, behavior: 'domain', entryType: 'domain' },
+  { name: 'google', label: 'Google（google）', group: GROUP.proxy, behavior: 'domain', entryType: 'domain' },
+  { name: 'proxy', label: '代理域名（proxy）', group: GROUP.proxy, behavior: 'domain', entryType: 'domain' },
+  { name: 'direct', label: '直连域名（direct）', group: GROUP.direct, behavior: 'domain', entryType: 'domain' },
+  { name: 'cncidr', label: '国内 IP（cncidr）', group: GROUP.direct, behavior: 'ipcidr', entryType: 'ip', noResolve: true },
+  { name: 'gfw', label: 'GFW（gfw）', group: GROUP.proxy, behavior: 'domain', entryType: 'domain' },
+  { name: 'tld-not-cn', label: '非中国 TLD（tld-not-cn）', group: GROUP.proxy, behavior: 'domain', entryType: 'domain' },
+  { name: 'telegramcidr', label: '电报 IP（telegramcidr）', group: GROUP.telegram, behavior: 'ipcidr', entryType: 'ip', noResolve: true },
 ]
 
 function providerRuleSets(): SchemeRuleSet[] {
@@ -85,6 +89,7 @@ function providerRuleSets(): SchemeRuleSet[] {
     ruleSetBehavior: spec.behavior,
     providerOnly: true,
     providerName: spec.name,
+    providerEntryType: spec.entryType,
     ruleSetOptions: spec.noResolve ? ['no-resolve'] : undefined,
     interval: PROVIDER_INTERVAL,
   }))

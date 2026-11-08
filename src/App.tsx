@@ -42,6 +42,7 @@ import { describeSubscriptionFormatFailures, generateConfig, generateSubscriptio
 import { nodeShareText } from './generator/shareLink'
 import { nodeTransportCapability } from './generator/nodeCapabilities'
 import { analyzeRuleCompatibility } from './generator/compatibility'
+import { describeRemoteReferences, groupEditorRuleSummary, groupRuleSummary, remoteReferenceCount, remoteReferenceCounts, ruleSetSummary } from './rules/ruleSetReferences'
 import { resolveHostedBaseURL } from './rules/remoteFormats'
 import { formatSupportsProxyCollections, prepareSchemeForExport } from './generator/groups'
 import { autoFillGroupEmojis } from './generator/groupIcons'
@@ -4591,6 +4592,8 @@ function GroupEditorDialog({
     (rule) => !ruleQuery || `${rule.type} ${rule.value ?? ''} ${rule.sourceName ?? ''}`.toLowerCase().includes(ruleQuery),
   )
   const totalGroupRules = groupCustomRules.length + groupRules.length
+  // providerOnly 规则集不在 rules 里；单独统计，避免组编辑器显示成 0。
+  const groupRemoteRefCount = remoteReferenceCount(scheme, group.name)
   const visibleGroupRules = [...visibleCustomRules.map((rule) => ({ rule, custom: true })), ...visibleRules.map((rule) => ({ rule, custom: false }))]
     .slice(0, 200)
 
@@ -4697,7 +4700,7 @@ function GroupEditorDialog({
             aria-selected={tab === 'rules'}
             className={`detail-tab${tab === 'rules' ? ' active' : ''}`}
             onClick={() => setTab('rules')}
-          >规则 {totalGroupRules}</button>
+          >规则 {totalGroupRules}{groupRemoteRefCount > 0 ? ` · 引用 ${groupRemoteRefCount}` : ''}</button>
         </div>
         {tab === 'settings' && (
         <>
@@ -4777,7 +4780,8 @@ function GroupEditorDialog({
         {tab === 'rules' && (
           <div className="group-rules-panel">
             <div className="hint">
-              {groupCustomRules.length} 条我添加的规则 · {groupRules.length} 条方案自带或规则集规则。
+              {groupEditorRuleSummary(groupCustomRules.length, groupRules.length, groupRemoteRefCount)}
+              {groupRemoteRefCount > 0 ? ` ${describeRemoteReferences(groupRemoteRefCount)}` : ''}
               新添加的域名会排在所有规则最前，优先于其他组。
             </div>
             <input
@@ -4819,7 +4823,11 @@ function GroupEditorDialog({
               </ul>
             ) : (
               <div className="hint">
-                {ruleQuery ? '没有匹配的规则' : '方案里没有直接指向这个组的规则；它通常作为其他策略组的候选使用。'}
+                {ruleQuery
+                  ? '没有匹配的规则'
+                  : groupRemoteRefCount > 0
+                    ? `方案没有直接写给这个组的规则；${describeRemoteReferences(groupRemoteRefCount)}`
+                    : '方案里没有直接指向这个组的规则；它通常作为其他策略组的候选使用。'}
               </div>
             )}
             {totalGroupRules > visibleGroupRules.length && (
@@ -5797,6 +5805,12 @@ function RulesTab({
   const schemeRules = useMemo(
     () => scheme ? orderedSchemeRules(scheme) : [],
     [scheme],
+  )
+  // providerOnly 规则集不保存正文；按组统计远程引用，避免组行显示成 0 条规则。
+  const remoteRefsByGroup = useMemo(() => remoteReferenceCounts(scheme), [scheme])
+  const remoteRefTotal = useMemo(
+    () => [...remoteRefsByGroup.values()].reduce((sum, count) => sum + count, 0),
+    [remoteRefsByGroup],
   )
   // 逐条顺序卡片：大方案只渲染前 300 条，搜索用来定位；顺序本身仍按全量计算。
   const ruleOrderRows = useMemo(() => {
@@ -6779,6 +6793,11 @@ function RulesTab({
         <div className="scheme-facts">
           <span><b>{scheme?.groups.length ?? 0}</b> 策略组</span>
           <span><b>{schemeRules.length}</b> 规则</span>
+          {remoteRefTotal > 0 && (
+            <span title="只保存 provider 地址，不保存正文；导出时写成 RULE-SET，由客户端自行下载">
+              <b>{remoteRefTotal}</b> 远程引用
+            </span>
+          )}
           <span><b>{enabledForRules.length}</b> 节点</span>
         </div>
         <p className="scheme-desc">{selectedMeta?.description}</p>
@@ -7084,6 +7103,7 @@ function RulesTab({
             const current = choices.includes(selectedValue ?? '') ? selectedValue : (choices[0] ?? '')
             const ruleCount = schemeRules.filter((r) => r.group === g.name).length
             const customCount = (scheme.customRules ?? []).filter((r) => r.group === g.name).length
+            const remoteRefCount = remoteRefsByGroup.get(g.name) ?? 0
             return (
               <div
                 className={`group-row${dragFromIndex === index ? ' dragging' : ''}${dragOverIndex === index ? ' drop-target' : ''}`}
@@ -7131,7 +7151,7 @@ function RulesTab({
                     <span className="gtype">{policyTypeLabel(g.type)}</span>
                   </div>
                   <div className="group-sub">
-                    {ruleCount} 条规则{customCount > 0 ? ` · ${customCount} 条自定义` : ''}
+                    {groupRuleSummary(ruleCount, customCount, remoteRefCount)}
                     {g.nodeFilter ? ` · 节点匹配 ${g.nodeFilter}` : ''}
                   </div>
                 </div>
@@ -7160,7 +7180,7 @@ function RulesTab({
                   {g.type !== 'select' && <span className="pill">{policyTypeLabel(g.type)}</span>}
                   {g.type === 'select' && choices.length === 0 && <span className="hint">没有候选策略</span>}
                   <button className="btn ghost group-rule-btn" onClick={() => beginEditGroup(scheme, g, 'rules')}>
-                    规则 {ruleCount}
+                    查看规则
                   </button>
                   <button
                     className="icon-btn"
@@ -7396,8 +7416,7 @@ function RulesTab({
                           </span>
                         )}
                         <span className="hint">
-                          {set.providerOnly ? '远程引用（不保存正文）' : `${set.rules.length} 条`} · {set.providerOnly ? 'Clash provider YAML' : set.inlined ? '固化快照（只读）' : set.sourceKind === 'library' ? '内置规则库' : set.sourceKind === 'url' ? '在线订阅' : '我的规则集'}
-                          {set.format ? ` · ${RULE_SET_FORMAT_TITLES[set.format]}` : ''}
+                          {ruleSetSummary(set, set.format ? RULE_SET_FORMAT_TITLES[set.format] : undefined)}
                           {set.updatedAt ? ` · 更新于 ${formatDate(set.updatedAt)}` : ''}
                         </span>
                         {set.lastDiff && <RuleSetDiffView diff={set.lastDiff} />}
@@ -8185,12 +8204,6 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     }) : undefined,
     [scheme, policySelections, preferRuleSets, targetFormat, target.target, ruleSetExclusions, hostedBaseURL],
   )
-  const compatibility = useMemo(
-    () => scheme ? analyzeRuleCompatibility(target, scheme, {
-      preferRuleSets, contentMode, ruleSetExclusions, hostedBaseURL,
-    }) : undefined,
-    [target, scheme, preferRuleSets, contentMode, ruleSetExclusions, hostedBaseURL],
-  )
   const [clientQuery, setClientQuery] = useState('')
   const [manageClients, setManageClients] = useState(false)
   const pickerRef = useRef<HTMLDetailsElement>(null)
@@ -8323,6 +8336,20 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     if (exportProtocols.length === 0) return regionFilteredNodes
     return regionFilteredNodes.filter((node) => exportProtocols.includes(node.kind))
   }, [regionFilteredNodes, exportProtocols])
+  // 与导出使用同一批节点判断空策略组：零节点时 ♻️ 自动选择会写成空 proxies，
+  // mihomo 会直接拒绝加载。这里统一算一次阻断，供下面的预览和各导出按钮共用。
+  const compatibility = useMemo(
+    () => scheme ? analyzeRuleCompatibility(target, scheme, {
+      preferRuleSets, contentMode, ruleSetExclusions, hostedBaseURL, nodes: usable,
+    }) : undefined,
+    [target, scheme, preferRuleSets, contentMode, ruleSetExclusions, hostedBaseURL, usable],
+  )
+  const exportBlockNote = compatibility?.providerOnlyBlocked
+    ? compatibility.providerOnlyNote
+    : compatibility?.emptyGroupsBlocked
+      ? compatibility.emptyGroupsNote
+      : undefined
+  const exportBlocked = !!exportBlockNote
   const remoteSubscriptions = useMemo<RemoteSubscriptionEntry[]>(() => {
     if (!embedRemoteSubscriptions) return []
     return sources
@@ -8446,7 +8473,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   }, [visibleClients, target])
 
   useEffect(() => {
-    if (!exportScheme || compatibility?.providerOnlyBlocked) {
+    if (!exportScheme || exportBlocked) {
       setGenerated('')
       setSkipped(0)
       setExportedNodeCount(0)
@@ -8460,7 +8487,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     setExportedNodeCount(out.exportedNodeCount)
     setRemoteSourceCount(out.remoteSourceCount)
     setTailnetNotes(out.notes)
-  }, [target, usable, exportScheme, outputOptions, compatibility?.providerOnlyBlocked])
+  }, [target, usable, exportScheme, outputOptions, exportBlocked])
 
   // importScheme 可用时包装成客户端 deep link，否则直接给订阅地址。
   const clientImportURL = useMemo(() => {
@@ -9396,9 +9423,11 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                 <span>{compatibility.note}</span>
               </div>
             ) : (
-              <div className={`hint rule-export-note${compatibility.providerOnlyBlocked ? ' warn' : ''}`}>
-                {compatibility.providerOnlyBlocked
-                  ? compatibility.providerOnlyNote
+              <div className={`hint rule-export-note${exportBlocked ? ' warn' : ''}`}>
+                {exportBlocked
+                  ? compatibility.emptyGroupsBlocked
+                    ? '导出已阻断：有策略组解析后没有任何成员，原因与修复方式见下方。'
+                    : exportBlockNote
                   : compatibility.providerOnlyCount > 0
                     ? compatibility.providerOnlyNote ?? (targetFormat === 'yaml'
                       ? `这个方案只保存 ${compatibility.providerOnlyCount} 组 Clash provider 引用（不保存正文），会直接写成 rule-providers + RULE-SET，不受「优先引用」开关影响；客户端需要能访问这些地址。`
@@ -9487,17 +9516,17 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           </div>
         )}
         <div className="row" style={{ gap: 8, marginBottom: 14 }}>
-          <button className="btn" disabled={!scheme || !hasExportable || compatibility?.providerOnlyBlocked} onClick={download}>{downloaded ? '已下载' : '下载文件'}</button>
-          <button className="btn ghost" disabled={!hasExportable || !generated || compatibility?.providerOnlyBlocked} onClick={copy}>{copied ? '已复制' : '复制'}</button>
+          <button className="btn" disabled={!scheme || !hasExportable || exportBlocked} onClick={download}>{downloaded ? '已下载' : '下载文件'}</button>
+          <button className="btn ghost" disabled={!hasExportable || !generated || exportBlocked} onClick={copy}>{copied ? '已复制' : '复制'}</button>
           {canImport && (
-            <button className="btn ghost" disabled={importing || !hasExportable || readOnly || compatibility?.providerOnlyBlocked} title={readOnly ? READONLY_NOTE : undefined} onClick={importIntoClient}>
+            <button className="btn ghost" disabled={importing || !hasExportable || readOnly || exportBlocked} title={readOnly ? READONLY_NOTE : undefined} onClick={importIntoClient}>
               {importing ? '生成链接…' : `导入到 ${target.name}`}
             </button>
           )}
         </div>
-        {compatibility?.providerOnlyBlocked && (
+        {exportBlocked && (
           <div className="inline-notice error" style={{ marginBottom: 10 }}>
-            <span>{compatibility.providerOnlyNote}</span>
+            <span>{exportBlockNote}</span>
             <button className="btn ghost" onClick={() => onGo?.('check')}>查看检查结果</button>
           </div>
         )}
