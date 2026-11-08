@@ -68,6 +68,7 @@
     "selfcheck:workspace-save": "tsx scripts/selfcheck-workspace-save.ts",
     "selfcheck:workspace-overwrite": "tsx scripts/selfcheck-workspace-overwrite.ts",
     "selfcheck:refresh-report": "tsx scripts/selfcheck-refresh-report.ts",
+    "selfcheck:ruleset-exclusions": "tsx scripts/selfcheck-ruleset-exclusions.ts",
     "selfcheck:sub-formats": "tsx scripts/selfcheck-sub-formats.ts",
     "selfcheck:workspace-conflict": "tsx scripts/selfcheck-workspace-conflict.ts",
     "selfcheck:yaml": "tsx scripts/selfcheck-yaml.ts"

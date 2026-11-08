@@ -115,6 +115,54 @@ export function exclusionSignatureText(signature: string): string {
   return signature.split('|').filter(Boolean).join(',')
 }
 
+/** 整张屏蔽表的签名总数（用于回滚影响文案）。 */
+export function countRuleSetExclusions(table: RuleSetExclusionTable | undefined): number {
+  if (!table) return 0
+  return Object.values(table).reduce((sum, list) => sum + list.length, 0)
+}
+
+/**
+ * 已不存在于任何方案 / 我的规则集 / 固化快照里的屏蔽表 id。
+ * 移除规则集会生成新 id，旧屏蔽记录如果没清理就会永久留在这里。
+ */
+export function orphanRuleSetIDs(
+  table: RuleSetExclusionTable | undefined,
+  liveIDs: Iterable<string>,
+): string[] {
+  if (!table) return []
+  const live = new Set(liveIDs)
+  return Object.keys(table).filter((id) => !live.has(id)).sort()
+}
+
+/** 孤儿屏蔽记录的签名总数；界面用它决定是否显示清理入口。 */
+export function countOrphanRuleSetExclusions(
+  table: RuleSetExclusionTable | undefined,
+  liveIDs: Iterable<string>,
+): number {
+  if (!table) return 0
+  return orphanRuleSetIDs(table, liveIDs)
+    .reduce((sum, id) => sum + (table[id]?.length ?? 0), 0)
+}
+
+/** 清理孤儿屏蔽记录；没有孤儿时返回原对象，避免无谓的状态更新。 */
+export function removeOrphanRuleSetExclusions(
+  table: RuleSetExclusionTable,
+  liveIDs: Iterable<string>,
+): RuleSetExclusionTable {
+  const orphans = orphanRuleSetIDs(table, liveIDs)
+  if (!orphans.length) return table
+  const next: RuleSetExclusionTable = { ...table }
+  for (const id of orphans) delete next[id]
+  return next
+}
+
+/** 移除规则集确认框里必须讲清屏蔽记录的后果，不能静默丢弃。 */
+export function describeRuleSetRemovalImpact(blockedCount: number): string {
+  return blockedCount > 0
+    ? `该规则集有 ${blockedCount} 条屏蔽记录，移除后会一并失效并从工作区删除。`
+    : '该规则集没有屏蔽记录。'
+}
+
 export interface RuleSetExclusionItem {
   setId: string
   setName: string

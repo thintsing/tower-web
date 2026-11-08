@@ -75,7 +75,7 @@ import { applyDuplicateCleanup, restoreRemovedRules, type DuplicateCleanupPlan, 
 import { clearRuleSetHistory, digestRules, recordRuleSetSnapshot } from './rules/ruleSetHistory'
 import { lintScheme, lintSummary, type SchemeLintIssue } from './rules/schemeLint'
 import { createEditableSchemeCopy, stripSchemeCustomSuffix, undoEditableSchemeCopy } from './rules/schemeCopy'
-import { isReadOnlyRuleSet } from './rules/ruleSetExclusions'
+import { countOrphanRuleSetExclusions, describeRuleSetRemovalImpact, isReadOnlyRuleSet } from './rules/ruleSetExclusions'
 
 const SELF_CONFIGURATION_NAME = 'Self-Configuration'
 const SELF_CONFIGURATION_URL = 'https://raw.githubusercontent.com/ClashConnectRules/Self-Configuration/main/Clash.yaml'
@@ -5637,6 +5637,7 @@ function RulesTab({
   const ruleSetExclusions = useStore((s) => s.ruleSetExclusions)
   const addLocalRuleSet = useStore((s) => s.addLocalRuleSet)
   const removeLocalRuleSet = useStore((s) => s.removeLocalRuleSet)
+  const clearOrphanRuleSetExclusions = useStore((s) => s.clearOrphanRuleSetExclusions)
   const builtinSchemeOverrides = useStore((s) => s.builtinSchemeOverrides)
   const schemeSnapshots = useStore((s) => s.schemeSnapshots)
   const saveBuiltinSchemeOverride = useStore((s) => s.saveBuiltinSchemeOverride)
@@ -5696,6 +5697,7 @@ function RulesTab({
   const [localSetEditor, setLocalSetEditor] = useState<{ set?: LocalRuleSet } | null>(null)
   const [localSetAddTarget, setLocalSetAddTarget] = useState<LocalRuleSet | null>(null)
   const [pendingLocalSetDelete, setPendingLocalSetDelete] = useState<LocalRuleSet | null>(null)
+  const [pendingRuleSetRemove, setPendingRuleSetRemove] = useState<SchemeRuleSet | null>(null)
   const [remoteSetOpen, setRemoteSetOpen] = useState(false)
   const [renamingLocalSet, setRenamingLocalSet] = useState<LocalRuleSet | null>(null)
   const [localSetSearch, setLocalSetSearch] = useState('')
@@ -5775,6 +5777,18 @@ function RulesTab({
       : `固化快照 #${selectedBuiltinResolution.missingId} 损坏或缺失，已自动回落到原厂快照。`
     : undefined
   const customScheme = customSchemes.find((c) => c.id === scheme?.id)
+  // 屏蔽表按规则集 id 存；规则集被移除 / 方案被删后，旧记录会留在工作区。
+  const orphanExclusionCount = useMemo(() => {
+    const live = new Set<string>()
+    for (const item of customSchemes) {
+      for (const set of item.ruleSets ?? []) live.add(set.id)
+    }
+    for (const set of localRuleSets) live.add(set.id)
+    for (const snapshot of Object.values(schemeSnapshots)) {
+      for (const set of snapshot.ruleSets ?? []) live.add(set.id)
+    }
+    return countOrphanRuleSetExclusions(ruleSetExclusions, live)
+  }, [customSchemes, localRuleSets, schemeSnapshots, ruleSetExclusions])
   const schemeRules = useMemo(
     () => scheme ? orderedSchemeRules(scheme) : [],
     [scheme],
@@ -6656,13 +6670,26 @@ function RulesTab({
 
   const removeSchemeRuleSet = (id: string) => {
     const fresh = customScheme
-    if (!fresh?.ruleSets) return
+    const target = fresh?.ruleSets?.find((set) => set.id === id)
+    if (target) setPendingRuleSetRemove(target)
+  }
+
+  const confirmRemoveSchemeRuleSet = () => {
+    const target = pendingRuleSetRemove
+    const fresh = customScheme
+    setPendingRuleSetRemove(null)
+    if (!target || !fresh?.ruleSets) return
+    const blocked = ruleSetExclusions[target.id]?.length ?? 0
     addCustomScheme({
       ...fresh,
-      ruleSets: fresh.ruleSets.filter((set) => set.id !== id),
+      ruleSets: fresh.ruleSets.filter((set) => set.id !== target.id),
       updatedAt: Date.now(),
     })
-    setFlash('已从当前方案移除规则集。')
+    // 屏蔽记录没有迁移目标；移除时一并删掉，避免旧 id 记录变成永久孤儿。
+    if (blocked) useStore.getState().restoreRuleSetExclusions(target.id, [])
+    setFlash(blocked
+      ? `已从当前方案移除「${target.name}」；${blocked} 条屏蔽记录已一并失效。`
+      : '已从当前方案移除规则集。')
   }
 
 
@@ -7311,6 +7338,19 @@ function RulesTab({
             <div className="rs-section-title">
               已加入当前方案
               <span className="meta">{scheme.ruleSets?.length ?? 0} 组</span>
+              {orphanExclusionCount > 0 && (
+                <button
+                  className="btn ghost"
+                  title="所属规则集已不存在，这些屏蔽记录不会再影响任何配置"
+                  {...writeGuard(readOnly)}
+                  onClick={() => {
+                    const removed = clearOrphanRuleSetExclusions()
+                    setFlash(`已清理 ${removed} 条孤儿屏蔽记录（所属规则集已不存在）。`)
+                  }}
+                >
+                  清理 {orphanExclusionCount} 条孤儿屏蔽
+                </button>
+              )}
             </div>
             {(scheme.ruleSets?.length ?? 0) > 0 ? (
               <ul className="rs-list">
@@ -7647,6 +7687,23 @@ function RulesTab({
           onConfirm={() => deleteNodeGroup(scheme, pendingGroupDelete)}
         />
       )}
+      <ConfirmDialog
+        open={!!pendingRuleSetRemove}
+        title="从当前方案移除规则集？"
+        body={(
+          <>
+            将移除 <b>「{pendingRuleSetRemove?.name}」</b>的 {pendingRuleSetRemove?.rules.length ?? 0} 条规则。
+            {describeRuleSetRemovalImpact(pendingRuleSetRemove
+              ? ruleSetExclusions[pendingRuleSetRemove.id]?.length ?? 0
+              : 0)}
+          </>
+        )}
+        confirmLabel="移除"
+        danger
+        confirmDisabled={readOnly}
+        onCancel={() => setPendingRuleSetRemove(null)}
+        onConfirm={confirmRemoveSchemeRuleSet}
+      />
       <ConfirmDialog
         open={!!pendingLocalSetDelete}
         title="删除本地规则集？"

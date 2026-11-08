@@ -6,7 +6,7 @@ import { createJSONStorage, persist } from 'zustand/middleware'
 import type { AppState, BuiltinSchemeOverrideRef, BuiltinSchemeSnapshot, BuiltinSchemeSnapshotContent, ClientTarget, ExportContentMode, LatencyTestMethod, LatencyTestMode, LocalRuleSet, NodeNameFilterSettings, ProxyKind, ProxyNode, RuleScheme, RuleSetExclusionTable, SubscriptionRequestOptions, SubscriptionSource, SubscriptionUsage, TailnetConnection } from './models/types'
 import { usageFieldsFrom } from './models/types'
 import { isBuiltinSchemeSnapshotValid, writeBuiltinSchemeSnapshot } from './rules/schemeSnapshots'
-import { addRuleSetExclusion as addExclusion, normalizeRuleSetExclusions, removeRuleSetExclusion as removeExclusion } from './rules/ruleSetExclusions'
+import { addRuleSetExclusion as addExclusion, normalizeRuleSetExclusions, orphanRuleSetIDs, removeOrphanRuleSetExclusions, removeRuleSetExclusion as removeExclusion } from './rules/ruleSetExclusions'
 import { loadTailnetAuthKeys, persistTailnetAuthKeys, pruneTailnetAuthKeys } from './models/tailnetAuthKeys'
 import type { BackupRejection, PersistedData } from './backup'
 import { clearCorruptPersistence, inspectSnapshotHealth, normalizeBuiltinSchemes, normalizeSource } from './backup'
@@ -146,6 +146,8 @@ export interface Store extends AppState {
   removeRuleSetExclusion: (ruleSetID: string, signature: string) => void
   /** 撤销时用：整组恢复某个规则集之前的屏蔽列表。 */
   restoreRuleSetExclusions: (ruleSetID: string, signatures: string[]) => void
+  /** 清理所属规则集已不存在的屏蔽记录，返回删除的表项数。 */
+  clearOrphanRuleSetExclusions: () => number
   /** 固化内置方案：新建独立快照并把指针指过去，返回新快照 id。 */
   saveBuiltinSchemeOverride: (id: string, content: BuiltinSchemeSnapshotContent) => number
   /** 回退到某个历史快照；快照缺失或归属不符时返回 false。 */
@@ -1101,6 +1103,25 @@ export const useStore = create<Store>()(
           else delete exclusions[ruleSetID]
           return { ruleSetExclusions: exclusions }
         }),
+
+      clearOrphanRuleSetExclusions: () => {
+        const s = get()
+        // 仍在使用的 id：自定义方案的规则集、我的规则集、固化快照里的只读规则集。
+        const live = new Set<string>()
+        for (const scheme of s.customSchemes) {
+          for (const set of scheme.ruleSets ?? []) live.add(set.id)
+        }
+        for (const set of s.localRuleSets) live.add(set.id)
+        for (const snapshot of Object.values(s.schemeSnapshots)) {
+          for (const set of snapshot.ruleSets ?? []) live.add(set.id)
+        }
+        const orphans = orphanRuleSetIDs(s.ruleSetExclusions, live)
+        if (orphans.length) {
+          set({ ruleSetExclusions: removeOrphanRuleSetExclusions(s.ruleSetExclusions, live) })
+        }
+        // 与按钮计数同口径：返回删除的屏蔽签名条数，而不是孤儿规则集 id 数。
+        return orphans.reduce((sum, id) => sum + s.ruleSetExclusions[id].length, 0)
+      },
 
       saveBuiltinSchemeOverride: (id, content) => {
         if (isWorkspaceReadOnly()) return 0
