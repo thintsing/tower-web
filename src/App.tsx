@@ -65,6 +65,7 @@ import { AdvancedSection } from './components/AdvancedSection'
 import { WorkspaceStatusBanner } from './components/WorkspaceStatusBanner'
 import { WorkspaceHistoryPanel } from './components/WorkspaceHistoryPanel'
 import { flushWorkspaceNow, useWorkspaceStatus } from './workspaceSync'
+import { autoRefreshReady, buildRefreshReport, describeRefreshReport, dismissRefreshReport, publishRefreshReport, refreshFailureText, selectRefreshTargets, useRefreshReport, type RefreshOutcome } from './subscriptionRefreshReport'
 import { fetchUpstreamStatus, triggerUpstreamStatusCheck, type UpstreamStatusPayload } from './upstreamStatus'
 import { READONLY_NOTE, writeGuard } from './util/readOnlyUi'
 import { buildFlow, explainNodePool, type FlowStepKey } from './flow/flow'
@@ -3287,6 +3288,7 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const [pendingManualDelete, setPendingManualDelete] = useState<ProxyNode | null>(null)
   const [batchFailures, setBatchFailures] = useState<SourceAddFailure[] | null>(null)
   const [refreshProgress, setRefreshProgress] = useState<{ done: number; total: number } | null>(null)
+  const refreshReport = useRefreshReport()
   const removeManualNode = useStore((s) => s.removeManualNode)
 
   // 视口尺寸变化后，已打开的菜单需要重新判断向下 / 向上展开。
@@ -3304,19 +3306,28 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const refreshing = refreshableSources.some((s) => loadingSourceIDs.includes(s.id))
   const refreshAll = async () => {
     if (refreshProgress) return
-    const targets = refreshableSources
+    // 已经在刷新中的订阅不再重复请求，避免同一条并发两次。
+    const targets = selectRefreshTargets(refreshableSources, loadingSourceIDs)
     if (!targets.length) return
     let done = 0
     setRefreshProgress({ done, total: targets.length })
+    const outcomes: RefreshOutcome[] = []
     await Promise.all(targets.map(async (source) => {
+      let error = ''
       try {
         await refreshSource(source.id)
+        error = useStore.getState().errors[source.id] ?? ''
+      } catch (e) {
+        error = e instanceof Error ? e.message : String(e)
       } finally {
+        outcomes.push({ id: source.id, name: source.name, error })
         done += 1
         setRefreshProgress({ done, total: targets.length })
       }
     }))
     setRefreshProgress(null)
+    // 汇总留在列表上方；失败原因在各自卡片里也有，但不该让用户自己去找。
+    publishRefreshReport(buildRefreshReport('manual', outcomes))
   }
   const selectedSources = sources.filter((s) => checkedSources.has(s.id))
   const selectedAllEnabled = selectedSources.length > 0 && selectedSources.every(isSourceEnabled)
@@ -3805,6 +3816,29 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                 : refreshing ? '刷新中…' : `刷新全部（${refreshableSources.length}）`}
             </button>
           )}
+        </div>
+      )}
+
+      {refreshReport && (
+        <div
+          className={`refresh-report${refreshReport.failures.length ? ' has-failures' : ''}`}
+          role="status"
+          aria-live="polite"
+        >
+          <div className="refresh-report-head">
+            <span>{describeRefreshReport(refreshReport)}</span>
+            {refreshReport.failures.length > 0 && (
+              <details className="refresh-report-details">
+                <summary>查看失败明细</summary>
+                <ul>
+                  {refreshReport.failures.map((item) => (
+                    <li key={item.id}>{refreshFailureText(item)}</li>
+                  ))}
+                </ul>
+              </details>
+            )}
+            <button className="btn ghost refresh-report-close" onClick={dismissRefreshReport}>知道了</button>
+          </div>
         </div>
       )}
 
@@ -9724,24 +9758,40 @@ export function App() {
   }, [])
 
   // 只在页面打开时尝试一次；未启用/没有地址的订阅不联网。
+  // 服务器模式必须等工作区在线后再跑，避免按本地旧缓存刷新远程订阅、报出不存在的失败。
   useEffect(() => {
     if (autoRefreshStarted.current) return
+    if (!autoRefreshReady(workspaceStatus.mode, workspaceStatus.state)) return
     autoRefreshStarted.current = true
     const run = () => {
       const state = useStore.getState()
       if (!state.autoRefreshOnOpen) return
-      const ids = state.sources
-        .filter((s) => s.url && isSourceEnabled(s) && !state.loadingSourceIDs.includes(s.id))
-        .map((s) => s.id)
-      if (!ids.length) return
-      void Promise.all(ids.map((id) => state.refreshSource(id)))
+      const targets = selectRefreshTargets(
+        state.sources.filter((s) => s.url && isSourceEnabled(s)),
+        state.loadingSourceIDs,
+      )
+      if (!targets.length) return
+      // 自动刷新不弹窗，但必须把结果留在订阅页；否则失败完全静默。
+      const outcomes: RefreshOutcome[] = []
+      void Promise.all(targets.map(async (source) => {
+        let error = ''
+        try {
+          await state.refreshSource(source.id)
+          error = useStore.getState().errors[source.id] ?? ''
+        } catch (e) {
+          error = e instanceof Error ? e.message : String(e)
+        }
+        outcomes.push({ id: source.id, name: source.name, error })
+      })).then(() => {
+        publishRefreshReport(buildRefreshReport('auto', outcomes))
+      })
     }
     if (useStore.persist.hasHydrated()) {
       run()
       return
     }
     return useStore.persist.onFinishHydration(run)
-  }, [])
+  }, [workspaceStatus.mode, workspaceStatus.state])
 
   // 打开时只比对内置方案的上游响应头，发现变化写一条提示；绝不自动覆盖。
   // 服务器版由服务端定时检查，这里只等模式确定后执行，server 模式直接跳过且不发请求。
