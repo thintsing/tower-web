@@ -38,7 +38,7 @@ import { autoGroupReferenceWarning, buildNodeFilterGroup, findGroupCyclePath, ne
 import { ONLINE_RULE_CATALOG } from './rules/ruleCatalog'
 import type { ManualNodeImportResult } from './manualNodes'
 import { MAX_BATCH_SUBSCRIPTIONS, splitSubscriptionURLs, subscriptionLabel } from './batchSubscriptions'
-import { generateConfig, generateSubscriptionFormats } from './generator'
+import { describeSubscriptionFormatFailures, generateConfig, generateSubscriptionFormatsDetailed } from './generator'
 import { nodeShareText } from './generator/shareLink'
 import { nodeTransportCapability } from './generator/nodeCapabilities'
 import { analyzeRuleCompatibility } from './generator/compatibility'
@@ -8492,7 +8492,7 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     try {
       // 一次生成全部载体，服务端按 format 参数分发，保证每个客户端拿到自己的格式。
       // 传原始方案而不是 exportScheme：内部会按各载体再次准备规则，避免规则重复。
-      const formats = generateSubscriptionFormats(usable, scheme, {
+      const generated = generateSubscriptionFormatsDetailed(usable, scheme, {
         policySelections,
         preferRuleSets,
         ruleSetExclusions,
@@ -8502,7 +8502,16 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         remoteSubscriptions,
         tailnets: activeTailnets,
       })
-      if (!formats.base64) throw new Error('节点列表为空或无法转换')
+      const formats = generated.formats
+      // 订阅链接对所有客户端共用；任何目标载体缺失都意味着对应客户端会收到
+      // 406，不能把半成品地址发出去。失败原因必须逐条展示，不能只报「发布失败」。
+      if (generated.failures.length > 0) {
+        throw new Error(
+          `以下 ${generated.failures.length} 个载体没有生成成功，已停止发布：`
+          + `${describeSubscriptionFormatFailures(generated.failures)}。`
+          + '请检查节点 / 规则方案后重试；缺失载体的客户端会收到 406。',
+        )
+      }
       // Stash / Surge Mac 的 Tailscale 写法与同格式其他客户端不同；Karing、
       // Egern、Hiddify 不支持，需要不带 Tailscale 的变体。
       const targets: Partial<Record<ClientTarget, string>> = {}

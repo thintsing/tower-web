@@ -67,6 +67,7 @@
     "selfcheck:workspace-validation": "tsx scripts/selfcheck-workspace-validation.ts",
     "selfcheck:workspace-save": "tsx scripts/selfcheck-workspace-save.ts",
     "selfcheck:workspace-overwrite": "tsx scripts/selfcheck-workspace-overwrite.ts",
+    "selfcheck:sub-formats": "tsx scripts/selfcheck-sub-formats.ts",
     "selfcheck:workspace-conflict": "tsx scripts/selfcheck-workspace-conflict.ts",
     "selfcheck:yaml": "tsx scripts/selfcheck-yaml.ts"
   },

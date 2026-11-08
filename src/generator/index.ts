@@ -54,16 +54,77 @@ export interface SubscriptionFormatOptions extends OutputOptions {
   contentModeByFormat?: Partial<Record<SubFormat, ExportContentMode>>
 }
 
-export function generateSubscriptionFormats(
+/** 订阅链接一次携带的载体；顺序与 B 服务端接受顺序一致，也用于结果展示。 */
+export const SUBSCRIPTION_FORMAT_ORDER: readonly SubFormat[] = [
+  'yaml', 'egern', 'surge', 'loon', 'quanx', 'json', 'base64',
+]
+
+export const SUBSCRIPTION_FORMAT_TITLES: Record<SubFormat, string> = {
+  yaml: 'Clash / mihomo YAML',
+  egern: 'Egern YAML',
+  surge: 'Surge',
+  loon: 'Loon',
+  quanx: 'Quantumult X',
+  json: 'sing-box JSON',
+  base64: 'Base64 通用链接',
+}
+
+export interface SubscriptionFormatFailure {
+  format: SubFormat
+  /** 生成失败原因：异常信息，或「内容为空」。 */
+  reason: string
+}
+
+export interface SubscriptionFormatsResult {
+  formats: SubscriptionFormats
+  /** 没有生成成功的载体；发布前必须逐条展示，否则缺失格式的客户端会收到 406。 */
+  failures: SubscriptionFormatFailure[]
+}
+
+/** 发布前与目标格式集合对比：返回内容为空 / 缺失的载体。 */
+export function missingSubscriptionFormats(
+  formats: Partial<Record<SubFormat, string>>,
+  required: readonly SubFormat[] = SUBSCRIPTION_FORMAT_ORDER,
+): SubFormat[] {
+  return required.filter((format) => !(formats[format] ?? '').trim())
+}
+
+/** 把失败载体列表写成界面可直接展示的一句话。 */
+export function describeSubscriptionFormatFailures(failures: SubscriptionFormatFailure[]): string {
+  return failures
+    .map((item) => `${SUBSCRIPTION_FORMAT_TITLES[item.format]}（${item.format}）：${item.reason}`)
+    .join('；')
+}
+
+export function generateSubscriptionFormatsDetailed(
   nodes: ProxyNode[],
   scheme: RuleScheme,
   options: SubscriptionFormatOptions = {},
-): SubscriptionFormats {
-  const safe = (fn: () => string): string => {
+): SubscriptionFormatsResult {
+  const formats: SubscriptionFormats = {
+    yaml: '',
+    surge: '',
+    loon: '',
+    quanx: '',
+    json: '',
+    base64: '',
+    egern: '',
+  }
+  const failures: SubscriptionFormatFailure[] = []
+  // 失败必须留下原因：服务端只保存非空载体，静默留空会让部分客户端在拉取时 406。
+  const build = (format: SubFormat, run: () => string): void => {
     try {
-      return fn()
-    } catch {
-      return ''
+      const text = run()
+      if (!text.trim()) {
+        failures.push({ format, reason: '生成的配置内容为空' })
+        return
+      }
+      formats[format] = text
+    } catch (error) {
+      const reason = error instanceof Error && error.message
+        ? error.message
+        : String(error) || '未知错误'
+      failures.push({ format, reason })
     }
   }
   // 通用载体没有 target；给每种格式选一个代表性客户端，按它的规则能力
@@ -99,24 +160,32 @@ export function generateSubscriptionFormats(
   const yamlMode = forOutput('yaml').contentMode ?? 'full'
   const surgeMode = forOutput('surge').contentMode ?? 'full'
   const jsonMode = forOutput('json').contentMode ?? 'full'
-  return {
-    yaml: safe(() => applyTailnetsForFormat(
-      generateClashYAML(nodes, forFormat('yaml'), forOutput('yaml')),
-      'yaml', yamlMode, options.tailnets ?? [],
-    )),
-    surge: safe(() => applyTailnetsForFormat(
-      generateSurge(nodes, forFormat('surge'), forOutput('surge')).text,
-      'surge', surgeMode, options.tailnets ?? [],
-    )),
-    loon: safe(() => generateLoon(nodes, forFormat('loon'), forOutput('loon')).text),
-    quanx: safe(() => generateQuanX(nodes, forFormat('quanx'), forOutput('quanx')).text),
-    json: safe(() => applyTailnetsForFormat(
-      generateSingBox(nodes, forFormat('json'), forOutput('json')).text,
-      'json', jsonMode, options.tailnets ?? [],
-    )),
-    base64: safe(() => generateBase64Subscription(nodes, forOutput('base64')).text),
-    egern: safe(() => generateEgern(nodes, forFormat('egern'), forOutput('egern')).text),
-  }
+  build('yaml', () => applyTailnetsForFormat(
+    generateClashYAML(nodes, forFormat('yaml'), forOutput('yaml')),
+    'yaml', yamlMode, options.tailnets ?? [],
+  ))
+  build('surge', () => applyTailnetsForFormat(
+    generateSurge(nodes, forFormat('surge'), forOutput('surge')).text,
+    'surge', surgeMode, options.tailnets ?? [],
+  ))
+  build('loon', () => generateLoon(nodes, forFormat('loon'), forOutput('loon')).text)
+  build('quanx', () => generateQuanX(nodes, forFormat('quanx'), forOutput('quanx')).text)
+  build('json', () => applyTailnetsForFormat(
+    generateSingBox(nodes, forFormat('json'), forOutput('json')).text,
+    'json', jsonMode, options.tailnets ?? [],
+  ))
+  build('base64', () => generateBase64Subscription(nodes, forOutput('base64')).text)
+  build('egern', () => generateEgern(nodes, forFormat('egern'), forOutput('egern')).text)
+  return { formats, failures }
+}
+
+/** 兼容只需要载体文本的调用方（预览等）；发布流程用 detailed 版本拿到失败原因。 */
+export function generateSubscriptionFormats(
+  nodes: ProxyNode[],
+  scheme: RuleScheme,
+  options: SubscriptionFormatOptions = {},
+): SubscriptionFormats {
+  return generateSubscriptionFormatsDetailed(nodes, scheme, options).formats
 }
 
 /** 按客户端声明的 subFormat 生成完整配置文本，供下载 / 预览 / 一键导入复用。 */
