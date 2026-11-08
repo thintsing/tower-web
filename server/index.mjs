@@ -20,6 +20,7 @@ import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib'
 import { convertRuleSet, RuleSetConversionError } from './ruleset-convert.mjs'
 import { loadIPASNData, organizationForAddress } from './ip-asn.mjs'
 import { createUpstreamChecker } from './upstream-status.mjs'
+import { BUILTIN_PROGRAMMATIC_SCHEMES, BUILTIN_SCHEME_COUNT, BUILTIN_SCHEME_FILES } from './builtin-scheme-counts.mjs'
 
 const rawPort = String(process.env.PORT ?? '').trim()
 const parsedPort = rawPort ? Number(rawPort) : 8787
@@ -53,6 +54,16 @@ function parsePublicURL(value) {
   if (!parsed.hostname) return { url: '', error: '缺少主机名' }
   if (parsed.username || parsed.password) return { url: '', error: '不能包含用户名或密码' }
   if (parsed.search || parsed.hash) return { url: '', error: '不能包含查询参数或片段' }
+  // 托管规则集要由手机 / 其他设备直接访问；回环地址只有本机可达，
+  // 等于把不可达地址写进客户端配置，必须当作配置错误。
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  const loopback = host === 'localhost'
+    || host.endsWith('.localhost')
+    || (isIP(host) === 4 && (host.startsWith('127.') || host === '0.0.0.0'))
+    || (isIP(host) === 6 && (host === '::1' || host === '::'))
+  if (loopback) {
+    return { url: '', error: '不能使用本机回环地址（localhost / 127.x / 0.0.0.0 / ::1）' }
+  }
   return { url: raw.replace(/\/+$/, ''), error: '' }
 }
 const publicURLConfig = parsePublicURL(process.env.TOWER_PUBLIC_URL)
@@ -117,13 +128,18 @@ function cacheRuleSet(key, artifact) {
   rulesetArtifacts.set(key, { ...artifact, updatedAt: Date.now() })
 }
 
+/**
+ * 查询侧与写入侧必须用同一个函数生成缓存键，否则 provider 这类新参数
+ * 会让写入键与查询键不一致，缓存永远 miss。
+ */
 function ruleSetCacheKey(query) {
   const format = String(query.get('format') ?? '').toLowerCase()
   const behavior = String(query.get('behavior') ?? '').toLowerCase()
+  const provider = String(query.get('provider') ?? '').toLowerCase()
   const file = query.get('file')
   const remote = query.get('url')
   if (!format || (!file && !remote)) return ''
-  return `${format}|${behavior}|${file ? `file:${file}` : `url:${remote}`}`
+  return `${format}|${behavior}|${provider}|${file ? `file:${file}` : `url:${remote}`}`
 }
 
 /**
@@ -177,12 +193,20 @@ function blockedRuleSetAddress(address) {
 /** 读取内置规则文件或抓取远程列表，再转换成目标客户端方言。 */
 async function buildRuleSetArtifact(query) {
   const format = String(query.get('format') ?? '').toLowerCase()
-  if (!['quanx', 'egern', 'singbox', 'sing-box', 'mrs', 'srs', 'srs-domain'].includes(format)) {
-    throw new RuleSetConversionError('format 必须是 quanx / egern / singbox / mrs / srs / srs-domain')
+  if (!['classic', 'quanx', 'egern', 'singbox', 'sing-box', 'mrs', 'srs', 'srs-domain'].includes(format)) {
+    throw new RuleSetConversionError('format 必须是 classic / quanx / egern / singbox / mrs / srs / srs-domain')
   }
   const behavior = String(query.get('behavior') ?? '').toLowerCase()
   if (format === 'mrs' && behavior !== 'domain' && behavior !== 'ipcidr') {
     throw new RuleSetConversionError('MRS 需要 behavior=domain 或 behavior=ipcidr', 400)
+  }
+  // provider=yaml：源文件是 Clash provider 的 `payload:`，必须先按 behavior 解开。
+  const provider = String(query.get('provider') ?? '').toLowerCase()
+  if (provider && provider !== 'yaml') {
+    throw new RuleSetConversionError('provider 只支持 yaml', 400)
+  }
+  if (provider && !['domain', 'ipcidr', 'classical'].includes(behavior)) {
+    throw new RuleSetConversionError('provider YAML 需要 behavior=domain / ipcidr / classical', 400)
   }
   const file = query.get('file')
   const remote = query.get('url')
@@ -230,9 +254,10 @@ async function buildRuleSetArtifact(query) {
     }
     sourceText = response.body.toString('utf8')
   }
-  const artifact = convertRuleSet(sourceText, format, { behavior })
+  const artifact = convertRuleSet(sourceText, format, { behavior, provider })
   return {
-    key: `${format}|${behavior}|${file ? `file:${file}` : `url:${remote}`}`,
+    // 与缓存查询复用同一个键构造函数，避免两侧再次漂移。
+    key: ruleSetCacheKey(query),
     body: artifact.text,
     contentType: artifact.contentType,
     ruleCount: artifact.ruleCount,
@@ -281,14 +306,9 @@ function schemeRuleCount(scheme) {
  * 历史差异只用服务端已有的数据统计。内置方案的原厂规则在客户端代码里，
  * 但同样打包在 public/rulesets 下；服务端按同一份 INI + 列表文件统计，
  * 这样回滚确认里的规则数不会把「内置方案有 3529 条」误报成 0。
- * 与 src/rules/scheme.ts 中的 BUILTIN_SCHEMES 保持同步。
+ * 文件清单与程序化方案计数在 builtin-scheme-counts.mjs，前端一致性由
+ * selfcheck:provider-rulesets 断言。
  */
-const BUILTIN_SCHEME_FILES = {
-  'acl4ssr-online': 'ACL4SSR_Online.ini',
-  'acl4ssr-mini': 'ACL4SSR_Online_Mini.ini',
-  'acl4ssr-full': 'ACL4SSR_Online_Full.ini',
-}
-const BUILTIN_SCHEME_COUNT = Object.keys(BUILTIN_SCHEME_FILES).length
 const builtinSchemeCountsCache = new Map()
 
 function readRulesetFile(name) {
@@ -317,6 +337,8 @@ function countRuleListLines(text) {
 
 /** 读取内置方案 INI 与它引用的本地列表，统计规则数 / 策略组数（进程内缓存）。 */
 function builtinSchemeCounts(id) {
+  const programmatic = BUILTIN_PROGRAMMATIC_SCHEMES[id]
+  if (programmatic) return programmatic
   const file = BUILTIN_SCHEME_FILES[id]
   if (!file) return null
   const cached = builtinSchemeCountsCache.get(id)
@@ -2304,6 +2326,8 @@ const server = createServer(async (req, res) => {
       try {
         const cacheKey = ruleSetCacheKey(url.searchParams)
         let artifact = cacheKey ? cachedRuleSet(cacheKey) : undefined
+        // 自检与线上排查都依赖这个头确认缓存键是否真正命中。
+        const cacheState = artifact ? 'hit' : 'miss'
         if (!artifact) {
           artifact = await buildRuleSetArtifact(url.searchParams)
           cacheRuleSet(artifact.key, artifact)
@@ -2313,6 +2337,7 @@ const server = createServer(async (req, res) => {
           'cache-control': 'public, max-age=3600',
           'x-tower-ruleset-format': url.searchParams.get('format') ?? '',
           'x-tower-ruleset-rules': String(artifact.ruleCount),
+          'x-tower-ruleset-cache': cacheState,
         })
       } catch (error) {
         const status = error instanceof RuleSetConversionError ? error.status : 500

@@ -3,6 +3,7 @@
 // conversion is rejected so a remote reference never silently loses rules.
 // Binary MRS / SRS output only contains the subset each format can express;
 // the caller keeps every other line inline in the generated profile.
+import { isIP } from 'node:net'
 import { encodeMihomoRuleSet, encodeSingBoxRuleSet } from './ruleset-binary.mjs'
 
 const QUANX_TYPES = {
@@ -47,6 +48,7 @@ const IP_CIDR_TYPES = new Set(['IP-CIDR', 'IP-CIDR6', 'IP6-CIDR'])
 const EGERN_IP_TYPES = new Set([...IP_CIDR_TYPES, 'GEOIP', 'IP-ASN'])
 
 const CONTENT_TYPES = {
+  classic: 'text/plain; charset=utf-8',
   quanx: 'text/plain; charset=utf-8',
   egern: 'text/yaml; charset=utf-8',
   singbox: 'application/json; charset=utf-8',
@@ -180,6 +182,8 @@ function convertQuanX(rules) {
       && (!EGERN_IP_TYPES.has(rule.type) || rule.fields[2].toLowerCase() !== 'no-resolve')) {
       throw new RuleSetConversionError(`QuanX 规则参数无法无损转换：${rule.type},${rule.fields[2]}`)
     }
+    // QuanX 远程列表没有 no-resolve 字段：IP 规则第三段只被接受后被丢弃，
+    // 语义上变成「允许 DNS 解析」。这是载体限制，导出侧不能宣称无损。
     const value = requireValue(rule, 'QuanX')
     if (value.includes(',')) {
       throw new RuleSetConversionError(`QuanX 规则值包含逗号，无法安全转换：${value}`)
@@ -254,6 +258,8 @@ function convertSingBox(rules) {
       || (!isIP && rule.fields.length === 3)) {
       throw new RuleSetConversionError(`sing-box 规则参数无法无损转换：${rule.type}`)
     }
+    // sing-box 规则集没有逐条 no-resolve 位；带 no-resolve 的 IP 规则会按
+    // 普通 ip_cidr 落地，匹配前可能触发解析。属于载体的语义降级。
     let value = requireValue(rule, 'sing-box')
     if (rule.type === 'DOMAIN-SUFFIX' && (value.startsWith('.') || value.startsWith('+.'))) {
       throw new RuleSetConversionError(`sing-box 域名后缀格式无法无损转换：${value}`)
@@ -272,7 +278,109 @@ function convertSingBox(rules) {
   }, null, 2) + '\n'
 }
 
-export const RULESET_CONVERT_FORMATS = ['quanx', 'egern', 'singbox', 'mrs', 'srs', 'srs-domain']
+const HTML_PAGE = /<!doctype|<html[\s>]|<\/html>/i
+const RULE_TYPE = /^[A-Z][A-Z0-9-]{0,31}$/
+const DOMAIN_LABEL = /^[a-z0-9*_-]+$/i
+
+/**
+ * 解开 Clash provider YAML（payload: 列表），按 behavior 转成普通规则。
+ * domain：`+.x` / `*.x` / `.x` → DOMAIN-SUFFIX，裸域名 → DOMAIN；
+ * ipcidr：按 v4/v6 生成 IP-CIDR / IP-CIDR6，并带 no-resolve；
+ * classical：payload 每行本身就是 `TYPE,value...`，原样拆字段。
+ *
+ * /api/ruleset 是免密钥 GET，输入不可信：必须存在 block 列表写法的
+ * payload:，逐条校验域名 / CIDR / 规则类型，HTML 页面直接 422，
+ * 不能「尽量转」。
+ */
+function providerRules(text, behavior) {
+  if (HTML_PAGE.test(text)) {
+    throw new RuleSetConversionError('规则集返回的是 HTML 页面，不是 Clash provider YAML')
+  }
+  if (behavior !== 'domain' && behavior !== 'ipcidr' && behavior !== 'classical') {
+    throw new RuleSetConversionError('provider YAML 需要 behavior=domain / ipcidr / classical', 400)
+  }
+  const lines = text.split(/\r?\n/)
+  let payloadIndex = -1
+  let payloadTail = ''
+  for (let index = 0; index < lines.length; index += 1) {
+    const probe = stripComment(lines[index]).trim()
+    const match = /^payload\s*:\s*(.*)$/.exec(probe)
+    if (!match) continue
+    if (payloadIndex >= 0) throw new RuleSetConversionError('provider YAML 出现多个 payload:')
+    payloadIndex = index
+    payloadTail = match[1].trim()
+  }
+  if (payloadIndex < 0) throw new RuleSetConversionError('不是 Clash provider YAML：缺少 payload:')
+  if (payloadTail === '[]') throw new RuleSetConversionError('provider YAML 的 payload 为空')
+  if (payloadTail) {
+    throw new RuleSetConversionError(`provider YAML 只支持 block 列表写法：payload: ${payloadTail.slice(0, 40)}`)
+  }
+  const rules = []
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = stripComment(lines[index])
+    const probe = line.trim()
+    if (!probe || probe.startsWith('#') || probe.startsWith(';') || probe.startsWith('//')) continue
+    if (index < payloadIndex) {
+      throw new RuleSetConversionError(`provider YAML 在 payload: 之前有无法解析的内容：${probe.slice(0, 40)}`)
+    }
+    if (index === payloadIndex) continue
+    const item = /^\s*-\s*(.*)$/.exec(line)
+    if (!item) {
+      throw new RuleSetConversionError(`provider YAML 列表项必须以 "- " 开头：${probe.slice(0, 60)}`)
+    }
+    const value = unquote(item[1].trim())
+    if (!value) continue
+    if (behavior === 'domain') {
+      const suffix = value.startsWith('+.') || value.startsWith('*.') || value.startsWith('.')
+      const domain = suffix ? value.replace(/^(\+\.|\*\.|\.)/, '') : value
+      if (!domain || domain.startsWith('.') || domain.endsWith('.') || domain.includes('..')
+        || /[\s,;<>/'"]/.test(domain)
+        || domain.split('.').some((label) => !DOMAIN_LABEL.test(label))) {
+        throw new RuleSetConversionError(`provider domain 规则无效：${value}`)
+      }
+      rules.push({ type: suffix ? 'DOMAIN-SUFFIX' : 'DOMAIN', fields: [suffix ? 'DOMAIN-SUFFIX' : 'DOMAIN', domain] })
+      continue
+    }
+    if (behavior === 'ipcidr') {
+      const slash = value.indexOf('/')
+      const version = slash > 0 ? isIP(value.slice(0, slash)) : 0
+      const prefixText = slash > 0 ? value.slice(slash + 1) : ''
+      if (!version || !/^\d{1,3}$/.test(prefixText)
+        || Number(prefixText) > (version === 6 ? 128 : 32)) {
+        throw new RuleSetConversionError(`provider ipcidr 规则无效：${value}`)
+      }
+      const type = version === 6 ? 'IP-CIDR6' : 'IP-CIDR'
+      rules.push({ type, fields: [type, value, 'no-resolve'] })
+      continue
+    }
+    const fields = splitFields(value)
+    const type = fields[0]?.toUpperCase() ?? ''
+    if (!RULE_TYPE.test(type) || !fields[1]?.trim() || /[<>]/.test(value)) {
+      throw new RuleSetConversionError(`provider classical 规则无法解析：${value}`)
+    }
+    rules.push({ type, fields })
+  }
+  return rules
+}
+
+function convertClassic(rules) {
+  const lines = []
+  for (const rule of rules) {
+    if (!rule.fields[1]) {
+      throw new RuleSetConversionError(`经典规则集不能转换 ${rule.type} 规则`)
+    }
+    // Surge 手册：规则集文件「每行是一条不带策略的规则声明」，no-resolve 是
+    // [Rule] 里 RULE-SET 行的参数，因此正文不能带参数。
+    // Loon 的 IP 规则文档展示的是 `IP-CIDR,addr,no-resolve`（无策略写法），但托管
+    // 正文与 Surge 共用同一个 URL，只能按更严格的 Surge 口径产出；Loon 因此失去
+    // no-resolve（语义降级，导出侧不宣称无损）。
+    lines.push([rule.fields[0], rule.fields[1]].map(unquote).join(','))
+  }
+  if (!lines.length) throw new RuleSetConversionError('没有可转换的经典规则')
+  return lines.join('\n') + '\n'
+}
+
+export const RULESET_CONVERT_FORMATS = ['classic', 'quanx', 'egern', 'singbox', 'mrs', 'srs', 'srs-domain']
 
 function normalizedRule(rule) {
   return {
@@ -289,12 +397,15 @@ export function convertRuleSet(text, format, options = {}) {
   if (text.length > 8 * 1024 * 1024) {
     throw new RuleSetConversionError('规则集内容过大')
   }
-  const rules = ruleLines(text)
+  const rules = options.provider === 'yaml'
+    ? providerRules(text, String(options.behavior ?? '').toLowerCase())
+    : ruleLines(text)
   if (!rules.length) throw new RuleSetConversionError('没有解析到规则')
   const normalized = format === 'sing-box' ? 'singbox' : format
   let body
   let ruleCount = rules.length
-  if (normalized === 'quanx') body = convertQuanX(rules)
+  if (normalized === 'classic') body = convertClassic(rules)
+  else if (normalized === 'quanx') body = convertQuanX(rules)
   else if (normalized === 'egern') body = convertEgern(rules)
   else if (normalized === 'singbox') body = convertSingBox(rules)
   else if (normalized === 'mrs') {
