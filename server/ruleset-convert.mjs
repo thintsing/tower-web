@@ -395,7 +395,11 @@ export function convertRuleSet(text, format, options = {}) {
   if (typeof text !== 'string' || !text.trim()) {
     throw new RuleSetConversionError('规则集内容为空')
   }
-  if (text.length > 8 * 1024 * 1024) {
+  // 远程抓取仍限制 8MB；GEOIP 这类从本地库展开的源可能更大，由调用方显式放宽。
+  const maxBytes = Number(options.maxSourceBytes) > 0
+    ? Number(options.maxSourceBytes)
+    : 8 * 1024 * 1024
+  if (text.length > maxBytes) {
     throw new RuleSetConversionError('规则集内容过大')
   }
   const rules = options.provider === 'yaml'

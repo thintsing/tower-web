@@ -62,7 +62,7 @@ const quanx = new Set([
 const singbox = new Set([
   'DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD', 'DOMAIN-REGEX', 'DOMAIN-WILDCARD',
   'IP-CIDR', 'IP-CIDR6', 'SRC-IP', 'SRC-IP-CIDR', 'DST-PORT', 'DEST-PORT', 'SRC-PORT',
-  'NETWORK', 'PROTOCOL',
+  'NETWORK', 'PROTOCOL', 'GEOIP',
   ...logical, 'RULE-SET', 'FINAL', 'MATCH',
 ])
 

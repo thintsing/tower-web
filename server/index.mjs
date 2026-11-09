@@ -19,6 +19,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib'
 import { convertRuleSet, RuleSetConversionError } from './ruleset-convert.mjs'
 import { loadIPASNData, organizationForAddress } from './ip-asn.mjs'
+import { countryCIDRs, loadIPCountryData } from './ip-country.mjs'
 import { createUpstreamChecker } from './upstream-status.mjs'
 import { BUILTIN_PROGRAMMATIC_SCHEMES, BUILTIN_SCHEME_COUNT, BUILTIN_SCHEME_FILES } from './builtin-scheme-counts.mjs'
 
@@ -138,8 +139,10 @@ function ruleSetCacheKey(query) {
   const provider = String(query.get('provider') ?? '').toLowerCase()
   const file = query.get('file')
   const remote = query.get('url')
-  if (!format || (!file && !remote)) return ''
-  return `${format}|${behavior}|${provider}|${file ? `file:${file}` : `url:${remote}`}`
+  const geoip = String(query.get('geoip') ?? '').trim().toUpperCase()
+  if (!format) return ''
+  if (!file && !remote && !geoip) return ''
+  return `${format}|${behavior}|${provider}|${geoip ? `geoip:${geoip}` : file ? `file:${file}` : `url:${remote}`}`
 }
 
 /**
@@ -210,10 +213,29 @@ async function buildRuleSetArtifact(query) {
   }
   const file = query.get('file')
   const remote = query.get('url')
-  if (!file && !remote) throw new RuleSetConversionError('缺少 file 或 url 参数')
+  // geoip=CN：从随包离线国家表生成 CIDR 列表，供 sing-box / Hiddify
+  // 把 GEOIP 规则写成可下载的本地规则集（1.12 起内核不再接受 geoip 字段）。
+  const geoipParam = String(query.get('geoip') ?? '').trim()
+  const geoip = geoipParam.toUpperCase()
+  if (geoip && !/^[A-Z]{2}$/.test(geoip)) {
+    throw new RuleSetConversionError('geoip 需要两位国家或地区代码，例如 CN', 400)
+  }
+  if (geoip && (file || remote)) {
+    throw new RuleSetConversionError('geoip 与 file / url 只能三选一', 400)
+  }
+  if (!file && !remote && !geoip) throw new RuleSetConversionError('缺少 file / url / geoip 参数')
   if (file && remote) throw new RuleSetConversionError('file 与 url 只能二选一')
   let sourceText
-  if (file) {
+  if (geoip) {
+    if (format === 'srs-domain') {
+      throw new RuleSetConversionError('srs-domain 只接受域名规则，不支持 geoip', 400)
+    }
+    const cidrs = geoipCidrs(geoip)
+    if (!cidrs.length) {
+      throw new RuleSetConversionError(`离线国家表里没有 ${geoip} 的 IP 段`, 404)
+    }
+    sourceText = cidrs.map((cidr) => `IP-CIDR,${cidr},no-resolve`).join('\n')
+  } else if (file) {
     const safeName = String(file)
     if (!/^[A-Za-z0-9_.-]+\.list$/.test(safeName) || safeName.includes('..')) {
       throw new RuleSetConversionError('规则集文件名无效', 400)
@@ -254,7 +276,12 @@ async function buildRuleSetArtifact(query) {
     }
     sourceText = response.body.toString('utf8')
   }
-  const artifact = convertRuleSet(sourceText, format, { behavior, provider })
+  const artifact = convertRuleSet(sourceText, format, {
+    behavior,
+    provider,
+    // 美国等国家的离线表拆出来可超过 8MB；本地生成不受远程抓取的上限约束。
+    maxSourceBytes: geoip ? 64 * 1024 * 1024 : undefined,
+  })
   return {
     // 与缓存查询复用同一个键构造函数，避免两侧再次漂移。
     key: ruleSetCacheKey(query),
@@ -1644,17 +1671,22 @@ function loadIPASNDatabase() {
   return ipASNData
 }
 let ipCountryData
-function loadIPCountryData() {
+function loadIPCountryDatabase() {
   if (ipCountryData !== undefined) return ipCountryData
-  try {
-    ipCountryData = {
-      v4: readFileSync(join(IP_COUNTRY_DIR, 'IPCountryIPv4.bin')),
-      v6: readFileSync(join(IP_COUNTRY_DIR, 'IPCountryIPv6.bin')),
-    }
-  } catch {
-    ipCountryData = null
-  }
+  ipCountryData = loadIPCountryData(IP_COUNTRY_DIR)
   return ipCountryData
+}
+
+/** 国家码 → CIDR 列表；同一国家只扫描一次二进制表。 */
+const geoipCidrCache = new Map()
+function geoipCidrs(code) {
+  const normalized = String(code ?? '').trim().toUpperCase()
+  if (!/^[A-Z]{2}$/.test(normalized)) return []
+  if (geoipCidrCache.has(normalized)) return geoipCidrCache.get(normalized)
+  const cidrs = countryCIDRs(loadIPCountryDatabase(), normalized)
+  if (geoipCidrCache.size >= 256) geoipCidrCache.clear()
+  geoipCidrCache.set(normalized, cidrs)
+  return cidrs
 }
 
 function ipv4Value(address) {
@@ -1688,7 +1720,7 @@ function ipv6Bytes(address) {
 }
 
 function countryCodeForAddress(address) {
-  const data = loadIPCountryData()
+  const data = loadIPCountryDatabase()
   if (!data) return null
   if (isIP(address) === 4) {
     const value = ipv4Value(address)

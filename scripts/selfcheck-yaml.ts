@@ -110,6 +110,16 @@ try {
     if (!ok) problems.push(`${fmt} 分发异常（节点 ${nodeCount}/${nodes.length}）`)
   }
   await fetch(`${BASE}/api/sub/${token}`, { method: 'DELETE' })
+
+  // GEOIP 托管规则集：服务端从离线国家表生成 SRS，sing-box / Hiddify 直接下载。
+  const geoip = await fetch(`${BASE}/api/ruleset?format=srs&geoip=CN`)
+  const geoipBytes = Buffer.from(await geoip.arrayBuffer())
+  const geoipOK = geoip.ok
+    && geoip.headers.get('content-type')?.includes('application/octet-stream')
+    && geoipBytes.subarray(0, 4).toString('hex') === '53525302'
+    && geoipBytes.length > 1000
+  console.log(`${geoipOK ? '✅' : '❌'} geoip: HTTP ${geoip.status} · ${geoipBytes.length} 字节`)
+  if (!geoipOK) problems.push('GEOIP 托管规则集分发异常')
 } catch (err) {
   console.log(`ℹ️ 跳过 E2E（服务端未启动？）：${err instanceof Error ? err.message : String(err)}`)
 }

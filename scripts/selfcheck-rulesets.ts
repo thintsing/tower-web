@@ -2,8 +2,11 @@
 // 用法：npm run selfcheck:rulesets
 import assert from 'node:assert/strict'
 import { inflateSync, zstdDecompressSync } from 'node:zlib'
+import { fileURLToPath } from 'node:url'
 // @ts-expect-error server converter is plain ESM and not part of the src tsconfig
 import { convertRuleSet, RuleSetConversionError } from '../server/ruleset-convert.mjs'
+// @ts-expect-error server module is plain ESM and not part of the src tsconfig
+import { cidrsForRange, countryCIDRs, loadIPCountryData } from '../server/ip-country.mjs'
 import type { RoutingRule, SchemeRuleSet } from '../src/models/types'
 import { mihomoBinaryPlan, singBoxBinaryPlan } from '../src/rules/binaryRuleSets'
 import {
@@ -731,6 +734,24 @@ function main(): void {
     assert.equal(parsed.format, 'yaml')
     assert.equal(parsed.rules[0].type, 'DOMAIN-SUFFIX')
     assert.equal(parsed.rules[0].value, 'mixed.case.example')
+  })
+
+  check('GEOIP：离线国家表可拆成 CIDR 并编码为 SRS', () => {
+    assert.deepEqual(cidrsForRange(0n, 255n, 32), ['0.0.0.0/24'])
+    assert.deepEqual(cidrsForRange(1n, 2n, 32), ['0.0.0.1/32', '0.0.0.2/32'])
+    const data = loadIPCountryData(fileURLToPath(new URL('../server/ip-country', import.meta.url)))
+    assert.ok(data, '离线国家表应随仓库提供')
+    const cn = countryCIDRs(data, 'CN')
+    assert.ok(cn.length > 1000, `CN CIDR 数量应足够多，实际 ${cn.length}`)
+    assert.ok(cn.includes('1.0.1.0/24'))
+    assert.deepEqual(countryCIDRs(data, 'ZZ'), [])
+    const srs = convertRuleSet(
+      cn.slice(0, 5).map((cidr: string) => `IP-CIDR,${cidr},no-resolve`).join('\n'),
+      'srs',
+    )
+    assert.ok(Buffer.isBuffer(srs.text))
+    assert.equal(srs.text.subarray(0, 4).toString('hex'), '53525302')
+    assert.equal(srs.ruleCount, 5)
   })
 
   if (failures) {

@@ -260,6 +260,21 @@ export function hostedRuleSetURL(
   return `${origin}/api/ruleset?${params.toString()}`
 }
 
+/**
+ * GEOIP 规则在 sing-box / Hiddify 里的托管规则集地址。
+ * 服务端从随包离线国家表生成 SRS；baseURL 语义与 hostedRuleSetURL 一致。
+ */
+export function hostedGeoIPRuleSetURL(code: string, baseURL?: string): string | undefined {
+  const normalized = String(code ?? '').trim().toUpperCase()
+  if (!/^[A-Z]{2}$/.test(normalized)) return undefined
+  const origin = baseURL !== undefined
+    ? baseURL.replace(/\/+$/, '')
+    : (typeof location !== 'undefined' && location.origin ? location.origin : '')
+  if (baseURL !== undefined && !origin) return undefined
+  const params = new URLSearchParams({ format: 'srs', geoip: normalized })
+  return `${origin}/api/ruleset?${params.toString()}`
+}
+
 /** PROCESS-NAME 这类 classic provider 只有 Surge 的远程列表能直接读。 */
 export function providerOnlyClassicalHostedSupported(target?: ClientTarget): boolean {
   return !target || target === 'surge' || target === 'surge-mac'

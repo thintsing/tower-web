@@ -528,6 +528,7 @@ const dialectedScheme: RuleScheme = {
     { type: 'SRC-IP', value: '10.0.0.5/32', group: '节点选择' },
     { type: 'AND', raw: 'AND,((DOMAIN,and.example),(NETWORK,udp))', group: '节点选择' },
     { type: 'GEOIP', value: 'CN', group: '节点选择' },
+    { type: 'GEOIP', value: 'PRIVATE', group: '节点选择' },
     { type: 'FINAL', group: '节点选择' },
   ],
 }
@@ -583,5 +584,22 @@ const egernDestPorts = ((egernDialect?.rules ?? []) as any[])
   .filter((rule) => rule.dest_port?.match === '443')
   .length
 if (egernDestPorts !== 1) problems.push(`egern: 443 端口规则应只写一次，实际 ${egernDestPorts}`)
+
+// sing-box / Hiddify：GEOIP 改写成托管国家 CIDR 规则集，LAN / PRIVATE 用内置字段。
+for (const target of ['sing-box', 'hiddify'] as ClientTarget[]) {
+  const doc = JSON.parse(dialected(target)) as any
+  const rules = (doc?.route?.rules ?? []) as any[]
+  const geoipSet = (doc?.route?.rule_set ?? [])
+    .find((set: any) => set.tag === 'tower-geoip-country-cn')
+  if (!geoipSet || !String(geoipSet.url).includes('geoip=CN')) {
+    problems.push(`${target}: GEOIP,CN 未写成托管国家规则集`)
+  }
+  if (!rules.some((rule) => rule.rule_set?.includes('tower-geoip-country-cn'))) {
+    problems.push(`${target}: 路由规则未引用 GEOIP 国家规则集`)
+  }
+  if (!rules.some((rule) => rule.ip_is_private === true)) {
+    problems.push(`${target}: GEOIP,PRIVATE 未写成 ip_is_private`)
+  }
+}
 
 console.log(problems.length ? `\n❌ ${problems.join('\n❌ ')}` : '\n✅ INI / base64 / Egern / Shadowrocket 结构自检通过')

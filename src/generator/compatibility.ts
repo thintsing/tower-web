@@ -147,14 +147,28 @@ export function analyzeRuleCompatibility(
     normalizeRuleForTarget(rule, client.target)
     && rule.type === 'RULE-SET'
     && !supportsRuleSetReference(rule, format, client.target))
-  const skippedRules = [...typeUnsupported, ...setUnsupported]
-  const unsupportedTypes = [...new Set(typeUnsupported.map((rule) => rule.type))]
+  // sing-box / Hiddify 的 GEOIP 依赖塔台托管的国家 CIDR 规则集；没有对外地址时
+  // 生成器会跳过它，这里必须如实计入，不能假装全部规则都写进去了。
+  const geoipNeedsHost = (client.target === 'sing-box' || client.target === 'hiddify')
+    && options.hostedBaseURL === ''
+  const geoipUnsupported = geoipNeedsHost
+    ? prepared.rules.filter((rule) =>
+        rule.type === 'GEOIP' && !['LAN', 'PRIVATE'].includes((rule.value ?? '').trim().toUpperCase()))
+    : []
+  const skippedRules = [...typeUnsupported, ...setUnsupported, ...geoipUnsupported]
+  const unsupportedTypes = [...new Set([
+    ...typeUnsupported.map((rule) => rule.type),
+    ...(geoipUnsupported.length ? ['GEOIP'] : []),
+  ])]
   const noteParts: string[] = []
   if (typeUnsupported.length > 0) {
-    noteParts.push(`${client.name} 不支持 ${unsupportedTypes.join('、')} 规则，这 ${typeUnsupported.length} 条会被跳过。`)
+    noteParts.push(`${client.name} 不支持 ${unsupportedTypes.filter((type) => type !== 'GEOIP').join('、')} 规则，这 ${typeUnsupported.length} 条会被跳过。`)
   }
   if (setUnsupported.length > 0) {
     noteParts.push(`${setUnsupported.length} 条 RULE-SET 使用了 ${client.name} 无法读取的规则集格式，会被跳过。`)
+  }
+  if (geoipUnsupported.length > 0) {
+    noteParts.push(`当前没有可用的托管地址，${geoipUnsupported.length} 条 GEOIP 规则无法下载国家 IP 段，会被跳过。`)
   }
   const note = noteParts.length ? noteParts.join(' ') : undefined
   const ruleSetNote = providerOnlyBlocked

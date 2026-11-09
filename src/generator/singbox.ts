@@ -9,7 +9,7 @@ import type {
 import { resolveGroups, uniqueDisplayNames, type OutputOptions } from './groups'
 import { effectiveGroupType, filterRulesForTarget, parseRuleCondition, type RuleCondition } from '../rules/capabilities'
 import { nodeSupportedForTarget, v2rayPluginSupported } from './nodeCapabilities'
-import { ruleSetFormatOfRule, supportsRuleSetReference } from '../rules/remoteFormats'
+import { hostedGeoIPRuleSetURL, ruleSetFormatOfRule, supportsRuleSetReference } from '../rules/remoteFormats'
 import {
   CHINA_CLIENT_SUBNET,
   DEFAULT_NETWORK_SETTINGS,
@@ -897,6 +897,7 @@ export function generateSingBox(
   // 路由规则必须保持源方案里的先后顺序：sing-box 是第一条命中即生效。
   // 每条源规则独立转换成 route 条件，不再按策略组分桶（A/B/A 会被改成 A/A/B）。
   const rules: Record<string, unknown>[] = []
+  const geoipRuleSetTags = new Map<string, string>()
   const finalRule = filteredRules.find((r) => r.type === 'FINAL')
   const rejectAll = finalRule?.group === 'REJECT'
   const finalGroup = rejectAll
@@ -913,9 +914,39 @@ export function generateSingBox(
         : { rule_set: [tag], outbound: rule.group })
       continue
     }
-    // sing-box 1.12 移除了 route 规则里的 geoip / asn 字段，离线生成没有
-    // 对应数据库，跳过而不是让内核拒绝整份配置。
-    if (rule.type === 'GEOIP' || rule.type === 'IP-ASN') continue
+    // sing-box 1.12 移除了 route 规则里的 geoip / asn 字段。GEOIP 改写成
+    // 塔台托管的国家 CIDR 规则集（服务端从随包离线国家表生成 SRS）；
+    // IP-ASN 目前没有对应数据，继续跳过。
+    if (rule.type === 'GEOIP') {
+      if (!rule.value) continue
+      const code = rule.value.trim().toUpperCase()
+      const reject = rule.group.toUpperCase() === 'REJECT'
+      if (code === 'LAN' || code === 'PRIVATE') {
+        rules.push(reject
+          ? { ip_is_private: true, action: 'reject' }
+          : { ip_is_private: true, outbound: rule.group })
+        continue
+      }
+      const url = hostedGeoIPRuleSetURL(code, options.hostedBaseURL)
+      if (!url) continue
+      let tag = geoipRuleSetTags.get(code)
+      if (!tag) {
+        tag = `tower-geoip-country-${code.toLowerCase()}`
+        geoipRuleSetTags.set(code, tag)
+        remoteRuleSetDefs.push({
+          type: 'remote',
+          tag,
+          format: 'binary',
+          url,
+          update_interval: '1d',
+        })
+      }
+      rules.push(reject
+        ? { rule_set: [tag], action: 'reject' }
+        : { rule_set: [tag], outbound: rule.group })
+      continue
+    }
+    if (rule.type === 'IP-ASN') continue
     const parsed = rule.raw ? parseRuleCondition(rule.raw) : undefined
     const condition = parsed
       ? singBoxCondition(parsed)
