@@ -1,8 +1,8 @@
 // 规则顺序移植自 Tower iOS RuleScheme：
 // - 用户附加的条件按“最具体优先”排列；
-// - 从规则库加入的规则集放在第一条与它冲突的模板规则之前，而不是全部压到最前；
+// - 从规则库加入的规则集在同来源 / 同值锚点之前插入，没有锚点时前置；
 // - FINAL / MATCH 永远留在最后，不参与拖动重排。
-import type { RoutingRule, RuleScheme } from '../models/types'
+import type { RoutingRule, RuleScheme, SchemeRuleSet } from '../models/types'
 import { reorderRulesByMatchingOrder } from './matchingOrder'
 import { ruleSignature } from './ruleDiff'
 import { isTerminalRule, isUnmovableRule, normalizedPolicyName, ruleMatchKey } from './ruleKeys'
@@ -48,34 +48,53 @@ export interface RuleSetBlock {
   rules: RoutingRule[]
   /** 规则已经在 baseRules 内联保存（固化快照），不再插入，避免同一批规则出现两份。 */
   inlined?: boolean
+  /** provider-only 引用（Loyalsoldier 那类只有远程数据源的规则集）。 */
+  providerOnly?: boolean
+}
+
+/** 模板里第一条与规则集重叠的规则位置；同来源或同 TYPE,value 才算锚点，没有则返回 -1。 */
+function findAnchorIndex(
+  baseRules: RoutingRule[],
+  block: Omit<RuleSetBlock, 'rules'>,
+): number {
+  const keys = new Set(
+    block.matchRules.map(ruleMatchKey).filter((key): key is string => !!key),
+  )
+  const sourceURL = block.sourceURL?.trim()
+  return baseRules.findIndex((rule) => {
+    if (isTerminalRule(rule)) return false
+    if (sourceURL && rule.type === 'RULE-SET' && (rule.value ?? '').trim() === sourceURL) return true
+    const key = ruleMatchKey(rule)
+    return !!key && keys.has(key)
+  })
 }
 
 /**
  * 一条规则集应该插到模板的第几条规则之前：
- * 同组、同来源地址或同 TYPE,value 的第一条；没有冲突就放到 FINAL 之前。
+ * 同来源地址或同 TYPE,value 的第一条；没有这类锚点时插到普通规则最前面，
+ * 即使目标组里已有别的规则——新加入的规则集默认优先匹配。
  */
 export function ruleSetInsertionIndex(
   baseRules: RoutingRule[],
   block: Omit<RuleSetBlock, 'rules'>,
 ): number {
-  const group = normalizedPolicyName(block.group)
-  const keys = new Set(
-    block.matchRules.map(ruleMatchKey).filter((key): key is string => !!key),
-  )
-  const sourceURL = block.sourceURL?.trim()
-  const index = baseRules.findIndex((rule) => {
-    if (isTerminalRule(rule)) return false
-    if (normalizedPolicyName(rule.group) === group) return true
-    if (sourceURL && rule.type === 'RULE-SET' && (rule.value ?? '').trim() === sourceURL) return true
-    const key = ruleMatchKey(rule)
-    return !!key && keys.has(key)
-  })
-  return index < 0 ? baseRules.length : index
+  const index = findAnchorIndex(baseRules, block)
+  return index < 0 ? 0 : index
+}
+
+/**
+ * 无锚点块的先后：用户规则集 → 有锚点的规则集 → provider 引用。
+ * provider 引用同样没有锚点，但它们代表模板自带的数据源，用户新加的
+ * 规则集必须排在它们之前；同一档内保持方案里的顺序。
+ */
+function blockPriority(block: Omit<RuleSetBlock, 'rules'>, anchored: boolean): number {
+  if (anchored) return 1
+  return block.providerOnly ? 2 : 0
 }
 
 /**
  * 把规则集块按插入位置与模板规则交错合并。
- * 多个规则集落在同一位置时保持它们在方案里的顺序。
+ * 同一插入点内保持块的最终顺序（稳定排序）。
  */
 export function insertRuleSetBlocks(
   baseRules: RoutingRule[],
@@ -83,11 +102,16 @@ export function insertRuleSetBlocks(
 ): RoutingRule[] {
   const ordinary = baseRules.filter((rule) => !isTerminalRule(rule))
   const finals = baseRules.filter(isTerminalRule)
-  const buckets = new Map<number, RoutingRule[]>()
-  for (const block of blocks) {
+  const ranked = blocks
     // 内联块（固化快照）的规则已经在 baseRules 里；跳过是导出逐字节一致的前提。
-    if (block.inlined) continue
-    const index = ruleSetInsertionIndex(ordinary, block)
+    .filter((block) => !block.inlined)
+    .map((block) => {
+      const anchor = findAnchorIndex(ordinary, block)
+      return { block, index: anchor < 0 ? 0 : anchor, anchored: anchor >= 0 }
+    })
+    .sort((left, right) => blockPriority(left.block, left.anchored) - blockPriority(right.block, right.anchored))
+  const buckets = new Map<number, RoutingRule[]>()
+  for (const { block, index } of ranked) {
     buckets.set(index, [...(buckets.get(index) ?? []), ...block.rules])
   }
   const merged: RoutingRule[] = []
@@ -110,6 +134,7 @@ export function orderedSchemeBaseRules(scheme: RuleScheme): RoutingRule[] {
     sourceURL: set.sourceRef,
     rules: set.rules.map((rule) => ({ ...rule, group: set.group })),
     inlined: set.inlined,
+    providerOnly: set.providerOnly,
   }))
   return reorderRulesByMatchingOrder(
     insertRuleSetBlocks(scheme.rules, blocks),
@@ -216,4 +241,23 @@ export function orderedSchemeRules(scheme: RuleScheme): RoutingRule[] {
     ],
     scheme.ruleOrder,
   )
+}
+
+/**
+ * 加入规则集后它是否落在方案普通规则之前（用于界面提示）。
+ * 用 orderedSchemeRules 的最终顺序判断，与实际导出同源，不写死文案。
+ * 方案里没有普通规则时没有“之前”可言，返回 false。
+ */
+export function ruleSetRanksBeforeSchemeRules(
+  scheme: RuleScheme,
+  set: Pick<SchemeRuleSet, 'name' | 'group'>,
+): boolean {
+  const ordered = orderedSchemeRules(scheme)
+  const group = normalizedPolicyName(set.group)
+  const firstSet = ordered.findIndex(
+    (rule) => rule.sourceName === set.name && normalizedPolicyName(rule.group) === group,
+  )
+  const schemeOrdinary = (scheme.rules ?? []).filter((rule) => !isTerminalRule(rule))
+  const firstScheme = ordered.findIndex((rule) => schemeOrdinary.includes(rule))
+  return firstSet >= 0 && firstScheme >= 0 && firstSet < firstScheme
 }

@@ -532,6 +532,7 @@ export function prepareSchemeForExport(
       matchRules: set.rules,
       sourceURL: remoteRuleSetURL(set),
       rules,
+      providerOnly: !!set.providerOnly,
     }
   })
   // 规则集插到第一条冲突规则之前；自定义规则仍全部前置，并最具体优先。

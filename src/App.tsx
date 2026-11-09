@@ -32,7 +32,7 @@ import { describeRuleSetParse, fetchRuleSet, inferRuleSetBehavior, parseRuleSetT
 import { matchingGroupNames, matchingOrderAfterDragging } from './rules/matchingOrder'
 import { findRuleOrderConflicts, type RuleOrderConflict } from './rules/orderConflicts'
 import { policyIssueText, validateSchemePolicy } from './rules/policyValidation'
-import { orderedSchemeBaseRules, orderedSchemeRules, isUnmovableRule, renameRuleOrderKeys, ruleOrderKeys } from './rules/ruleOrder'
+import { orderedSchemeBaseRules, orderedSchemeRules, isUnmovableRule, renameRuleOrderKeys, ruleOrderKeys, ruleSetRanksBeforeSchemeRules } from './rules/ruleOrder'
 import { analyzeRuleImpact, ruleImpactText } from './rules/ruleImpact'
 import { autoGroupReferenceWarning, buildNodeFilterGroup, findGroupCyclePath, nextGroupName, previewNodeMatches, removePolicyGroup, validateGroupCandidates, validateNodeGroupDraft, type NodeGroupDraft } from './rules/groupEditing'
 import { ONLINE_RULE_CATALOG } from './rules/ruleCatalog'
@@ -4621,7 +4621,7 @@ function GroupEditorDialog({
     onAddRule(rule)
     setAddedRules((current) => [...current, rule])
     setNewDomain('')
-    setRuleNotice(`已添加，会排在所有规则最前。${ruleImpactText(impact)}`)
+    setRuleNotice(`已添加，默认排在方案规则之前；若同组已有更具体的规则，仍按具体度排序。${ruleImpactText(impact)}`)
   }
 
   const save = () => {
@@ -6225,6 +6225,19 @@ function RulesTab({
   }
 
   /**
+   * 写入整份逐条顺序（上移 / 下移 / 置顶共用）；撤销槽按动作记录。
+   */
+  const commitRuleOrder = (editable: RuleScheme, next: RoutingRule[], moved: RoutingRule, action: string) => {
+    setRuleOrderUndo({
+      schemeID: editable.id,
+      ruleOrder: editable.ruleOrder,
+      label: `${moved.type} ${moved.value ?? ''}`.trim(),
+    })
+    addCustomScheme({ ...editable, ruleOrder: ruleOrderKeys(next), updatedAt: Date.now() })
+    setFlash(`已${action}规则「${moved.type} ${moved.value ?? ''}」。`)
+  }
+
+  /**
    * 逐条上移 / 下移。只在相邻兜底锚点之间交换，写回 ruleOrder；
    * 展示（orderedSchemeRules）与导出（prepareSchemeForExport）都走同一份顺序。
    */
@@ -6238,14 +6251,29 @@ function RulesTab({
     const next = [...ordered]
     const [moved] = next.splice(index, 1)
     next.splice(target, 0, moved)
-    const ruleOrder = ruleOrderKeys(next)
-    setRuleOrderUndo({
-      schemeID: editable.id,
-      ruleOrder: editable.ruleOrder,
-      label: `${moved.type} ${moved.value ?? ''}`.trim(),
-    })
-    addCustomScheme({ ...editable, ruleOrder, updatedAt: Date.now() })
-    setFlash(`${delta < 0 ? '已上移' : '已下移'}规则「${moved.type} ${moved.value ?? ''}」。`)
+    commitRuleOrder(editable, next, moved, delta < 0 ? '上移' : '下移')
+  }
+
+  /** 置顶：移到当前兜底锚点之后的第一条，不越过 GEOIP / FINAL / MATCH。 */
+  const pinRule = (source: RuleScheme, index: number) => {
+    if (readOnly) return
+    const editable = makeEditableScheme(source)
+    const ordered = orderedSchemeRules(editable)
+    if (index < 0 || index >= ordered.length || isUnmovableRule(ordered[index])) return
+    // 目标位置是同一段（相邻兜底锚点之间）的第一条；跨不过锚点。
+    let target = index
+    for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+      target = cursor
+      if (isUnmovableRule(ordered[cursor])) {
+        target = cursor + 1
+        break
+      }
+    }
+    if (target >= index) return
+    const next = [...ordered]
+    const [moved] = next.splice(index, 1)
+    next.splice(target, 0, moved)
+    commitRuleOrder(editable, next, moved, '置顶')
   }
 
   const undoRuleOrder = () => {
@@ -6501,10 +6529,14 @@ function RulesTab({
     const ruleSets = existingIndex >= 0
       ? existing.map((set, index) => index === existingIndex ? snapshot : set)
       : [...existing, snapshot]
-    addCustomScheme({ ...editable, ruleSets, updatedAt: Date.now() })
-    setFlash(existingIndex >= 0
+    const nextScheme = { ...editable, ruleSets, updatedAt: Date.now() }
+    addCustomScheme(nextScheme)
+    // 提示与真实顺序同源：用加入后的方案算出它是否真的排在方案规则之前。
+    const preposed = ruleSetRanksBeforeSchemeRules(nextScheme, snapshot)
+    const summary = existingIndex >= 0
       ? `已更新「${payload.name}」：${rules.length} 条规则仍然加入「${payload.group}」。`
-      : `已把「${payload.name}」的 ${rules.length} 条规则加入「${payload.group}」。`)
+      : `已把「${payload.name}」的 ${rules.length} 条规则加入「${payload.group}」。`
+    setFlash(`${summary}${preposed ? '该规则集已排在方案规则之前，导出时优先匹配。' : ''}`)
   }
 
   const addLocalSetToScheme = (source: RuleScheme, set: LocalRuleSet, group: string) => {
@@ -7298,9 +7330,11 @@ function RulesTab({
                 const nextRule = schemeRules[index + 1]
                 const canUp = movable && !!previous && !isUnmovableRule(previous)
                 const canDown = movable && !!nextRule && !isUnmovableRule(nextRule)
+                const canPin = movable && index > 0 && !isUnmovableRule(schemeRules[index - 1])
                 const disabledNote = !movable
                   ? 'GEOIP / FINAL / MATCH 是兜底锚点，不能手动移动'
                   : readOnly ? READONLY_NOTE : undefined
+                const pinNote = disabledNote ?? (canPin ? '移到本段最前（不越过兜底锚点）' : '已经在最前')
                 const upNote = disabledNote ?? (canUp ? '上移这条规则' : '上方是兜底锚点或已经是第一条')
                 const downNote = disabledNote ?? (canDown ? '下移这条规则' : '下方是兜底锚点或已经是最后一条')
                 return (
@@ -7312,6 +7346,14 @@ function RulesTab({
                     <span className="mono rule-value">{rule.value ?? '—'}</span>
                     {rule.noResolve && <span className="hint">no-resolve</span>}
                     <span className="rule-order-actions">
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        disabled={!canPin || readOnly}
+                        aria-label={`置顶规则 ${rule.type} ${rule.value ?? ''}`}
+                        title={pinNote}
+                        onClick={() => pinRule(scheme, index)}
+                      >⇈</button>
                       <button
                         type="button"
                         className="icon-btn"
@@ -7347,7 +7389,7 @@ function RulesTab({
           )}
           <div className="hint rule-order-hint">
             这里调整的是导出配置里真正从上到下的匹配顺序。自定义规则默认仍排在最前（最具体优先），手动移动后以这里的顺序为准；
-            调整策略组顺序会重置这里的逐条顺序（组排序优先）。GEOIP / FINAL / MATCH 是兜底锚点，按钮会明确禁用。
+            ⇈ 置顶会把它移到普通规则最前。调整策略组顺序会重置这里的逐条顺序（组排序优先）。GEOIP / FINAL / MATCH 是兜底锚点，按钮会明确禁用。
           </div>
         </div>
       )}

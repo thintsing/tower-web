@@ -8,7 +8,7 @@
 import type { RuleScheme, RoutingRule } from '../models/types'
 import { reorderRulesByMatchingOrder } from './matchingOrder'
 import { ruleSignature } from './ruleDiff'
-import { applyRuleOrder, ruleSetInsertionIndex, sortSupplementRules, type RuleSetBlock } from './ruleOrder'
+import { applyRuleOrder, insertRuleSetBlocks, sortSupplementRules, type RuleSetBlock } from './ruleOrder'
 import { isReadOnlyRuleSet } from './ruleSetExclusions'
 import { isTerminalRule } from './ruleKeys'
 import { shadowedRuleIndexes } from './schemeLint'
@@ -194,35 +194,22 @@ function flattenScheme(scheme: RuleScheme): TaggedRule[] {
       sourceURL: set.sourceRef,
       rules: tags.map((tag) => tag.rule),
       inlined: set.inlined,
+      providerOnly: set.providerOnly,
     }
     return { tags, block }
   })
 
-  // 与 insertRuleSetBlocks 相同的插入算法，但带着索引一起合并。
-  const ordinary = schemeTags.filter((tag) => !isTerminalRule(tag.rule))
-  const finals = schemeTags.filter((tag) => isTerminalRule(tag.rule))
-  const buckets = new Map<number, TaggedRule[]>()
-  for (const { tags, block } of blocks) {
-    // 固化快照的规则已在 scheme.rules 里，块只是展示 / 屏蔽入口，不能再插一遍。
-    if (block.inlined) continue
-    const index = ruleSetInsertionIndex(ordinary.map((tag) => tag.rule), block)
-    buckets.set(index, [...(buckets.get(index) ?? []), ...tags])
-  }
-  const merged: TaggedRule[] = []
-  ordinary.forEach((tag, index) => {
-    const bucket = buckets.get(index)
-    if (bucket) merged.push(...bucket)
-    merged.push(tag)
-  })
-  const tail = buckets.get(ordinary.length)
-  if (tail) merged.push(...tail)
-  merged.push(...finals)
-
-  const baseNatural = reorderRulesByMatchingOrder(
-    merged.map((tag) => tag.rule),
-    scheme.matchingOrder,
+  // 直接复用导出的插入算法，保证这里的顺序与配置里的真实顺序一致。
+  const mergedRules = insertRuleSetBlocks(
+    schemeTags.map((tag) => tag.rule),
+    blocks.map(({ block }) => block),
   )
-    .map((rule) => merged.find((tag) => tag.rule === rule))
+  const tagByRule = new Map<RoutingRule, TaggedRule>()
+  for (const tag of [...schemeTags, ...blocks.flatMap((entry) => entry.tags)]) {
+    tagByRule.set(tag.rule, tag)
+  }
+  const baseNatural = reorderRulesByMatchingOrder(mergedRules, scheme.matchingOrder)
+    .map((rule) => tagByRule.get(rule))
     .filter((tag): tag is TaggedRule => !!tag)
   const allTags = [...customOrdered, ...baseNatural]
   const byRule = new Map(allTags.map((tag) => [tag.rule, tag]))

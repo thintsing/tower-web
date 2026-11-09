@@ -130,7 +130,7 @@ function main(): void {
     assert.equal(prepared.rules.at(-1)?.type, 'FINAL')
   })
 
-  check('规则集插到第一条冲突规则之前，而不是全部压到最前', () => {
+  check('规则集：有同值锚点插在其前，没有锚点时前置', () => {
     const scheme: RuleScheme = {
       id: 'ruleset-placement',
       name: '测试',
@@ -168,11 +168,11 @@ function main(): void {
     assert.deepEqual(
       prepared.rules.map((item) => `${item.type},${item.value ?? ''},${item.group}`),
       [
+        'DOMAIN,not-in-template.example.com,C',
         'DOMAIN,a.example.com,A',
         'DOMAIN,b.example.com,B',
         'DOMAIN,b2.example.com,B',
         'DOMAIN,b.example.com,B',
-        'DOMAIN,not-in-template.example.com,C',
         'DOMAIN,c.example.com,C',
         'FINAL,,A',
       ],
@@ -590,10 +590,11 @@ function main(): void {
 
   check('完整轨迹：确定命中后立即短路，后续规则不再评估', () => {
     const result = explainQuery({ scheme: certaintyScheme, nodes: explainNodes, policySelections: {} }, 'example.com')
-    assert.equal(result.steps.length, 3)
-    assert.equal(result.match?.index, 3)
-    assert.equal(result.steps[2].certainty, 'confirmed-match')
-    assert.equal(result.totalRules - result.steps.length, 8)
+    assert.ok(result.match)
+    // 命中即停：轨迹长度等于命中序号（1 起算），后面的规则不再评估。
+    assert.equal(result.steps.length, result.match.index)
+    assert.equal(result.steps.at(-1)?.certainty, 'confirmed-match')
+    assert.ok(result.totalRules > result.steps.length)
     assert.equal(result.steps.some((step) => step.rule.type === 'GEOIP'), false)
   })
 
