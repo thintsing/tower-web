@@ -262,6 +262,12 @@ function main(): void {
           rules: [rule('A', 'set-a.example.com', 'DOMAIN-SUFFIX')],
           sourceKind: 'local', updatedAt: 1,
         },
+        {
+          id: 'set-remote', name: 'A 远程引用', group: 'A',
+          rules: [],
+          sourceKind: 'url', sourceRef: 'https://example.com/a.txt',
+          providerOnly: true, providerName: 'a-remote',
+        },
       ],
     }
     const removed = removePolicyGroup(scheme, 'A')
@@ -273,7 +279,10 @@ function main(): void {
     assert.deepEqual(removed.scheme.matchingOrder, ['B'])
     assert.equal(removed.removedRules, A.length)
     assert.equal(removed.removedCustomRules, 1)
-    assert.equal(removed.removedRuleSets, 1)
+    // 删除确认框必须同时数规则集与被删掉的远程引用：providerOnly 不贡献正文，
+    // 只数直接规则会显示「移除 0 条」，与随后的「移除了 N 组规则集」自相矛盾。
+    assert.equal(removed.removedRuleSets, 2)
+    assert.equal(removed.removedRemoteReferences, 1)
     assert.deepEqual(removed.referencingGroups, ['B'])
   })
 

@@ -15,10 +15,12 @@ import { generateConfig } from '../src/generator'
 import { analyzeRuleCompatibility } from '../src/generator/compatibility'
 import { prepareSchemeForExport, resolveGroups } from '../src/generator/groups'
 import { resolveHostedBaseURL } from '../src/rules/remoteFormats'
-import { compileScheme, explainWith, foldPossibleMatches, POSSIBLE_PREVIEW } from '../src/rules/ruleExplain'
+import { compileScheme, certaintyFor, explainWith, foldPossibleMatches, POSSIBLE_PREVIEW } from '../src/rules/ruleExplain'
+import { evaluateRule, parseQuery } from '../src/rules/ruleMatcher'
 import { describeRemoteReferences, groupEditorRuleSummary, groupRuleSummary, remoteReferenceCount, remoteReferenceCounts, ruleSetSummary } from '../src/rules/ruleSetReferences'
 import { BUILTIN_SCHEMES } from '../src/rules/scheme'
 import { buildLoyalsoldierScheme, LOYALSONDIER_SCHEME_ID } from '../src/rules/loyalsoldierScheme'
+import { lintScheme } from '../src/rules/schemeLint'
 
 const BASE = 'https://tower.example'
 const PROVIDER_ROOT = 'https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/'
@@ -273,9 +275,11 @@ async function main(): Promise<void> {
     // FINAL 仍是确定兜底，但结论必须让位给前面的远程引用可能命中。
     assert.equal((google.match?.rule.type ?? '').toUpperCase(), 'FINAL')
     // 无确定命中时，列全所有可能命中的引用（按匹配顺序），而不是只给第一条。
+    // 进程类列表对任何静态输入都只能「可能命中」；载体未知时，带 no-resolve 的
+    // IP 列表对域名输入也只能「可能命中」，所以 13 条引用全部进入清单。
     assert.deepEqual(
       google.possibleMatches.map((step) => step.rule.ruleSetProviderKey),
-      ['private', 'reject', 'icloud', 'apple', 'google', 'proxy', 'direct', 'gfw', 'tld-not-cn'],
+      ['applications', 'private', 'lancidr', 'reject', 'icloud', 'apple', 'google', 'proxy', 'direct', 'cncidr', 'gfw', 'tld-not-cn', 'telegramcidr'],
     )
     for (const [index, step] of google.possibleMatches.entries()) {
       assert.equal(step.certainty, 'possible-match')
@@ -290,32 +294,73 @@ async function main(): Promise<void> {
     assert.equal(privateStep?.certainty, 'confirmed-miss')
   })
 
-  await check('条目类型判定：域名不命中进程名列表，IP 不命中域名列表', () => {
+  await check('条目类型判定：进程名列表只能可能命中，IP 不命中域名列表', () => {
     const compiled = compileScheme({ scheme, nodes: [node] })
-    // 域名输入：applications 是 PROCESS-NAME 列表，确定未命中，不能再挡住后面 12 条。
+    // 域名输入：applications 是 PROCESS-NAME 列表，与规则匹配器一致只标可能命中。
     const domain = explainWith(compiled, 'www.google.com')
     const applications = domain.steps.find((step) => step.rule.ruleSetProviderKey === 'applications')
-    assert.equal(applications?.certainty, 'confirmed-miss')
+    assert.equal(applications?.certainty, 'possible-match')
+    assert.equal(applications?.evaluation.status, 'skip')
     assert.match(applications?.evaluation.detail ?? '', /进程名列表/)
-    // youtube 不再被 applications 接住，落到后面第一条可能命中的引用。
+    assert.ok(domain.possibleMatches.some((step) => step.rule.ruleSetProviderKey === 'applications'))
+    // youtube 仍从第一条可能命中的引用 applications 开始，而不是 private。
     const youtube = explainWith(compiled, 'https://www.youtube.com/watch?v=1')
     const ytApplications = youtube.steps.find((step) => step.rule.ruleSetProviderKey === 'applications')
-    assert.equal(ytApplications?.certainty, 'confirmed-miss')
-    assert.equal(youtube.possibleMatches[0]?.rule.ruleSetProviderKey, 'private')
-    // IP 输入：applications 仍确定未命中，域名列表也确定未命中。
+    assert.equal(ytApplications?.certainty, 'possible-match')
+    assert.equal(youtube.possibleMatches[0]?.rule.ruleSetProviderKey, 'applications')
+    // IP 输入：applications 同样只标可能命中；域名列表 google 确定不命中。
     const ip = explainWith(compiled, '1.1.1.1')
     const ipApplications = ip.steps.find((step) => step.rule.ruleSetProviderKey === 'applications')
-    assert.equal(ipApplications?.certainty, 'confirmed-miss')
+    assert.equal(ipApplications?.certainty, 'possible-match')
+    assert.equal(ipApplications?.evaluation.status, 'skip')
     assert.match(ipApplications?.evaluation.detail ?? '', /进程名列表/)
+    assert.ok(ip.possibleMatches.some((step) => step.rule.ruleSetProviderKey === 'applications'))
     const ipGoogle = ip.steps.find((step) => step.rule.ruleSetProviderKey === 'google')
     assert.equal(ipGoogle?.certainty, 'confirmed-miss')
     assert.match(ipGoogle?.evaluation.detail ?? '', /域名列表/)
-    // IP 输入只列出 IP 段引用，不再把域名列表算进来。
+    // IP 输入只列出可命中的引用：进程类 + 三个 IP 段，域名列表全部确定不命中。
     assert.deepEqual(
       ip.possibleMatches.map((step) => step.rule.ruleSetProviderKey),
-      ['lancidr', 'cncidr', 'telegramcidr'],
+      ['applications', 'lancidr', 'cncidr', 'telegramcidr'],
     )
     assert.equal(ip.possibleMatches[0]?.rule.group, '🎯 全球直连')
+  })
+
+  await check('三种口径一致：规则匹配器 / 远程引用解释 / 确定度映射对进程规则都只标可能命中', () => {
+    const target = parseQuery('www.google.com')
+    // 1) 普通 PROCESS-* 规则：规则匹配器判 skip。
+    const direct = evaluateRule({ type: 'PROCESS-NAME', value: 'git', group: 'x' }, target)
+    assert.equal(direct.status, 'skip')
+    assert.equal(certaintyFor(direct), 'possible-match')
+    // 2) providerOnly 进程类远程引用：解释器同样判 skip，而不是 confirmed-miss。
+    const compiled = compileScheme({ scheme, nodes: [node] })
+    const applications = explainWith(compiled, 'www.google.com').steps
+      .find((step) => step.rule.ruleSetProviderKey === 'applications')
+    assert.equal(applications?.evaluation.status, 'skip')
+    assert.equal(applications?.certainty, 'possible-match')
+    // 3) IP 输入也一样，不能被域名/IP 形态差异判死。
+    const ipApplications = explainWith(compiled, '1.1.1.1').steps
+      .find((step) => step.rule.ruleSetProviderKey === 'applications')
+    assert.equal(ipApplications?.evaluation.status, 'skip')
+    assert.equal(ipApplications?.certainty, 'possible-match')
+  })
+
+  await check('no-resolve 判定按载体分档：Clash 原生 / Surge 确定不命中，其余载体可能命中', () => {
+    const domain = 'www.google.com'
+    const pick = (format: 'yaml' | 'surge' | 'loon') =>
+      explainWith(compileScheme({ scheme, nodes: [node], format }), domain)
+        .steps.find((step) => step.rule.ruleSetProviderKey === 'lancidr')
+    // lancidr 是 IP 列表且带 no-resolve。
+    assert.equal(pick('yaml')?.certainty, 'confirmed-miss')
+    assert.match(pick('yaml')?.evaluation.detail ?? '', /一定不会命中/)
+    assert.equal(pick('surge')?.certainty, 'confirmed-miss')
+    // Loon 的托管行不带逐条参数，域名解析后仍可能命中。
+    assert.equal(pick('loon')?.certainty, 'possible-match')
+    assert.match(pick('loon')?.evaluation.detail ?? '', /托管行不带 no-resolve/)
+    // 未指定载体时按通用口径标可能命中，不替所有客户端下结论。
+    const generic = explainWith(compileScheme({ scheme, nodes: [node] }), domain)
+      .steps.find((step) => step.rule.ruleSetProviderKey === 'lancidr')
+    assert.equal(generic?.certainty, 'possible-match')
   })
 
   await check('可能命中清单：有确定命中时列出其前的引用，折叠计数正确', () => {
@@ -510,6 +555,35 @@ async function main(): Promise<void> {
       () => generateConfig(client('loon'), [node], scheme, { contentMode: 'full', hostedBaseURL: '' }),
       /托管转换地址不可用/,
     )
+  })
+
+  await check('检查面板与导出页同源：所有可导出载体被阻断时提为 error', () => {
+    const nonNative = [client('loon'), client('quanx'), client('egern'), client('sing-box')]
+    // 静态部署解析结果是空地址：与导出页一样，全部非 Clash 目标被阻断。
+    const blocked = lintScheme({ scheme, nodes: [node], clients: nonNative, hostedBaseURL: '' })
+    const issue = blocked.find((item) => item.code === 'providerOnlyUnsupported')
+    assert.equal(issue?.level, 'error')
+    assert.match(issue?.message ?? '', /所有可导出的客户端/)
+    // 只有部分载体被阻断时保持 warn，不把可正常导出的 Clash 一起判死。
+    const partial = lintScheme({
+      scheme, nodes: [node],
+      clients: [client('clash-verge'), client('loon')],
+      hostedBaseURL: '',
+    }).find((item) => item.code === 'providerOnlyUnsupported')
+    assert.equal(partial?.level, 'warn')
+    // 传入可用的托管地址后，检查面板不再误报阻断。
+    const ok = lintScheme({ scheme, nodes: [node], clients: nonNative, hostedBaseURL: BASE })
+    assert.equal(ok.some((item) => item.code === 'providerOnlyUnsupported'), false)
+  })
+
+  await check('S3：providerOnly 缺少有效远程地址时 lint 报 error', () => {
+    const broken = JSON.parse(JSON.stringify(scheme)) as typeof scheme
+    broken.ruleSets = (broken.ruleSets ?? []).map((set, index) =>
+      index === 0 ? { ...set, sourceRef: 'ftp://rules.example/not-http.list' } : set)
+    const issue = lintScheme({ scheme: broken, nodes: [node] })
+      .find((item) => item.code === 'providerOnlyMissingReference')
+    assert.equal(issue?.level, 'error')
+    assert.match(issue?.message ?? '', /地址无效/)
   })
 
   // ---------- 服务端托管缓存 ----------

@@ -74,6 +74,8 @@ interface DiagnosisPanelProps {
   showGroupEmoji: boolean
   versionHistoryEnabled: boolean
   historyRevision?: number
+  /** 与导出页同一份托管地址解析结果；undefined 表示载体未知，不能当作可托管。 */
+  hostedBaseURL?: string
   /** 当前方案是内置只读方案；删除前必须先说明会创建副本。 */
   requiresCopy: boolean
   onLocate: (issue: SchemeLintIssue) => void
@@ -107,6 +109,7 @@ export function DiagnosisPanel({
   showGroupEmoji,
   versionHistoryEnabled,
   historyRevision = 0,
+  hostedBaseURL,
   requiresCopy,
   onLocate,
   onApplyFix,
@@ -143,9 +146,9 @@ export function DiagnosisPanel({
 
   const compiled = useMemo(
     () => (scheme
-      ? compileScheme({ scheme, nodes, policySelections, latencyByNodeId, localRuleSets, ruleSetExclusions })
+      ? compileScheme({ scheme, nodes, policySelections, latencyByNodeId, localRuleSets, ruleSetExclusions, hostedBaseURL })
       : null),
-    [scheme, nodes, policySelections, latencyByNodeId, localRuleSets, ruleSetExclusions],
+    [scheme, nodes, policySelections, latencyByNodeId, localRuleSets, ruleSetExclusions, hostedBaseURL],
   )
 
   const result = useMemo(() => {
@@ -156,9 +159,9 @@ export function DiagnosisPanel({
   // 诊断数据只在用户真正查询后才计算，避免首屏就把 5000 条规则的全部检查跑一遍。
   const lintState = useMemo(() => {
     if (!scheme || !result) return { issues: [] as SchemeLintIssue[], summary: { error: 0, warn: 0, info: 0, total: 0 } }
-    const issues = lintScheme({ scheme, nodes, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions })
+    const issues = lintScheme({ scheme, nodes, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions, hostedBaseURL })
     return { issues, summary: lintSummary(issues) }
-  }, [scheme, result, nodes, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions])
+  }, [scheme, result, nodes, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions, hostedBaseURL])
 
   const history = useMemo<RuleSetHistory>(
     () => (versionHistoryEnabled ? readRuleSetHistory() : {}),

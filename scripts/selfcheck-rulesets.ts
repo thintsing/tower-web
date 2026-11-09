@@ -313,6 +313,23 @@ function main(): void {
     )
   })
 
+  check('托管转换：provider domain 严格校验域名 label', () => {
+    const convertDomain = (value: string) =>
+      convertRuleSet(`payload:\n  - "${value}"\n`, 'classic', { provider: 'yaml', behavior: 'domain' })
+    // 允许 *. / +. / . 前缀；剥掉后必须仍然是合法域名。
+    for (const value of ['+.example.com', '*.example.com', '.example.com', 'example.com', 'foo-bar.com']) {
+      assert.doesNotThrow(() => convertDomain(value), value)
+    }
+    // *、_ 与首尾连字符都不是合法 DNS label；无法识别时 fail-closed 返回 422。
+    for (const value of ['*example.com', 'foo_bar.com', '-bad.com', 'bad-.com', 'bad..com']) {
+      assert.throws(
+        () => convertDomain(value),
+        (error) => error instanceof RuleSetConversionError && error.status === 422,
+        value,
+      )
+    }
+  })
+
   check('前端：MRS / SRS 二进制规划保留无法编码的规则', () => {
     const rules: RoutingRule[] = [
       rule('DOMAIN-SUFFIX', 'ads.example'),

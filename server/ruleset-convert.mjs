@@ -280,7 +280,8 @@ function convertSingBox(rules) {
 
 const HTML_PAGE = /<!doctype|<html[\s>]|<\/html>/i
 const RULE_TYPE = /^[A-Z][A-Z0-9-]{0,31}$/
-const DOMAIN_LABEL = /^[a-z0-9*_-]+$/i
+// DNS label：字母/数字/连字符，不能以连字符开头或结尾；不允许通配符 * 与下划线。
+const DOMAIN_LABEL = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i
 
 /**
  * 解开 Clash provider YAML（payload: 列表），按 behavior 转成普通规则。

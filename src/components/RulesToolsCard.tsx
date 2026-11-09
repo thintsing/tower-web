@@ -62,6 +62,7 @@ function ExplainPanel({
   latencyByNodeId,
   localRuleSets,
   showGroupEmoji,
+  hostedBaseURL,
 }: {
   scheme: RuleScheme
   nodes: ProxyNode[]
@@ -69,6 +70,7 @@ function ExplainPanel({
   latencyByNodeId: Record<string, number | null>
   localRuleSets: LocalRuleSet[]
   showGroupEmoji: boolean
+  hostedBaseURL?: string
 }) {
   const [input, setInput] = useState('www.google.com\nhttps://www.youtube.com/watch?v=1\n1.1.1.1\n[2606:4700:4700::1111]:443')
   const [results, setResults] = useState<ExplainResult[]>([])
@@ -79,8 +81,8 @@ function ExplainPanel({
   const ruleSetExclusions = useStore((state) => state.ruleSetExclusions)
 
   const compiled = useMemo(
-    () => compileScheme({ scheme, nodes, policySelections, latencyByNodeId, localRuleSets, ruleSetExclusions }),
-    [scheme, nodes, policySelections, latencyByNodeId, localRuleSets, ruleSetExclusions],
+    () => compileScheme({ scheme, nodes, policySelections, latencyByNodeId, localRuleSets, ruleSetExclusions, hostedBaseURL }),
+    [scheme, nodes, policySelections, latencyByNodeId, localRuleSets, ruleSetExclusions, hostedBaseURL],
   )
   const compiledKey = `${scheme.id}|${scheme.updatedAt ?? 0}|${nodes.length}|${localRuleSets.map((set) => `${set.id}:${set.paused ? 1 : 0}`).join(',')}|${JSON.stringify(ruleSetExclusions)}`
 
@@ -161,7 +163,7 @@ function ExplainPanel({
   return (
     <div className="rt-panel">
       <div className="rt-hint">
-        解释器直接复用导出管线的规则顺序和策略组解析。导出时会按目标客户端过滤它不支持的规则，这里按完整规则集解释，个别客户端可能略有差异。域名不会解析成 IP，所以 IP-CIDR / GEOIP / IP-ASN 等 IP 规则对域名输入只能标「可能命中」；GEOIP 非 CN、GeoSite、无效正则等缺少离线数据时标「无法判定」；UA / 进程 / 来源地址规则同样只能标「可能命中」。第一条「确定命中」出现后停止评估；停止前出现的全部「可能命中」会单独列出，远程引用没有本地正文，客户端会按清单顺序取第一条真正命中的。
+        解释器直接复用导出管线的规则顺序和策略组解析。导出时会按目标客户端过滤它不支持的规则，这里按完整规则集解释，个别客户端可能略有差异。域名不会解析成 IP，所以 IP-CIDR / GEOIP / IP-ASN 等 IP 规则对域名输入通常只能标「可能命中」；只有导出到 Clash 原生 / Surge 且规则集带 no-resolve 时，才可确定不命中。GEOIP 非 CN、GeoSite、无效正则等缺少离线数据时标「无法判定」；UA / 进程 / 来源地址规则同样只能标「可能命中」。第一条「确定命中」出现后停止评估；停止前出现的全部「可能命中」会单独列出，远程引用没有本地正文，客户端会按清单顺序取第一条真正命中的。
       </div>
       <div className="rt-field">
         <textarea
@@ -361,6 +363,7 @@ function LintPanel({
   localRuleSets,
   onLocate,
   onGoExport,
+  hostedBaseURL,
 }: {
   scheme: RuleScheme
   nodes: ProxyNode[]
@@ -369,6 +372,7 @@ function LintPanel({
   localRuleSets: LocalRuleSet[]
   onLocate: (issue: SchemeLintIssue) => void
   onGoExport: () => void
+  hostedBaseURL?: string
 }) {
   const [issues, setIssues] = useState<SchemeLintIssue[]>([])
   const [linting, setLinting] = useState(false)
@@ -387,7 +391,7 @@ function LintPanel({
     setError('')
     const timer = window.setTimeout(() => {
       try {
-        const next = lintScheme({ scheme, nodes, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions })
+        const next = lintScheme({ scheme, nodes, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions, hostedBaseURL })
         if (!cancelled) setIssues(next)
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e))
@@ -396,7 +400,7 @@ function LintPanel({
       }
     }, 120)
     return () => { cancelled = true; window.clearTimeout(timer) }
-  }, [scheme, nodes, policySelections, preferRuleSets, localRuleSets, ruleSetExclusions, schemeKey, nodeKey, ruleSetKey, exclusionKey])
+  }, [scheme, nodes, policySelections, preferRuleSets, localRuleSets, ruleSetExclusions, hostedBaseURL, schemeKey, nodeKey, ruleSetKey, exclusionKey])
 
   const summary = lintSummary(issues)
   const visible = issues.filter((issue) => level === 'all' || issue.level === level).slice(0, 300)
@@ -644,6 +648,7 @@ export function RulesToolsCard({
   preferRuleSets,
   showGroupEmoji,
   versionHistoryEnabled,
+  hostedBaseURL,
   onLocate,
   onGoExport,
 }: {
@@ -655,6 +660,8 @@ export function RulesToolsCard({
   preferRuleSets: boolean
   showGroupEmoji: boolean
   versionHistoryEnabled: boolean
+  /** 与导出页同一份托管地址解析结果；undefined 表示载体未知，不能当作可托管。 */
+  hostedBaseURL?: string
   onLocate: (issue: SchemeLintIssue) => void
   onGoExport: () => void
 }) {
@@ -693,6 +700,7 @@ export function RulesToolsCard({
           latencyByNodeId={latencyByNodeId}
           localRuleSets={localRuleSets}
           showGroupEmoji={showGroupEmoji}
+          hostedBaseURL={hostedBaseURL}
         />
       )}
       {tool === 'lint' && (
@@ -702,6 +710,7 @@ export function RulesToolsCard({
           policySelections={policySelections}
           preferRuleSets={preferRuleSets}
           localRuleSets={localRuleSets}
+          hostedBaseURL={hostedBaseURL}
           onLocate={onLocate}
           onGoExport={onGoExport}
         />

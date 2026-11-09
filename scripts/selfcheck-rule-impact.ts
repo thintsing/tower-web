@@ -81,6 +81,34 @@ function main(): void {
     assert.doesNotMatch(text, /历史连接 0 条/)
   })
 
+  check('目标组远程引用与组行口径一致，文本按「N 条规则 + M 条远程引用」输出', () => {
+    const scheme: RuleScheme = {
+      ...baseScheme(),
+      ruleSets: [
+        {
+          id: 'remote-1', name: '远程一', group: '国外媒体', rules: [],
+          sourceKind: 'url', sourceRef: 'https://example.com/r1.txt',
+          providerOnly: true, providerName: 'remote1',
+        },
+        {
+          id: 'remote-2', name: '远程二', group: '国外媒体', rules: [],
+          sourceKind: 'url', sourceRef: 'https://example.com/r2.txt',
+          providerOnly: true, providerName: 'remote2',
+        },
+        {
+          id: 'local', name: '本地集', group: '国外媒体',
+          rules: [rule('国外媒体', 'local.example.com')],
+          sourceKind: 'local',
+        },
+      ],
+    }
+    const impact = analyzeRuleImpact(scheme, rule('国外媒体', 'example.com'))
+    // 目标是 baseScheme 自带的 1 条 + 本地规则集展开的 1 条；远程引用单独计数。
+    assert.equal(impact.targetGroupRules, 2)
+    assert.equal(impact.targetGroupRemoteReferences, 2)
+    assert.match(ruleImpactText(impact), /目标组现有 2 条规则 \+ 2 条远程引用/)
+  })
+
   check('不同类型的同值规则不会被算成同一影响面', () => {
     const scheme = baseScheme()
     const impact = analyzeRuleImpact(scheme, { type: 'DOMAIN', value: 'example.com', group: '广告' })

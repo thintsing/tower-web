@@ -1,5 +1,6 @@
 // 命中解释器：规则顺序、规则来源和策略组解析都走导出管线，保证解释结果与客户端收到的配置一致。
 import type {
+  ClientTarget,
   LocalRuleSet,
   ProviderEntryType,
   ProxyNode,
@@ -7,6 +8,7 @@ import type {
   RuleSetExclusionTable,
   RoutingRule,
   SchemeRuleSet,
+  SubFormat,
 } from '../models/types'
 import { prepareSchemeForExport, resolveGroups, uniqueDisplayNames } from '../generator/groups'
 import { filterExcludedRuleSets } from './ruleSetExclusions'
@@ -81,6 +83,15 @@ export interface CompileExplainOptions {
   localRuleSets?: LocalRuleSet[]
   /** 只读规则集的本地屏蔽表；命中解释与导出必须用同一份。 */
   ruleSetExclusions?: RuleSetExclusionTable
+  /**
+   * 按哪个导出载体展开 providerOnly 引用。不传表示「载体未知」：
+   * 需要 no-resolve 才能确定的判断只能标可能命中，不能替所有客户端下结论。
+   */
+  format?: SubFormat
+  /** 与 format 配套的目标客户端；用于 MRS / Shadowrocket 等载体差异。 */
+  target?: ClientTarget
+  /** 托管转换地址；与导出页使用同一份解析结果。 */
+  hostedBaseURL?: string
 }
 
 export interface CompiledScheme {
@@ -95,6 +106,8 @@ export interface CompiledScheme {
   pausedSetNames: Set<string>
   notes: string[]
   latencyByNodeId: Record<string, number | null>
+  /** 解释时采用的导出载体；undefined 表示载体未知。 */
+  carrierFormat?: SubFormat
 }
 
 function ruleKey(rule: Pick<RoutingRule, 'type' | 'value' | 'group' | 'raw'>): string {
@@ -109,10 +122,12 @@ export function compileScheme(options: CompileExplainOptions): CompiledScheme {
   const prepared = prepareSchemeForExport(scheme, policySelections, {
     preferRuleSets: false,
     ruleSetExclusions: options.ruleSetExclusions,
-    // providerOnly 规则集只有在格式已知时才会写成 RULE-SET 引用。命中解释
-    // 固定按 YAML（provider 的原生载体）展开，否则 13 条引用会被当成空规则集，
-    // 整条链路退化成 FINAL。普通规则集仍按 preferRuleSets: false 逐条内联。
-    format: 'yaml',
+    // providerOnly 规则集只有在载体已知时才会写成 RULE-SET 引用。未指定载体时
+    // 仍按 YAML（provider 的原生载体）展开，保证引用链不退化；但 no-resolve
+    // 这类「只有部分客户端成立」的判断会单独降级（见 evaluateRuleSetReference）。
+    format: options.format ?? 'yaml',
+    target: options.format ? options.target : undefined,
+    hostedBaseURL: options.hostedBaseURL,
   })
   const displayNameByNodeID = uniqueDisplayNames(options.nodes, (value) => value)
   const nodeByDisplayName = new Map<string, ProxyNode>()
@@ -182,6 +197,7 @@ export function compileScheme(options: CompileExplainOptions): CompiledScheme {
     pausedSetNames,
     notes,
     latencyByNodeId: options.latencyByNodeId ?? {},
+    carrierFormat: options.format,
   }
 }
 
@@ -234,35 +250,42 @@ function evaluateRuleSetReference(
     const hostInput = target.kind === 'domain' || target.kind === 'url'
     const ipInput = target.kind === 'ipv4' || target.kind === 'ipv6'
     const noResolve = (set.ruleSetOptions ?? []).some((option) => option.toLowerCase() === 'no-resolve')
-    // 条目类型来自 provider 元数据；旧快照没有元数据时按 behavior 推断，行为保持不变。
     const entry: ProviderEntryType = set.providerEntryType
       ?? (set.ruleSetBehavior === 'ipcidr' ? 'ip' : set.ruleSetBehavior === 'classical' ? 'process' : 'domain')
     // IP 前留一个空格，避免「是IP 列表」这种中英混排。
     const entryLabel = entry === 'process' ? '进程名列表（PROCESS-NAME）' : entry === 'ip' ? ' IP 列表' : '域名列表'
-    if (hostInput && entry === 'process') {
+    // 进程类规则依赖客户端运行时，与规则匹配器的 skip 口径保持一致：
+    // 无论域名还是 IP 输入都只能标「可能命中」，不能判死。
+    if (entry === 'process') {
       return {
         evaluation: {
-          status: 'miss',
+          status: 'skip',
           matchType: '规则集引用',
-          detail: `RULE-SET,${key} 是进程名列表（PROCESS-NAME）：域名请求不携带进程名，一定不会命中`,
+          detail: `RULE-SET,${key} 是${entryLabel}的远程引用：静态输入不携带进程名，本地无法确认是否命中，只能标可能命中`,
+          reason: `规则集「${set.name}」需要在客户端按进程名匹配`,
         },
       }
     }
+    // no-resolve 的结论依赖载体：Clash 原生 / Surge 的规则行会带 no-resolve，
+    // 域名输入确实不会命中；Loon / Quantumult X / Egern / sing-box 的托管行
+    // 不带逐条参数，域名解析后仍可能命中。载体未知时按通用口径标可能命中。
+    const carrierCarriesNoResolve = compiled.carrierFormat === 'yaml' || compiled.carrierFormat === 'surge'
     if (hostInput && entry === 'ip' && noResolve) {
-      return {
-        evaluation: {
-          status: 'miss',
-          matchType: '规则集引用',
-          detail: `RULE-SET,${key} 是 IP 列表并带 no-resolve：域名请求不会解析 IP，一定不会命中`,
-        },
+      if (carrierCarriesNoResolve) {
+        return {
+          evaluation: {
+            status: 'miss',
+            matchType: '规则集引用',
+            detail: `RULE-SET,${key} 是 IP 列表并带 no-resolve：域名请求不会解析 IP，一定不会命中`,
+          },
+        }
       }
-    }
-    if (ipInput && entry === 'process') {
       return {
         evaluation: {
-          status: 'miss',
+          status: 'skip',
           matchType: '规则集引用',
-          detail: `RULE-SET,${key} 是进程名列表（PROCESS-NAME）：IP 输入不携带进程名，一定不会命中`,
+          detail: `RULE-SET,${key} 是 IP 列表：Clash 原生 / Surge 的规则行带 no-resolve，域名输入一定不会命中；Loon / Quantumult X / Egern / sing-box 的托管行不带 no-resolve，域名解析后仍可能命中，因此这里只标可能命中`,
+          reason: '当前解释未指定导出载体，按通用口径标可能命中',
         },
       }
     }

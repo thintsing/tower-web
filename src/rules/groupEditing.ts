@@ -3,6 +3,7 @@
 import type { PolicyGroup, ProxyNode, RuleScheme, SchemeRuleSet } from '../models/types'
 import { DEFAULT_TEST_URL } from '../models/networkSettings'
 import { dropRuleOrderKeysForGroup } from './ruleOrder'
+import { isRemoteReferenceSet } from './ruleSetReferences'
 
 export type NodeGroupType = 'select' | 'url-test' | 'fallback'
 
@@ -164,6 +165,8 @@ export interface RemovedGroupSummary {
   removedRules: number
   removedCustomRules: number
   removedRuleSets: number
+  /** 被一并删除、且原本以远程引用（provider / 只读快照）写入的规则集数量。 */
+  removedRemoteReferences: number
   /** 候选里引用过这个组的其他策略组；删除时它们的引用会被一并移除。 */
   referencingGroups: string[]
 }
@@ -186,10 +189,12 @@ export function removePolicyGroup(source: RuleScheme, name: string): RemovedGrou
   const customRules = (source.customRules ?? []).filter((rule) => rule.group !== name)
 
   let removedRuleSets = 0
+  let removedRemoteReferences = 0
   const ruleSets: SchemeRuleSet[] = []
   for (const set of source.ruleSets ?? []) {
     if (set.group === name) {
       removedRuleSets += 1
+      if (isRemoteReferenceSet(set)) removedRemoteReferences += 1
       continue
     }
     const kept = set.rules.filter((rule) => rule.group !== name)
@@ -198,7 +203,10 @@ export function removePolicyGroup(source: RuleScheme, name: string): RemovedGrou
       continue
     }
     if (kept.length > 0) ruleSets.push({ ...set, rules: kept })
-    else removedRuleSets += 1
+    else {
+      removedRuleSets += 1
+      if (isRemoteReferenceSet(set)) removedRemoteReferences += 1
+    }
   }
 
   const matchingOrder = source.matchingOrder?.filter((group) => group !== name)
@@ -217,6 +225,7 @@ export function removePolicyGroup(source: RuleScheme, name: string): RemovedGrou
     removedRules: source.rules.length - rules.length,
     removedCustomRules: (source.customRules ?? []).length - customRules.length,
     removedRuleSets,
+    removedRemoteReferences,
     referencingGroups,
   }
 }

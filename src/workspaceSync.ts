@@ -178,6 +178,9 @@ let serverMode = false
 let ready = false
 let serverVersion = 0
 let lastSignature = ''
+// 启动时本机缓存的签名。首连之前用户如果已经改过工作区，不能把它当成
+// 「过期缓存」直接让服务端数据覆盖。
+let bootSignature: string | undefined
 let watchedState: Store | null = null
 let unsubscribeStore: (() => void) | undefined
 let initialized: Promise<void> | null = null
@@ -321,6 +324,7 @@ function rememberOwnWrite(): void {
 
 async function startSync(): Promise<void> {
   if (typeof window === 'undefined') return
+  bootSignature = signature(workspaceSnapshot(useStore.getState()))
   await detectMode()
 }
 
@@ -426,9 +430,14 @@ function warnBeforeUnload(event: BeforeUnloadEvent): void {
     return
   }
   if (status.state !== 'unsaved') {
-    // lastSignature 为空时页面刚载入、还没确认过服务端版本：
-    // 此时本机缓存不算「本次编辑」，不能无端弹离开确认。
-    if (lastSignature === '' || currentSignature() === lastSignature) return
+    // lastSignature 为空时页面刚载入、还没确认过服务端版本：本机缓存本身
+    // 不算「本次编辑」，但本次会话确实改过（与启动缓存签名不同）就必须提醒。
+    const current = currentSignature()
+    if (lastSignature === '') {
+      if (bootSignature === undefined || current === bootSignature) return
+    } else if (current === lastSignature) {
+      return
+    }
   }
   event.preventDefault()
   // 旧浏览器要求设置 returnValue 才会弹确认。
@@ -727,9 +736,21 @@ async function fetchFull(options: { notice?: string; force?: boolean; allowCreat
     return false
   }
 
+  // 首次连接前用户已经改过工作区（例如服务端暂时连不上时先编辑）：
+  // 直接套用服务端数据会静默丢掉这些改动，必须转成冲突让用户选择。
+  const currentDraft = workspaceSnapshot(useStore.getState())
+  if (!options.force
+    && lastSignature === ''
+    && bootSignature !== undefined
+    && signature(currentDraft) !== bootSignature
+    && signature(currentDraft) !== signature(data)) {
+    enterConflict(payload.version)
+    return false
+  }
+
   // 本地完全没有数据、服务端有数据：多半是新设备 / 新访问地址，
   // 明确说明这是从服务端载入，避免用户把正常同步误认为数据丢失。
-  const localWasEmpty = !hasContent(workspaceSnapshot(useStore.getState()))
+  const localWasEmpty = !hasContent(currentDraft)
   applyServerData(data, droppedKeys)
   serverVersion = payload.version
   lastSignature = signature(workspaceSnapshot(useStore.getState()))

@@ -30,7 +30,10 @@ const server = {
   put: 'ok' as 'ok' | '413' | 'offline',
   puts: [] as Array<Record<string, any>>,
   gets: 0,
+  holdGet: false,
 }
+
+let releaseGet: (() => void) | undefined
 
 function reply(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -78,6 +81,10 @@ function installEnvironment(): Map<string, () => void> {
     if (url.pathname === '/api/workspace/version') return reply(200, { version: server.version })
     if (url.pathname === '/api/workspace' && method === 'GET') {
       server.gets += 1
+      if (server.holdGet) {
+        server.holdGet = false
+        await new Promise<void>((resolve) => { releaseGet = resolve })
+      }
       return reply(200, { version: server.version, data: server.data })
     }
     if (url.pathname === '/api/workspace' && method === 'PUT') {
@@ -184,6 +191,32 @@ async function runWorker(): Promise<void> {
     return
   }
 
+  if (scenario === 'p14-boot-edit') {
+    // 服务端首次拉取挂起期间用户已经编辑：不能拿服务端数据静默覆盖。
+    server.version = 1
+    server.data = { sources: [sourceA] }
+    server.holdGet = true
+    const init = sync.initWorkspaceSync()
+    await waitFor('等待首次拉取挂起', () => server.gets > 0)
+    useStore.setState({ sources: [sourceLocal] })
+    releaseGet?.()
+    await init
+    await waitFor('首连后进入冲突', () => status().state === 'conflict')
+    assert.deepEqual(
+      useStore.getState().sources.map((item: any) => item.id),
+      ['local-edit'],
+      '首连前编辑的内容必须保留为草稿',
+    )
+    assert.equal(server.puts.length, 0, '不能自动写服务端掩盖冲突')
+    assert.deepEqual(
+      (server.data.sources as any[]).map((item: any) => item.id),
+      ['source-a'],
+      '服务端数据不能被心跳写回覆盖',
+    )
+    assert.match(status().message, /未保存/)
+    return
+  }
+
   if (scenario === 'p13-create') {
     server.version = 0
     server.data = {}
@@ -214,6 +247,7 @@ if (scenario) {
     ['p01-offline', '离线重连先推本机改动，写不进去也不拉服务端'],
     ['p02-preserve', '新设备不会把整块损坏字段的空值推回服务端'],
     ['p13-create', '首次创建保存失败进入未保存而不是静默'],
+    ['p14-boot-edit', '首次连接前编辑的工作区不会被服务端静默覆盖'],
   ]
 
   let failures = 0

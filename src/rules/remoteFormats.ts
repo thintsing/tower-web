@@ -266,6 +266,16 @@ export function providerOnlyClassicalHostedSupported(target?: ClientTarget): boo
 }
 
 /**
+ * Clash 原生 provider 只认原 YAML 地址：内置 .list 必须先由服务端托管，
+ * 没有可用地址时不能返回 'native'，否则写出来是一条指向空地址的 RULE-SET。
+ */
+function nativeProviderAddressUsable(set: SchemeRuleSet): boolean {
+  if (set.sourceKind === 'url') return /^https?:\/\//i.test(set.sourceRef ?? '')
+  if (set.sourceKind === 'library') return (set.sourceRef ?? '').startsWith('ACL4SSR_')
+  return false
+}
+
+/**
  * provider-only 规则集能否在当前载体上变成一条远程引用：
  * Clash 系直接引用原 YAML provider；其余载体交给塔台服务托管转换。
  * hostedBaseURL === '' 表示调用方明确判定「没有对外地址」，此时不允许托管引用。
@@ -278,6 +288,7 @@ export function providerOnlyCanReference(
 ): 'native' | 'hosted' | undefined {
   if (!set.ruleSetBehavior) return undefined
   if (format === 'yaml' && (!target || targetSupportsRuleSetFormat(target, 'yaml'))) {
+    if (!nativeProviderAddressUsable(set)) return undefined
     // Shadowrocket 的 Clash YAML 变体按经典文本口径判断规则类型（见
     // classicalRulesFitTarget），不读 classic provider 的 PROCESS-NAME 等条目；
     // 这里对 classic 引用保持同样的口径，避免同一个列表在两条导出路径上结论相反。

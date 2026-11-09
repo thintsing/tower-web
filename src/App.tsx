@@ -51,6 +51,7 @@ import { copyToClipboard, newID } from './util/browser'
 import { browserStorage, clearTowerStorage, createSafeStorage, describeStorageFull, getStorageFullSerial, isStorageFull, measureStorage, onStorageFullChange } from './util/localStore'
 import { placeDetailsPanel, placeOpenDetailsPanels } from './util/menuPlacement'
 import { apiFetch, clearAPIKey, getAPIKey, setAPIKey } from './util/apiAuth'
+import { isLoopbackHost, useNetworkInfo } from './util/networkInfo'
 import { MAX_REMOTE_RULE_SET_URLS, normalizeRemoteTextURL, remoteRuleSetNameFromURL, splitRemoteTextURLs } from './util/remoteURL'
 import { GITHUB_REPO_URL } from './config'
 import { RouteIllustration } from './components/RouteIllustration'
@@ -5641,6 +5642,16 @@ function RulesTab({
   const latencyByNodeId = useStore((s) => s.latencyByNodeId)
   const ruleSetVersionHistory = useStore((s) => s.ruleSetVersionHistory)
   const scheme = useScheme()
+  const net = useNetworkInfo()
+  const hostedBaseURL = useMemo(
+    () => resolveHostedBaseURL({
+      providerOnly: (scheme?.ruleSets ?? []).some((set) => set.providerOnly),
+      net,
+      loopback: isLoopbackHost(),
+      origin: window.location.origin,
+    }),
+    [net, scheme],
+  )
   const nodes = useStore((s) => s.nodes)
   const sources = useStore((s) => s.sources)
   const customSchemes = useStore((s) => s.customSchemes)
@@ -6147,6 +6158,7 @@ function RulesTab({
     if (result.removedRules > 0) details.push(`${result.removedRules} 条规则`)
     if (result.removedCustomRules > 0) details.push(`${result.removedCustomRules} 条自定义规则`)
     if (result.removedRuleSets > 0) details.push(`${result.removedRuleSets} 组规则集`)
+    if (result.removedRemoteReferences > 0) details.push(`${result.removedRemoteReferences} 条远程引用`)
     if (result.referencingGroups.length > 0) {
       details.push(`${result.referencingGroups.length} 个组引用（${result.referencingGroups.map((name) => groupDisplayName(name, true)).join('、')}）`)
     }
@@ -7588,6 +7600,7 @@ function RulesTab({
           preferRuleSets={preferRuleSets}
           showGroupEmoji={showGroupEmoji}
           versionHistoryEnabled={ruleSetVersionHistory}
+          hostedBaseURL={hostedBaseURL}
           onLocate={locateLintIssue}
           onGoExport={() => onGo?.('export')}
         />
@@ -7758,13 +7771,25 @@ function RulesTab({
           title="删除策略组？"
           body={(
             <>
-              将删除 <b>「{pendingGroupDelete.name}」</b>，并移除 {schemeRules.filter((rule) => rule.group === pendingGroupDelete.name).length} 条规则。
               {(() => {
-                const referencing = scheme.groups
-                  .filter((g) => g.name !== pendingGroupDelete.name && g.options.includes(pendingGroupDelete.name))
-                  .map((g) => groupDisplayName(g.name, true))
-                if (referencing.length === 0) return '其他策略组里的引用也会一并移除。'
-                return <>候选里引用它的策略组：{referencing.join('、')}，这些候选会一并移除。</>
+                // 与 removePolicyGroup 返回字段同源，避免确认框只数直接规则、
+                // 把 providerOnly 远程引用显示成「移除 0 条」。
+                const summary = removePolicyGroup(scheme, pendingGroupDelete.name)
+                const details: string[] = []
+                if (summary.removedRules > 0) details.push(`${summary.removedRules} 条规则`)
+                if (summary.removedCustomRules > 0) details.push(`${summary.removedCustomRules} 条自定义规则`)
+                if (summary.removedRuleSets > 0) details.push(`${summary.removedRuleSets} 组规则集`)
+                if (summary.removedRemoteReferences > 0) details.push(`${summary.removedRemoteReferences} 条远程引用`)
+                const referenced = summary.referencingGroups.map((name) => groupDisplayName(name, true))
+                return (
+                  <>
+                    将删除 <b>「{pendingGroupDelete.name}」</b>
+                    {details.length > 0 ? `，同时移除 ${details.join('、')}。` : '。'}
+                    {referenced.length === 0
+                      ? '其他策略组里的引用也会一并移除。'
+                      : `候选里引用它的策略组：${referenced.join('、')}，这些候选会一并移除。`}
+                  </>
+                )
               })()}
               此操作会先复制为自定义方案，内置方案本身不受影响。
             </>
@@ -7843,6 +7868,17 @@ function CheckTab({
   onLocate?: (issue: SchemeLintIssue) => void
 }) {
   const scheme = useScheme()
+  const net = useNetworkInfo()
+  // 诊断页与导出页共用同一份托管地址；undefined 代表载体未知，不能当可托管。
+  const hostedBaseURL = useMemo(
+    () => resolveHostedBaseURL({
+      providerOnly: (scheme?.ruleSets ?? []).some((set) => set.providerOnly),
+      net,
+      loopback: isLoopbackHost(),
+      origin: window.location.origin,
+    }),
+    [net, scheme],
+  )
   const nodes = useStore((s) => s.nodes)
   const sources = useStore((s) => s.sources)
   const errors = useStore((s) => s.errors)
@@ -8101,6 +8137,7 @@ function CheckTab({
           preferRuleSets={preferRuleSets}
           showGroupEmoji={showGroupEmoji}
           versionHistoryEnabled={ruleSetVersionHistory}
+          hostedBaseURL={hostedBaseURL}
           historyRevision={ruleSetVersionHistory ? 1 : 0}
           requiresCopy={requiresCopy}
           onLocate={(issue) => onLocate?.(issue)}
@@ -9895,16 +9932,27 @@ export function App() {
   const customSchemes = useStore((s) => s.customSchemes)
   const ruleSetExclusions = useStore((s) => s.ruleSetExclusions)
   const enabled = useMemo(() => enabledNodes({ sources, nodes }), [sources, nodes])
+  const net = useNetworkInfo()
+  // 主线检查与导出页共用同一份托管地址；undefined 代表载体未知，不能当可托管。
+  const flowHostedBaseURL = useMemo(
+    () => resolveHostedBaseURL({
+      providerOnly: (scheme?.ruleSets ?? []).some((set) => set.providerOnly),
+      net,
+      loopback: isLoopbackHost(),
+      origin: window.location.origin,
+    }),
+    [net, scheme],
+  )
 
   const flowLint = useMemo(() => {
     if (!scheme) return { error: 0, warn: 0 }
     try {
-      const issues = lintScheme({ scheme, nodes: enabled, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions })
+      const issues = lintScheme({ scheme, nodes: enabled, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions, hostedBaseURL: flowHostedBaseURL })
       return lintSummary(issues)
     } catch {
       return { error: 0, warn: 0 }
     }
-  }, [scheme, enabled, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions])
+  }, [scheme, enabled, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions, flowHostedBaseURL])
 
   const sourceErrors = useMemo(
     () => sources.map((source) => errors[source.id]?.trim()).filter((value): value is string => !!value),
@@ -10039,6 +10087,9 @@ export function App() {
   // 在线规则集订阅的打开时刷新；只更新「我的规则集」快照，不改方案快照。
   useEffect(() => {
     if (ruleSetAutoRefreshStarted.current) return
+    // 服务器模式必须等工作区在线后再跑：首连前刷新会改写 localRuleSets，
+    // 既可能被服务端数据静默覆盖，也可能被误判成用户编辑而进入冲突。
+    if (!autoRefreshReady(workspaceStatus.mode, workspaceStatus.state)) return
     ruleSetAutoRefreshStarted.current = true
     const run = () => {
       const state = useStore.getState()
@@ -10071,7 +10122,7 @@ export function App() {
       return
     }
     return useStore.persist.onFinishHydration(run)
-  }, [])
+  }, [workspaceStatus.mode, workspaceStatus.state])
 
   // Close drawer on desktop resize
   useEffect(() => {

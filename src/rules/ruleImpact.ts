@@ -4,6 +4,7 @@
 import type { RoutingRule, RuleScheme } from '../models/types'
 import { ruleSignature } from './ruleDiff'
 import { orderedSchemeRules } from './ruleOrder'
+import { remoteReferenceCount } from './ruleSetReferences'
 
 export interface RuleImpact {
   /** 规则要落到 / 当前所属的策略组。 */
@@ -16,6 +17,8 @@ export interface RuleImpact {
   shadowedRules: number
   /** 目标策略组当前承载的规则总数（静态口径）。 */
   targetGroupRules: number
+  /** 目标策略组的远程引用数；与组行 / 组编辑器同口径。 */
+  targetGroupRemoteReferences: number
   /** 服务端历史连接数；没有连接记录时是 null，界面不得展示为 0。 */
   connections: number | null
 }
@@ -55,6 +58,7 @@ export function analyzeRuleImpact(
     matchedRules: matches.length,
     shadowedRules: matches.filter((match) => match.index > selfIndex).length,
     targetGroupRules: rows.filter((row) => row.rule.group === rule.group).length,
+    targetGroupRemoteReferences: remoteReferenceCount(scheme, rule.group),
     connections: null,
   }
 }
@@ -70,7 +74,7 @@ export function ruleImpactText(impact: RuleImpact): string {
     impact.shadowedRules > 0
       ? `其中 ${impact.shadowedRules} 条排在本条之后，会被本条遮蔽`
       : '没有同值规则会被本条遮蔽',
-    `目标组现有 ${impact.targetGroupRules} 条规则`,
+    `目标组现有 ${impact.targetGroupRules} 条规则${impact.targetGroupRemoteReferences > 0 ? ` + ${impact.targetGroupRemoteReferences} 条远程引用` : ''}`,
     impact.connections === null ? '无历史数据，仅静态影响面' : `历史连接 ${impact.connections} 条`,
   ]
   return parts.join('；')

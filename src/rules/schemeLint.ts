@@ -1,7 +1,7 @@
 // 方案 lint：默认只提示，不硬阻断导出。所有判断复用导出管线的规则顺序、策略组解析和客户端兼容性。
 import type { ClientInfo, LocalRuleSet, PolicyGroup, ProxyNode, RuleScheme, RuleSetExclusionTable, RoutingRule } from '../models/types'
 import { CLIENTS } from '../models/types'
-import { prepareSchemeForExport, resolveGroups, uniqueDisplayNames } from '../generator/groups'
+import { prepareSchemeForExport, remoteRuleSetURL, resolveGroups, uniqueDisplayNames } from '../generator/groups'
 import { analyzeRuleCompatibility } from '../generator/compatibility'
 import { validateSchemePolicy } from './policyValidation'
 import { DOMAIN_TYPES } from './ruleMatcher'
@@ -431,12 +431,15 @@ function findRuleSetIssues(options: SchemeLintOptions, prepared: RuleScheme): Sc
   for (const set of prepared.ruleSets ?? []) {
     // provider-only 规则集本来就不保存正文，rules 为空是预期状态，不能报空。
     if (set.providerOnly) {
-      if (!set.sourceRef || !set.ruleSetBehavior) {
+      const address = remoteRuleSetURL(set)
+      if (!set.sourceRef || !set.ruleSetBehavior || !address) {
         issues.push({
           id: `ruleset:provider:${set.id}`,
           level: 'error',
           code: 'providerOnlyMissingReference',
-          message: `规则集「${set.name}」缺少 provider 地址或 behavior，无法写成 rule-providers 引用`,
+          message: !address && set.sourceRef
+            ? `规则集「${set.name}」的 provider 地址无效（必须是 http(s) 地址或内置 .list），无法写成远程引用`
+            : `规则集「${set.name}」缺少 provider 地址或 behavior，无法写成 rule-providers 引用`,
           hint: '重新加入该在线规则集，或改回普通规则集',
           location: { kind: 'ruleSet', ruleSet: set.name, group: set.group },
         })
@@ -487,7 +490,9 @@ function findRuleSetIssues(options: SchemeLintOptions, prepared: RuleScheme): Sc
 function findCompatibilityIssues(options: SchemeLintOptions): SchemeLintIssue[] {
   const clients = options.clients ?? CLIENTS
   const issues: SchemeLintIssue[] = []
-  let providerOnlyReported = false
+  // 先收集实际参与规则导出的客户端，再决定 providerOnly 阻断的级别：
+  // 所有可导出载体都被阻断是 error，只有部分被阻断是 warn。
+  const evaluated: Array<{ client: ClientInfo; compatibility: ReturnType<typeof analyzeRuleCompatibility> }> = []
   for (const client of clients) {
     if (client.contentMode === 'nodes') continue
     const compatibility = analyzeRuleCompatibility(client, options.scheme, {
@@ -496,21 +501,24 @@ function findCompatibilityIssues(options: SchemeLintOptions): SchemeLintIssue[] 
       hostedBaseURL: options.hostedBaseURL,
     })
     if (compatibility.nodeOnly) continue
-    if (compatibility.providerOnlyBlocked) {
-      // 同一原因只报一次，避免每个非 Clash 客户端各来一条。
-      if (!providerOnlyReported) {
-        issues.push({
-          id: 'target:providerOnly',
-          level: 'warn',
-          code: 'providerOnlyUnsupported',
-          message: `方案只保存 Clash provider 引用（不保存正文），${client.name} 等非 Clash 系客户端无法导出，已硬阻断`,
-          hint: '改用 Clash / mihomo 系客户端导出',
-          location: { kind: 'target', target: client.name },
-        })
-        providerOnlyReported = true
-      }
-      continue
-    }
+    evaluated.push({ client, compatibility })
+  }
+  const blocked = evaluated.filter((item) => item.compatibility.providerOnlyBlocked)
+  if (blocked.length > 0) {
+    const allBlocked = blocked.length === evaluated.length
+    issues.push({
+      id: 'target:providerOnly',
+      level: allBlocked ? 'error' : 'warn',
+      code: 'providerOnlyUnsupported',
+      message: allBlocked
+        ? `方案只保存 Clash provider 引用（不保存正文），当前所有可导出的客户端（${blocked.map((item) => item.client.name).join('、')}）都无法引用，已硬阻断`
+        : `方案只保存 Clash provider 引用（不保存正文），${blocked.map((item) => item.client.name).join('、')} 无法导出，已硬阻断`,
+      hint: '改用 Clash / mihomo 系客户端导出，或确认部署提供了可被设备访问的托管地址',
+      location: { kind: 'target', target: blocked.map((item) => item.client.name).join('、') },
+    })
+  }
+  for (const { client, compatibility } of evaluated) {
+    if (compatibility.providerOnlyBlocked) continue
     if (compatibility.skipped === 0) continue
     const types = compatibility.unsupportedTypes.slice(0, 4).join('、')
     issues.push({

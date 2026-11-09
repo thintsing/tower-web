@@ -9,6 +9,7 @@ import { generateBase64Subscription } from '../src/generator/base64Sub'
 import { generateConfig, generateSubscriptionFormats } from '../src/generator'
 import { SURGE_UPDATE_INTERVAL } from '../src/generator/surge'
 import { compileRuleLine, prepareSchemeForExport } from '../src/generator/groups'
+import { yaml as yamlScalar, yamlMultiline } from '../src/generator/naming'
 import { CLIENTS, clientSupportsImport, type ClientTarget, type ProxyNode, type RuleScheme } from '../src/models/types'
 
 const base = { tls: false, skipCertificateVerification: false } as const
@@ -488,5 +489,20 @@ console.log(`base64: URI ${uriCount}/${SAMPLE.length}`)
 if (v2box.skipped !== 0) problems.push(`v2box: 应写出全部 4 个 URI，实际跳过 ${v2box.skipped}`)
 if (anywhere.skipped !== 1) problems.push(`anywhere: 应跳过 1 个不支持的 VMess，实际跳过 ${anywhere.skipped}`)
 console.log(`v2box: skipped=${v2box.skipped} · anywhere: skipped=${anywhere.skipped}`)
+
+// ---------- YAML 标量：订阅备注里的控制字符必须转义 ----------
+// mihomo / Go YAML 不允许双引号标量里出现裸 C0 控制字符，否则整份配置被拒。
+const hostileName = '节点\u0007\t"引号"\\反斜杠'
+const hostileScalar = yamlScalar(hostileName)
+if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(hostileScalar)) {
+  problems.push('naming: yaml 标量仍含裸控制字符')
+}
+const roundTrip = (parse(`name: ${hostileScalar}`) as { name?: unknown }).name
+if (roundTrip !== hostileName) problems.push('naming: yaml 转义后无法还原原值')
+const hostileMultiline = yamlMultiline('KEY\u0001\nSECOND')
+if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(hostileMultiline)) {
+  problems.push('naming: yamlMultiline 仍含裸控制字符')
+}
+if (!hostileMultiline.includes('\\x01')) problems.push('naming: yamlMultiline 未写出 \\x01 转义')
 
 console.log(problems.length ? `\n❌ ${problems.join('\n❌ ')}` : '\n✅ INI / base64 / Egern / Shadowrocket 结构自检通过')
