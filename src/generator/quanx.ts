@@ -168,9 +168,11 @@ const QX_RULE_TYPE: Record<string, string> = {
   DOMAIN: 'host',
   'DOMAIN-SUFFIX': 'host-suffix',
   'DOMAIN-KEYWORD': 'host-keyword',
+  'DOMAIN-WILDCARD': 'host-wildcard',
   'IP-CIDR': 'ip-cidr',
   'IP-CIDR6': 'ip6-cidr',
-  GEOIP: 'geo',
+  GEOIP: 'geoip',
+  'IP-ASN': 'ip-asn',
   'USER-AGENT': 'user-agent',
 }
 
@@ -267,9 +269,8 @@ export function generateQuanX(
       }
       const mapped = QX_RULE_TYPE[rule.type]
       if (!mapped || !rule.value) continue
-      // QuanX 的 geo / final 不接受 no-resolve
-      const tail = rule.noResolve && mapped !== 'geo' ? ', no-resolve' : ''
-      local.push(`${mapped}, ${rule.value}, ${group}${tail}`)
+      // QuanX 的 filter 不接受 no-resolve 参数，写了会让整条规则失效。
+      local.push(`${mapped}, ${rule.value}, ${group}`)
     }
     out.push('', '[filter_remote]', ...remote)
     out.push('', '[rewrite_remote]')

@@ -2,7 +2,7 @@
 // generators can actually express, so the export page never promises a
 // fully-compatible config when a client will drop rules.
 import { subFormatFor, type ClientInfo, type ExportContentMode, type ProxyNode, type RuleScheme, type RuleSetExclusionTable } from '../models/types'
-import { targetSupportsRule } from '../rules/capabilities'
+import { normalizeRuleForTarget } from '../rules/capabilities'
 import { targetSupportsInlineRuleSets } from '../rules/inlineSets'
 import { formatSupportsRemoteRuleSets, providerOnlyCanReference, supportsRuleSetReference } from '../rules/remoteFormats'
 import { prepareSchemeForExport, remoteRuleSetCandidates, remoteRuleSetURL, resolveGroups } from './groups'
@@ -142,9 +142,9 @@ export function analyzeRuleCompatibility(
     ruleSetExclusions: options.ruleSetExclusions,
     hostedBaseURL: options.hostedBaseURL,
   })
-  const typeUnsupported = prepared.rules.filter((rule) => !targetSupportsRule(client.target, rule.type))
+  const typeUnsupported = prepared.rules.filter((rule) => !normalizeRuleForTarget(rule, client.target))
   const setUnsupported = prepared.rules.filter((rule) =>
-    targetSupportsRule(client.target, rule.type)
+    normalizeRuleForTarget(rule, client.target)
     && rule.type === 'RULE-SET'
     && !supportsRuleSetReference(rule, format, client.target))
   const skippedRules = [...typeUnsupported, ...setUnsupported]

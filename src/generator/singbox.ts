@@ -7,7 +7,7 @@ import type {
   RuleSchemeNetworkSettings,
 } from '../models/types'
 import { resolveGroups, uniqueDisplayNames, type OutputOptions } from './groups'
-import { effectiveGroupType, filterRulesForTarget } from '../rules/capabilities'
+import { effectiveGroupType, filterRulesForTarget, parseRuleCondition, type RuleCondition } from '../rules/capabilities'
 import { nodeSupportedForTarget, v2rayPluginSupported } from './nodeCapabilities'
 import { ruleSetFormatOfRule, supportsRuleSetReference } from '../rules/remoteFormats'
 import {
@@ -25,6 +25,96 @@ type SingBoxDNSServer = Record<string, unknown>
 
 const CHINA_RULE_SET_TAG = 'tower-geoip-cn'
 const REMOTE_CN_TAG = 'remote-cn'
+
+/** sing-box 的 port / port_range 取值：443、8000-8100、>1000，多个用 / 分隔。 */
+function portBounds(value: string): { ports: number[]; ranges: string[] } | undefined {
+  const ports: number[] = []
+  const ranges: string[] = []
+  const parts = value.split('/').map((item) => item.trim()).filter(Boolean)
+  if (!parts.length) return undefined
+  for (const part of parts) {
+    let low: number
+    let high: number
+    const compare = part.match(/^(>=|<=|>|<)\s*(\d+)$/)
+    if (compare) {
+      const port = Number(compare[2])
+      if (!Number.isInteger(port) || port < 0 || port > 65535) return undefined
+      low = compare[1].startsWith('>') ? port + (compare[1] === '>' ? 1 : 0) : 0
+      high = compare[1].startsWith('<') ? port - (compare[1] === '<' ? 1 : 0) : 65535
+    } else {
+      const bounds = part.match(/^(\d+)(?:-(\d+))?$/)
+      if (!bounds) return undefined
+      low = Number(bounds[1])
+      high = bounds[2] === undefined ? low : Number(bounds[2])
+    }
+    if (low < 0 || high > 65535 || low > high) return undefined
+    if (low === high) ports.push(low)
+    else ranges.push(`${low}:${high}`)
+  }
+  return { ports, ranges }
+}
+
+/** DOMAIN-WILDCARD 在 sing-box 里只能转成正则。 */
+function wildcardRegex(value: string): string {
+  const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return `(?i)^${escaped.replace(/\\\*/g, '.*').replace(/\\\?/g, '.')}$`
+}
+
+/** 方案规则 → sing-box route 条件；无法表达时返回 undefined。 */
+function singBoxCondition(condition: RuleCondition): Record<string, unknown> | undefined {
+  if (condition.children) {
+    const mapped = condition.children.map(singBoxCondition)
+    if (mapped.some((item) => !item)) return undefined
+    const rule: Record<string, unknown> = {
+      type: 'logical',
+      mode: condition.type === 'OR' ? 'or' : 'and',
+      rules: mapped,
+    }
+    if (condition.type === 'NOT') rule.invert = true
+    return rule
+  }
+  const type = condition.type.toUpperCase()
+  const value = condition.value
+  const source = condition.options.some((option) => option.toLowerCase() === 'src')
+  switch (type) {
+    case 'DOMAIN': return { domain: [value] }
+    case 'DOMAIN-SUFFIX': return { domain_suffix: [value] }
+    case 'DOMAIN-KEYWORD': return { domain_keyword: [value] }
+    case 'DOMAIN-REGEX': return { domain_regex: [value] }
+    case 'DOMAIN-WILDCARD': return { domain_regex: [wildcardRegex(value)] }
+    case 'IP-CIDR':
+    case 'IP-CIDR6':
+      return { [source ? 'source_ip_cidr' : 'ip_cidr']: [value] }
+    case 'SRC-IP':
+    case 'SRC-IP-CIDR':
+      return { source_ip_cidr: [value] }
+    case 'NETWORK': {
+      const network = value.toLowerCase()
+      return network === 'tcp' || network === 'udp' ? { network: [network] } : undefined
+    }
+    case 'PROTOCOL': {
+      const protocol = value.toLowerCase()
+      if (protocol === 'tcp' || protocol === 'udp') return { network: [protocol] }
+      const sniffed = protocol === 'https' ? 'tls' : protocol
+      return ['http', 'tls', 'quic', 'stun'].includes(sniffed)
+        ? { protocol: [sniffed] }
+        : undefined
+    }
+    case 'DST-PORT':
+    case 'DEST-PORT':
+    case 'SRC-PORT': {
+      const bounds = portBounds(value)
+      if (!bounds) return undefined
+      const result: Record<string, unknown> = {}
+      const isSource = type === 'SRC-PORT'
+      if (bounds.ports.length) result[isSource ? 'source_port' : 'port'] = bounds.ports
+      if (bounds.ranges.length) result[isSource ? 'source_port_range' : 'port_range'] = bounds.ranges
+      return Object.keys(result).length ? result : undefined
+    }
+    default:
+      return undefined
+  }
+}
 
 /** 加密 DNS 条目 → sing-box server，补上 TLS 名称、路径与启动解析器。 */
 function encryptedDNSServer(
@@ -805,58 +895,38 @@ export function generateSingBox(
   }
 
   // 路由规则必须保持源方案里的先后顺序：sing-box 是第一条命中即生效。
-  // 只合并“连续且同一策略”的规则（同一规则内 domain/ip 条件本来就是 OR），
-  // 不能按策略组全局分桶，否则 A/B/A 这类交错规则会被改成 A/A/B。
+  // 每条源规则独立转换成 route 条件，不再按策略组分桶（A/B/A 会被改成 A/A/B）。
   const rules: Record<string, unknown>[] = []
   const finalRule = filteredRules.find((r) => r.type === 'FINAL')
   const rejectAll = finalRule?.group === 'REJECT'
   const finalGroup = rejectAll
     ? 'DIRECT'
     : finalRule?.group ?? resolved[0]?.group.name ?? 'DIRECT'
-  let pending: { key: string; rule: Record<string, unknown> } | undefined
-  const flushPending = () => {
-    if (!pending) return
-    rules.push(pending.rule)
-    pending = undefined
-  }
   for (const rule of filteredRules) {
     if (rule.type === 'FINAL') continue
     if (rule.type === 'RULE-SET') {
       if (!rule.value) continue
       const tag = ruleSetTags.get(rule.value)
       if (!tag) continue
-      flushPending()
       rules.push(rule.group.toUpperCase() === 'REJECT'
         ? { rule_set: [tag], action: 'reject' }
         : { rule_set: [tag], outbound: rule.group })
       continue
     }
-    if (!rule.value) continue
-    // sing-box 1.12 移除了 route 规则里的 geoip 字段（要用 rule_set）。
-    // 离线生成的配置没有 GeoIP 库，跳过而不是让整份配置被内核拒绝。
-    if (rule.type === 'GEOIP') continue
-    const field = rule.type === 'DOMAIN' ? 'domain'
-      : rule.type === 'DOMAIN-SUFFIX' ? 'domain_suffix'
-        : rule.type === 'DOMAIN-KEYWORD' ? 'domain_keyword'
-          : rule.type === 'DOMAIN-REGEX' ? 'domain_regex'
-            : rule.type === 'IP-CIDR' || rule.type === 'IP-CIDR6' ? 'ip_cidr'
-              : undefined
-    if (!field) continue
-    const reject = rule.group.toUpperCase() === 'REJECT'
-    const key = reject ? 'reject' : `route:${rule.group}`
-    if (!pending || pending.key !== key) {
-      flushPending()
-      pending = {
-        key,
-        // 拦截规则用动作表达，DIRECT 走内置 direct 出站。
-        rule: reject ? { action: 'reject' } : { outbound: rule.group },
-      }
-    }
-    const list = pending.rule[field]
-    if (Array.isArray(list)) list.push(rule.value)
-    else pending.rule[field] = [rule.value]
+    // sing-box 1.12 移除了 route 规则里的 geoip / asn 字段，离线生成没有
+    // 对应数据库，跳过而不是让内核拒绝整份配置。
+    if (rule.type === 'GEOIP' || rule.type === 'IP-ASN') continue
+    const parsed = rule.raw ? parseRuleCondition(rule.raw) : undefined
+    const condition = parsed
+      ? singBoxCondition(parsed)
+      : rule.value
+        ? singBoxCondition({ type: rule.type, value: rule.value, options: [...(rule.options ?? [])] })
+        : undefined
+    if (!condition) continue
+    rules.push(rule.group.toUpperCase() === 'REJECT'
+      ? { ...condition, action: 'reject' }
+      : { ...condition, outbound: rule.group })
   }
-  flushPending()
   if (rejectAll) rules.push({ action: 'reject' })
 
   const directFinal = defaultsToDirect(finalGroup, definitions)

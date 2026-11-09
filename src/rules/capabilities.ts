@@ -42,25 +42,28 @@ const surge = new Set([
 const loon = new Set([
   'DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD', 'IP-CIDR', 'IP-CIDR6',
   'GEOIP', 'IP-ASN', 'URL-REGEX', 'USER-AGENT', 'SRC-PORT',
-  'DEST-PORT', 'DST-PORT', 'PROTOCOL', 'NETWORK',
+  'DEST-PORT', 'PROTOCOL',
   ...logical, 'RULE-SET', 'FINAL', 'MATCH',
 ])
 
 const shadowrocket = new Set([
   'DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD', 'DOMAIN-WILDCARD',
   'USER-AGENT', 'URL-REGEX', 'IP-CIDR', 'IP-CIDR6', 'IP-ASN',
-  'GEOIP', 'DST-PORT', 'DEST-PORT', 'PROTOCOL',
+  'GEOIP', 'DST-PORT', 'PROTOCOL',
   ...logical, 'RULE-SET', 'FINAL', 'MATCH',
 ])
 
 const quanx = new Set([
-  'DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD', 'IP-CIDR', 'IP-CIDR6',
-  'GEOIP', 'USER-AGENT', 'RULE-SET', 'FINAL', 'MATCH',
+  'DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD', 'DOMAIN-WILDCARD',
+  'IP-CIDR', 'IP-CIDR6', 'GEOIP', 'IP-ASN', 'USER-AGENT',
+  'RULE-SET', 'FINAL', 'MATCH',
 ])
 
 const singbox = new Set([
-  'DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD', 'DOMAIN-REGEX',
-  'IP-CIDR', 'IP-CIDR6', 'RULE-SET', 'FINAL', 'MATCH',
+  'DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD', 'DOMAIN-REGEX', 'DOMAIN-WILDCARD',
+  'IP-CIDR', 'IP-CIDR6', 'SRC-IP', 'SRC-IP-CIDR', 'DST-PORT', 'DEST-PORT', 'SRC-PORT',
+  'NETWORK', 'PROTOCOL',
+  ...logical, 'RULE-SET', 'FINAL', 'MATCH',
 ])
 
 const egern = new Set([
@@ -98,13 +101,188 @@ export function targetSupportsRule(target: ClientTarget | undefined, type: strin
   return set ? set.has(type.toUpperCase()) : true
 }
 
+// ---------- 客户端方言归一化 ----------
+// 同一语义在不同客户端拼写不同：Surge / Loon 用 PROTOCOL，mihomo 用 NETWORK；
+// Loon 用 DEST-PORT，Shadowrocket 用 DST-PORT。规则进入生成器前先归一化，
+// 避免把目标客户端不认识的 TYPE 原样写进配置（见原版 RoutingRuleSyntax.convert）。
+
+export interface RuleCondition {
+  type: string
+  value: string
+  options: string[]
+  children?: RuleCondition[]
+}
+
+type RuleLike = Pick<RoutingRule, 'type' | 'value' | 'options' | 'raw'>
+
+const LOON_PROTOCOLS = new Set(['HTTP', 'HTTPS', 'TCP', 'QUIC', 'STUN', 'UDP'])
+
+function splitTopLevel(text: string): string[] {
+  const parts: string[] = []
+  let depth = 0
+  let start = 0
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+    if (char === '(') depth += 1
+    else if (char === ')') depth -= 1
+    else if (char === ',' && depth === 0) {
+      parts.push(text.slice(start, index))
+      start = index + 1
+    }
+  }
+  parts.push(text.slice(start))
+  return parts
+}
+
+function closingParen(text: string, open: number): number {
+  let depth = 0
+  for (let index = open; index < text.length; index += 1) {
+    if (text[index] === '(') depth += 1
+    else if (text[index] === ')') {
+      depth -= 1
+      if (depth === 0) return index
+    }
+  }
+  return -1
+}
+
+/** 解析 AND / OR / NOT 的原始行；无法结构化时返回 undefined。 */
+export function parseRuleCondition(text: string): RuleCondition | undefined {
+  const line = text.trim()
+  const comma = line.indexOf(',')
+  if (comma < 0) return undefined
+  const type = line.slice(0, comma).trim().toUpperCase()
+  const rest = line.slice(comma + 1).trim()
+  if (type === 'AND' || type === 'OR' || type === 'NOT') {
+    if (!rest.startsWith('(')) return undefined
+    const close = closingParen(rest, 0)
+    if (close < 0) return undefined
+    const inner = rest.slice(1, close)
+    const tail = rest.slice(close + 1).trim()
+    const children = splitTopLevel(inner).map((part) => {
+      const trimmed = part.trim()
+      if (!trimmed.startsWith('(') || !trimmed.endsWith(')')) return undefined
+      return parseRuleCondition(trimmed.slice(1, -1))
+    })
+    if (children.some((child) => !child)) return undefined
+    if (type === 'NOT' && children.length !== 1) return undefined
+    return {
+      type,
+      value: '',
+      options: tail ? tail.split(',').map((item) => item.trim()).filter(Boolean) : [],
+      children: children as RuleCondition[],
+    }
+  }
+  const fields = splitTopLevel(rest)
+  return {
+    type,
+    value: (fields[0] ?? '').trim(),
+    options: fields.slice(1).map((item) => item.trim()).filter(Boolean),
+  }
+}
+
+export function renderRuleCondition(condition: RuleCondition): string {
+  if (condition.children) {
+    const body = condition.children
+      .map((child) => `(${renderRuleCondition(child)})`)
+      .join(',')
+    const tail = condition.options.length ? `,${condition.options.join(',')}` : ''
+    return `${condition.type},(${body})${tail}`
+  }
+  const tail = condition.options.length ? `,${condition.options.join(',')}` : ''
+  return `${condition.type},${condition.value}${tail}`
+}
+
+function normalizeCondition(
+  condition: RuleCondition,
+  target: ClientTarget,
+  depth: number,
+  mihomoTarget: boolean,
+): RuleCondition | undefined {
+  if (condition.children) {
+    const children = condition.children.map((child) =>
+      normalizeCondition(child, target, depth + 1, mihomoTarget))
+    if (children.some((child) => !child)) return undefined
+    return { ...condition, children: children as RuleCondition[] }
+  }
+  let type = condition.type.toUpperCase()
+  let value = condition.value
+  const upperValue = value.toUpperCase()
+  if (type === 'IP6-CIDR') type = 'IP-CIDR6'
+  if (mihomoTarget) {
+    if (type === 'DEST-PORT') type = 'DST-PORT'
+    else if (type === 'SRC-IP') type = 'SRC-IP-CIDR'
+    else if (type === 'PROTOCOL') {
+      if (!['TCP', 'UDP'].includes(upperValue)) return undefined
+      type = 'NETWORK'
+      value = upperValue
+    }
+  } else if (target === 'clash') {
+    if (type === 'DEST-PORT') type = 'DST-PORT'
+  } else if (target === 'surge' || target === 'surge-mac') {
+    if (type === 'DST-PORT') type = 'DEST-PORT'
+    else if (type === 'NETWORK') {
+      if (!['TCP', 'UDP'].includes(upperValue)) return undefined
+      type = 'PROTOCOL'
+      value = upperValue
+    }
+  } else if (target === 'loon') {
+    if (type === 'DST-PORT') type = 'DEST-PORT'
+    else if (type === 'NETWORK' || type === 'PROTOCOL') {
+      if (!LOON_PROTOCOLS.has(upperValue)) return undefined
+      type = 'PROTOCOL'
+      value = upperValue
+    }
+  } else if (target === 'shadowrocket') {
+    if (type === 'DEST-PORT') type = 'DST-PORT'
+    else if (type === 'NETWORK' || type === 'PROTOCOL') {
+      // Shadowrocket 只在逻辑规则里接受 PROTOCOL，且只认 TCP / UDP。
+      if (depth < 1 || !['TCP', 'UDP'].includes(upperValue)) return undefined
+      type = 'PROTOCOL'
+      value = upperValue
+    }
+  }
+  if (!targetSupportsRule(target, type)) return undefined
+  return { ...condition, type, value }
+}
+
+/**
+ * 把一条规则转换成目标客户端原生拼写；无法无损表达时返回 undefined。
+ * 逻辑规则的子条件会递归转换，任一子条件不支持时整条丢弃（避免语义被改）。
+ */
+export function normalizeRuleForTarget<T extends RuleLike>(rule: T, target?: ClientTarget): T | undefined {
+  if (!target) return rule
+  if (rule.raw || ['AND', 'OR', 'NOT'].includes(rule.type.toUpperCase())) {
+    const parsed = parseRuleCondition(rule.raw ?? `${rule.type},${rule.value ?? ''}`)
+    if (!parsed) return undefined
+    const normalized = normalizeCondition(parsed, target, 0, MIHOMO_TARGETS.includes(target))
+    if (!normalized || !targetSupportsRule(target, normalized.type)) return undefined
+    return { ...rule, type: normalized.type, raw: renderRuleCondition(normalized) }
+  }
+  const normalized = normalizeCondition(
+    {
+      type: rule.type,
+      value: rule.value ?? '',
+      options: [...(rule.options ?? [])],
+    },
+    target,
+    0,
+    MIHOMO_TARGETS.includes(target),
+  )
+  if (!normalized) return undefined
+  return { ...rule, type: normalized.type, value: normalized.value || undefined }
+}
+
 /** Drop rules the destination cannot express. FINAL is always kept. */
-export function filterRulesForTarget<T extends Pick<RoutingRule, 'type'>>(
+export function filterRulesForTarget<T extends RuleLike>(
   rules: T[],
-  target: ClientTarget | undefined,
+  target?: ClientTarget,
 ): T[] {
-  const set = ruleSetFor(target)
-  return set ? rules.filter((rule) => set.has(rule.type.toUpperCase())) : rules
+  if (!target) return rules
+  return rules.flatMap((rule) => {
+    const normalized = normalizeRuleForTarget(rule, target)
+    return normalized ? [normalized] : []
+  })
 }
 
 export const RULE_TYPE_CAPABILITIES = {

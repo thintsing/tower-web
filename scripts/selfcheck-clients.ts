@@ -259,8 +259,12 @@ if (!shadowRules) problems.push('shadowrocket: 缺少 rules')
 if (!surge.text.includes('PROCESS-NAME,curl')) problems.push('surge: 未写入 PROCESS-NAME')
 if (loon.text.includes('PROCESS-NAME')) problems.push('loon: 不应写入 PROCESS-NAME')
 if (quanx.text.includes('PROCESS-NAME')) problems.push('quanx: 不应写入 PROCESS-NAME')
-if (!surge.text.includes('AND,((DOMAIN,foo.example),(NETWORK,udp))')) problems.push('surge: 未写入逻辑规则')
-if (!loon.text.includes('AND,((DOMAIN,foo.example),(NETWORK,udp))')) problems.push('loon: 未写入逻辑规则')
+// 逻辑规则里的 NETWORK 要按目标方言归一：Surge / Loon 用 PROTOCOL。
+if (!surge.text.includes('AND,((DOMAIN,foo.example),(PROTOCOL,UDP))')) problems.push('surge: 未写入逻辑规则或未转换为 PROTOCOL')
+if (!loon.text.includes('AND,((DOMAIN,foo.example),(PROTOCOL,UDP))')) problems.push('loon: 未写入逻辑规则或未转换为 PROTOCOL')
+if (hasRule(surge.text, 'NETWORK') || hasRule(loon.text, 'NETWORK')) {
+  problems.push('surge/loon: 不应写入 NETWORK 规则')
+}
 if (!egern.text.includes('domain_regex:')) problems.push('egern: 未写入 domain_regex')
 if (egern.text.includes('PROCESS-NAME')) problems.push('egern: 不应写入 PROCESS-NAME')
 
@@ -504,5 +508,80 @@ if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(hostileMultiline)) {
   problems.push('naming: yamlMultiline 仍含裸控制字符')
 }
 if (!hostileMultiline.includes('\\x01')) problems.push('naming: yamlMultiline 未写出 \\x01 转义')
+
+// ---------- 规则方言归一化：同一语义在各客户端只写它认识的拼写 ----------
+const dialectedScheme: RuleScheme = {
+  id: 'dialect',
+  name: 'dialect',
+  description: '',
+  groups: [
+    { name: '节点选择', type: 'select', options: ['DIRECT'], nodeFilter: '.*' },
+    { name: '广告拦截', type: 'select', options: ['REJECT'] },
+  ],
+  rules: [
+    { type: 'DOMAIN-WILDCARD', value: '*.wild.example', group: '节点选择' },
+    { type: 'IP-ASN', value: '13335', group: '节点选择' },
+    { type: 'DST-PORT', value: '443', group: '节点选择' },
+    { type: 'DEST-PORT', value: '8443', group: '节点选择' },
+    { type: 'NETWORK', value: 'udp', group: '节点选择' },
+    { type: 'PROTOCOL', value: 'HTTP', group: '节点选择' },
+    { type: 'SRC-IP', value: '10.0.0.5/32', group: '节点选择' },
+    { type: 'AND', raw: 'AND,((DOMAIN,and.example),(NETWORK,udp))', group: '节点选择' },
+    { type: 'GEOIP', value: 'CN', group: '节点选择' },
+    { type: 'FINAL', group: '节点选择' },
+  ],
+}
+const dialected = (target: ClientTarget) =>
+  generateConfig(client(target), SAMPLE, dialectedScheme, { contentMode: 'full' }).text
+
+const quanxDialect = dialected('quanx')
+if (!quanxDialect.includes('geoip, CN')) problems.push('quanx: GEOIP 未写成 geoip')
+if (/\ngeo, /.test(quanxDialect)) problems.push('quanx: 不应写 geo')
+if (!quanxDialect.includes('host-wildcard, *.wild.example')) problems.push('quanx: 未写 host-wildcard')
+if (!quanxDialect.includes('ip-asn, 13335')) problems.push('quanx: 未写 ip-asn')
+if (quanxDialect.includes('no-resolve')) problems.push('quanx: filter 不应带 no-resolve')
+
+const loonDialect = dialected('loon')
+if (/\nNETWORK,/.test(loonDialect)) problems.push('loon: 不应写 NETWORK')
+if (/\nDST-PORT,/.test(loonDialect)) problems.push('loon: 不应写 DST-PORT')
+if (!loonDialect.includes('DEST-PORT,443') || !loonDialect.includes('DEST-PORT,8443')) {
+  problems.push('loon: 未把端口规则写成 DEST-PORT')
+}
+
+const shadowDialect = dialected('shadowrocket')
+if (shadowDialect.includes('DEST-PORT,')) problems.push('shadowrocket: 不应写 DEST-PORT')
+if (!shadowDialect.includes('DST-PORT,443')) problems.push('shadowrocket: 未写 DST-PORT')
+if (!shadowDialect.includes('AND,((DOMAIN,and.example),(PROTOCOL,UDP))')) {
+  problems.push('shadowrocket: 逻辑规则未转换为 PROTOCOL')
+}
+if (/\n\s+- PROTOCOL,HTTP,/.test(shadowDialect)) problems.push('shadowrocket: 不应写独立 PROTOCOL')
+
+const clashDialect = parse(dialected('clash-verge')) as any
+const clashDialectRules = (clashDialect?.rules ?? []) as string[]
+if (!clashDialectRules.some((line) => line.startsWith('SRC-IP-CIDR,10.0.0.5/32'))) {
+  problems.push('mihomo: SRC-IP 未转换为 SRC-IP-CIDR')
+}
+if (clashDialectRules.some((line) => line.startsWith('DEST-PORT,'))) {
+  problems.push('mihomo: 不应写 DEST-PORT')
+}
+if (clashDialectRules.some((line) => line.startsWith('PROTOCOL,'))) {
+  problems.push('mihomo: 不应写 PROTOCOL')
+}
+
+const singboxDialect = JSON.parse(dialected('sing-box')) as any
+const singboxFlattened = JSON.stringify(singboxDialect?.route?.rules ?? [])
+if (!singboxFlattened.includes('"network":["udp"]')) problems.push('sing-box: 未写 network')
+if (!singboxFlattened.includes('"protocol":["http"]')) problems.push('sing-box: 未写 protocol')
+if (!singboxFlattened.includes('"type":"logical"')) problems.push('sing-box: 未写 logical')
+if (!singboxFlattened.includes('"port":[443]')) problems.push('sing-box: 未写 port')
+if (!singboxFlattened.includes('"source_ip_cidr":["10.0.0.5/32"]')) {
+  problems.push('sing-box: 未写 source_ip_cidr')
+}
+
+const egernDialect = parse(dialected('egern')) as any
+const egernDestPorts = ((egernDialect?.rules ?? []) as any[])
+  .filter((rule) => rule.dest_port?.match === '443')
+  .length
+if (egernDestPorts !== 1) problems.push(`egern: 443 端口规则应只写一次，实际 ${egernDestPorts}`)
 
 console.log(problems.length ? `\n❌ ${problems.join('\n❌ ')}` : '\n✅ INI / base64 / Egern / Shadowrocket 结构自检通过')

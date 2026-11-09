@@ -428,6 +428,8 @@ export function generateEgern(
     ?? groups[0]?.group.name
     ?? 'DIRECT'
   const rules: string[] = ['rules:']
+  // DST-PORT 与 DEST-PORT 会映射成同一个 dest_port；同一匹配 + 策略只写一次。
+  const emittedRules = new Set<string>()
   for (const rule of filterRulesForTarget(scheme.rules, options.target)) {
     if (rule.type === 'FINAL') continue
     if (rule.type === 'RULE-SET') {
@@ -440,6 +442,9 @@ export function generateEgern(
     }
     const mapped = mapRule(rule)
     if (!mapped || !mapped.value) continue
+    const key = `${mapped.key}\u0000${mapped.value}\u0000${rule.group}`
+    if (emittedRules.has(key)) continue
+    emittedRules.add(key)
     rules.push(`  - ${mapped.key}:`)
     rules.push(`      match: ${yaml(mapped.value)}`)
     rules.push(`      policy: ${yaml(rule.group)}`)
