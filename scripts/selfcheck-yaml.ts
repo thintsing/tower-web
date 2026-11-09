@@ -120,6 +120,16 @@ try {
     && geoipBytes.length > 1000
   console.log(`${geoipOK ? '✅' : '❌'} geoip: HTTP ${geoip.status} · ${geoipBytes.length} 字节`)
   if (!geoipOK) problems.push('GEOIP 托管规则集分发异常')
+
+  // IP-ASN 托管规则集：服务端从离线 ASN 表展开 CIDR 再编码为 SRS。
+  const asn = await fetch(`${BASE}/api/ruleset?format=srs&asn=13335`)
+  const asnBytes = Buffer.from(await asn.arrayBuffer())
+  const asnOK = asn.ok
+    && asn.headers.get('content-type')?.includes('application/octet-stream')
+    && asnBytes.subarray(0, 4).toString('hex') === '53525302'
+    && asnBytes.length > 1000
+  console.log(`${asnOK ? '✅' : '❌'} asn: HTTP ${asn.status} · ${asnBytes.length} 字节`)
+  if (!asnOK) problems.push('IP-ASN 托管规则集分发异常')
 } catch (err) {
   console.log(`ℹ️ 跳过 E2E（服务端未启动？）：${err instanceof Error ? err.message : String(err)}`)
 }

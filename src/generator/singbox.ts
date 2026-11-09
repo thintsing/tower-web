@@ -9,7 +9,7 @@ import type {
 import { resolveGroups, uniqueDisplayNames, type OutputOptions } from './groups'
 import { effectiveGroupType, filterRulesForTarget, parseRuleCondition, type RuleCondition } from '../rules/capabilities'
 import { nodeSupportedForTarget, v2rayPluginSupported } from './nodeCapabilities'
-import { hostedGeoIPRuleSetURL, ruleSetFormatOfRule, supportsRuleSetReference } from '../rules/remoteFormats'
+import { hostedASNRuleSetURL, hostedGeoIPRuleSetURL, normalizedASN, ruleSetFormatOfRule, supportsRuleSetReference } from '../rules/remoteFormats'
 import {
   CHINA_CLIENT_SUBNET,
   DEFAULT_NETWORK_SETTINGS,
@@ -60,10 +60,19 @@ function wildcardRegex(value: string): string {
   return `(?i)^${escaped.replace(/\\\*/g, '.*').replace(/\\\?/g, '.')}$`
 }
 
+/** 逻辑子条件里的 GEOIP / IP-ASN 需要展开成托管规则集引用。 */
+interface SingBoxRuleSetRefs {
+  geoip: (code: string) => Record<string, unknown> | undefined
+  asn: (value: string) => Record<string, unknown> | undefined
+}
+
 /** 方案规则 → sing-box route 条件；无法表达时返回 undefined。 */
-function singBoxCondition(condition: RuleCondition): Record<string, unknown> | undefined {
+function singBoxCondition(
+  condition: RuleCondition,
+  refs?: SingBoxRuleSetRefs,
+): Record<string, unknown> | undefined {
   if (condition.children) {
-    const mapped = condition.children.map(singBoxCondition)
+    const mapped = condition.children.map((child) => singBoxCondition(child, refs))
     if (mapped.some((item) => !item)) return undefined
     const rule: Record<string, unknown> = {
       type: 'logical',
@@ -82,6 +91,9 @@ function singBoxCondition(condition: RuleCondition): Record<string, unknown> | u
     case 'DOMAIN-KEYWORD': return { domain_keyword: [value] }
     case 'DOMAIN-REGEX': return { domain_regex: [value] }
     case 'DOMAIN-WILDCARD': return { domain_regex: [wildcardRegex(value)] }
+    // 1.12 起内核不再接受 geoip / asn 字段，逻辑子条件同样只能引用规则集。
+    case 'GEOIP': return refs?.geoip(value)
+    case 'IP-ASN': return refs?.asn(value)
     case 'IP-CIDR':
     case 'IP-CIDR6':
       return { [source ? 'source_ip_cidr' : 'ip_cidr']: [value] }
@@ -898,6 +910,47 @@ export function generateSingBox(
   // 每条源规则独立转换成 route 条件，不再按策略组分桶（A/B/A 会被改成 A/A/B）。
   const rules: Record<string, unknown>[] = []
   const geoipRuleSetTags = new Map<string, string>()
+  const asnRuleSetTags = new Map<number, string>()
+  // sing-box 1.12 移除了 route 规则里的 geoip / asn 字段；独立规则和逻辑子条件
+  // 都改写为塔台托管的 IP CIDR 规则集（服务端从随包离线表生成 SRS）。
+  const geoIPCondition = (rawCode: string): Record<string, unknown> | undefined => {
+    const code = rawCode.trim().toUpperCase()
+    if (code === 'LAN' || code === 'PRIVATE') return { ip_is_private: true }
+    const url = hostedGeoIPRuleSetURL(code, options.hostedBaseURL)
+    if (!url) return undefined
+    let tag = geoipRuleSetTags.get(code)
+    if (!tag) {
+      tag = `tower-geoip-country-${code.toLowerCase()}`
+      geoipRuleSetTags.set(code, tag)
+      remoteRuleSetDefs.push({
+        type: 'remote',
+        tag,
+        format: 'binary',
+        url,
+        update_interval: '1d',
+      })
+    }
+    return { rule_set: [tag] }
+  }
+  const asnCondition = (value: string): Record<string, unknown> | undefined => {
+    const asn = normalizedASN(value)
+    const url = asn ? hostedASNRuleSetURL(String(asn), options.hostedBaseURL) : undefined
+    if (!asn || !url) return undefined
+    let tag = asnRuleSetTags.get(asn)
+    if (!tag) {
+      tag = `tower-asn-${asn}`
+      asnRuleSetTags.set(asn, tag)
+      remoteRuleSetDefs.push({
+        type: 'remote',
+        tag,
+        format: 'binary',
+        url,
+        update_interval: '1d',
+      })
+    }
+    return { rule_set: [tag] }
+  }
+  const ruleSetRefs: SingBoxRuleSetRefs = { geoip: geoIPCondition, asn: asnCondition }
   const finalRule = filteredRules.find((r) => r.type === 'FINAL')
   const rejectAll = finalRule?.group === 'REJECT'
   const finalGroup = rejectAll
@@ -914,44 +967,14 @@ export function generateSingBox(
         : { rule_set: [tag], outbound: rule.group })
       continue
     }
-    // sing-box 1.12 移除了 route 规则里的 geoip / asn 字段。GEOIP 改写成
-    // 塔台托管的国家 CIDR 规则集（服务端从随包离线国家表生成 SRS）；
-    // IP-ASN 目前没有对应数据，继续跳过。
-    if (rule.type === 'GEOIP') {
-      if (!rule.value) continue
-      const code = rule.value.trim().toUpperCase()
-      const reject = rule.group.toUpperCase() === 'REJECT'
-      if (code === 'LAN' || code === 'PRIVATE') {
-        rules.push(reject
-          ? { ip_is_private: true, action: 'reject' }
-          : { ip_is_private: true, outbound: rule.group })
-        continue
-      }
-      const url = hostedGeoIPRuleSetURL(code, options.hostedBaseURL)
-      if (!url) continue
-      let tag = geoipRuleSetTags.get(code)
-      if (!tag) {
-        tag = `tower-geoip-country-${code.toLowerCase()}`
-        geoipRuleSetTags.set(code, tag)
-        remoteRuleSetDefs.push({
-          type: 'remote',
-          tag,
-          format: 'binary',
-          url,
-          update_interval: '1d',
-        })
-      }
-      rules.push(reject
-        ? { rule_set: [tag], action: 'reject' }
-        : { rule_set: [tag], outbound: rule.group })
-      continue
-    }
-    if (rule.type === 'IP-ASN') continue
     const parsed = rule.raw ? parseRuleCondition(rule.raw) : undefined
     const condition = parsed
-      ? singBoxCondition(parsed)
+      ? singBoxCondition(parsed, ruleSetRefs)
       : rule.value
-        ? singBoxCondition({ type: rule.type, value: rule.value, options: [...(rule.options ?? [])] })
+        ? singBoxCondition(
+            { type: rule.type, value: rule.value, options: [...(rule.options ?? [])] },
+            ruleSetRefs,
+          )
         : undefined
     if (!condition) continue
     rules.push(rule.group.toUpperCase() === 'REJECT'

@@ -69,7 +69,7 @@ export function cidrsForRange(start, end, bits) {
   return result
 }
 
-function mergeRanges(ranges) {
+export function mergeRanges(ranges) {
   if (!ranges.length) return ranges
   ranges.sort((left, right) => left.start < right.start ? -1 : left.start > right.start ? 1 : 0)
   const merged = [ranges[0]]

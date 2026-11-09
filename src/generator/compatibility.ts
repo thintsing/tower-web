@@ -1,10 +1,10 @@
 // Per-client rule capability summary. The result describes what the current
 // generators can actually express, so the export page never promises a
 // fully-compatible config when a client will drop rules.
-import { subFormatFor, type ClientInfo, type ExportContentMode, type ProxyNode, type RuleScheme, type RuleSetExclusionTable } from '../models/types'
-import { normalizeRuleForTarget } from '../rules/capabilities'
+import { subFormatFor, type ClientInfo, type ExportContentMode, type ProxyNode, type RoutingRule, type RuleScheme, type RuleSetExclusionTable } from '../models/types'
+import { normalizeRuleForTarget, parseRuleCondition, type RuleCondition } from '../rules/capabilities'
 import { targetSupportsInlineRuleSets } from '../rules/inlineSets'
-import { formatSupportsRemoteRuleSets, providerOnlyCanReference, supportsRuleSetReference } from '../rules/remoteFormats'
+import { formatSupportsRemoteRuleSets, normalizedASN, providerOnlyCanReference, supportsRuleSetReference } from '../rules/remoteFormats'
 import { prepareSchemeForExport, remoteRuleSetCandidates, remoteRuleSetURL, resolveGroups } from './groups'
 
 export interface RuleCompatibility {
@@ -54,6 +54,32 @@ export interface AnalyzeRuleOptions {
    * 缺省时跳过该检测（方案检查等不涉及导出的调用保持原行为）。
    */
   nodes?: ProxyNode[]
+}
+
+/** 规则（含逻辑子条件）里依赖托管地址的 IP 规则类型。 */
+function conditionHostedIPTypes(condition: RuleCondition, types: Set<string>): void {
+  if (condition.children) {
+    for (const child of condition.children) conditionHostedIPTypes(child, types)
+    return
+  }
+  const type = condition.type.toUpperCase()
+  // LAN / PRIVATE 用内核内置的 ip_is_private，不需要托管地址。
+  if (type === 'GEOIP' && !['LAN', 'PRIVATE'].includes(condition.value.trim().toUpperCase())) {
+    types.add('GEOIP')
+  } else if (type === 'IP-ASN' && normalizedASN(condition.value) !== undefined) {
+    types.add('IP-ASN')
+  }
+}
+
+function ruleHostedIPTypes(rule: RoutingRule): Set<string> {
+  const types = new Set<string>()
+  const parsed = rule.raw ? parseRuleCondition(rule.raw) : undefined
+  if (parsed) {
+    conditionHostedIPTypes(parsed, types)
+  } else {
+    conditionHostedIPTypes({ type: rule.type, value: rule.value ?? '', options: [] }, types)
+  }
+  return types
 }
 
 /**
@@ -147,28 +173,32 @@ export function analyzeRuleCompatibility(
     normalizeRuleForTarget(rule, client.target)
     && rule.type === 'RULE-SET'
     && !supportsRuleSetReference(rule, format, client.target))
-  // sing-box / Hiddify 的 GEOIP 依赖塔台托管的国家 CIDR 规则集；没有对外地址时
-  // 生成器会跳过它，这里必须如实计入，不能假装全部规则都写进去了。
-  const geoipNeedsHost = (client.target === 'sing-box' || client.target === 'hiddify')
+  // sing-box / Hiddify 的 GEOIP 与 IP-ASN 依赖塔台托管的 CIDR 规则集；
+  // 没有对外地址时生成器会跳过它们，这里必须如实计入，不能假装全部规则都写进去了。
+  const offlineIPNeedsHost = (client.target === 'sing-box' || client.target === 'hiddify')
     && options.hostedBaseURL === ''
-  const geoipUnsupported = geoipNeedsHost
+  const offlineIPUnsupported = offlineIPNeedsHost
     ? prepared.rules.filter((rule) =>
-        rule.type === 'GEOIP' && !['LAN', 'PRIVATE'].includes((rule.value ?? '').trim().toUpperCase()))
+        normalizeRuleForTarget(rule, client.target) && ruleHostedIPTypes(rule).size > 0)
     : []
-  const skippedRules = [...typeUnsupported, ...setUnsupported, ...geoipUnsupported]
+  const offlineIPTypes = [...new Set(
+    offlineIPUnsupported.flatMap((rule) => [...ruleHostedIPTypes(rule)]),
+  )]
+  const skippedRules = [...typeUnsupported, ...setUnsupported, ...offlineIPUnsupported]
   const unsupportedTypes = [...new Set([
     ...typeUnsupported.map((rule) => rule.type),
-    ...(geoipUnsupported.length ? ['GEOIP'] : []),
+    ...offlineIPTypes,
   ])]
+  const hostedIPTypes = new Set(['GEOIP', 'IP-ASN'])
   const noteParts: string[] = []
   if (typeUnsupported.length > 0) {
-    noteParts.push(`${client.name} 不支持 ${unsupportedTypes.filter((type) => type !== 'GEOIP').join('、')} 规则，这 ${typeUnsupported.length} 条会被跳过。`)
+    noteParts.push(`${client.name} 不支持 ${unsupportedTypes.filter((type) => !hostedIPTypes.has(type)).join('、')} 规则，这 ${typeUnsupported.length} 条会被跳过。`)
   }
   if (setUnsupported.length > 0) {
     noteParts.push(`${setUnsupported.length} 条 RULE-SET 使用了 ${client.name} 无法读取的规则集格式，会被跳过。`)
   }
-  if (geoipUnsupported.length > 0) {
-    noteParts.push(`当前没有可用的托管地址，${geoipUnsupported.length} 条 GEOIP 规则无法下载国家 IP 段，会被跳过。`)
+  if (offlineIPUnsupported.length > 0) {
+    noteParts.push(`当前没有可用的托管地址，${offlineIPUnsupported.length} 条 ${offlineIPTypes.join(' / ')} 规则无法下载 IP 段，会被跳过。`)
   }
   const note = noteParts.length ? noteParts.join(' ') : undefined
   const ruleSetNote = providerOnlyBlocked

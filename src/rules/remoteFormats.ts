@@ -221,6 +221,19 @@ export function ruleSetRulesFitDialect(rules: RoutingRule[], dialect: HostedRule
   return true
 }
 
+/**
+ * 托管规则的站点前缀。
+ * baseURL 缺省时沿用旧行为：返回站点相对地址（浏览器里由 location.origin 补全；
+ * 纯 Node 自检里就是空串）。显式空字符串表示「没有对外地址」，返回 null。
+ */
+function hostedOrigin(baseURL?: string): string | null {
+  const origin = baseURL !== undefined
+    ? baseURL.replace(/\/+$/, '')
+    : (typeof location !== 'undefined' && location.origin ? location.origin : '')
+  if (baseURL !== undefined && !origin) return null
+  return origin
+}
+
 /** 塔台服务托管的转换产物；baseURL 缺省时退回当前站点地址。 */
 export function hostedRuleSetURL(
   set: SchemeRuleSet,
@@ -253,10 +266,8 @@ export function hostedRuleSetURL(
   }
   // baseURL 缺省时沿用旧行为：返回站点相对地址（浏览器里由 location.origin 补全；
   // 纯 Node 自检里就是 `/api/ruleset?...`）。显式空字符串才表示「没有对外地址」。
-  const origin = baseURL !== undefined
-    ? baseURL.replace(/\/+$/, '')
-    : (typeof location !== 'undefined' && location.origin ? location.origin : '')
-  if (baseURL !== undefined && !origin) return undefined
+  const origin = hostedOrigin(baseURL)
+  if (origin === null) return undefined
   return `${origin}/api/ruleset?${params.toString()}`
 }
 
@@ -267,11 +278,30 @@ export function hostedRuleSetURL(
 export function hostedGeoIPRuleSetURL(code: string, baseURL?: string): string | undefined {
   const normalized = String(code ?? '').trim().toUpperCase()
   if (!/^[A-Z]{2}$/.test(normalized)) return undefined
-  const origin = baseURL !== undefined
-    ? baseURL.replace(/\/+$/, '')
-    : (typeof location !== 'undefined' && location.origin ? location.origin : '')
-  if (baseURL !== undefined && !origin) return undefined
+  const origin = hostedOrigin(baseURL)
+  if (origin === null) return undefined
   const params = new URLSearchParams({ format: 'srs', geoip: normalized })
+  return `${origin}/api/ruleset?${params.toString()}`
+}
+
+/** "AS13335" / "13335" → 13335；非法返回 undefined。 */
+export function normalizedASN(value: string): number | undefined {
+  const normalized = String(value ?? '').trim().replace(/^AS/i, '')
+  if (!/^\d{1,10}$/.test(normalized)) return undefined
+  const asn = Number(normalized)
+  return Number.isSafeInteger(asn) && asn > 0 && asn <= 0xffffffff ? asn : undefined
+}
+
+/**
+ * IP-ASN 规则在 sing-box / Hiddify 里的托管规则集地址。
+ * 服务端从随包离线 ASN 表展开成 CIDR，再编码为 SRS。
+ */
+export function hostedASNRuleSetURL(asn: string, baseURL?: string): string | undefined {
+  const value = normalizedASN(asn)
+  if (!value) return undefined
+  const origin = hostedOrigin(baseURL)
+  if (origin === null) return undefined
+  const params = new URLSearchParams({ format: 'srs', asn: String(value) })
   return `${origin}/api/ruleset?${params.toString()}`
 }
 

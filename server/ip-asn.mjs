@@ -4,6 +4,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { isIP } from 'node:net'
+import { cidrsForRange, mergeRanges } from './ip-country.mjs'
 
 export function loadIPASNData(dir) {
   try {
@@ -64,6 +65,50 @@ function readOrganization(records, names, offset, width) {
   const organization = nameAt(names, nameOffset, length)
   if (!asn || !organization) return null
   return { asn, organization }
+}
+
+/**
+ * 某个 ASN 的全部 CIDR；数据库里没有该 ASN 时返回空数组。
+ * 供 sing-box / Hiddify 把 IP-ASN 规则写成可下载的 IP 规则集
+ * （1.12 起内核不再接受 route 规则里的 asn 字段）。
+ * 调用方应缓存结果：全表扫描在冷启动时只发生一次。
+ * @param {{v4: Buffer, v6: Buffer, names: Buffer} | null} data
+ * @param {number} rawASN
+ * @returns {string[]}
+ */
+export function asnCIDRs(data, rawASN) {
+  if (!data) return []
+  const asn = Number(rawASN)
+  // BGP 的 ASN 是 32 位整数；0 在表里表示未知，不能作为查询条件。
+  if (!Number.isInteger(asn) || asn <= 0 || asn > 0xffffffff) return []
+  const v4 = []
+  if (data.v4.length % 18 === 0) {
+    for (let offset = 0; offset < data.v4.length; offset += 18) {
+      if (data.v4.readUInt32BE(offset + 8) !== asn) continue
+      v4.push({
+        start: BigInt(data.v4.readUInt32BE(offset)),
+        end: BigInt(data.v4.readUInt32BE(offset + 4)),
+      })
+    }
+  }
+  const v6 = []
+  if (data.v6.length % 42 === 0) {
+    for (let offset = 0; offset < data.v6.length; offset += 42) {
+      if (data.v6.readUInt32BE(offset + 32) !== asn) continue
+      v6.push({
+        start: data.v6.readBigUInt64BE(offset) << 64n | data.v6.readBigUInt64BE(offset + 8),
+        end: data.v6.readBigUInt64BE(offset + 16) << 64n | data.v6.readBigUInt64BE(offset + 24),
+      })
+    }
+  }
+  const result = []
+  for (const range of mergeRanges(v4)) {
+    result.push(...cidrsForRange(range.start, range.end, 32))
+  }
+  for (const range of mergeRanges(v6)) {
+    result.push(...cidrsForRange(range.start, range.end, 128))
+  }
+  return result
 }
 
 /**

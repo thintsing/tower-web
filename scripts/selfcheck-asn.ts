@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { loadIPASNData, organizationForAddress } from '../server/ip-asn.mjs'
+import { loadIPASNData, organizationForAddress, asnCIDRs } from '../server/ip-asn.mjs'
 
 const dir = join(fileURLToPath(new URL('.', import.meta.url)), '..', 'server', 'ip-asn')
 
@@ -43,6 +43,15 @@ function main(): void {
     assert.ok(result)
     assert.equal(result.asn, 13335)
     assert.match(result.organization, /Cloudflare/i)
+  })
+
+  check('ASN → CIDR 反查与 IP → ASN 查询可互相印证', () => {
+    const cidrs = asnCIDRs(data, 13335)
+    assert.ok(cidrs.includes('1.1.1.0/24'), 'AS13335 应包含 Cloudflare 的 1.1.1.0/24')
+    const sample = cidrs.find((cidr) => cidr.includes('.'))
+    assert.ok(sample)
+    const address = sample!.split('/')[0]
+    assert.equal(organizationForAddress(data, address)?.asn, 13335)
   })
 
   check('非法地址与缺失数据库安全返回 null', () => {

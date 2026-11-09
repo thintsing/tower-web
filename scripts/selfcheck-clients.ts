@@ -600,6 +600,46 @@ for (const target of ['sing-box', 'hiddify'] as ClientTarget[]) {
   if (!rules.some((rule) => rule.ip_is_private === true)) {
     problems.push(`${target}: GEOIP,PRIVATE 未写成 ip_is_private`)
   }
+  const asnSet = (doc?.route?.rule_set ?? [])
+    .find((set: any) => set.tag === 'tower-asn-13335')
+  if (!asnSet || !String(asnSet.url).includes('asn=13335')) {
+    problems.push(`${target}: IP-ASN,13335 未写成托管 ASN 规则集`)
+  }
+  if (!rules.some((rule) => rule.rule_set?.includes('tower-asn-13335'))) {
+    problems.push(`${target}: 路由规则未引用 ASN 规则集`)
+  }
+}
+
+// 逻辑规则里的 GEOIP / IP-ASN 也必须展开成 rule_set 子条件，而不是整条丢掉。
+const logicalHostedScheme: RuleScheme = {
+  ...dialectedScheme,
+  rules: [
+    { type: 'AND', raw: 'AND,((DOMAIN,geo.example),(GEOIP,CN))', group: '节点选择' },
+    { type: 'OR', raw: 'OR,((DOMAIN,asn.example),(IP-ASN,15169))', group: '节点选择' },
+    { type: 'FINAL', group: '节点选择' },
+  ],
+}
+for (const target of ['sing-box', 'hiddify'] as ClientTarget[]) {
+  const doc = JSON.parse(generateConfig(
+    client(target),
+    SAMPLE,
+    logicalHostedScheme,
+    { contentMode: 'full' },
+  ).text) as any
+  const rules = (doc?.route?.rules ?? []) as any[]
+  const logical = rules.filter((rule) => rule.type === 'logical')
+  const geo = logical.find((rule) => JSON.stringify(rule.rules).includes('"tower-geoip-country-cn"'))
+  if (!geo || !geo.rules.some((child: any) => child.domain?.[0] === 'geo.example')) {
+    problems.push(`${target}: 逻辑规则里的 GEOIP 未展开成规则集子条件`)
+  }
+  const asn = logical.find((rule) => JSON.stringify(rule.rules).includes('"tower-asn-15169"'))
+  if (!asn || !asn.rules.some((child: any) => child.domain?.[0] === 'asn.example')) {
+    problems.push(`${target}: 逻辑规则里的 IP-ASN 未展开成规则集子条件`)
+  }
+  if (!(doc?.route?.rule_set ?? []).some((set: any) =>
+    set.tag === 'tower-asn-15169' && String(set.url).includes('asn=15169'))) {
+    problems.push(`${target}: 逻辑规则未声明 AS15169 规则集`)
+  }
 }
 
 console.log(problems.length ? `\n❌ ${problems.join('\n❌ ')}` : '\n✅ INI / base64 / Egern / Shadowrocket 结构自检通过')

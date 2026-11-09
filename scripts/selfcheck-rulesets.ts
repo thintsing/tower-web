@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url'
 import { convertRuleSet, RuleSetConversionError } from '../server/ruleset-convert.mjs'
 // @ts-expect-error server module is plain ESM and not part of the src tsconfig
 import { cidrsForRange, countryCIDRs, loadIPCountryData } from '../server/ip-country.mjs'
+// @ts-expect-error server module is plain ESM and not part of the src tsconfig
+import { asnCIDRs, loadIPASNData } from '../server/ip-asn.mjs'
 import type { RoutingRule, SchemeRuleSet } from '../src/models/types'
 import { mihomoBinaryPlan, singBoxBinaryPlan } from '../src/rules/binaryRuleSets'
 import {
@@ -747,6 +749,24 @@ function main(): void {
     assert.deepEqual(countryCIDRs(data, 'ZZ'), [])
     const srs = convertRuleSet(
       cn.slice(0, 5).map((cidr: string) => `IP-CIDR,${cidr},no-resolve`).join('\n'),
+      'srs',
+    )
+    assert.ok(Buffer.isBuffer(srs.text))
+    assert.equal(srs.text.subarray(0, 4).toString('hex'), '53525302')
+    assert.equal(srs.ruleCount, 5)
+  })
+
+  check('IP-ASN：离线 ASN 表可反查 CIDR 并编码为 SRS', () => {
+    const data = loadIPASNData(fileURLToPath(new URL('../server/ip-asn', import.meta.url)))
+    assert.ok(data, '离线 ASN 表应随仓库提供')
+    const cloudflare = asnCIDRs(data, 13335)
+    assert.ok(cloudflare.length > 100, `AS13335 CIDR 数量应足够多，实际 ${cloudflare.length}`)
+    assert.ok(cloudflare.includes('1.1.1.0/24'))
+    // ASN 0 表示未知 / 非法查询，不能把整张表吐出来。
+    assert.deepEqual(asnCIDRs(data, 0), [])
+    assert.deepEqual(asnCIDRs(data, 4294967295), [])
+    const srs = convertRuleSet(
+      cloudflare.slice(0, 5).map((cidr: string) => `IP-CIDR,${cidr},no-resolve`).join('\n'),
       'srs',
     )
     assert.ok(Buffer.isBuffer(srs.text))

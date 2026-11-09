@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib'
 import { convertRuleSet, RuleSetConversionError } from './ruleset-convert.mjs'
-import { loadIPASNData, organizationForAddress } from './ip-asn.mjs'
+import { asnCIDRs, loadIPASNData, organizationForAddress } from './ip-asn.mjs'
 import { countryCIDRs, loadIPCountryData } from './ip-country.mjs'
 import { createUpstreamChecker } from './upstream-status.mjs'
 import { BUILTIN_PROGRAMMATIC_SCHEMES, BUILTIN_SCHEME_COUNT, BUILTIN_SCHEME_FILES } from './builtin-scheme-counts.mjs'
@@ -129,6 +129,18 @@ function cacheRuleSet(key, artifact) {
   rulesetArtifacts.set(key, { ...artifact, updatedAt: Date.now() })
 }
 
+/** asn 参数：返回规范化后的 AS 号；非法值带 error。缺省时 value 为 0。 */
+function parseASN(raw) {
+  const value = String(raw ?? '').trim()
+  if (!value) return { value: 0 }
+  if (!/^\d{1,10}$/.test(value)) return { value: 0, error: 'asn 需要十进制 AS 号，例如 13335' }
+  const asn = Number(value)
+  if (!Number.isSafeInteger(asn) || asn <= 0 || asn > 0xffffffff) {
+    return { value: 0, error: 'asn 需要 1–4294967295 之间的 AS 号' }
+  }
+  return { value: asn }
+}
+
 /**
  * 查询侧与写入侧必须用同一个函数生成缓存键，否则 provider 这类新参数
  * 会让写入键与查询键不一致，缓存永远 miss。
@@ -140,9 +152,17 @@ function ruleSetCacheKey(query) {
   const file = query.get('file')
   const remote = query.get('url')
   const geoip = String(query.get('geoip') ?? '').trim().toUpperCase()
+  const asn = parseASN(query.get('asn')).value
   if (!format) return ''
-  if (!file && !remote && !geoip) return ''
-  return `${format}|${behavior}|${provider}|${geoip ? `geoip:${geoip}` : file ? `file:${file}` : `url:${remote}`}`
+  if (!file && !remote && !geoip && !asn) return ''
+  const source = geoip
+    ? `geoip:${geoip}`
+    : asn
+      ? `asn:${asn}`
+      : file
+        ? `file:${file}`
+        : `url:${remote}`
+  return `${format}|${behavior}|${provider}|${source}`
 }
 
 /**
@@ -220,19 +240,28 @@ async function buildRuleSetArtifact(query) {
   if (geoip && !/^[A-Z]{2}$/.test(geoip)) {
     throw new RuleSetConversionError('geoip 需要两位国家或地区代码，例如 CN', 400)
   }
-  if (geoip && (file || remote)) {
-    throw new RuleSetConversionError('geoip 与 file / url 只能三选一', 400)
+  // asn=13335：同样从随包离线 ASN 表生成 CIDR 列表，承接 IP-ASN 规则。
+  const asnParam = parseASN(query.get('asn'))
+  if (asnParam.error) throw new RuleSetConversionError(asnParam.error, 400)
+  const asn = asnParam.value
+  if ((geoip && (file || remote)) || (asn && (file || remote || geoip))) {
+    throw new RuleSetConversionError('geoip / asn 与 file / url 只能四选一', 400)
   }
-  if (!file && !remote && !geoip) throw new RuleSetConversionError('缺少 file / url / geoip 参数')
+  if (!file && !remote && !geoip && !asn) {
+    throw new RuleSetConversionError('缺少 file / url / geoip / asn 参数')
+  }
   if (file && remote) throw new RuleSetConversionError('file 与 url 只能二选一')
   let sourceText
-  if (geoip) {
+  if (geoip || asn) {
     if (format === 'srs-domain') {
-      throw new RuleSetConversionError('srs-domain 只接受域名规则，不支持 geoip', 400)
+      throw new RuleSetConversionError(`srs-domain 只接受域名规则，不支持 ${geoip ? 'geoip' : 'asn'}`, 400)
     }
-    const cidrs = geoipCidrs(geoip)
+    const cidrs = geoip ? geoipCidrs(geoip) : asnCidrs(asn)
     if (!cidrs.length) {
-      throw new RuleSetConversionError(`离线国家表里没有 ${geoip} 的 IP 段`, 404)
+      throw new RuleSetConversionError(
+        geoip ? `离线国家表里没有 ${geoip} 的 IP 段` : `离线 ASN 表里没有 AS${asn} 的 IP 段`,
+        404,
+      )
     }
     sourceText = cidrs.map((cidr) => `IP-CIDR,${cidr},no-resolve`).join('\n')
   } else if (file) {
@@ -279,8 +308,9 @@ async function buildRuleSetArtifact(query) {
   const artifact = convertRuleSet(sourceText, format, {
     behavior,
     provider,
-    // 美国等国家的离线表拆出来可超过 8MB；本地生成不受远程抓取的上限约束。
-    maxSourceBytes: geoip ? 64 * 1024 * 1024 : undefined,
+    // 美国等国家的离线表、大型运营商的 ASN 拆出来可超过 8MB；
+    // 本地生成不受远程抓取的上限约束。
+    maxSourceBytes: geoip || asn ? 64 * 1024 * 1024 : undefined,
   })
   return {
     // 与缓存查询复用同一个键构造函数，避免两侧再次漂移。
@@ -1686,6 +1716,17 @@ function geoipCidrs(code) {
   const cidrs = countryCIDRs(loadIPCountryDatabase(), normalized)
   if (geoipCidrCache.size >= 256) geoipCidrCache.clear()
   geoipCidrCache.set(normalized, cidrs)
+  return cidrs
+}
+
+/** AS 号 → CIDR 列表；大型运营商可拆出十几万条，必须缓存。 */
+const asnCidrCache = new Map()
+function asnCidrs(asn) {
+  if (!Number.isInteger(asn) || asn <= 0) return []
+  if (asnCidrCache.has(asn)) return asnCidrCache.get(asn)
+  const cidrs = asnCIDRs(loadIPASNDatabase(), asn)
+  if (asnCidrCache.size >= 256) asnCidrCache.clear()
+  asnCidrCache.set(asn, cidrs)
   return cidrs
 }
 
