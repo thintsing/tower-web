@@ -22,6 +22,7 @@ import { asnCIDRs, loadIPASNData, organizationForAddress } from './ip-asn.mjs'
 import { countryCIDRs, loadIPCountryData } from './ip-country.mjs'
 import { createUpstreamChecker } from './upstream-status.mjs'
 import { BUILTIN_PROGRAMMATIC_SCHEMES, BUILTIN_SCHEME_COUNT, BUILTIN_SCHEME_FILES } from './builtin-scheme-counts.mjs'
+import { WORKSPACE_MAX_BYTES } from './workspace-limits.mjs'
 
 const rawPort = String(process.env.PORT ?? '').trim()
 const parsedPort = rawPort ? Number(rawPort) : 8787
@@ -193,18 +194,35 @@ function assertAllowedTarget(target) {
 }
 
 /**
+ * IPv4-mapped（::ffff:0:0/96）和 NAT64（64:ff9b::/96）都能携带任意 IPv4。
+ * URL 会把点分形式规范化成十六进制（::ffff:a9fe:a9fe），只剥前缀再判 isIP
+ * 会整条跳过 IPv4 分支，云元数据地址因此可达。这里统一还原成点分四段。
+ */
+function embeddedIPv4(ip) {
+  const match = ip.match(/^(?:::ffff:|64:ff9b::)(.+)$/)
+  if (!match) return undefined
+  const tail = match[1]
+  if (isIP(tail) === 4) return tail
+  const hex = tail.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/)
+  if (!hex) return undefined
+  const high = parseInt(hex[1], 16)
+  const low = parseInt(hex[2], 16)
+  return `${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`
+}
+
+/**
  * 解析结果也要校验：只按域名挡，A 记录指向 169.254.169.254 的域名仍能绕过。
  * 私网（10/8、172.16/12、192.168/16）与回环地址按原有设计放行，
  * 只拦截链路本地、云元数据、组播和保留地址。
  */
 function blockedRuleSetAddress(address) {
   const ip = String(address).trim().toLowerCase()
-  const mapped = ip.startsWith('::ffff:') ? ip.slice('::ffff:'.length) : ip
-  if (isIP(mapped) === 4) {
-    const [first, second] = mapped.split('.').map(Number)
+  const v4 = isIP(ip) === 4 ? ip : embeddedIPv4(ip)
+  if (v4) {
+    const [first, second] = v4.split('.').map(Number)
     return (first === 169 && second === 254)   // 169.254.0.0/16 链路本地
-      || mapped === '100.100.100.200'          // 阿里云元数据
-      || first === 0                            // 0.0.0.0/8 本网络
+      || v4 === '100.100.100.200'              // 阿里云元数据
+      || first === 0                           // 0.0.0.0/8 本网络
       || first >= 224                          // 224.0.0.0/4 组播 + 240.0.0.0/4 保留（含广播）
   }
   return /^fe80:/.test(ip)                     // IPv6 链路本地
@@ -331,8 +349,6 @@ const SETTINGS_FILE = join(DATA_DIR, 'settings.json')
 // 任何设备打开都是同一份数据。默认 local，保持原有 localStorage 行为。
 const SERVER_MODE = String(process.env.TOWER_MODE ?? '').trim().toLowerCase() === 'server'
 const WORKSPACE_FILE = join(DATA_DIR, 'workspace.json')
-// 工作区含节点与规则，但远小于已发布配置；16MB 足够且能挡住误传大文件。
-const WORKSPACE_MAX_BYTES = 16 * 1024 * 1024
 
 // ---------- 工作区历史 ----------
 // 每次覆盖前把即将被替换的版本存到这里。目录与工作区同级，Docker 挂载卷会一起持久化。
@@ -1841,8 +1857,31 @@ async function handleIPCountry(url, res) {
 }
 
 function send(res, status, body, headers = {}) {
-  res.writeHead(status, headers)
+  res.writeHead(status, { 'x-content-type-options': 'nosniff', ...headers })
   res.end(body)
+}
+
+/**
+ * 上游和分享者可控的 Content-Type 必须收敛到白名单：text/html 或 SVG 会让浏览器
+ * 在塔台自己的源上执行脚本，读走 localStorage 里的管理密钥和整份工作区。
+ * 原始类型另存 x-upstream-content-type，上游漂移检测仍按真实类型判断。
+ */
+const PASSTHROUGH_CONTENT_TYPES = new Set([
+  'text/plain',
+  'text/yaml',
+  'application/yaml',
+  'application/x-yaml',
+  'text/x-yaml',
+  'application/json',
+  'text/json',
+  'application/octet-stream',
+  'application/base64',
+])
+
+function safeContentType(value) {
+  const raw = String(value ?? '').trim()
+  const essence = raw.split(';')[0].trim().toLowerCase()
+  return PASSTHROUGH_CONTENT_TYPES.has(essence) ? raw : 'text/plain; charset=utf-8'
 }
 
 /** 订阅文本里的托管规则集地址跟随请求的局域网/域名 origin。 */
@@ -1949,7 +1988,7 @@ function systemLookup(hostname, options, callback) {
  * 需要逐跳安全检查时使用：解析出的地址命中链路本地 / 云元数据就直接拒绝，
  * 避免域名指向内网地址绕过只按 hostname 的拦截。
  */
-function lookupWithGuard(endpoint, guard) {
+function lookupWithGuard(endpoint) {
   const base = endpoint ? dohLookup(endpoint) : systemLookup
   return (hostname, options, callback) => {
     base(hostname, options, (error, address, family) => {
@@ -1982,7 +2021,7 @@ function requestOnce(target, userAgent, dohEndpoint, headersOnly = false, guard 
       method: 'GET',
       agent: false,
       lookup: guard
-        ? lookupWithGuard(dohEndpoint, guard)
+        ? lookupWithGuard(dohEndpoint)
         : (dohEndpoint ? dohLookup(dohEndpoint) : undefined),
       headers: {
         // Airports switch payloads on the UA; ask for the raw subscription.
@@ -2111,9 +2150,11 @@ async function handleFetch(url, options, res) {
   if (upstream.status < 200 || upstream.status >= 300) {
     return json(res, 502, { error: `订阅服务器返回 HTTP ${upstream.status}` })
   }
+  const upstreamContentType = headerValue(upstream.headers, 'content-type')
   const headers = {
-    'content-type': headerValue(upstream.headers, 'content-type') ?? 'text/plain; charset=utf-8',
+    'content-type': safeContentType(upstreamContentType ?? 'text/plain; charset=utf-8'),
   }
+  if (upstreamContentType) headers['x-upstream-content-type'] = upstreamContentType
   const userinfo = headerValue(upstream.headers, 'subscription-userinfo')
   if (userinfo) headers['x-subscription-userinfo'] = userinfo
   const title = headerValue(upstream.headers, 'profile-title')
@@ -2457,7 +2498,7 @@ const server = createServer(async (req, res) => {
       }
       share.used = true
       return send(res, 200, share.body, {
-        'content-type': share.contentType,
+        'content-type': safeContentType(share.contentType),
         'cache-control': 'no-store',
       })
     }

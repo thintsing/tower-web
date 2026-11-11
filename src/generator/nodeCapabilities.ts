@@ -96,7 +96,7 @@ export function nativeShadowsocksTLSSupported(node: ProxyNode, target?: ClientTa
   return !!target && (SHADOWROCKET_TARGETS.has(target) || target === 'quanx')
 }
 
-const LOON_DELIMITERS = /[\s,\"'\\#;]/
+const LOON_DELIMITERS = /[\s,"'\\#;]/
 
 export function hysteria2ObfsType(node: ProxyNode): { type: string; password: string } | undefined {
   if (node.kind !== 'hysteria2' || !node.obfs) return undefined

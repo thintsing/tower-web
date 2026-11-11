@@ -119,7 +119,7 @@ async function defaultFetchText(url: string): Promise<UpstreamTextResult> {
   return {
     text: await res.text(),
     etag: res.headers.get('x-upstream-etag') ?? undefined,
-    contentType: res.headers.get('content-type') ?? undefined,
+    contentType: res.headers.get('x-upstream-content-type') ?? res.headers.get('content-type') ?? undefined,
     contentLength: Number.isFinite(contentLength) && contentLength > 0 ? contentLength : undefined,
     status: res.status,
   }

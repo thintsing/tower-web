@@ -654,7 +654,7 @@ await checkAsync('配额探测命中后复用变体，上游失败时保留旧�
   quotaFailNext = false
   quotaTargets.length = 0
   await useStore.getState().refreshSource('quota-retain')
-  let source = useStore.getState().sources.find((item) => item.id === 'quota-retain')!
+  const source = useStore.getState().sources.find((item) => item.id === 'quota-retain')!
   assert.equal(source.totalBytes, 107374182400, 'clash=1 探测应写回总量')
   assert.equal(source.usedBytes, 1048576 + 10737418240, '应写回已用流量')
   assert.equal(source.expireAt, 1798761600000, '应写回到期时间')

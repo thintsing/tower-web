@@ -2,6 +2,7 @@
 // A scheme group's nodeFilter regex is matched against node display names;
 // declared options ([]引用 / DIRECT / REJECT) always come first.
 import type { ClientTarget, ExportContentMode, PolicyGroup, ProxyNode, RemoteSubscriptionEntry, RoutingRule, RuleScheme, RuleSetExclusionTable, RuleSetFormat, SchemeRuleSet, SubFormat, TailnetExport } from '../models/types'
+import { ACL4SSR_PIN_COMMIT } from '../../server/upstream-check.mjs'
 import { filterExcludedRuleSets } from '../rules/ruleSetExclusions'
 import {
   classicalRulesFitTarget,
@@ -243,11 +244,10 @@ export function compileRuleLine(
 }
 
 /**
- * 内置 ACL4SSR 快照对应的上游固定提交。用户开启“优先引用规则集”时，
+ * 内置 ACL4SSR 快照对应的上游固定提交取自 server/upstream-check.mjs，
+ * 与上游更新检查共用同一值。用户开启“优先引用规则集”时，
  * Clash / Surge / QuanX 会直接引用这些远程列表，而不是把规则全部内联。
  */
-const ACL4SSR_COMMIT = '802e3abf065f8609e7d9073ba506158dbe2ba6e7'
-
 export function remoteRuleSetURL(set: SchemeRuleSet): string | undefined {
   if (set.sourceKind === 'local') return undefined
   if (set.sourceKind === 'url') {
@@ -257,7 +257,7 @@ export function remoteRuleSetURL(set: SchemeRuleSet): string | undefined {
   const path = set.sourceRef.startsWith('ACL4SSR_Ruleset_')
     ? `Clash/Ruleset/${set.sourceRef.slice('ACL4SSR_Ruleset_'.length)}`
     : `Clash/${set.sourceRef.slice('ACL4SSR_'.length)}`
-  return `https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/${ACL4SSR_COMMIT}/${path}`
+  return `https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/${ACL4SSR_PIN_COMMIT}/${path}`
 }
 
 export interface PrepareSchemeOptions {

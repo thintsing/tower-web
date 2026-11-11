@@ -76,7 +76,7 @@ function prepared(target: string, format: string, hostedBaseURL = BASE) {
   })
 }
 
-function refsOf(text: string, target: string): number {
+function refsOf(text: string, _target: string): number {
   return (text.match(/\/api\/ruleset\?/g) ?? []).length
 }
 

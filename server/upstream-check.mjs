@@ -9,8 +9,13 @@ export const ACL4SSR_REPO = 'ACL4SSR/ACL4SSR'
 export const ACL4SSR_BRANCH = 'master'
 export const ACL4SSR_RAW_BASE = `https://raw.githubusercontent.com/${ACL4SSR_REPO}`
 export const ACL4SSR_API_BASE = `https://api.github.com/repos/${ACL4SSR_REPO}`
-/** 随塔台打包的 ACL4SSR 规则快照对应的上游 commit（README 里同一值）。 */
-export const ACL4SSR_PIN_COMMIT = '802e3abf065f8609e7d9073ba506158dbe2ba6e7'
+/**
+ * 随塔台打包的 ACL4SSR 规则快照对应的上游 commit。
+ * 取值来自原生仓 ACL4SSR_manifest.json 的 revision（快照逐字节同源），
+ * 远程引用与上游更新检查都必须用它，否则离线内联和在线引用会指向不同版本。
+ * 前端 src/generator/groups.ts 与 src/rules/upstreamScheme.ts 共用此常量。
+ */
+export const ACL4SSR_PIN_COMMIT = '575637df38884575bfa523e95c17d0ee3be1676c'
 
 /** 按 commit 拉某个仓库路径；不使用 branch，避免 force-push 后拼成混合版本。 */
 export function upstreamRawURL(path, commitSha) {

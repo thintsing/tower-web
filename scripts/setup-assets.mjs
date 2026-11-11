@@ -13,7 +13,6 @@ const countrySrc = readFileSync(join(iosDir, 'Tower/Services/CountryTable.swift'
 const countries = {}
 const countryRe = /"([A-Z]{2})":\s*\.init\(chineseName:\s*"((?:[^"\\]|\\.)*)",\s*englishName:\s*"((?:[^"\\]|\\.)*)",\s*latitude:\s*(-?[\d.]+),\s*longitude:\s*(-?[\d.]+),\s*names:\s*\[([^\]]*)\],\s*codes:\s*\[([^\]]*)\]\)/g
 let m
-const strArr = (s) => [...s.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((x) => x[1])
 while ((m = countryRe.exec(countrySrc))) {
   countries[m[1]] = {
     cn: m[2],

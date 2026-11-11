@@ -157,7 +157,7 @@ export function normalizeTailnetControlURL(value: string): string | undefined {
 }
 
 export function normalizeTailnetMagicDNSSuffix(value: string): string | undefined {
-  let trimmed = value.trim().toLowerCase().replace(/^\.+|\.+$/g, '')
+  const trimmed = value.trim().toLowerCase().replace(/^\.+|\.+$/g, '')
   if (!trimmed) return undefined
   if (trimmed.length > 253) throw new TailnetValidationError('magicDNSSuffix')
   const labels = trimmed.split('.')

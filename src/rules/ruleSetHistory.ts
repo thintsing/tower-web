@@ -129,7 +129,7 @@ export function recordRuleSetSnapshot(setID: string, rules: RuleSetRuleLike[], e
   if (!enabled || !setID) return
   const digest = digestRules(rules)
   const history = readRuleSetHistory()
-  let snapshot: RuleSetSnapshot = {
+  const snapshot: RuleSetSnapshot = {
     at: Date.now(),
     count: rules.length,
     digest,

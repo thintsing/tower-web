@@ -29,6 +29,8 @@ server/.tower-write-probe-*
 .tmp*/
 .taste-skill/
 coverage/
+.kernel-cache/
+_preview/
 
 # logs
 npm-debug.log*

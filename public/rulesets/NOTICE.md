@@ -4,7 +4,7 @@
 源码的一部分，不适用本仓库根目录 `LICENSE` 中的 MIT 许可。
 
 - **上游仓库**：<https://github.com/ACL4SSR/ACL4SSR>
-- **固定版本**：`802e3abf065f8609e7d9073ba506158dbe2ba6e7`
+- **固定版本**：`575637df38884575bfa523e95c17d0ee3be1676c`
 - **许可证**：**Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)**
   - 许可证全文：<https://creativecommons.org/licenses/by-sa/4.0/legalcode>
 - **署名**：ACL4SSR 项目及其贡献者。

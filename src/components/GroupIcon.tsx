@@ -7,6 +7,7 @@ import type { ReactNode } from 'react'
 export function groupDisplayName(name: string, showEmoji = false): string {
   if (showEmoji) return name.trim() || name
   const stripped = name
+    // eslint-disable-next-line no-misleading-character-class -- 刻意逐码位剥离 emoji 展示序列（ZWJ / 变体选择符 / 键帽）
     .replace(/^[\p{Extended_Pictographic}\uFE0F\u200D\u20E3]+\s*/u, '')
     .trim()
   return stripped || name

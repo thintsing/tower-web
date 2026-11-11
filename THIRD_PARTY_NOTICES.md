@@ -37,7 +37,7 @@ Tower Web 不是 Tower iOS 的官方发行版，也不代表上游对本项目�
 ## 2. ACL4SSR 规则集
 
 - 上游：<https://github.com/ACL4SSR/ACL4SSR>
-- 固定版本：`802e3abf065f8609e7d9073ba506158dbe2ba6e7`
+- 固定版本：`575637df38884575bfa523e95c17d0ee3be1676c`
 - 位置：`public/rulesets/ACL4SSR_*.ini`、`public/rulesets/ACL4SSR_*.list`
 - 许可证：**CC BY-SA 4.0**
   <https://creativecommons.org/licenses/by-sa/4.0/legalcode>

@@ -241,7 +241,7 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 - 每次写入前服务端保留上一版 `workspace.json.bak`；启动时主文件解析失败会改名为 `workspace.json.broken-<时间戳>`，优先用可解析的 `.bak` 恢复（版本可能回退一版，客户端轮询会自己拉到最新）；`.bak` 也不可用时才返回明确的 `workspace_corrupt`，不会当成空工作区。
 - 设备偏好（导出目标、隐藏客户端、排序、Emoji、测速模式、地图状态、高级区展开等）仍留在本机 localStorage，不跨设备同步；Tailscale Auth Key 属于工作区，会保存在服务端。
 - 同一个 `TOWER_DATA_DIR` 只支持一个服务进程。两个进程同时写会各自按内存里的版本号覆盖同一个 `workspace.json`，实测会静默丢失更新；需要多副本时请为每个实例使用独立数据目录。
-- 上游更新检查：服务器模式启动后按间隔检查 ACL4SSR 内置方案（已固化的比快照 commit/blob，未固化的比构建时 pin `802e3ab`）。结果只写 `TOWER_DATA_DIR/upstream-status.json`，**不写工作区**，所以检查不会让版本号 +1、也不会唤醒其他设备；只提示，不自动固化。默认每天一次，失败后至少隔 6 小时再试，重启后先等 5 分钟。可用 `TOWER_UPSTREAM_CHECK=off` 关闭，`TOWER_UPSTREAM_CHECK_INTERVAL_MS` / `TOWER_UPSTREAM_CHECK_INITIAL_DELAY_MS` 调整间隔与启动延迟；规则页也可「立即检查一次」。
+- 上游更新检查：服务器模式启动后按间隔检查 ACL4SSR 内置方案（已固化的比快照 commit/blob，未固化的比构建时 pin `575637d`）。结果只写 `TOWER_DATA_DIR/upstream-status.json`，**不写工作区**，所以检查不会让版本号 +1、也不会唤醒其他设备；只提示，不自动固化。默认每天一次，失败后至少隔 6 小时再试，重启后先等 5 分钟。可用 `TOWER_UPSTREAM_CHECK=off` 关闭，`TOWER_UPSTREAM_CHECK_INTERVAL_MS` / `TOWER_UPSTREAM_CHECK_INITIAL_DELAY_MS` 调整间隔与启动延迟；规则页也可「立即检查一次」。
 
 ## 数据存在哪里（服务端 vs 浏览器）
 
@@ -274,6 +274,9 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 | `npm run dev` | 同时启动 Vite 与本地 API |
 | `npm run build` | TypeScript 检查 + 生产构建 |
 | `npm start` | 生产模式运行 `server/index.mjs` |
+| `npm run lint` | ESLint 检查（含 react-hooks 规则） |
+| `npm run typecheck:scripts` | 对 `scripts/` 与 `server/` 做类型检查（基线工具，存量错误待逐步收敛） |
+| `npm run selfcheck:kernels` | 用真实 sing-box / mihomo 内核校验生成的配置 |
 | `npm run selfcheck:clients` | 校验各客户端配置结构 |
 | `npm run selfcheck:dns` | 校验 DNS 投影、纯节点组与 ECS |
 | `npm run selfcheck:importers` | 校验规则方案导入 |
@@ -284,7 +287,7 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 | `npm run selfcheck:upstream-status` | 校验服务端上游定时检查、失败退避与工作区隔离 |
 
 <details>
-<summary>全部 42 项自检</summary>
+<summary>全部 43 项自检</summary>
 
 ```text
 selfcheck:asn         离线 IP / ASN 查询
@@ -301,6 +304,7 @@ selfcheck:flow        四步状态推导与诊断
 selfcheck:freeze-preview 固化前影响预览与取消
 selfcheck:importers   Clash / Surge / Egern / sing-box / INI 导入
 selfcheck:icons       策略组图标与能力矩阵
+selfcheck:kernels     真实 sing-box / mihomo 内核校验生成产物
 selfcheck:manual      自有节点导入与去重
 selfcheck:manual-form 手动节点表单
 selfcheck:map         地图地区聚合
@@ -331,7 +335,7 @@ selfcheck:workspace-overwrite 覆盖恢复不丢未保存改动
 selfcheck:yaml        Clash YAML 结构
 ```
 
-自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建并运行全部 42 项自检；`package.json` 与 `.github/workflows/ci.yml` 的清单逐条对齐。
+自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建、运行 ESLint 并执行全部 43 项自检；`package.json` 与 `.github/workflows/ci.yml` 的清单逐条对齐。`selfcheck:kernels` 会下载固定版本的 sing-box / mihomo 真实校验生成产物（Linux 上自动取二进制；其他平台用 `SING_BOX_BIN` / `MIHOMO_BIN` 指定，否则跳过；GitHub Actions 下两个内核缺一即失败）。
 
 </details>
 
@@ -386,7 +390,7 @@ Dockerfile / docker-compose.yml  容器镜像与本地编排
 | 内容 | 来源 | 许可证 |
 | --- | --- | --- |
 | 领域模型、解析语义、区域数据、项目 Logo | [pengchujin/tower](https://github.com/pengchujin/tower) | MIT |
-| ACL4SSR 规则数据 | [ACL4SSR](https://github.com/ACL4SSR/ACL4SSR/tree/802e3abf065f8609e7d9073ba506158dbe2ba6e7) | CC BY-SA 4.0 |
+| ACL4SSR 规则数据 | [ACL4SSR](https://github.com/ACL4SSR/ACL4SSR/tree/575637df38884575bfa523e95c17d0ee3be1676c) | CC BY-SA 4.0 |
 | 离线 IP 国家 / ASN 库 | [sapics/ip-location-db](https://github.com/sapics/ip-location-db) | PDDL-1.0 |
 | 世界地图 | [world-atlas](https://github.com/topojson/world-atlas) / [Natural Earth](https://www.naturalearthdata.com/) | ISC / public domain |
 | 客户端图标 | 各客户端官方素材 | 商标 / 各自版权 |

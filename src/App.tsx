@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, lazy, Suspense, type ReactNode, type SyntheticEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, lazy, Suspense, memo, useCallback, type ReactNode, type SyntheticEvent } from 'react'
 import { renderSVG } from 'uqr'
 import { CLIENTS, PROXY_KIND_TITLES, clientSupportsImport, subFormatFor, subscriptionUsageSummary, type ClientInfo, type ClientTarget, type ExportContentMode, type LatencyTestMode, type LocalRuleSet, type NodeNameFilterSettings, type PolicyGroup, type ProxyKind, type ProxyNode, type RemoteSubscriptionEntry, type RoutingRule, type RuleScheme, type RuleSetFormat, type RuleSetRefreshDiff, type SchemeRuleSet, type SubFormat, type SubscriptionSource, type TailnetConnection, type TailnetExport } from './models/types'
 import { allRegions, filterNodesByRegionCodes, regionForName, regionForNode } from './models/region'
@@ -2523,7 +2523,7 @@ function nodeMatchesKeyword(node: ProxyNode, needle: string): boolean {
   ].join(' ').toLowerCase().includes(needle)
 }
 
-function NodeRow({
+const NodeRow = memo(function NodeRow({
   node,
   onCountryClick,
   onEditCountry,
@@ -2545,22 +2545,20 @@ function NodeRow({
 }) {
   const toggle = useStore((s) => s.toggleNodeExcluded)
   const updateManualNode = useStore((s) => s.updateManualNode)
-  const sources = useStore((s) => s.sources)
-  const latencyMap = useStore((s) => s.latencyByNodeId)
-  const latencyMethodMap = useStore((s) => s.latencyMethodByNodeId)
-  const probeErrors = useStore((s) => s.probeErrorByNodeId)
-  const testingIds = useStore((s) => s.testingNodeIds)
-  const readOnly = useWorkspaceStatus().readOnly
-
-  const excluded = useMemo(() => {
+  // 只订阅本节点自己的切片。订阅整张 latency / probeError 表会让任一节点测速
+  // 完成时所有 NodeRow 一起重渲染，千节点订阅在测速期间会明显卡顿。
+  const latency = useStore((s) => s.latencyByNodeId[node.id])
+  const method = useStore((s) => s.latencyMethodByNodeId[node.id])
+  const probeError = useStore((s) => s.probeErrorByNodeId[node.id])
+  const testing = useStore((s) => s.testingNodeIds.includes(node.id))
+  const subscribedSourceName = useStore((s) => s.sources.find((src) => src.id === node.sourceID)?.name)
+  const excluded = useStore((s) => {
     if (node.isManual) return node.isEnabled === false
-    const src = sources.find((s) => s.id === node.sourceID)
+    const src = s.sources.find((item) => item.id === node.sourceID)
     if (!src || src.excludedNodeKeys.length === 0) return false
     return src.excludedNodeKeys.includes(nodeExactKey(node))
-  }, [sources, node])
-  const latency = latencyMap[node.id]
-  const probeError = probeErrors[node.id]
-  const testing = testingIds.includes(node.id)
+  })
+  const readOnly = useWorkspaceStatus().readOnly
   const region = regionForNode(node)
   const [expanded, setExpanded] = useState(false)
   const [copiedURI, setCopiedURI] = useState(false)
@@ -2582,7 +2580,7 @@ function NodeRow({
   }
 
   const sourceName = node.sourceID
-    ? sources.find((source) => source.id === node.sourceID)?.name
+    ? subscribedSourceName
     : node.isManual ? '自有节点' : '本地节点'
   const regionSource = node.countryOverride
     ? '手动标记'
@@ -2591,7 +2589,6 @@ function NodeRow({
       : node.detectedCountry ? '离线 IP' : '未知'
   const shareURI = nodeShareText(node)
   const capability = nodeTransportCapability(node)
-  const method = latencyMethodMap[node.id]
   const methodText = method === 'icmp'
     ? 'ICMP 近似（服务器可达性，非 UDP RTT）'
     : 'TCP 握手'
@@ -2647,7 +2644,7 @@ function NodeRow({
         </span>
       )
     }
-    const measured = latencyMethodMap[node.id]
+    const measured = method
     // ICMP 只是服务器可达性参考，不套用 TCP 延迟的三档色阶。
     if (measured === 'icmp') {
       return (
@@ -2886,7 +2883,7 @@ function NodeRow({
       )}
     </>
   )
-}
+})
 
 function ManualNodesCard({
   nodes,
@@ -3289,6 +3286,7 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const [manualEditor, setManualEditor] = useState<{ node?: ProxyNode } | null>(null)
   const [renamingManualNode, setRenamingManualNode] = useState<ProxyNode | null>(null)
   const [pendingManualDelete, setPendingManualDelete] = useState<ProxyNode | null>(null)
+  const handleEditManualNode = useCallback((node: ProxyNode) => setManualEditor({ node }), [])
   const [batchFailures, setBatchFailures] = useState<SourceAddFailure[] | null>(null)
   const [refreshProgress, setRefreshProgress] = useState<{ done: number; total: number } | null>(null)
   const refreshReport = useRefreshReport()
@@ -3916,7 +3914,7 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           onEditCountry={setEditingCountryNode}
           onAdd={() => setAddingManual(true)}
           onCreate={() => setManualEditor({})}
-          onEditNode={(node) => setManualEditor({ node })}
+          onEditNode={handleEditManualNode}
           onRename={setRenamingManualNode}
           onRequestDelete={setPendingManualDelete}
         />

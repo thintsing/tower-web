@@ -219,7 +219,7 @@ function egernNode(node: ProxyNode, name: string): string | undefined {
       body.push('      udp_relay: true')
       break
     }
-    case 'ssh':
+    case 'ssh': {
       // Egern 2.20+ 支持私钥，但不接受私钥口令。
       if (node.ssh?.privateKeyPassphrase?.trim()) return undefined
       type = 'ssh'
@@ -234,6 +234,7 @@ function egernNode(node: ProxyNode, name: string): string | undefined {
         body.push(`      host_keys: [${hostKeys.map(yaml).join(', ')}]`)
       }
       break
+    }
     default:
       // ssr / hysteria1 / masque / trusttunnel: no faithful Egern encoding.
       return undefined

@@ -2,7 +2,9 @@
 // 否则用户只知道保存失败，不知道从哪减。
 import type { WorkspaceData } from './workspaceValidation'
 
-export const WORKSPACE_MAX_BYTES = 16 * 1024 * 1024
+import { WORKSPACE_MAX_BYTES } from '../server/workspace-limits.mjs'
+
+export { WORKSPACE_MAX_BYTES }
 
 export interface WorkspaceSizeItem {
   label: string

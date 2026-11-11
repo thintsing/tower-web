@@ -33,6 +33,8 @@
     "start": "node server/index.mjs",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
+    "lint": "eslint .",
+    "typecheck:scripts": "tsc -p tsconfig.scripts.json",
     "selfcheck:asn": "tsx scripts/selfcheck-asn.ts",
     "selfcheck:auth": "tsx scripts/selfcheck-auth.ts",
     "selfcheck:backup": "tsx scripts/selfcheck-backup.ts",
@@ -46,6 +48,7 @@
     "selfcheck:flow": "tsx scripts/selfcheck-flow.ts",
     "selfcheck:importers": "tsx scripts/selfcheck-importers.ts",
     "selfcheck:icons": "tsx scripts/selfcheck-icons.ts",
+    "selfcheck:kernels": "tsx scripts/selfcheck-kernels.ts",
     "selfcheck:manual": "tsx scripts/selfcheck-manual.ts",
     "selfcheck:manual-form": "tsx scripts/selfcheck-manual-form.ts",
     "selfcheck:map": "tsx scripts/selfcheck-map.ts",
@@ -87,13 +90,19 @@
     "zustand": "^5.0.6"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@types/d3-geo": "^3.1.1",
+    "@types/node": "^22.20.5",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
     "@vitejs/plugin-react": "^5.0.0",
     "concurrently": "^9.2.0",
+    "eslint": "^9.39.5",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "globals": "^14.0.0",
     "tsx": "^4.23.15",
     "typescript": "^5.9.0",
+    "typescript-eslint": "^8.72.2",
     "vite": "^7.1.0"
   }
 }
