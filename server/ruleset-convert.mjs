@@ -392,7 +392,8 @@ function normalizedRule(rule) {
 }
 
 export function convertRuleSet(text, format, options = {}) {
-  if (typeof text !== 'string' || !text.trim()) {
+  const allowEmpty = options.allowEmpty === true
+  if (typeof text !== 'string' || (!text.trim() && !allowEmpty)) {
     throw new RuleSetConversionError('规则集内容为空')
   }
   // 远程抓取仍限制 8MB；GEOIP 这类从本地库展开的源可能更大，由调用方显式放宽。
@@ -405,8 +406,11 @@ export function convertRuleSet(text, format, options = {}) {
   const rules = options.provider === 'yaml'
     ? providerRules(text, String(options.behavior ?? '').toLowerCase())
     : ruleLines(text)
-  if (!rules.length) throw new RuleSetConversionError('没有解析到规则')
   const normalized = format === 'sing-box' ? 'singbox' : format
+  // 只有 SRS 能表达零规则占位；其他格式没有合法的空规则集。
+  if (!rules.length && !(allowEmpty && normalized === 'srs')) {
+    throw new RuleSetConversionError('没有解析到规则')
+  }
   let body
   let ruleCount = rules.length
   if (normalized === 'classic') body = convertClassic(rules)
@@ -429,7 +433,7 @@ export function convertRuleSet(text, format, options = {}) {
     try {
       const binary = encodeSingBoxRuleSet(
         rules.map(normalizedRule),
-        { domainOnly: normalized === 'srs-domain' },
+        { domainOnly: normalized === 'srs-domain', allowEmpty },
       )
       body = binary.body
       ruleCount = binary.ruleCount

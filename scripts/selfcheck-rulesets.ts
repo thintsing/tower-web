@@ -774,6 +774,17 @@ function main(): void {
     assert.equal(srs.ruleCount, 5)
   })
 
+  check('GEOIP / IP-ASN：离线表里没有的代码返回零规则 SRS', () => {
+    const output = convertRuleSet('', 'srs', { allowEmpty: true })
+    assert.equal(output.text.subarray(0, 4).toString('hex'), '53525302')
+    assert.equal(output.ruleCount, 0)
+    // 零规则 SRS 只有 RuleSet 版本号，没有任何 HeadlessRule。
+    assert.deepEqual([...inflateSync(output.text.subarray(4))], [1])
+    // 其他格式没有合法的空规则集表达，仍然明确报错。
+    assert.throws(() => convertRuleSet('', 'classic', { allowEmpty: true }), /没有解析到规则/)
+    assert.throws(() => convertRuleSet('', 'srs'), /规则集内容为空/)
+  })
+
   if (failures) {
     console.error(`\n${failures} 项检查失败`)
     process.exit(1)

@@ -276,10 +276,16 @@ async function buildRuleSetArtifact(query) {
     }
     const cidrs = geoip ? geoipCidrs(geoip) : asnCidrs(asn)
     if (!cidrs.length) {
-      throw new RuleSetConversionError(
-        geoip ? `离线国家表里没有 ${geoip} 的 IP 段` : `离线 ASN 表里没有 AS${asn} 的 IP 段`,
-        404,
-      )
+      // 离线表里没有该代码：SRS 仍返回一份零规则产物，让客户端配置里的远程
+      // 规则集能正常下载（只是永不命中），而不是每天报一次 404。
+      // 其他文本格式没有「空规则集」的合法表达，继续如实返回 404。
+      if (format !== 'srs') {
+        throw new RuleSetConversionError(
+          geoip ? `离线国家表里没有 ${geoip} 的 IP 段` : `离线 ASN 表里没有 AS${asn} 的 IP 段`,
+          404,
+        )
+      }
+      console.warn(`[tower] 离线表里没有 ${geoip || `AS${asn}`} 的 IP 段，返回空规则集`)
     }
     sourceText = cidrs.map((cidr) => `IP-CIDR,${cidr},no-resolve`).join('\n')
   } else if (file) {
@@ -329,6 +335,8 @@ async function buildRuleSetArtifact(query) {
     // 美国等国家的离线表、大型运营商的 ASN 拆出来可超过 8MB；
     // 本地生成不受远程抓取的上限约束。
     maxSourceBytes: geoip || asn ? 64 * 1024 * 1024 : undefined,
+    // geoip / asn 查不到时返回零规则 SRS，而不是让客户端反复下载 404。
+    allowEmpty: geoip || asn ? true : undefined,
   })
   return {
     // 与缓存查询复用同一个键构造函数，避免两侧再次漂移。

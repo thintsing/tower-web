@@ -130,6 +130,17 @@ try {
     && asnBytes.length > 1000
   console.log(`${asnOK ? '✅' : '❌'} asn: HTTP ${asn.status} · ${asnBytes.length} 字节`)
   if (!asnOK) problems.push('IP-ASN 托管规则集分发异常')
+
+  // 离线表里没有的代码：仍返回可下载的零规则 SRS，客户端不会每天报 404。
+  for (const query of ['format=srs&geoip=ZZ', 'format=srs&asn=4294967295']) {
+    const empty = await fetch(`${BASE}/api/ruleset?${query}`)
+    const emptyBytes = Buffer.from(await empty.arrayBuffer())
+    const emptyOK = empty.ok
+      && emptyBytes.subarray(0, 4).toString('hex') === '53525302'
+      && emptyBytes.length < 100
+    console.log(`${emptyOK ? '✅' : '❌'} ${query}: HTTP ${empty.status} · ${emptyBytes.length} 字节`)
+    if (!emptyOK) problems.push(`${query} 未返回零规则 SRS`)
+  }
 } catch (err) {
   console.log(`ℹ️ 跳过 E2E（服务端未启动？）：${err instanceof Error ? err.message : String(err)}`)
 }

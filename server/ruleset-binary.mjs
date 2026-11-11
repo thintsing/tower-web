@@ -363,7 +363,7 @@ export function encodeMihomoRuleSet(rules, behavior) {
  * 生成 SRS v2；默认把域名 / 关键字 / 正则 / IP 放进同一条 headless 规则（OR 语义）。
  * `domainOnly` 只写 DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD，供 DNS 投影引用。
  */
-export function encodeSingBoxRuleSet(rules, { domainOnly = false } = {}) {
+export function encodeSingBoxRuleSet(rules, { domainOnly = false, allowEmpty = false } = {}) {
   const domains = []
   const suffixes = []
   const keywords = []
@@ -398,9 +398,25 @@ export function encodeSingBoxRuleSet(rules, { domainOnly = false } = {}) {
       count += 1
     }
   }
-  if (!count) throw new BinaryRuleSetError(domainOnly
-    ? '没有可编码为 SRS domain 的规则'
-    : '没有可编码为 SRS 的规则')
+  if (!count) {
+    if (allowEmpty && !domainOnly) {
+      // 零规则的 SRS 合法：只有 RuleSet 版本号，没有任何 HeadlessRule。
+      // 离线表里查不到的 GEOIP / ASN 用它当占位，客户端能正常下载，
+      // 不会每天报一次下载失败；这条规则永远不会命中。
+      const empty = Buffer.concat([writeUvarint(1)])
+      return {
+        body: Buffer.concat([
+          Buffer.from([0x53, 0x52, 0x53]), // SRS
+          Buffer.from([2]),
+          deflateSync(empty, { level: constants.Z_BEST_COMPRESSION }),
+        ]),
+        ruleCount: 0,
+      }
+    }
+    throw new BinaryRuleSetError(domainOnly
+      ? '没有可编码为 SRS domain 的规则'
+      : '没有可编码为 SRS 的规则')
+  }
 
   const items = [Buffer.from([0])] // default rule
   if (domains.length || suffixes.length) {
