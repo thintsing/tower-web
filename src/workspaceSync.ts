@@ -247,6 +247,18 @@ export function initWorkspaceSync(): Promise<void> {
   return initialized
 }
 
+/** 示例模式：不连接服务端、不写工作区，固定为本地可用状态。 */
+export function enterDemoMode(): void {
+  updateStatus({
+    mode: 'local',
+    state: 'local',
+    readOnly: false,
+    message: '示例工作区：虚构数据，不会写入真实工作区。',
+    issues: [],
+    conflict: null,
+  })
+}
+
 function readRememberedConflict(): ConflictDraft | null {
   try {
     const raw = localStorage.getItem(CONFLICT_CACHE_KEY)

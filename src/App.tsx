@@ -64,6 +64,7 @@ import { RulesToolsCard } from './components/RulesToolsCard'
 import { SchemeDriftNotice } from './components/SchemeDriftNotice'
 import { DiagnosisPanel, type FixOutcome } from './components/DiagnosisPanel'
 import { FlowRail } from './components/FlowRail'
+import { RuleOrderCard } from './components/RuleOrderCard'
 import { AdvancedSection } from './components/AdvancedSection'
 import { WorkspaceStatusBanner } from './components/WorkspaceStatusBanner'
 import { WorkspaceHistoryPanel } from './components/WorkspaceHistoryPanel'
@@ -72,6 +73,7 @@ import { autoRefreshReady, buildRefreshReport, describeRefreshReport, dismissRef
 import { fetchUpstreamStatus, triggerUpstreamStatusCheck, type UpstreamStatusPayload } from './upstreamStatus'
 import { READONLY_NOTE, writeGuard } from './util/readOnlyUi'
 import { buildFlow, explainNodePool, type FlowStepKey } from './flow/flow'
+import { DEMO_MODE, SUB_TOKEN_KEY, SUB_URL_KEY } from './demo/demoMode'
 import { markExported, readExportedAt } from './flow/prefs'
 import { applyFixAction, type FixAction } from './rules/diagnosis'
 import { applyDuplicateCleanup, restoreRemovedRules, type DuplicateCleanupPlan, type RemovedRuleRecord } from './rules/duplicateCleanup'
@@ -5714,7 +5716,6 @@ function RulesTab({
     ruleOrderUndoSlot = next
     setRuleOrderUndoState(next)
   }
-  const [ruleOrderSearch, setRuleOrderSearch] = useState('')
   const [libraryOpen, setLibraryOpen] = useState(false)
   const [localSetEditor, setLocalSetEditor] = useState<{ set?: LocalRuleSet } | null>(null)
   const [localSetAddTarget, setLocalSetAddTarget] = useState<LocalRuleSet | null>(null)
@@ -5821,15 +5822,6 @@ function RulesTab({
     () => [...remoteRefsByGroup.values()].reduce((sum, count) => sum + count, 0),
     [remoteRefsByGroup],
   )
-  // 逐条顺序卡片：大方案只渲染前 300 条，搜索用来定位；顺序本身仍按全量计算。
-  const ruleOrderRows = useMemo(() => {
-    const query = ruleOrderSearch.trim().toLowerCase()
-    const rows = schemeRules
-      .map((rule, index) => ({ rule, index }))
-      .filter(({ rule }) => !query
-        || `${rule.type} ${rule.value ?? ''} ${rule.group} ${rule.sourceName ?? ''}`.toLowerCase().includes(query))
-    return { total: rows.length, rows: rows.slice(0, 300) }
-  }, [schemeRules, ruleOrderSearch])
   const enabledForRules = useMemo(() => enabledNodes({ sources, nodes }), [sources, nodes])
   // 方案卡已经显示总数；策略组卡片只补充不重复的信息。
   const groupCardMeta = useMemo(() => {
@@ -7313,95 +7305,16 @@ function RulesTab({
       )}
 
       {scheme && (
-        <div className="card">
-          <div className="card-head">
-            <h3>规则顺序（逐条）</h3>
-            <span className="meta">{schemeRules.length} 条 · 导出按这里的顺序匹配</span>
-          </div>
-          {schemeRules.length > 30 && (
-            <div className="search-wrap rs-search">
-              <input
-                className="input"
-                value={ruleOrderSearch}
-                onChange={(e) => setRuleOrderSearch(e.target.value)}
-                placeholder="搜索类型、域名、策略组或规则集…"
-                aria-label="搜索规则顺序"
-              />
-              {ruleOrderSearch && (
-                <button className="search-clear" aria-label="清空规则搜索" onClick={() => setRuleOrderSearch('')}>×</button>
-              )}
-            </div>
-          )}
-          {ruleOrderRows.rows.length > 0 ? (
-            <ul className="rule-list rule-order-list">
-              {ruleOrderRows.rows.map(({ rule, index }) => {
-                const movable = !isUnmovableRule(rule)
-                const previous = schemeRules[index - 1]
-                const nextRule = schemeRules[index + 1]
-                const canUp = movable && !!previous && !isUnmovableRule(previous)
-                const canDown = movable && !!nextRule && !isUnmovableRule(nextRule)
-                const canPin = movable && index > 0 && !isUnmovableRule(schemeRules[index - 1])
-                const disabledNote = !movable
-                  ? 'GEOIP / FINAL / MATCH 是兜底锚点，不能手动移动'
-                  : readOnly ? READONLY_NOTE : undefined
-                const pinNote = disabledNote ?? (canPin ? '移到本段最前（不越过兜底锚点）' : '已经在最前')
-                const upNote = disabledNote ?? (canUp ? '上移这条规则' : '上方是兜底锚点或已经是第一条')
-                const downNote = disabledNote ?? (canDown ? '下移这条规则' : '下方是兜底锚点或已经是最后一条')
-                return (
-                  <li key={`${index}-${rule.type}-${rule.value ?? ''}-${rule.group}`}>
-                    <span className="hint rule-order-position">{index + 1}</span>
-                    <span className="pill">{groupDisplayName(rule.group, showGroupEmoji)}</span>
-                    {rule.sourceName && <span className="pill rule-source">{rule.sourceName}</span>}
-                    <span className="mono rule-type">{rule.type}</span>
-                    <span className="mono rule-value">{rule.value ?? '—'}</span>
-                    {rule.noResolve && <span className="hint">no-resolve</span>}
-                    <span className="rule-order-actions">
-                      <button
-                        type="button"
-                        className="icon-btn"
-                        disabled={!canPin || readOnly}
-                        aria-label={`置顶规则 ${rule.type} ${rule.value ?? ''}`}
-                        title={pinNote}
-                        onClick={() => pinRule(scheme, index)}
-                      >⇈</button>
-                      <button
-                        type="button"
-                        className="icon-btn"
-                        disabled={!canUp || readOnly}
-                        aria-label={`上移规则 ${rule.type} ${rule.value ?? ''}`}
-                        title={upNote}
-                        onClick={() => moveRule(scheme, index, -1)}
-                      >↑</button>
-                      <button
-                        type="button"
-                        className="icon-btn"
-                        disabled={!canDown || readOnly}
-                        aria-label={`下移规则 ${rule.type} ${rule.value ?? ''}`}
-                        title={downNote}
-                        onClick={() => moveRule(scheme, index, 1)}
-                      >↓</button>
-                    </span>
-                  </li>
-                )
-              })}
-            </ul>
-          ) : (
-            <div className="hint">{ruleOrderSearch ? '没有匹配的规则' : '当前方案没有可调整的规则。'}</div>
-          )}
-          {ruleOrderRows.total > ruleOrderRows.rows.length && (
-            <div className="hint">共 {ruleOrderRows.total} 条匹配，仅显示前 {ruleOrderRows.rows.length} 条；用搜索缩小范围后再调整。</div>
-          )}
-          {ruleOrderUndo && ruleOrderUndo.schemeID === scheme.id && (
-            <div className="inline-notice" role="status">
-              <span>已调整规则「{ruleOrderUndo.label}」顺序。</span>
-              <button type="button" className="btn ghost" {...writeGuard(readOnly)} onClick={undoRuleOrder}>撤销</button>
-            </div>
-          )}
-          <div className="hint rule-order-hint">
-            这里调整的是导出配置里真正从上到下的匹配顺序。自定义规则默认仍排在最前（最具体优先），手动移动后以这里的顺序为准；
-            ⇈ 置顶会把它移到普通规则最前。调整策略组顺序会重置这里的逐条顺序（组排序优先）。GEOIP / FINAL / MATCH 是兜底锚点，按钮会明确禁用。
-          </div>
-        </div>
+        <RuleOrderCard
+          scheme={scheme}
+          rules={schemeRules}
+          readOnly={readOnly}
+          showGroupEmoji={showGroupEmoji}
+          undoLabel={ruleOrderUndo?.schemeID === scheme.id ? ruleOrderUndo.label : undefined}
+          onPin={pinRule}
+          onMove={moveRule}
+          onUndo={undoRuleOrder}
+        />
       )}
 
       {scheme && (
@@ -8295,9 +8208,9 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const [downloaded, setDownloaded] = useState(false)
   const [pendingRevoke, setPendingRevoke] = useState(false)
   const [importing, setImporting] = useState(false)
-  const [subToken, setSubToken] = useState<string>(() => localPrefs.getItem('tower-sub-token') ?? '')
+  const [subToken, setSubToken] = useState<string>(() => localPrefs.getItem(SUB_TOKEN_KEY) ?? '')
   const [subURL, setSubURL] = useState(() => {
-    const raw = localPrefs.getItem('tower-sub-url') ?? ''
+    const raw = localPrefs.getItem(SUB_URL_KEY) ?? ''
     if (!raw) return ''
     // 旧版本 / 手工改坏的地址：不要让它带着整个导出页一起崩。
     try {
@@ -8870,12 +8783,12 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       const json = await res.json()
       setSubToken(json.token)
       setRevokeError('')
-      localPrefs.setItem('tower-sub-token', json.token)
+      localPrefs.setItem(SUB_TOKEN_KEY, json.token)
       // 服务器模式优先用服务端返回的规范前缀；未配置 TOWER_PUBLIC_URL 时才
       // 回退到当前 origin（导出页会同时显示配置提示）。
       const abs = new URL(json.url, serverMode && json.publicUrl ? json.publicUrl : window.location.origin).href
       setSubURL(abs)
-      localPrefs.setItem('tower-sub-url', abs)
+      localPrefs.setItem(SUB_URL_KEY, abs)
       const now = Date.now()
       setSubUpdatedAt(now)
       localPrefs.setItem('tower-sub-updated-at', String(now))
@@ -8995,9 +8908,9 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         : window.location.origin
       const abs = new URL(payload.url, base).href
       setSubToken(token)
-      localPrefs.setItem('tower-sub-token', token)
+      localPrefs.setItem(SUB_TOKEN_KEY, token)
       setSubURL(abs)
-      localPrefs.setItem('tower-sub-url', abs)
+      localPrefs.setItem(SUB_URL_KEY, abs)
       const now = Date.now()
       setSubUpdatedAt(now)
       localPrefs.setItem('tower-sub-updated-at', String(now))
@@ -9005,8 +8918,8 @@ function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       return
     }
     setSubToken(''); setSubURL(''); setSubUpdatedAt(null)
-    localPrefs.removeItem('tower-sub-token')
-    localPrefs.removeItem('tower-sub-url')
+    localPrefs.removeItem(SUB_TOKEN_KEY)
+    localPrefs.removeItem(SUB_URL_KEY)
     localPrefs.removeItem('tower-sub-updated-at')
   }
 
@@ -9969,7 +9882,7 @@ export function App() {
   const nodeCount = nodes.filter((node) => !node.isSubscriptionMetadata).length
 
   const published = (() => {
-    try { return !!window.localStorage.getItem('tower-sub-token') } catch { return false }
+    try { return !!window.localStorage.getItem(SUB_TOKEN_KEY) } catch { return false }
   })()
   const exportedAt = useMemo(() => readExportedAt(), [exportTick])
 
@@ -10058,6 +9971,8 @@ export function App() {
   // 打开时只比对内置方案的上游响应头，发现变化写一条提示；绝不自动覆盖。
   // 服务器版由服务端定时检查，这里只等模式确定后执行，server 模式直接跳过且不发请求。
   useEffect(() => {
+    // 示例工作区保持完全离线，不因检查上游更新向外发请求。
+    if (DEMO_MODE) return
     if (builtinUpdateCheckStarted.current) return
     if (workspaceMode === 'unknown') return
     builtinUpdateCheckStarted.current = true
@@ -10250,6 +10165,12 @@ export function App() {
       />
 
       <main className="right-col">
+        {DEMO_MODE && (
+          <div className="demo-banner" role="status">
+            <span><b>示例工作区</b> · 虚构节点与用量，不会写入真实工作区</span>
+            <a href={window.location.pathname}>退出示例</a>
+          </div>
+        )}
         {/* 窄屏导航条：桌面端由侧栏导航，这里不重复页名。 */}
         <div className="topbar">
           <button

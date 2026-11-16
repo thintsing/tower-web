@@ -26,11 +26,18 @@
 </p>
 
 <p align="center">
-  <a href="./docs/screenshot-desktop.jpg">桌面端原图</a> ·
-  <a href="./docs/screenshot-mobile.jpg">移动端原图</a>
+  <img src="./docs/screenshot-dark.png" width="100%" alt="塔台 Tower Web：暗色界面与示例工作区">
 </p>
 
-> 截图使用虚构订阅、示例节点和虚构用量，不含真实节点、密码或订阅 token。
+<p align="center">
+  <a href="./docs/screenshot-desktop.jpg">桌面端原图</a> ·
+  <a href="./docs/screenshot-mobile.jpg">移动端原图</a> ·
+  <a href="./docs/screenshot-dark.png">暗色原图</a>
+</p>
+
+> 截图使用虚构订阅、示例节点和虚构用量，不含真实节点、密码或订阅 token；暗色界面跟随系统外观。
+
+**先看示例工作区**：启动后打开 <http://127.0.0.1:8787/?demo=1>（Docker 部署同理），会载入虚构节点、示例测速结果和默认规则方案，不需要导入真实订阅就能走完「导入 → 方案 → 检查 → 导出」。示例数据保存在独立的浏览器命名空间 `tower-web-state-demo`，不会读取或写入真实工作区；点顶部「退出示例」即可返回。
 
 本项目是 [塔台 Tower（iOS / macOS）](https://github.com/pengchujin/tower) 的 Web 版本，复用其领域模型、订阅解析语义和区域数据。源码与第三方素材的许可范围不同，详见 [第三方声明](THIRD_PARTY_NOTICES.md)。
 

@@ -19,6 +19,8 @@ import { newID } from './util/browser'
 import { browserStorage, createSafeStorage } from './util/localStore'
 import { isWorkspaceReadOnly } from './util/workspaceLock'
 import { WORKSPACE_STATE_KEYS } from './workspaceKeys'
+import { DEMO_MODE, STORE_KEY } from './demo/demoMode'
+import { demoSeedState } from './demo/demoWorkspace'
 
 export interface Store extends AppState {
   loadingSourceIDs: string[]
@@ -1293,7 +1295,8 @@ export const useStore = create<Store>()(
       }
     },
     {
-      name: 'tower-web-state',
+      // 示例模式使用独立命名空间，避免虚构节点混进真实工作区。
+      name: STORE_KEY,
       // 配额满时只标记状态、不抛出：否则每个 set() 都会让界面操作失败。
       storage: createJSONStorage(() => createSafeStorage(browserStorage)),
       partialize: persistedSnapshot,
@@ -1317,10 +1320,14 @@ export const useStore = create<Store>()(
             || customSchemes.some((scheme) => scheme?.id === data.selectedSchemeID))
           ? data.selectedSchemeID
           : current.selectedSchemeID
+        // 示例模式首次进入（演示命名空间还没有节点）时注入虚构节点与测速结果；
+        // 之后的编辑仍保存在演示命名空间里，不会影响真实工作区。
+        const seedDemo = DEMO_MODE && !(Array.isArray(data?.nodes) && data.nodes.length > 0)
         return {
           ...current,
           ...(data ?? {}),
           ...builtin,
+          ...(seedDemo ? demoSeedState() : {}),
           // 归一化丢掉的坏快照 / 悬空指针必须可见，不能静默回落。
           persistenceWarnings: builtin.rejections,
           selectedSchemeID,
