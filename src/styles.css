@@ -3101,12 +3101,26 @@ dialog h3 { font-family: var(--font-display); font-size: 20px; font-weight: 600;
   line-height: 1.5;
 }
 .demo-banner b { color: var(--text); }
-.demo-banner a {
+.demo-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
   margin-left: auto;
+}
+.demo-banner button,
+.demo-banner a {
   color: var(--accent);
   font-size: 11.5px;
   white-space: nowrap;
 }
+.demo-banner button {
+  border: 0;
+  padding: 0;
+  background: none;
+  font-family: inherit;
+  cursor: pointer;
+}
+.demo-banner button:hover,
 .demo-banner a:hover { text-decoration: underline; }
 /* 服务器版工作区状态横幅：固定底部，不挤压主布局。 */
 .workspace-alert {

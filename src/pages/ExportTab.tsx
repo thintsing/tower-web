@@ -30,7 +30,7 @@ import { filterNodesByRegionCodes, regionForNode } from '../models/region'
 import { apiFetch } from '../util/apiAuth'
 import { copyToClipboard } from '../util/browser'
 import { browserStorage, createSafeStorage } from '../util/localStore'
-import { SUB_TOKEN_KEY, SUB_URL_KEY } from '../demo/demoMode'
+import { DEMO_MODE, DEMO_PUBLISH_NOTE, SUB_TOKEN_KEY, SUB_UPDATED_AT_KEY, SUB_URL_KEY, demoBlocksServerWrites } from '../demo/demoMode'
 import { markExported } from '../flow/prefs'
 import { READONLY_NOTE, writeGuard } from '../util/readOnlyUi'
 import { AdvancedSection } from '../components/AdvancedSection'
@@ -192,7 +192,7 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   })
   const [subRefreshing, setSubRefreshing] = useState(false)
   const [subUpdatedAt, setSubUpdatedAt] = useState<number | null>(() => {
-    const v = Number(localPrefs.getItem('tower-sub-updated-at'))
+    const v = Number(localPrefs.getItem(SUB_UPDATED_AT_KEY))
     return Number.isFinite(v) && v > 0 ? v : null
   })
   const [checking, setChecking] = useState(false)
@@ -203,6 +203,8 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const [importNotice, setImportNotice] = useState('')
 
   useEffect(() => {
+    // 示例工作区不读取服务端网络信息，也不会发布可分享的订阅地址。
+    if (DEMO_MODE) return
     apiFetch('/api/network')
       .then((r) => r.json())
       .then((d) => setNet({
@@ -542,6 +544,10 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
 
   const importNow = async () => {
     if (!canImport) return
+    if (demoBlocksServerWrites(DEMO_MODE)) {
+      setImportNotice(DEMO_PUBLISH_NOTE)
+      return
+    }
     if (!exportScheme) {
       setCheckResult({ ok: false, text: '规则方案还没加载完成，稍后再试' })
       return
@@ -607,6 +613,10 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
 
   /** 发布当前节点到订阅地址；返回可用的绝对地址（不含 format 参数）。 */
   const publishNow = async (): Promise<string | null> => {
+    if (demoBlocksServerWrites(DEMO_MODE)) {
+      setCheckResult({ ok: false, text: DEMO_PUBLISH_NOTE })
+      return null
+    }
     if (usable.length === 0) {
       setCheckResult({ ok: false, text: '没有可导出的节点：请先在「订阅管理」添加订阅或自有节点，并启用节点' })
       return null
@@ -762,7 +772,7 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       localPrefs.setItem(SUB_URL_KEY, abs)
       const now = Date.now()
       setSubUpdatedAt(now)
-      localPrefs.setItem('tower-sub-updated-at', String(now))
+      localPrefs.setItem(SUB_UPDATED_AT_KEY, String(now))
       markExported()
       return abs
     } catch (e: unknown) {
@@ -791,7 +801,7 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   // 进入导出页时静默同步一次，地址不变，用户 Clash 刷新订阅就能拿到修复后的配置。
   const autoSyncedRef = useRef(false)
   useEffect(() => {
-    if (autoSyncedRef.current) return
+    if (autoSyncedRef.current || DEMO_MODE) return
     if (!subToken || !scheme || usable.length === 0) return
     autoSyncedRef.current = true
     void publishNow()
@@ -842,6 +852,10 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
 
   const revokeSubscription = async () => {
     if (!subToken) return
+    if (demoBlocksServerWrites(DEMO_MODE)) {
+      setRevokeError(DEMO_PUBLISH_NOTE)
+      return
+    }
     setRevokeError('')
     let payload: { reset?: unknown; token?: unknown; url?: unknown; publicUrl?: unknown } = {}
     try {
@@ -884,14 +898,14 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       localPrefs.setItem(SUB_URL_KEY, abs)
       const now = Date.now()
       setSubUpdatedAt(now)
-      localPrefs.setItem('tower-sub-updated-at', String(now))
+      localPrefs.setItem(SUB_UPDATED_AT_KEY, String(now))
       setCheckResult({ ok: true, text: '已重置工作区订阅链接；旧链接已失效，其他设备下次同步会使用新链接。' })
       return
     }
     setSubToken(''); setSubURL(''); setSubUpdatedAt(null)
     localPrefs.removeItem(SUB_TOKEN_KEY)
     localPrefs.removeItem(SUB_URL_KEY)
-    localPrefs.removeItem('tower-sub-updated-at')
+    localPrefs.removeItem(SUB_UPDATED_AT_KEY)
   }
 
   const toggleProtocol = (kind: ProxyKind) => {
@@ -1479,7 +1493,7 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         <div className="row" style={{ gap: 8, marginBottom: 14 }}>
           <button className="btn" disabled={!scheme || !hasExportable || exportBlocked} onClick={download}>{downloaded ? '已下载' : '下载文件'}</button>
           <button className="btn ghost" disabled={!hasExportable || !generated || exportBlocked} onClick={copy}>{copied ? '已复制' : '复制'}</button>
-          {canImport && (
+          {canImport && !DEMO_MODE && (
             <button className="btn ghost" disabled={importing || !hasExportable || readOnly || exportBlocked} title={readOnly ? READONLY_NOTE : undefined} onClick={importIntoClient}>
               {importing ? '生成链接…' : `导入到 ${target.name}`}
             </button>
@@ -1570,6 +1584,10 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           <div className="meta" style={{ margin: 0 }}>按客户端自动分发格式</div>
         </div>
         <div className="field" style={{ marginTop: 14 }}>
+          {DEMO_MODE ? (
+            <div className="hint">{DEMO_PUBLISH_NOTE}</div>
+          ) : (
+            <>
           {serverMode && net && !net.publicUrl && (
             <div className="error" role="alert" style={{ marginBottom: 10 }}>
               跨设备使用同一条订阅地址需要给服务端配置 <span className="mono">TOWER_PUBLIC_URL</span>。
@@ -1695,7 +1713,10 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
               </div>
             </>
           )}
+            </>
+          )}
         </div>
+        {!DEMO_MODE && (
         <details className="link-note">
           <summary>链接存储与有效期</summary>
           <div className="link-note-body">
@@ -1706,6 +1727,7 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                   server 关闭期间客户端更新会失败，重新启动即可恢复。撤销或删除订阅会让对应链接立即失效。</>}
           </div>
         </details>
+        )}
       </div>
 
       <ConfirmDialog

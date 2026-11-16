@@ -41,6 +41,7 @@
     "selfcheck:batch": "tsx scripts/selfcheck-batch.ts",
     "selfcheck:catalog": "tsx scripts/selfcheck-catalog.ts",
     "selfcheck:clients": "tsx scripts/selfcheck-clients.ts",
+    "selfcheck:demo": "tsx scripts/selfcheck-demo.ts",
     "selfcheck:dns": "tsx scripts/selfcheck-dns.ts",
     "selfcheck:drift": "tsx scripts/selfcheck-drift.ts",
     "selfcheck:duplicates": "tsx scripts/selfcheck-duplicates.ts",

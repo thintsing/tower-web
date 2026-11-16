@@ -253,7 +253,7 @@ export function enterDemoMode(): void {
     mode: 'local',
     state: 'local',
     readOnly: false,
-    message: '示例工作区：虚构数据，不会写入真实工作区。',
+    message: '示例工作区：只保存在本机演示空间，不写入真实工作区，也不发布订阅链接。',
     issues: [],
     conflict: null,
   })

@@ -37,7 +37,7 @@
 
 > 截图使用虚构订阅、示例节点和虚构用量，不含真实节点、密码或订阅 token；暗色界面跟随系统外观。
 
-**先看示例工作区**：启动后打开 <http://127.0.0.1:8787/?demo=1>（Docker 部署同理），会载入虚构节点、示例测速结果和默认规则方案，不需要导入真实订阅就能走完「导入 → 方案 → 检查 → 导出」。示例数据保存在独立的浏览器命名空间 `tower-web-state-demo`，不会读取或写入真实工作区；点顶部「退出示例」即可返回。
+**先看示例工作区**：启动后打开 <http://127.0.0.1:8787/?demo=1>（Docker 部署同理），会载入虚构节点、示例测速结果和默认规则方案，不需要导入真实订阅就能走完「导入 → 方案 → 检查 → 导出」。示例数据只写入独立的浏览器命名空间 `tower-web-state-demo`，不读取、不写入真实工作区；示例模式下也不会生成服务端订阅链接或修改服务端设置（页面仍可能通过本机服务读取局域网信息、抓取远程规则集）。点顶部「恢复示例数据」可回到初始状态，「退出示例」返回真实工作区。
 
 本项目是 [塔台 Tower（iOS / macOS）](https://github.com/pengchujin/tower) 的 Web 版本，复用其领域模型、订阅解析语义和区域数据。源码与第三方素材的许可范围不同，详见 [第三方声明](THIRD_PARTY_NOTICES.md)。
 
@@ -287,6 +287,7 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 | `npm run selfcheck:clients` | 校验各客户端配置结构 |
 | `npm run selfcheck:dns` | 校验 DNS 投影、纯节点组与 ECS |
 | `npm run selfcheck:importers` | 校验规则方案导入 |
+| `npm run selfcheck:demo` | 校验示例工作区隔离：演示命名空间、真实工作区不被清除、发布操作被禁用 |
 | `npm run selfcheck:protocols` | 校验协议解析与降级 |
 | `npm run selfcheck:provider-rulesets` | 校验 Loyalsoldier provider 方案、托管转换与本地模式导出 |
 | `npm run selfcheck:workspace` | 校验服务器版工作区接口、版本号、密钥与并发写 |
@@ -294,7 +295,7 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 | `npm run selfcheck:upstream-status` | 校验服务端上游定时检查、失败退避与工作区隔离 |
 
 <details>
-<summary>全部 43 项自检</summary>
+<summary>全部 44 项自检</summary>
 
 ```text
 selfcheck:asn         离线 IP / ASN 查询
@@ -303,6 +304,7 @@ selfcheck:backup      备份与版本历史
 selfcheck:batch       批量订阅导入
 selfcheck:catalog     在线规则目录
 selfcheck:clients     客户端配置结构
+selfcheck:demo        示例工作区隔离：独立键 / 恢复示例数据 / 服务端写操作禁用
 selfcheck:dns         DNS 投影 / 纯节点组 / ECS
 selfcheck:drift       上游漂移：diff 计数 / 忽略记忆 / 未知不冒充已最新
 selfcheck:duplicates  重复规则清理：同组 / 跨组 / 前置失效 / 只读来源
@@ -342,7 +344,7 @@ selfcheck:workspace-overwrite 覆盖恢复不丢未保存改动
 selfcheck:yaml        Clash YAML 结构
 ```
 
-自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建、运行 ESLint 并执行全部 43 项自检；`package.json` 与 `.github/workflows/ci.yml` 的清单逐条对齐。`selfcheck:kernels` 会下载固定版本的 sing-box / mihomo 真实校验生成产物（Linux 上自动取二进制；其他平台用 `SING_BOX_BIN` / `MIHOMO_BIN` 指定，否则跳过；GitHub Actions 下两个内核缺一即失败）。
+自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建、运行 ESLint 并执行全部 44 项自检；`package.json` 与 `.github/workflows/ci.yml` 的清单逐条对齐。`selfcheck:kernels` 会下载固定版本的 sing-box / mihomo 真实校验生成产物（Linux 上自动取二进制；其他平台用 `SING_BOX_BIN` / `MIHOMO_BIN` 指定，否则跳过；GitHub Actions 下两个内核缺一即失败）。
 
 </details>
 

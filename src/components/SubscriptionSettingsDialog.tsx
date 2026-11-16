@@ -22,6 +22,7 @@ import {
   type BackupHistoryItem,
 } from '../backupHistory'
 import { clearRuleSetHistory } from '../rules/ruleSetHistory'
+import { DEMO_MODE } from '../demo/demoMode'
 import { apiFetch, clearAPIKey, setAPIKey } from '../util/apiAuth'
 import { copyToClipboard } from '../util/browser'
 import { clearTowerStorage } from '../util/localStore'
@@ -202,7 +203,8 @@ export function SubscriptionSettingsDialog({
       setResetConfirm(false)
       setServerAccessError('')
       setServerAccessNotice('')
-      void loadServerAccess()
+      // 示例工作区不读取、也不修改服务端的局域网与访问密钥设置。
+      if (!DEMO_MODE) void loadServerAccess()
       refreshHistory()
     } else {
       ref.current?.close()
@@ -444,12 +446,16 @@ export function SubscriptionSettingsDialog({
           </div>
           {serverAccessBusy && <span className="hint">保存中…</span>}
         </div>
-        {serverAccessError && (
+        {DEMO_MODE ? (
+          <div className="hint">
+            示例工作区不读取或修改服务端设置。局域网共享与访问密钥请在退出示例后，用真实工作区打开这里管理。
+          </div>
+        ) : serverAccessError ? (
           <div className="form-error" role="alert">
             <span>{serverAccessError}</span>
           </div>
-        )}
-        {serverAccess ? (
+        ) : null}
+        {!DEMO_MODE && (serverAccess ? (
           <>
             <label className="setting-toggle">
               <input
@@ -514,8 +520,8 @@ export function SubscriptionSettingsDialog({
           </>
         ) : (
           !serverAccessError && <div className="hint">正在读取服务端设置…</div>
-        )}
-        {serverAccessNotice && <div className="inline-notice" role="status">{serverAccessNotice}</div>}
+        ))}
+        {!DEMO_MODE && serverAccessNotice && <div className="inline-notice" role="status">{serverAccessNotice}</div>}
 
         <div className="settings-divider" />
         <div className="settings-data-head">

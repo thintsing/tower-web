@@ -39,7 +39,7 @@ import { autoRefreshReady, buildRefreshReport, describeRefreshReport, dismissRef
 import { READONLY_NOTE, writeGuard } from './util/readOnlyUi'
 import { buildFlow, explainNodePool, type FlowStepKey } from './flow/flow'
 import { useScheme } from './rules/useScheme'
-import { DEMO_MODE, SUB_TOKEN_KEY } from './demo/demoMode'
+import { DEMO_MODE, SUB_TOKEN_KEY, resetDemoWorkspace } from './demo/demoMode'
 import { readExportedAt } from './flow/prefs'
 import { digestRules, recordRuleSetSnapshot } from './rules/ruleSetHistory'
 import { lintScheme, lintSummary, type SchemeLintIssue } from './rules/schemeLint'
@@ -50,6 +50,13 @@ const localPrefs = createSafeStorage(browserStorage)
 // 地图与扫码只在对应面板出现时才加载，避免把 d3/map 和 jsQR 塞进首屏。
 const WorldMapSVG = lazy(() => import('./worldmap/WorldMapSVG').then((mod) => ({ default: mod.WorldMapSVG })))
 const QrScanner = lazy(() => import('./components/QrScanner').then((mod) => ({ default: mod.QrScanner })))
+
+/** 示例工作区的「恢复示例数据」：只清演示命名空间，再按种子数据重新载入。 */
+function restoreDemoWorkspace(): void {
+  if (!window.confirm('恢复示例数据会丢弃你在示例工作区里的改动（节点、方案、订阅设置），确定继续？')) return
+  resetDemoWorkspace(window.localStorage)
+  window.location.reload()
+}
 
 /** details 菜单打开/关闭后按视口可用空间决定向上或向下展开。 */
 function updateDetailsPlacement(event: SyntheticEvent<HTMLDetailsElement>): void {
@@ -2859,7 +2866,8 @@ export function App() {
 
   return (
     <div className="app-shell">
-      <LANAccessGate />
+      {/* 示例工作区使用独立命名空间，不需要也不应该经过局域网访问门。 */}
+      {!DEMO_MODE && <LANAccessGate />}
       <WorkspaceStatusBanner />
       {showStorageFull && (
         <div className="storage-alert" role="alert">
@@ -2942,8 +2950,14 @@ export function App() {
       <main className="right-col">
         {DEMO_MODE && (
           <div className="demo-banner" role="status">
-            <span><b>示例工作区</b> · 虚构节点与用量，不会写入真实工作区</span>
-            <a href={window.location.pathname}>退出示例</a>
+            <span>
+              <b>示例工作区</b>
+              {' '}· 只写入本机演示空间，不写入真实工作区，也不生成服务端订阅链接
+            </span>
+            <span className="demo-banner-actions">
+              <button type="button" onClick={restoreDemoWorkspace}>恢复示例数据</button>
+              <a href={window.location.pathname}>退出示例</a>
+            </span>
           </div>
         )}
         {/* 窄屏导航条：桌面端由侧栏导航，这里不重复页名。 */}
