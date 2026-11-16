@@ -18,6 +18,8 @@ import { fileURLToPath } from 'node:url'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib'
 import { convertRuleSet, RuleSetConversionError } from './ruleset-convert.mjs'
+import { assertAllowedTarget, blockedRuleSetAddress, BLOCKED_TARGET_MESSAGE, isBlockedRuleSetTarget } from './net-guard.mjs'
+import { safeContentType } from './content-type.mjs'
 import { asnCIDRs, loadIPASNData, organizationForAddress } from './ip-asn.mjs'
 import { countryCIDRs, loadIPCountryData } from './ip-country.mjs'
 import { createUpstreamChecker } from './upstream-status.mjs'
@@ -164,71 +166,6 @@ function ruleSetCacheKey(query) {
         ? `file:${file}`
         : `url:${remote}`
   return `${format}|${behavior}|${provider}|${source}`
-}
-
-/**
- * 云元数据 / 链路本地 / 组播 / 保留地址不可能是合法订阅或规则集来源。
- * `/api/ruleset` 与 `/api/fetch` 是免密钥端点（客户端要直接拉取），因此在这里
- * 共用同一套判断；局域网 NAS 等私网地址仍然允许。
- */
-const BLOCKED_TARGET_MESSAGE = '地址不能指向链路本地、云元数据、组播或保留地址'
-const BLOCKED_RULESET_HOSTS = new Set([
-  '169.254.169.254',
-  '100.100.100.200',
-  'fd00:ec2::254',
-  'metadata',
-  'metadata.google.internal',
-  'metadata.tencentyun.com',
-])
-
-function isBlockedRuleSetTarget(target) {
-  const host = target.hostname.toLowerCase().replace(/^\[|\]$/g, '')
-  return BLOCKED_RULESET_HOSTS.has(host)
-    || blockedRuleSetAddress(host)
-    || host.endsWith('.metadata.google.internal')
-}
-
-/** 初始地址和每一跳跳转都走这里：命中直接抛错，调用方负责带上第几跳。 */
-function assertAllowedTarget(target) {
-  if (isBlockedRuleSetTarget(target)) throw new Error(BLOCKED_TARGET_MESSAGE)
-}
-
-/**
- * IPv4-mapped（::ffff:0:0/96）和 NAT64（64:ff9b::/96）都能携带任意 IPv4。
- * URL 会把点分形式规范化成十六进制（::ffff:a9fe:a9fe），只剥前缀再判 isIP
- * 会整条跳过 IPv4 分支，云元数据地址因此可达。这里统一还原成点分四段。
- */
-function embeddedIPv4(ip) {
-  const match = ip.match(/^(?:::ffff:|64:ff9b::)(.+)$/)
-  if (!match) return undefined
-  const tail = match[1]
-  if (isIP(tail) === 4) return tail
-  const hex = tail.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/)
-  if (!hex) return undefined
-  const high = parseInt(hex[1], 16)
-  const low = parseInt(hex[2], 16)
-  return `${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`
-}
-
-/**
- * 解析结果也要校验：只按域名挡，A 记录指向 169.254.169.254 的域名仍能绕过。
- * 私网（10/8、172.16/12、192.168/16）与回环地址按原有设计放行，
- * 只拦截链路本地、云元数据、组播和保留地址。
- */
-function blockedRuleSetAddress(address) {
-  const ip = String(address).trim().toLowerCase()
-  const v4 = isIP(ip) === 4 ? ip : embeddedIPv4(ip)
-  if (v4) {
-    const [first, second] = v4.split('.').map(Number)
-    return (first === 169 && second === 254)   // 169.254.0.0/16 链路本地
-      || v4 === '100.100.100.200'              // 阿里云元数据
-      || first === 0                           // 0.0.0.0/8 本网络
-      || first >= 224                          // 224.0.0.0/4 组播 + 240.0.0.0/4 保留（含广播）
-  }
-  return /^fe80:/.test(ip)                     // IPv6 链路本地
-    || ip === '::'                             // IPv6 未指定地址
-    || /^ff[0-9a-f]{2}:/.test(ip)              // IPv6 组播
-    || /^fd00:ec2::/.test(ip)                  // AWS 元数据
 }
 
 /** 读取内置规则文件或抓取远程列表，再转换成目标客户端方言。 */
@@ -1867,29 +1804,6 @@ async function handleIPCountry(url, res) {
 function send(res, status, body, headers = {}) {
   res.writeHead(status, { 'x-content-type-options': 'nosniff', ...headers })
   res.end(body)
-}
-
-/**
- * 上游和分享者可控的 Content-Type 必须收敛到白名单：text/html 或 SVG 会让浏览器
- * 在塔台自己的源上执行脚本，读走 localStorage 里的管理密钥和整份工作区。
- * 原始类型另存 x-upstream-content-type，上游漂移检测仍按真实类型判断。
- */
-const PASSTHROUGH_CONTENT_TYPES = new Set([
-  'text/plain',
-  'text/yaml',
-  'application/yaml',
-  'application/x-yaml',
-  'text/x-yaml',
-  'application/json',
-  'text/json',
-  'application/octet-stream',
-  'application/base64',
-])
-
-function safeContentType(value) {
-  const raw = String(value ?? '').trim()
-  const essence = raw.split(';')[0].trim().toLowerCase()
-  return PASSTHROUGH_CONTENT_TYPES.has(essence) ? raw : 'text/plain; charset=utf-8'
 }
 
 /** 订阅文本里的托管规则集地址跟随请求的局域网/域名 origin。 */

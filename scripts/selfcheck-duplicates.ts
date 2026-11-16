@@ -977,8 +977,10 @@ function main(): void {
     assert.equal(lintSummary(lintScheme({ ...base, ruleSetExclusions: restored })).error, withoutExclusions.error)
   })
 
-  check('App 的两处 lintScheme 调用都传了 ruleSetExclusions', () => {
-    const calls = lintCallArgs(readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8'))
+  check('页面里的两处 lintScheme 调用都传了 ruleSetExclusions', () => {
+    // 规则诊断（App 主页）与导出页各自会 lint 一次；页面拆分后分别位于两个文件。
+    const calls = ['../src/App.tsx', '../src/pages/ExportTab.tsx']
+      .flatMap((path) => lintCallArgs(readFileSync(new URL(path, import.meta.url), 'utf8')))
     assert.ok(calls.length >= 2, `应至少找到 2 处 lintScheme 调用，实际 ${calls.length} 处`)
     for (const call of calls) assert.match(call, /ruleSetExclusions/)
   })
