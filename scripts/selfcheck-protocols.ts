@@ -762,6 +762,37 @@ function main(): void {
     assert.match(safari.text, /tls-profile=safari-ios18/)
   })
 
+  check('Egern 2.21 写出 SSR，并跳过非流加密', () => {
+    const ssr = {
+      id: 'egern-ssr',
+      kind: 'ssr',
+      name: 'Egern SSR',
+      server: 'ssr.example.com',
+      port: 32103,
+      cipher: 'aes-256-cfb',
+      password: 'p2',
+      protocolName: 'auth_aes128_md5',
+      protocolParam: '10102:demo',
+      obfs: 'tls1.2_ticket_auth',
+      obfsParam: 'obfs.example.com',
+      tls: false,
+      skipCertificateVerification: false,
+      udpRelayEnabled: true,
+    } as ProxyNode
+    const result = generateEgern([ssr], scheme, { target: 'egern' })
+    assert.equal(result.skipped, 0)
+    assert.match(result.text, /- shadowsocksr:/)
+    assert.match(result.text, /method: "aes-256-cfb"/)
+    assert.match(result.text, /protocol: "auth_aes128_md5"/)
+    assert.match(result.text, /protocol_param: "10102:demo"/)
+    assert.match(result.text, /obfs: "tls1\.2_ticket_auth"/)
+    assert.match(result.text, /obfs_param: "obfs\.example\.com"/)
+    assert.match(result.text, /udp_relay: true/)
+
+    assert.equal(generateEgern([{ ...ssr, cipher: 'aes-256-gcm' }], scheme, { target: 'egern' }).skipped, 1)
+    assert.equal(generateEgern([{ ...ssr, obfs: 'unknown-obfs' }], scheme, { target: 'egern' }).skipped, 1)
+  })
+
   if (failures) {
     console.error(`\n${failures} 项检查失败`)
     process.exit(1)

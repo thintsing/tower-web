@@ -68,7 +68,7 @@
 | 载体 | 客户端 |
 | --- | --- |
 | Clash / YAML | Clash Verge、Mihomo Party、FlClash、Clash Mi、Clash、ClashMac、Stash、Karing、Shadowrocket |
-| Egern YAML | Egern |
+| Egern YAML | Egern（2.21+ 支持 ShadowsocksR） |
 | Surge | Surge、Surge Mac（含测试版 VLESS 档位） |
 | Loon / Quantumult X | Loon、Quantumult X |
 | sing-box JSON | sing-box、Hiddify |
@@ -79,6 +79,7 @@
 - mihomo 的 ECS 需要较新内核并支持 `#代理组` DNS 后缀；sing-box 的 ECS 需要官方 1.14+，Hiddify 1.13 会跳过 ECS 提示。
 - Surge 的仅节点输出是纯 `policy-path` 列表；Quantumult X 的仅节点作为 `server_remote` 资源导入；sing-box MT 完整配置提供「规则判定 / 全局代理 / 直接连接」三种模式。
 - Loon 3.5.3+ 支持 `DOMAIN-WILDCARD`：`*.example.com` 会写成排除 apex 的逻辑规则，其他 glob 原样写出；Reality 节点的指纹映射为 Loon 的 `tls-profile`（chrome / safari-ios18）。
+- Egern 2.21+ 可导出 ShadowsocksR，仅限流加密白名单和 Egern 支持的 protocol / obfs 组合；不支持的组合仍会跳过并计数。
 - 经典规则列表会按目标客户端自动转换为二进制规则集：mihomo / Stash 用 MRS（domain + ipcidr 两份引用），sing-box / Hiddify 用 SRS；无法表达的规则类型继续内联。Karing、Shadowrocket 不读 MRS，仍引用经典列表。
 - Surge 订阅按请求 UA 返回对应测试版档位：iOS 4024 / 4026 / 4027 与 Mac 12820 / 12840 / 12860 分别开放 VLESS、VLESS Encryption / XHTTP、HTTPUpgrade；正式版和未知 UA 仍拿基线（不含测试版节点），这些节点在页面上标记为「仅一键导入」。订阅链接加 `content=nodes` 时只返回节点，测试版 Surge 同样按 UA 拿到带测试版节点的 policy-path 列表。
 - Anywhere 订阅在请求头 `X-Anywhere-Format: ajson/1` 时返回 AJSON：跳过证书校验的 VLESS（TLS + raw / HTTPUpgrade）、Trojan、AnyTLS 写成结构化代理，其余节点保持分享链接；无 TLS 的 WS / gRPC / XHTTP 无法保真，整体退回原 Base64 列表。
@@ -293,7 +294,7 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 | `npm run selfcheck:demo` | 校验示例工作区隔离：演示命名空间、真实工作区不被清除、发布操作被禁用 |
 | `npm run selfcheck:surge-anywhere` | 校验 Surge 测试版分档、tier 强制档位、Anywhere AJSON 与 content=nodes 仅节点链接 |
 | `npm run selfcheck:rule-files` | 校验独立规则文件、客户端规则诊断、存量规则集重新探测与跳过计数 |
-| `npm run selfcheck:protocols` | 校验协议解析与降级、Loon 通配 / Reality |
+| `npm run selfcheck:protocols` | 校验协议解析与降级、Loon 通配 / Reality、Egern SSR |
 | `npm run selfcheck:provider-rulesets` | 校验 Loyalsoldier provider 方案、托管转换与本地模式导出 |
 | `npm run selfcheck:workspace` | 校验服务器版工作区接口、版本号、密钥与并发写 |
 | `npm run selfcheck:workspace-history` | 校验工作区历史、回滚版本号与容量淘汰 |

@@ -80,6 +80,37 @@ export function snellVersionSupported(node: ProxyNode, target?: ClientTarget): b
   return true
 }
 
+const EGERN_SSR_METHODS = new Set([
+  'none', 'dummy', 'rc4-md5', 'aes-128-cfb', 'aes-192-cfb', 'aes-256-cfb',
+  'aes-128-ctr', 'aes-192-ctr', 'aes-256-ctr', 'chacha20', 'chacha20-ietf', 'xchacha20',
+])
+const EGERN_SSR_PROTOCOLS = new Set([
+  'origin', 'auth_sha1_v4', 'auth_aes128_md5', 'auth_aes128_sha1', 'auth_chain_a', 'auth_chain_b',
+])
+const EGERN_SSR_OBFS = new Set([
+  'plain', 'http_simple', 'http_post', 'random_head',
+  'tls1.2_ticket_auth', 'tls1.2_ticket_fastauth',
+])
+
+/** Egern 2.21 的 SSR 加密方式白名单；空值按 none，其余非流加密别名拒绝。 */
+export function egernSSRMethod(node: ProxyNode): string | undefined {
+  const cipher = normalizedCipher(node)
+  if (!cipher) return undefined
+  const method = cipher === 'plain' ? 'none' : cipher
+  return EGERN_SSR_METHODS.has(method) ? method : undefined
+}
+
+/** Egern 2.21 的 SSR 只支持流加密和这批 protocol / obfs 插件。 */
+export function egernAcceptsShadowsocksR(node: ProxyNode): boolean {
+  if (node.kind !== 'ssr' || !egernSSRMethod(node)) return false
+  const allowed = (value: string | undefined, set: Set<string>) => {
+    const normalized = (value ?? '').trim().toLowerCase()
+    return !normalized || set.has(normalized)
+  }
+  return allowed(node.protocolName, EGERN_SSR_PROTOCOLS)
+    && allowed(node.obfs, EGERN_SSR_OBFS)
+}
+
 /** Xray VLESS encryption is only verified on mihomo-family targets and Surge betas. */
 export function vlessEncryptionSupported(
   node: ProxyNode,
@@ -210,6 +241,7 @@ export function nodeSupportedForTarget(
     && v2rayPluginSupported(node, target)
     && hysteria2ObfsSupported(node, target)
     && socksTLSSupported(node, target)
+    && (node.kind !== 'ssr' || target !== 'egern' || egernAcceptsShadowsocksR(node))
 }
 
 /** 节点实际承载在哪种传输层上；用于选择更合适的测速方式。 */

@@ -2,7 +2,7 @@
 // and one mapping per rule (`- domain: { match, policy }`).
 import type { ProxyNode, RemoteSubscriptionEntry, RuleScheme, RoutingRule } from '../models/types'
 import { yaml, yamlMultiline } from './naming'
-import { nodeSupportedForTarget } from './nodeCapabilities'
+import { egernSSRMethod, nodeSupportedForTarget } from './nodeCapabilities'
 import {
   remoteGroupSelection,
   remoteNodePlan,
@@ -134,6 +134,18 @@ function egernNode(node: ProxyNode, name: string): string | undefined {
       }
       body.push(`      udp_relay: ${node.udpRelayEnabled ?? true}`)
       break
+    case 'ssr':
+      // Egern 2.21+：字段名与取值白名单对齐 Sub-Store 的 Egern SSR 输出。
+      type = 'shadowsocksr'
+      endpoint()
+      body.push(`      method: ${yaml(egernSSRMethod(node) ?? 'none')}`)
+      body.push(`      password: ${yaml(node.password ?? '')}`)
+      body.push(`      protocol: ${yaml((node.protocolName ?? 'origin').toLowerCase())}`)
+      if (node.protocolParam) body.push(`      protocol_param: ${yaml(node.protocolParam)}`)
+      body.push(`      obfs: ${yaml((node.obfs ?? 'plain').toLowerCase())}`)
+      if (node.obfsParam) body.push(`      obfs_param: ${yaml(node.obfsParam)}`)
+      body.push(`      udp_relay: ${node.udpRelayEnabled ?? true}`)
+      break
     case 'vmess':
       type = 'vmess'
       endpoint()
@@ -236,7 +248,7 @@ function egernNode(node: ProxyNode, name: string): string | undefined {
       break
     }
     default:
-      // ssr / hysteria1 / masque / trusttunnel: no faithful Egern encoding.
+      // hysteria1 / masque / trusttunnel: no faithful Egern encoding.
       return undefined
   }
 
@@ -244,7 +256,7 @@ function egernNode(node: ProxyNode, name: string): string | undefined {
     body.push('      reality:')
     body.push(`        public_key: ${yaml(node.realityPublicKey)}`)
     if (node.realityShortID) body.push(`        short_id: ${yaml(node.realityShortID)}`)
-  } else if (![ 'vmess', 'vless' ].includes(node.kind) && (node.tls || node.kind === 'trojan' || node.kind === 'hysteria2' || node.kind === 'tuic' || node.kind === 'anytls')) {
+  } else if (!['vmess', 'vless', 'ssr'].includes(node.kind) && (node.tls || node.kind === 'trojan' || node.kind === 'hysteria2' || node.kind === 'tuic' || node.kind === 'anytls')) {
     const extra = skipTLS(node).filter((line) => {
       // hysteria2/tuic/anytls/trojan already wrote `sni` above when present.
       return !line.trimStart().startsWith('sni:')
