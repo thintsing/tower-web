@@ -15,7 +15,7 @@ export const ACL4SSR_API_BASE = `https://api.github.com/repos/${ACL4SSR_REPO}`
  * 远程引用与上游更新检查都必须用它，否则离线内联和在线引用会指向不同版本。
  * 前端 src/generator/groups.ts 与 src/rules/upstreamScheme.ts 共用此常量。
  */
-export const ACL4SSR_PIN_COMMIT = '575637df38884575bfa523e95c17d0ee3be1676c'
+export const ACL4SSR_PIN_COMMIT = 'e2f257307bf0ee31921ac948036e942a29a35b35'
 
 /** 按 commit 拉某个仓库路径；不使用 branch，避免 force-push 后拼成混合版本。 */
 export function upstreamRawURL(path, commitSha) {

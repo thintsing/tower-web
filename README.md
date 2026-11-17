@@ -255,7 +255,7 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 - 每次写入前服务端保留上一版 `workspace.json.bak`；启动时主文件解析失败会改名为 `workspace.json.broken-<时间戳>`，优先用可解析的 `.bak` 恢复（版本可能回退一版，客户端轮询会自己拉到最新）；`.bak` 也不可用时才返回明确的 `workspace_corrupt`，不会当成空工作区。
 - 设备偏好（导出目标、隐藏客户端、排序、Emoji、测速模式、地图状态、高级区展开等）仍留在本机 localStorage，不跨设备同步；Tailscale Auth Key 属于工作区，会保存在服务端。
 - 同一个 `TOWER_DATA_DIR` 只支持一个服务进程。两个进程同时写会各自按内存里的版本号覆盖同一个 `workspace.json`，实测会静默丢失更新；需要多副本时请为每个实例使用独立数据目录。
-- 上游更新检查：服务器模式启动后按间隔检查 ACL4SSR 内置方案（已固化的比快照 commit/blob，未固化的比构建时 pin `575637d`）。结果只写 `TOWER_DATA_DIR/upstream-status.json`，**不写工作区**，所以检查不会让版本号 +1、也不会唤醒其他设备；只提示，不自动固化。默认每天一次，失败后至少隔 6 小时再试，重启后先等 5 分钟。可用 `TOWER_UPSTREAM_CHECK=off` 关闭，`TOWER_UPSTREAM_CHECK_INTERVAL_MS` / `TOWER_UPSTREAM_CHECK_INITIAL_DELAY_MS` 调整间隔与启动延迟；规则页也可「立即检查一次」。
+- 上游更新检查：服务器模式启动后按间隔检查 ACL4SSR 内置方案（已固化的比快照 commit/blob，未固化的比构建时 pin `e2f2573`）。结果只写 `TOWER_DATA_DIR/upstream-status.json`，**不写工作区**，所以检查不会让版本号 +1、也不会唤醒其他设备；只提示，不自动固化。默认每天一次，失败后至少隔 6 小时再试，重启后先等 5 分钟。可用 `TOWER_UPSTREAM_CHECK=off` 关闭，`TOWER_UPSTREAM_CHECK_INTERVAL_MS` / `TOWER_UPSTREAM_CHECK_INITIAL_DELAY_MS` 调整间隔与启动延迟；规则页也可「立即检查一次」。
 
 ## 数据存在哪里（服务端 vs 浏览器）
 
@@ -411,7 +411,7 @@ Dockerfile / docker-compose.yml  容器镜像与本地编排
 | 内容 | 来源 | 许可证 |
 | --- | --- | --- |
 | 领域模型、解析语义、区域数据、项目 Logo | [pengchujin/tower](https://github.com/pengchujin/tower) | MIT |
-| ACL4SSR 规则数据 | [ACL4SSR](https://github.com/ACL4SSR/ACL4SSR/tree/575637df38884575bfa523e95c17d0ee3be1676c) | CC BY-SA 4.0 |
+| ACL4SSR 规则数据 | [ACL4SSR](https://github.com/ACL4SSR/ACL4SSR/tree/e2f257307bf0ee31921ac948036e942a29a35b35) | CC BY-SA 4.0 |
 | 离线 IP 国家 / ASN 库 | [sapics/ip-location-db](https://github.com/sapics/ip-location-db) | PDDL-1.0 |
 | 世界地图 | [world-atlas](https://github.com/topojson/world-atlas) / [Natural Earth](https://www.naturalearthdata.com/) | ISC / public domain |
 | 客户端图标 | 各客户端官方素材 | 商标 / 各自版权 |
