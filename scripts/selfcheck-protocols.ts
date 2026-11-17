@@ -10,6 +10,7 @@ import { generateLoon } from '../src/generator/loon'
 import { generateQuanX } from '../src/generator/quanx'
 import { generateSingBox } from '../src/generator/singbox'
 import { generateSurge } from '../src/generator/surge'
+import { surgeBetaNodeCount } from '../src/generator/surgeCapabilities'
 import { generateBase64Subscription } from '../src/generator/base64Sub'
 import { nodeShareText } from '../src/generator/shareLink'
 
@@ -327,6 +328,36 @@ function main(): void {
     assert.ok(result.text.includes('server-fingerprint="ssh-ed25519 AAAA-test"'))
     assert.ok(result.text.includes('= anytls,'))
     assert.equal(result.skipped, 2) // SSH-Key 需要 [Keystore]，MASQUE 非 Surge 类型
+  })
+
+  check('Surge / Clash 导入 TrustTunnel 随机认证密钥', () => {
+    const surge = parse('[Proxy]\nTT = trust-tunnel, tt.example.com, 443, username=u, password=p, sni=tt.example.com, client-random-auth-key=a1b2c3d4\nBad = trust-tunnel, tt2.example.com, 443, username=u, password=p, client-random-auth-key=not-hex\n')
+    assert.equal(surge.nodes.length, 1)
+    assert.equal(surge.nodes[0].trustTunnel?.clientRandomAuthKey, 'a1b2c3d4')
+    assert.equal(surge.rejectedLineCount, 1)
+    const clash = parse('proxies:\n  - name: TT-Key\n    type: trusttunnel\n    server: tt.example.com\n    port: 443\n    username: u\n    password: p\n    sni: tt.example.com\n    client-random-auth-key: a1b2c3d4\n')
+    assert.equal(clash.nodes.length, 1)
+    assert.equal(clash.nodes[0].trustTunnel?.clientRandomAuthKey, 'a1b2c3d4')
+  })
+
+  check('TrustTunnel 随机认证密钥只写入 Surge 测试版', () => {
+    const base = nodes.find((node) => node.name === 'TT-H2')!
+    const node: ProxyNode = {
+      ...base,
+      id: 'tt-auth-key',
+      name: 'TT Auth Key',
+      trustTunnel: { quic: false, clientRandomAuthKey: 'a1b2c3d4' },
+    }
+    assert.equal(generateSurge([node], scheme).skipped, 1)
+    const tier1 = generateSurge([node], scheme, { target: 'surge', surgeTier: 1 })
+    assert.equal(tier1.skipped, 0)
+    assert.ok(tier1.text.includes('client-random-auth-key=a1b2c3d4'))
+    assert.equal(clashSkippedCount([node], 'clash-verge'), 1)
+    assert.equal(surgeBetaNodeCount([node]), 1)
+    const ipOnly: ProxyNode = { ...node, server: '1.2.3.4', sni: undefined }
+    assert.equal(generateSurge([ipOnly], scheme, { target: 'surge', surgeTier: 1 }).skipped, 1)
+    const hostnameOnly: ProxyNode = { ...node, sni: undefined }
+    assert.equal(generateSurge([hostnameOnly], scheme, { target: 'surge', surgeTier: 1 }).skipped, 0)
   })
 
   check('Surge 写出 WireGuard section', () => {

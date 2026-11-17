@@ -3,6 +3,7 @@
 // parseClashYAML semantics (field names, plugin handling, rejections).
 import { parse as parseYAML } from 'yaml'
 import type { MASQUEOptions, ProxyKind, ProxyNode, ShadowTLSOptions } from '../models/types'
+import { isValidTrustTunnelAuthKey } from '../models/types'
 import { boolString, mbps, nextNodeID, normalizedHost, normalizedName, normalizedTransport, snellModeIsDefault } from './util'
 
 const CLASH_KINDS: Record<string, ProxyKind> = {
@@ -77,6 +78,8 @@ function clashProxy(entry: unknown, sourceID?: string): ProxyNode | undefined {
     if (!username || (!password && !privateKey)) return undefined
   }
   if (kind === 'trusttunnel' && (!str(d['username']) || !str(d['password']))) return undefined
+  const trustTunnelAuthKey = kind === 'trusttunnel' ? str(d['client-random-auth-key']) : undefined
+  if (trustTunnelAuthKey !== undefined && !isValidTrustTunnelAuthKey(trustTunnelAuthKey)) return undefined
   const masque = kind === 'masque' ? masqueOptions(d) : undefined
   if (kind === 'masque' && !masque) return undefined
 
@@ -249,7 +252,12 @@ function clashProxy(entry: unknown, sourceID?: string): ProxyNode | undefined {
       hostKeys: csv(d['host-key']),
       hostKeyAlgorithms: csv(d['host-key-algorithms']),
     } : undefined,
-    trustTunnel: kind === 'trusttunnel' ? { quic: boolString(str(d['quic'])) } : undefined,
+    trustTunnel: kind === 'trusttunnel'
+      ? {
+        quic: boolString(str(d['quic'])),
+        ...(trustTunnelAuthKey ? { clientRandomAuthKey: trustTunnelAuthKey } : {}),
+      }
+      : undefined,
     masque: kind === 'masque' ? masque : undefined,
     rawURI: `clash://local/${nextNodeID()}`,
     vlessEncryption: kind === 'vless' ? vlessEncryption(str(d['encryption'])) : undefined,

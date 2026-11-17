@@ -82,6 +82,7 @@
 - Egern 2.21+ 可导出 ShadowsocksR，仅限流加密白名单和 Egern 支持的 protocol / obfs 组合；不支持的组合仍会跳过并计数。
 - sing-box / Hiddify 暂不导出 MASQUE：`masque-client` endpoint 需要 sing-box 1.15，App Store 的 sing-box MT 仍是 1.14，写入未知 endpoint 会导致整份配置加载失败；现在跳过并计数，等 MT 跟进后开放。
 - Snell v6 的 `mode` 只接受缺省或 `default`；`unshaped` / `unsafe-raw` 节点导入时拒绝并计数，带 `obfs` 的 v6 节点在 Surge 导出时跳过（v6 不支持 obfs）。
+- TrustTunnel 的 `client-random-auth-key` 只写入 Surge 测试版（iOS 4024+ / Mac 12820+），且节点必须能发送 SNI；其他客户端会跳过该节点，避免丢掉密钥后无法连接。手动节点与 Surge / Clash 配置导入均可填写。
 - 经典规则列表会按目标客户端自动转换为二进制规则集：mihomo / Stash 用 MRS（domain + ipcidr 两份引用），sing-box / Hiddify 用 SRS；无法表达的规则类型继续内联。Karing、Shadowrocket 不读 MRS，仍引用经典列表。
 - Surge 订阅按请求 UA 返回对应测试版档位：iOS 4024 / 4026 / 4027 与 Mac 12820 / 12840 / 12860 分别开放 VLESS、VLESS Encryption / XHTTP、HTTPUpgrade；正式版和未知 UA 仍拿基线（不含测试版节点），这些节点在页面上标记为「仅一键导入」。订阅链接加 `content=nodes` 时只返回节点，测试版 Surge 同样按 UA 拿到带测试版节点的 policy-path 列表。
 - Anywhere 订阅在请求头 `X-Anywhere-Format: ajson/1` 时返回 AJSON：跳过证书校验的 VLESS（TLS + raw / HTTPUpgrade）、Trojan、AnyTLS 写成结构化代理，其余节点保持分享链接；无 TLS 的 WS / gRPC / XHTTP 无法保真，整体退回原 Base64 列表。

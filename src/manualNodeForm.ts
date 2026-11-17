@@ -1,6 +1,6 @@
 // 自有节点手动表单：把逐协议字段转换回 ProxyNode。
 // 只负责表单数据与校验；不依赖 React，便于自检和后续复用。
-import { PROXY_KIND_TITLES, type ProxyKind, type ProxyNode } from './models/types'
+import { isValidTrustTunnelAuthKey, PROXY_KIND_TITLES, type ProxyKind, type ProxyNode } from './models/types'
 import { newID } from './util/browser'
 
 export interface ManualNodeDraft {
@@ -49,6 +49,7 @@ export interface ManualNodeDraft {
   wireGuardPersistentKeepalive: string
   wireGuardDNS: string
   quic: boolean
+  trustTunnelAuthKey: string
   udpRelayEnabled: boolean
   idleSessionCheckInterval: string
   idleSessionTimeout: string
@@ -143,6 +144,7 @@ export function emptyManualDraft(kind: ProxyKind = 'ss'): ManualNodeDraft {
     wireGuardPersistentKeepalive: '',
     wireGuardDNS: '',
     quic: false,
+    trustTunnelAuthKey: '',
     udpRelayEnabled: false,
     idleSessionCheckInterval: '',
     idleSessionTimeout: '',
@@ -225,6 +227,7 @@ export function manualDraftFromNode(node: ProxyNode): ManualNodeDraft {
       : '',
     wireGuardDNS: node.wireGuardDNS ?? '',
     quic: node.trustTunnel?.quic ?? false,
+    trustTunnelAuthKey: node.trustTunnel?.clientRandomAuthKey ?? '',
     udpRelayEnabled: node.udpRelayEnabled ?? false,
     idleSessionCheckInterval: node.idleSessionCheckInterval !== undefined
       ? String(node.idleSessionCheckInterval)
@@ -297,6 +300,7 @@ export function buildManualNode(draft: ManualNodeDraft, existing?: ProxyNode): P
   const flow = optional(draft.flow)
   const realityPublicKey = optional(draft.realityPublicKey)
   const realityShortID = optional(draft.realityShortID)
+  const trustTunnelAuthKey = kind === 'trusttunnel' ? optional(draft.trustTunnelAuthKey) : undefined
 
   if (kind === 'ss' || kind === 'ssr') {
     required(cipher, '加密方式')
@@ -318,6 +322,9 @@ export function buildManualNode(draft: ManualNodeDraft, existing?: ProxyNode): P
   if (kind === 'trusttunnel') {
     required(username, '用户名')
     required(password, '密码')
+    if (trustTunnelAuthKey && !isValidTrustTunnelAuthKey(trustTunnelAuthKey)) {
+      throw new Error('客户端随机数认证密钥必须是偶数位十六进制字符')
+    }
   }
   if (kind === 'ssh') {
     required(username, '用户名')
@@ -473,7 +480,12 @@ export function buildManualNode(draft: ManualNodeDraft, existing?: ProxyNode): P
     idleSessionCheckInterval,
     idleSessionTimeout,
     minIdleSession,
-    trustTunnel: kind === 'trusttunnel' ? { quic: draft.quic } : undefined,
+    trustTunnel: kind === 'trusttunnel'
+      ? {
+        quic: draft.quic,
+        ...(trustTunnelAuthKey ? { clientRandomAuthKey: trustTunnelAuthKey } : {}),
+      }
+      : undefined,
     ssh: kind === 'ssh' ? { hostKeys: hostKeyList(draft.sshHostKeys) } : undefined,
     masque,
     rawURI: '',

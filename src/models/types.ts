@@ -58,6 +58,18 @@ export interface SSHOptions {
 /** TrustTunnel 默认 HTTP/2 + TLS；`quic` 选择 HTTP/3。 */
 export interface TrustTunnelOptions {
   quic: boolean
+  /**
+   * 服务器 `rules.toml` 中 `client_random_auth_key` 对应的十六进制密钥。
+   * 客户端随机数与 SNI 一起派生；目前只有 Surge 测试版能写出该字段，
+   * 其他客户端必须跳过节点而不是丢掉密钥。
+   */
+  clientRandomAuthKey?: string
+}
+
+/** 随机认证密钥：非空、偶数位、仅 ASCII 十六进制。 */
+export function isValidTrustTunnelAuthKey(value: string | undefined | null): boolean {
+  const key = (value ?? '').trim()
+  return key.length > 0 && key.length % 2 === 0 && /^[0-9a-f]+$/i.test(key)
 }
 
 /** MASQUE 的两套不兼容方言：mihomo 的密钥 CONNECT-IP 与 sing-box 的 basic CONNECT-IP。 */

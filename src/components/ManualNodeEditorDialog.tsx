@@ -314,6 +314,11 @@ export function ManualNodeEditorDialog({
                 </select>
               </Field>
             )}
+            {kind === 'trusttunnel' && (
+              <Field label="随机认证密钥（可选）" hint="服务器的 rules.toml 设置了 client_random_auth_key 时填写。只有 Surge 测试版能导出，其他客户端会跳过此节点。">
+                <input className="input mono" value={draft.trustTunnelAuthKey} onChange={(event) => patch({ trustTunnelAuthKey: event.target.value })} />
+              </Field>
+            )}
             {kind === 'ssh' && (
               <Field label="Host Key（可选，每行一个）" hint="当前只导出密码登录；host-key 会用于固定服务器身份。">
                 <textarea className="input mono" rows={2} value={draft.sshHostKeys} onChange={(event) => patch({ sshHostKeys: event.target.value })} />

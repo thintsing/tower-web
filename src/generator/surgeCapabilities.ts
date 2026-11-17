@@ -1,7 +1,7 @@
 // Surge 测试版协议能力：按请求方 User-Agent 的构建号分级。
 // 正式版 App Store 构建只拿基线配置；测试版依次解锁 VLESS、
 // VLESS Encryption / XHTTP、HTTPUpgrade。与上游 SurgeClientCapabilities 对齐。
-import type { ProxyNode } from '../models/types'
+import { isValidTrustTunnelAuthKey, type ProxyNode } from '../models/types'
 
 export type SurgeTier = 1 | 2 | 3
 
@@ -72,8 +72,28 @@ export function surgeAcceptsVLESS(node: ProxyNode, tier: SurgeTier): boolean {
   return transport === 'grpc' && secured
 }
 
+/** 纯 IP（含 IPv6）没有可派生的 SNI；主机名可以。 */
+function isIPHost(value: string): boolean {
+  const host = value.trim().replace(/^\[|\]$/g, '')
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return true
+  return host.includes(':')
+}
+
+/**
+ * TrustTunnel 的 `client-random-auth-key` 与 SNI 一起派生：
+ * 显式 `sni`（不能是 `off`）或主机名服务器才能写。
+ */
+export function surgeAcceptsTrustTunnelAuthKey(node: ProxyNode): boolean {
+  if (node.kind !== 'trusttunnel') return false
+  if (!isValidTrustTunnelAuthKey(node.trustTunnel?.clientRandomAuthKey)) return false
+  const sni = (node.sni ?? '').trim()
+  if (sni) return sni.toLowerCase() !== 'off'
+  return !isIPHost(node.server)
+}
+
 /** tier 3 下能进入 Surge 的节点数；用于发布时判断是否需要生成测试版变体。 */
 export function surgeBetaNodeCount(nodes: ProxyNode[]): number {
   return nodes.filter((node) => surgeAcceptsVLESS(node, 3)
-    || (['vmess', 'trojan'].includes(node.kind) && (node.transport ?? '').toLowerCase() === 'httpupgrade')).length
+    || (['vmess', 'trojan'].includes(node.kind) && (node.transport ?? '').toLowerCase() === 'httpupgrade')
+    || (node.kind === 'trusttunnel' && surgeAcceptsTrustTunnelAuthKey(node))).length
 }

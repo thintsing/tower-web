@@ -2,7 +2,7 @@
 // ConfigurationGenerator.swift. These checks keep Tower from emitting a
 // configuration that a client accepts but can never connect with.
 import type { ClientTarget, ProxyNode } from '../models/types'
-import { surgeAcceptsVLESS, surgeAcceptsVLESSEncryption, type SurgeTier } from './surgeCapabilities'
+import { surgeAcceptsTrustTunnelAuthKey, surgeAcceptsVLESS, surgeAcceptsVLESSEncryption, type SurgeTier } from './surgeCapabilities'
 
 const MIHOMO_TARGETS = new Set<ClientTarget>([
   'clash-verge', 'clashmac', 'flclash', 'mihomo-party', 'clash-mi', 'clash-apple',
@@ -224,6 +224,20 @@ export function v2rayPluginSupported(node: ProxyNode, target?: ClientTarget): bo
 }
 
 /**
+ * 带 client-random-auth-key 的 TrustTunnel 只能由 Surge 测试版完整写出；
+ * 其他客户端丢弃密钥后服务器会拒绝连接，因此跳过节点。
+ */
+export function trustTunnelAuthKeySupported(
+  node: ProxyNode,
+  target?: ClientTarget,
+  surgeTier?: SurgeTier,
+): boolean {
+  if (node.kind !== 'trusttunnel' || !node.trustTunnel?.clientRandomAuthKey) return true
+  if (target !== 'surge' && target !== 'surge-mac') return false
+  return !!surgeTier && surgeAcceptsTrustTunnelAuthKey(node)
+}
+
+/**
  * Common gate used by every text / sing-box writer. It covers the checks that
  * are independent of a client's transport/format implementation.
  */
@@ -243,6 +257,7 @@ export function nodeSupportedForTarget(
     && v2rayPluginSupported(node, target)
     && hysteria2ObfsSupported(node, target)
     && socksTLSSupported(node, target)
+    && trustTunnelAuthKeySupported(node, target, surgeTier)
     && (node.kind !== 'ssr' || target !== 'egern' || egernAcceptsShadowsocksR(node))
 }
 

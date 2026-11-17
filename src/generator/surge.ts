@@ -251,6 +251,9 @@ function surgeNode(node: ProxyNode, name: string, target?: ClientTarget, surgeTi
         ...tlsFlags(),
       ]
       if (node.trustTunnel?.quic) parts.push('h3=true')
+      if (node.trustTunnel?.clientRandomAuthKey) {
+        parts.push(`client-random-auth-key=${node.trustTunnel.clientRandomAuthKey}`)
+      }
       if (node.certificateFingerprint) {
         parts.push(`server-cert-fingerprint-sha256=${node.certificateFingerprint}`)
       }

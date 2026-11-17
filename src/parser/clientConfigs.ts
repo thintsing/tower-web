@@ -5,7 +5,7 @@
 // family and one internal ProxyNode model; the public subscription parser
 // (`parse`) remains the only entry point.
 import type { ProxyKind, ProxyNode } from '../models/types'
-import { PROXY_KIND_TITLES } from '../models/types'
+import { isValidTrustTunnelAuthKey, PROXY_KIND_TITLES } from '../models/types'
 import { baseNode } from './uri'
 import {
   boolString,
@@ -556,11 +556,14 @@ function parseTrustTunnel(
   const username = option(options, 'username')
   const password = option(options, 'password')
   if (!username || !password) return undefined
+  const authKey = option(options, 'client-random-auth-key')
+  if (authKey !== undefined && !isValidTrustTunnelAuthKey(authKey)) return undefined
   const node = makeNode('trusttunnel', name, target.host, target.port, raw, sourceID)
   node.username = username
   node.password = password
   node.tls = true
   node.trustTunnel = { quic: boolOption(options, 'h3', 'quic') ?? false }
+  if (authKey) node.trustTunnel.clientRandomAuthKey = authKey
   applyTLS(node, options)
   node.tls = true
   applyUDP(node, options)

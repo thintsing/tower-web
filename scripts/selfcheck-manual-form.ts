@@ -56,7 +56,7 @@ function main(): void {
     assert.throws(() => buildManualNode(draft), /UUID/)
   })
 
-  check('TrustTunnel 写出用户名、H3 与 UDP', () => {
+  check('TrustTunnel 写出用户名、H3、UDP 与随机认证密钥', () => {
     const draft = {
       ...emptyManualDraft('trusttunnel'),
       server: 'tt.example.com',
@@ -64,6 +64,7 @@ function main(): void {
       username: 'tt-user',
       password: 'tt-pass',
       quic: true,
+      trustTunnelAuthKey: 'a1b2c3d4',
       udpRelayEnabled: true,
     }
     const node = buildManualNode(draft)
@@ -71,8 +72,10 @@ function main(): void {
     assert.equal(node.username, 'tt-user')
     assert.equal(node.password, 'tt-pass')
     assert.equal(node.trustTunnel?.quic, true)
+    assert.equal(node.trustTunnel?.clientRandomAuthKey, 'a1b2c3d4')
     assert.equal(node.udpRelayEnabled, true)
     assert.equal(node.tls, true)
+    assert.throws(() => buildManualNode({ ...draft, trustTunnelAuthKey: 'not-hex' }), /十六进制/)
   })
 
   check('WireGuard 缺少密钥或本机地址时拒绝保存', () => {
