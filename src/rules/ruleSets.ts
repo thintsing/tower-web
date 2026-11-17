@@ -3,7 +3,7 @@
 import { parse as parseYAML } from 'yaml'
 import type { RuleSetFormat, RoutingRule } from '../models/types'
 import { apiFetch } from '../util/apiAuth'
-import { inlineRuleFromFields, splitRuleFields } from './scheme'
+import { inlineRuleFromFields, parsePlainRulesetText, splitRuleFields } from './scheme'
 
 export type RuleSetRule = Omit<RoutingRule, 'group'>
 
@@ -402,6 +402,43 @@ export function parseRuleSetText(textBody: string, format?: RuleSetFormat): Pars
     default:
       throw new Error(`不支持的规则集格式：${resolved}`)
   }
+}
+
+/**
+ * 按实际内容判断方言。subconverter 的 `clash-domain` / `clash-ipcidr` 前缀
+ * 只是纯文本列表的提示；文件本身是 YAML / JSON 时仍按内容解析，避免把
+ * 域名 payload 当成经典规则文本，导出后一条都不命中。
+ */
+export function parseRuleSetContent(
+  textBody: string,
+  plainList?: 'domain' | 'ipcidr',
+): ParsedRuleSet {
+  const format = detectRuleSetFormat(textBody)
+  if (format === 'classical' && plainList) {
+    return { format, rules: parsePlainRulesetText(textBody, plainList) }
+  }
+  let parsed: ParsedRuleSet
+  try {
+    parsed = parseRuleSetText(textBody, format)
+  } catch (error) {
+    // 裸 IP 列表会被经典解析器整行跳过并抛错；按内容判断是域名还是 IP 列表。
+    if (format !== 'classical') throw error
+    const lines = textBody.split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith('#') && !line.startsWith(';') && line !== 'payload:')
+    const kind = lines.length > 0 && lines.every((line) => line.includes('/')) ? 'ipcidr' : 'domain'
+    return { format, rules: parsePlainRulesetText(textBody, kind) }
+  }
+  // 没有前缀提示的裸 IP 列表会被经典解析器整行跳过；确认没有解析出规则时
+  // 再按内容判断是域名还是 IP 列表，避免空规则集。
+  if (format === 'classical' && parsed.rules.length === 0) {
+    const lines = textBody.split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith('#') && !line.startsWith(';') && line !== 'payload:')
+    const kind = lines.length > 0 && lines.every((line) => line.includes('/')) ? 'ipcidr' : 'domain'
+    return { format, rules: parsePlainRulesetText(textBody, kind) }
+  }
+  return parsed
 }
 
 /** 通过塔台 /api/fetch 读取在线规则集并自动识别格式。 */

@@ -1,8 +1,9 @@
 // 自检：多格式规则方案导入（Clash / Surge / Egern / sing-box / INI）。
 // 用法：npm run selfcheck:importers
 import assert from 'node:assert/strict'
-import { detectRuleSchemeFormat, parseRuleSchemeText } from '../src/rules/importers'
+import { detectRuleSchemeFormat, enrichRuleSetReferences, parseRuleSchemeText } from '../src/rules/importers'
 import { parsePlainRulesetText, subconverterRulesetReference } from '../src/rules/scheme'
+import { parseRuleSetContent } from '../src/rules/ruleSets'
 import { validateSchemePolicy } from '../src/rules/policyValidation'
 import type { PolicyGroup, RuleScheme } from '../src/models/types'
 
@@ -483,6 +484,37 @@ rules:
       ['IP-CIDR6', '2001:db8::/32'],
     ])
     assert.ok(ip.every((item) => item.noResolve === true))
+  })
+
+  check('规则集类型按内容判断：YAML payload 覆盖 clash-domain 前缀', () => {
+    const yaml = 'payload:\n  - "+.openai.com"\n  - "claude.ai"\n'
+    const parsed = parseRuleSetContent(yaml, 'domain')
+    assert.equal(parsed.format, 'yaml')
+    assert.deepEqual(parsed.rules.map((item) => item.type), ['DOMAIN-SUFFIX', 'DOMAIN-SUFFIX'])
+    const plainIP = parseRuleSetContent('1.2.3.0/24\n2001:db8::/32\n')
+    assert.deepEqual(plainIP.rules.map((item) => item.type), ['IP-CIDR', 'IP-CIDR6'])
+  })
+
+  await checkAsync('规则集引用缺少 behavior 时按内容补全', async () => {
+    const rules = [
+      { type: 'RULE-SET' as const, value: 'https://example.com/ai.list', group: 'AI', ruleSetFormat: 'classical' as const },
+      { type: 'RULE-SET' as const, value: 'https://example.com/ip.txt', group: '直连', ruleSetFormat: 'classical' as const },
+    ]
+    const bodies: Record<string, string> = {
+      'https://example.com/ai.list': 'payload:\n  - "+.openai.com"\n  - "claude.ai"\n',
+      'https://example.com/ip.txt': '1.2.3.0/24\n2001:db8::/32\n',
+    }
+    const enriched = await enrichRuleSetReferences(rules, async (url) => bodies[url] ?? '')
+    assert.equal(enriched[0].ruleSetFormat, 'yaml')
+    assert.equal(enriched[0].ruleSetBehavior, 'domain')
+    assert.equal(enriched[1].ruleSetFormat, 'classical')
+    assert.equal(enriched[1].ruleSetBehavior, 'ipcidr')
+    // 已声明 behavior 的引用不再探测。
+    let calls = 0
+    const declared = [{ type: 'RULE-SET' as const, value: 'https://example.com/declared', group: 'AI', ruleSetFormat: 'yaml' as const, ruleSetBehavior: 'domain' }]
+    const untouched = await enrichRuleSetReferences(declared, async () => { calls += 1; return '' })
+    assert.equal(calls, 0)
+    assert.equal(untouched[0].ruleSetBehavior, 'domain')
   })
 
   check('策略组图预校验：重复、缺失、循环、空组与非法正则', () => {

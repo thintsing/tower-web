@@ -344,18 +344,15 @@ export async function parseSchemeINI(
     if (!text.trim()) return { group: rs.group, rules: [] as Omit<RoutingRule, 'group'>[] }
 
     let parsed: Omit<RoutingRule, 'group'>[] = []
-    const looksStructured = text.trim().startsWith('{') || /^\s*(payload:|proxies:|rules:)/m.test(text)
-    if (reference.plainList && !looksStructured) {
-      parsed = parsePlainRulesetText(text, reference.plainList)
-    } else {
-      try {
-        // Dynamic import avoids a static cycle: ruleSets.ts imports helpers from
-        // this module for its classical parser.
-        const { parseRuleSetText } = await import('./ruleSets')
-        parsed = parseRuleSetText(text, reference.format).rules
-      } catch {
-        parsed = parseRuleList(text)
-      }
+    try {
+      // 先看实际内容：`clash-domain` / `clash-classic` 前缀只提示纯文本列表
+      // 怎么读，不能覆盖文件本身是 YAML / JSON 的事实。
+      // Dynamic import avoids a static cycle: ruleSets.ts imports helpers from
+      // this module for its classical parser.
+      const { parseRuleSetContent } = await import('./ruleSets')
+      parsed = parseRuleSetContent(text, reference.plainList).rules
+    } catch {
+      parsed = parseRuleList(text)
     }
     return { group: rs.group, rules: parsed }
   }))

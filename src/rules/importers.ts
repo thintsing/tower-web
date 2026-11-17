@@ -18,7 +18,9 @@ import {
   isHTTPTestURL,
 } from '../models/networkSettings'
 import { inlineRuleFromFields, parseSchemeINI, splitRuleFields } from './scheme'
+import { inferRuleSetBehavior, parseRuleSetContent } from './ruleSets'
 import { inferRuleSetFormat } from './remoteFormats'
+import { apiFetch } from '../util/apiAuth'
 
 type Dict = Record<string, unknown>
 
@@ -597,6 +599,61 @@ function parseClash(id: string, name: string, description: string, textBody: str
     sourceFormat: 'clash',
     networkSettings: clashNetwork(root, ensured),
   }
+}
+
+const RULE_SET_PROBE_LIMIT = 12
+
+/**
+ * 外部方案常只写 RULE-SET 的 URL，不声明 behavior；Clash 导出会退回
+ * classical，域名 payload 因此一条都不命中。导入时按实际内容补全格式与
+ * behavior，下载失败或内容是二进制时保留原有的 URL 推断。
+ */
+export async function enrichRuleSetReferences(
+  rules: RoutingRule[],
+  load: (url: string) => Promise<string>,
+  limit = RULE_SET_PROBE_LIMIT,
+): Promise<RoutingRule[]> {
+  const urls = [...new Set(rules
+    .filter((rule) => rule.type === 'RULE-SET'
+      && /^https?:\/\//i.test(rule.value ?? '')
+      && !rule.ruleSetBehavior
+      && rule.ruleSetFormat !== 'mrs'
+      && rule.ruleSetFormat !== 'singbox-binary')
+    .map((rule) => rule.value!))]
+    .slice(0, limit)
+  if (!urls.length) return rules
+  const probes = new Map<string, {
+    format: RuleSetFormat
+    behavior?: 'domain' | 'ipcidr' | 'classical'
+  }>()
+  await Promise.all(urls.map(async (url) => {
+    try {
+      const body = await load(url)
+      if (!body.trim()) return
+      const parsed = parseRuleSetContent(body)
+      const behavior = inferRuleSetBehavior(parsed.rules)
+      probes.set(url, { format: parsed.format, ...(behavior ? { behavior } : {}) })
+    } catch {
+      // 保留 URL 扩展名推断。
+    }
+  }))
+  if (!probes.size) return rules
+  return rules.map((rule) => {
+    const probe = rule.type === 'RULE-SET' && rule.value ? probes.get(rule.value) : undefined
+    if (!probe) return rule
+    return {
+      ...rule,
+      ruleSetFormat: probe.format,
+      ...(probe.behavior ? { ruleSetBehavior: probe.behavior } : {}),
+    }
+  })
+}
+
+async function loadRuleSetReference(url: string): Promise<string> {
+  const response = await apiFetch(`/api/fetch?url=${encodeURIComponent(url)}`, {
+    signal: AbortSignal.timeout(4000),
+  })
+  return response.ok ? await response.text() : ''
 }
 
 // ---------------- Surge ----------------
@@ -1235,8 +1292,13 @@ export async function parseRuleSchemeText(
   if (!textBody.trim()) throw new Error('规则方案内容为空')
   if (textBody.length > MAX_IMPORT_BYTES) throw new Error('规则方案内容过大')
   switch (format) {
-    case 'clash':
-      return parseClash(id, name, description, textBody)
+    case 'clash': {
+      const scheme = parseClash(id, name, description, textBody)
+      // 外部 Clash / mihomo 方案的 provider 经常省略 behavior；导入时按
+      // 实际内容补全，导出才不会被写成 classical 后整组不命中。
+      const rules = await enrichRuleSetReferences(scheme.rules, loadRuleSetReference)
+      return rules === scheme.rules ? scheme : { ...scheme, rules }
+    }
     case 'surge':
       return parseSurge(id, name, description, textBody)
     case 'egern':
