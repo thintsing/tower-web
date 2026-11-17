@@ -117,7 +117,8 @@ export function generateSubscriptionFormatsDetailed(
   // 失败必须留下原因：服务端只保存非空载体，静默留空会让部分客户端在拉取时 406。
   const build = (format: SubFormat, run: () => string): void => {
     try {
-      if (providerOnlyCount > 0 && format !== 'yaml' && format !== 'base64') {
+      const mode = options.contentModeByFormat?.[format] ?? options.contentMode
+      if (providerOnlyCount > 0 && mode !== 'nodes' && format !== 'yaml' && format !== 'base64') {
         if (options.hostedBaseURL === '') {
           throw new Error('托管转换地址不可用：塔台服务未响应，或没有手机可访问的地址')
         }
@@ -144,14 +145,19 @@ export function generateSubscriptionFormatsDetailed(
     quanx: 'quanx',
     egern: 'egern',
   }
-  const forFormat = (format: SubFormat) =>
-    prepareSchemeForExport(scheme, options.policySelections ?? {}, {
+  const forFormat = (format: SubFormat) => {
+    // 仅节点模式不写规则，也不需要 provider 引用或托管转换；直接用原方案，
+    // 避免 provider-only 方案在没有托管地址时生成空载体。
+    const mode = options.contentModeByFormat?.[format] ?? options.contentMode
+    if (mode === 'nodes') return scheme
+    return prepareSchemeForExport(scheme, options.policySelections ?? {}, {
       preferRuleSets: options.preferRuleSets,
       format,
       target: options.target ?? targetByFormat[format],
       ruleSetExclusions: options.ruleSetExclusions,
       hostedBaseURL: options.hostedBaseURL,
     })
+  }
   // 通用载体没有 target；选一个有代表性的图标写法，避免发布出去的订阅丢图标。
   const iconTargetByFormat: Partial<Record<SubFormat, ClientTarget>> = {
     yaml: 'clash-verge',

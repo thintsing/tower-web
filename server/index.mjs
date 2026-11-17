@@ -1604,6 +1604,49 @@ function canonicalSubTarget(value) {
   return key && key !== 'auto' ? SUB_TARGET_CANONICAL[key] ?? null : null
 }
 
+/** 只保留服务端认识的载体文本；其余键值直接丢弃。 */
+function readSubFormatMap(source) {
+  const result = {}
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return result
+  for (const key of SUB_FORMATS) {
+    if (typeof source[key] === 'string' && source[key].length > 0) result[key] = source[key]
+  }
+  return result
+}
+
+/** 客户端专属变体：键先规范化为服务端 target 名。 */
+function readSubTargetMap(source) {
+  const result = {}
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return result
+  for (const [rawKey, value] of Object.entries(source)) {
+    const key = canonicalSubTarget(rawKey)
+    if (key && typeof value === 'string' && value.length > 0) result[key] = value
+  }
+  return result
+}
+
+/** Surge 测试版档位：platform → { "1" | "2" | "3": text }。 */
+function readSurgeTierMap(source) {
+  const result = {}
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return result
+  for (const platform of ['surge', 'surge-mac']) {
+    const tiers = source[platform]
+    if (!tiers || typeof tiers !== 'object' || Array.isArray(tiers)) continue
+    const kept = {}
+    for (const tier of ['1', '2', '3']) {
+      if (typeof tiers[tier] === 'string' && tiers[tier].length > 0) kept[tier] = tiers[tier]
+    }
+    if (Object.keys(kept).length > 0) result[platform] = kept
+  }
+  return result
+}
+
+/** `content=nodes` / `nodesOnly` / `node` 都表示只要节点。 */
+function nodesOnlyContent(value) {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  return normalized === 'nodes' || normalized === 'nodesonly' || normalized === 'node'
+}
+
 /** User-Agent 只用来挑选目标专属变体；格式仍由 resolveSubFormat 决定。 */
 function subTargetFromUserAgent(userAgent) {
   const agent = String(userAgent ?? '').toLowerCase()
@@ -2469,7 +2512,10 @@ const server = createServer(async (req, res) => {
       let title = normalizeSubscriptionTitle(url.searchParams.get('title'))
       let formats
       let targets = {}
+      let nodeFormats = {}
+      let nodeTargets = {}
       let surgeTiers = {}
+      let surgeNodeTiers = {}
       let anywhereAjson = ''
       if (contentType.includes('application/json')) {
         let parsed
@@ -2481,37 +2527,23 @@ const server = createServer(async (req, res) => {
         if (typeof parsed?.title === 'string' && parsed.title) {
           title = normalizeSubscriptionTitle(parsed.title)
         }
-        const src = parsed?.formats ?? {}
-        formats = {}
-        for (const key of SUB_FORMATS) {
-          if (typeof src[key] === 'string' && src[key].length > 0) formats[key] = src[key]
-        }
+        formats = readSubFormatMap(parsed?.formats)
         // 目标专属变体（Stash / Surge Mac / 不支持 Tailscale 的客户端）。
-        const srcTargets = parsed?.targets
-        if (srcTargets && typeof srcTargets === 'object' && !Array.isArray(srcTargets)) {
-          for (const [rawKey, value] of Object.entries(srcTargets)) {
-            const key = canonicalSubTarget(rawKey)
-            if (key && typeof value === 'string' && value.length > 0) targets[key] = value
-          }
-        }
+        targets = readSubTargetMap(parsed?.targets)
+        // 仅节点变体：content=nodes 链接单独取这一份，不受发布时的内容模式影响。
+        nodeFormats = readSubFormatMap(parsed?.nodeFormats)
+        nodeTargets = readSubTargetMap(parsed?.nodeTargets)
         // Surge 测试版变体：按 UA 构建号返回对应档位。
-        const srcSurge = parsed?.surgeTiers
-        if (srcSurge && typeof srcSurge === 'object' && !Array.isArray(srcSurge)) {
-          for (const platform of ['surge', 'surge-mac']) {
-            const tiers = srcSurge[platform]
-            if (!tiers || typeof tiers !== 'object' || Array.isArray(tiers)) continue
-            const kept = {}
-            for (const tier of ['1', '2', '3']) {
-              if (typeof tiers[tier] === 'string' && tiers[tier].length > 0) kept[tier] = tiers[tier]
-            }
-            if (Object.keys(kept).length > 0) surgeTiers[platform] = kept
-          }
-        }
+        surgeTiers = readSurgeTierMap(parsed?.surgeTiers)
+        surgeNodeTiers = readSurgeTierMap(parsed?.surgeNodeTiers)
         if (typeof parsed?.anywhereAjson === 'string' && parsed.anywhereAjson.trim()) {
           anywhereAjson = parsed.anywhereAjson
         }
         if (Object.keys(formats).length === 0
-          && Object.keys(surgeTiers).length === 0 && !anywhereAjson) {
+          && Object.keys(nodeFormats).length === 0
+          && Object.keys(surgeTiers).length === 0
+          && Object.keys(surgeNodeTiers).length === 0
+          && !anywhereAjson) {
           return json(res, 400, { error: '没有可用格式' })
         }
       } else {
@@ -2540,7 +2572,10 @@ const server = createServer(async (req, res) => {
       subscriptions.set(token, {
         formats,
         targets,
+        ...(Object.keys(nodeFormats).length ? { nodeFormats } : {}),
+        ...(Object.keys(nodeTargets).length ? { nodeTargets } : {}),
         ...(Object.keys(surgeTiers).length ? { surgeTiers } : {}),
+        ...(Object.keys(surgeNodeTiers).length ? { surgeNodeTiers } : {}),
         ...(anywhereAjson ? { anywhereAjson } : {}),
         updatedAt: Date.now(),
         title,
@@ -2580,30 +2615,42 @@ const server = createServer(async (req, res) => {
       // （Clash 收到 base64 会报“订阅创建失败”，错误信息反而不如 406 清楚）。
       const requestedTarget = canonicalSubTarget(url.searchParams.get('target'))
         ?? subTargetFromUserAgent(req.headers['user-agent'])
+      // content=nodes：只返回节点载体；Surge 测试版仍按 UA 选档位。
+      const nodesOnly = nodesOnlyContent(url.searchParams.get('content'))
       // Anywhere 的 AJSON 变体：只在请求头明确声明时返回，旧版客户端继续拿链接列表。
       if (sub.anywhereAjson && fmt === 'base64' && acceptsAnywhereAjson(req.headers['x-anywhere-format'])) {
         return send(res, 200, sub.anywhereAjson, {
           'content-type': 'application/json; charset=utf-8',
           'cache-control': 'no-store',
           'x-tower-format': 'anywhere-ajson',
+          'x-tower-content': 'nodes',
         })
       }
       // Surge 测试版：请求方 UA 的构建号决定拿哪一档 VLESS / XHTTP / HTTPUpgrade。
-      const surgePayload = fmt === 'surge' ? surgeVariantFor(sub.surgeTiers, req.headers['user-agent']) : undefined
+      const surgePayload = fmt === 'surge'
+        ? surgeVariantFor(nodesOnly ? sub.surgeNodeTiers : sub.surgeTiers, req.headers['user-agent'])
+        : undefined
+      const targetSource = nodesOnly ? sub.nodeTargets : sub.targets
       const variant = surgePayload
         ? surgePayload
         : requestedTarget && SUB_TARGET_FORMAT[requestedTarget] === fmt
-          ? sub.targets?.[requestedTarget]
+          ? targetSource?.[requestedTarget]
           : undefined
+      const formatSource = nodesOnly ? sub.nodeFormats : sub.formats
       // 旧版 Egern 链接请求的是 yaml，新链接请求 egern；旧发布记录没有
       // egern 载体时回退到 yaml，避免升级后旧链接直接 406。
-      let payload = variant ?? sub.formats[fmt]
+      let payload = variant ?? formatSource?.[fmt]
       let servedFormat = fmt
-      if (!payload && fmt === 'egern' && sub.formats.yaml) {
-        payload = sub.formats.yaml
+      if (!payload && fmt === 'egern' && formatSource?.yaml) {
+        payload = formatSource.yaml
         servedFormat = 'yaml'
       }
       if (!payload) {
+        if (nodesOnly) {
+          return send(res, 406, '该订阅没有仅节点变体。请回导出页点「同步节点到链接」重新发布后再使用 content=nodes。', {
+            'content-type': 'text/plain; charset=utf-8',
+          })
+        }
         return send(res, 406, `该订阅不包含 ${fmt} 格式，可用：${Object.keys(sub.formats).join(', ') || '无'}`, {
           'content-type': 'text/plain; charset=utf-8',
         })
@@ -2618,6 +2665,7 @@ const server = createServer(async (req, res) => {
         'content-type': SUB_MIME[servedFormat],
         'cache-control': 'no-store',
         'x-tower-format': servedFormat,
+        'x-tower-content': nodesOnly ? 'nodes' : 'full',
         'profile-title': asciiName,
         'profile-update-interval': '24',
         // 让客户端识别这是订阅而非普通文本

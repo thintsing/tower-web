@@ -1,8 +1,14 @@
 // 自检：Surge 测试版分档与 Anywhere AJSON。
 // 用法：npm run selfcheck:surge-anywhere
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { ProxyNode, RuleScheme } from '../src/models/types'
 import { generateSurge } from '../src/generator/surge'
+import { generateSubscriptionFormatsDetailed } from '../src/generator'
 import { anywhereAjsonDocument, anywhereAjsonCount } from '../src/generator/anywhere'
 import {
   SURGE_TIER_BUILDS,
@@ -179,6 +185,122 @@ check('VLESS Encryption 值格式校验', () => {
   assert.equal(surgeAcceptsVLESSEncryption('aes-128-gcm'), false)
   assert.equal(surgeAcceptsVLESSEncryption('mlkem768x25519plus.future.0rtt.AAAA'), false)
 })
+
+check('仅节点模式仍按档位写出 VLESS / HTTPUpgrade', () => {
+  const vless = node({ id: 'node-only' })
+  const nodeOnly = generateSurge([vless], scheme, {
+    target: 'surge',
+    contentMode: 'nodes',
+    surgeTier: 1,
+  }).text
+  assert.match(nodeOnly, /= vless, /)
+  assert.doesNotMatch(nodeOnly, /FINAL/)
+  const up = node({ id: 'up', transport: 'httpupgrade', path: '/up' })
+  const tier3 = generateSurge([up], scheme, {
+    target: 'surge',
+    contentMode: 'nodes',
+    surgeTier: 3,
+  }).text
+  assert.match(tier3, /ws=true, ws-http-upgrade=true/)
+})
+
+check('发布用的仅节点载体不写规则段', () => {
+  const trojan = node({ id: 'publish-node', kind: 'trojan', password: 'pass' })
+  const generated = generateSubscriptionFormatsDetailed([trojan], scheme, { contentMode: 'nodes' })
+  assert.match(generated.formats.surge, /= trojan, /)
+  assert.doesNotMatch(generated.formats.surge, /\[Rule]/)
+  assert.ok(generated.formats.base64.length > 0)
+  assert.ok(generated.formats.yaml.includes('proxies:'))
+})
+
+const ROOT = fileURLToPath(new URL('..', import.meta.url))
+
+/** content=nodes 的变体选择需要真实服务端路由；纯函数覆盖不到查询参数。 */
+async function startTestServer(): Promise<{ base: string; stop: () => Promise<void> }> {
+  const dir = mkdtempSync(join(tmpdir(), 'tower-node-link-'))
+  const port = 20000 + Math.floor(Math.random() * 30000)
+  const child = spawn(process.execPath, ['server/index.mjs'], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      HOST: '127.0.0.1',
+      TOWER_DATA_DIR: dir,
+      TOWER_MODE: '',
+      TOWER_API_TOKEN: '',
+      TOWER_PUBLIC_URL: '',
+    },
+    stdio: 'ignore',
+  })
+  const base = `http://127.0.0.1:${port}`
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      if ((await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(500) })).ok) {
+        return {
+          base,
+          stop: async () => {
+            child.kill()
+            await new Promise((resolve) => setTimeout(resolve, 150))
+            rmSync(dir, { recursive: true, force: true })
+          },
+        }
+      }
+    } catch {
+      // 服务仍在启动
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  child.kill()
+  rmSync(dir, { recursive: true, force: true })
+  throw new Error('测试服务未启动')
+}
+
+try {
+  const server = await startTestServer()
+  try {
+    const publish = await fetch(`${server.base}/api/subscribe?title=node-check`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+      body: JSON.stringify({
+        title: 'node-check',
+        formats: { surge: 'FULL-SURGE' },
+        nodeFormats: { surge: 'NODES-SURGE' },
+        nodeTargets: { surge: 'NODES-TARGET' },
+        surgeTiers: { surge: { '2': 'FULL-TIER2' } },
+        surgeNodeTiers: { surge: { '2': 'NODE-TIER2' } },
+      }),
+    })
+    assert.equal(publish.status, 200)
+    const { token } = await publish.json() as { token: string }
+    const get = (query: string, userAgent?: string) => fetch(`${server.base}/api/sub/${token}${query}`, {
+      headers: userAgent ? { 'user-agent': userAgent } : {},
+    })
+
+    const full = await get('?format=surge&target=surge')
+    assert.equal(await full.text(), 'FULL-SURGE')
+    assert.equal(full.headers.get('x-tower-content'), 'full')
+
+    const nodes = await get('?format=surge&target=surge&content=nodes')
+    assert.equal(await nodes.text(), 'NODES-TARGET')
+    assert.equal(nodes.headers.get('x-tower-content'), 'nodes')
+
+    const betaFull = await get('?format=surge&target=surge', 'Surge iOS/4026')
+    assert.equal(await betaFull.text(), 'FULL-TIER2')
+    const betaNodes = await get('?format=surge&target=surge&content=nodes', 'Surge iOS/4026')
+    assert.equal(await betaNodes.text(), 'NODE-TIER2')
+
+    // 旧订阅没有仅节点变体时必须明确 406，不能悄悄回退完整配置。
+    const missing = await get('?format=base64&content=nodes')
+    assert.equal(missing.status, 406)
+    console.log('✓ 服务端按 content=nodes 选择仅节点变体，Surge 测试版仍按 UA 选档')
+  } finally {
+    await server.stop()
+  }
+} catch (error) {
+  failures += 1
+  console.error('✗ 服务端按 content=nodes 选择仅节点变体，Surge 测试版仍按 UA 选档')
+  console.error(`  ${error instanceof Error ? error.message : String(error)}`)
+}
 
 console.log(failures === 0 ? '\n全部 Surge / Anywhere 自检通过' : `\n${failures} 项 Surge / Anywhere 自检失败`)
 process.exit(failures === 0 ? 0 : 1)

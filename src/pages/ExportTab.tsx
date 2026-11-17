@@ -201,7 +201,7 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const [checkResult, setCheckResult] = useState<{ ok: boolean; text: string } | null>(null)
   /** 撤销链接失败时保留 token 与地址，显示原因并提供重试。 */
   const [revokeError, setRevokeError] = useState('')
-  const [copiedField, setCopiedField] = useState<'sub' | 'import' | 'lan' | null>(null)
+  const [copiedField, setCopiedField] = useState<'sub' | 'nodes' | 'import' | 'lan' | null>(null)
   const [importNotice, setImportNotice] = useState('')
 
   useEffect(() => {
@@ -236,7 +236,7 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   }, [])
 
   // 本机打开的页面，手机端要用局域网地址而不是 127.0.0.1。
-  const copyText = async (field: 'sub' | 'import' | 'lan', value: string) => {
+  const copyText = async (field: 'sub' | 'nodes' | 'import' | 'lan', value: string) => {
     const ok = await copyToClipboard(value)
     if (!ok) {
       setCheckResult({ ok: false, text: '这台机器不允许网页写剪贴板，请点输入框手动全选复制' })
@@ -407,6 +407,18 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       return ''
     }
   }, [serverMode, target, subURL])
+
+  /** 同一订阅的仅节点地址：服务端按 content=nodes 返回只含节点的载体。 */
+  const clientNodeSubURL = useMemo(() => {
+    if (!clientSubURL) return ''
+    try {
+      const u = new URL(clientSubURL)
+      u.searchParams.set('content', 'nodes')
+      return u.href
+    } catch {
+      return ''
+    }
+  }, [clientSubURL])
 
   const outputOptions = useMemo(
     () => ({
@@ -667,6 +679,21 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       // Anywhere 的 AJSON 变体只在有跳过证书校验节点时生成；它不替代基线
       // 链接列表，旧版 Anywhere 仍按原格式读取。
       const anywhereAjson = anywhereAjsonDocument(usable, configName)
+      // 仅节点变体与发布时的内容模式无关：content=nodes 链接单独取这一份。
+      const nodeGenerated = generateSubscriptionFormatsDetailed(usable, scheme, {
+        policySelections,
+        preferRuleSets,
+        ruleSetExclusions,
+        contentMode: 'nodes',
+        nameForNode,
+        remoteSubscriptions: [],
+        tailnets: [],
+        hostedBaseURL,
+      })
+      const nodeFormats: Partial<Record<SubFormat, string>> = {}
+      for (const [format, text] of Object.entries(nodeGenerated.formats)) {
+        if (text.trim()) nodeFormats[format as SubFormat] = text
+      }
       const failures = generated.failures.filter(
         (failure) => !(failure.format === 'base64' && anywhereAjson),
       )
@@ -765,9 +792,30 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           }).text
         }
       }
+      // 仅节点目标变体：Surge / Shadowrocket / Karing / sing-box 系的节点写法
+      // 与通用载体不同；content=nodes 链接按 target 取这里的一份。
+      const nodeTargets: Partial<Record<ClientTarget, string>> = {}
+      for (const targetKey of ['surge', 'surge-mac', 'shadowrocket', 'karing', 'sing-box', 'hiddify'] as const) {
+        const client = CLIENTS.find((item) => item.target === targetKey)
+        if (!client) continue
+        try {
+          // 仅节点模式不读规则；不准备方案，provider-only 方案也能生成。
+          const text = generateConfig(client, usable, scheme, {
+            contentMode: 'nodes',
+            nameForNode,
+            remoteSubscriptions: [],
+            tailnets: [],
+            hostedBaseURL,
+          }).text
+          if (text.trim()) nodeTargets[targetKey] = text
+        } catch {
+          // 单个目标生成失败不影响其他客户端；缺失时服务端会回退通用载体。
+        }
+      }
       // Surge 测试版变体：按构建号分档，服务端根据请求 UA 返回。
       // 正式版仍拿基线载体，不会被未知参数破坏。
       const surgeTiers: Partial<Record<'surge' | 'surge-mac', Record<string, string>>> = {}
+      const surgeNodeTiers: Partial<Record<'surge' | 'surge-mac', Record<string, string>>> = {}
       if (surgeBetaNodeCount(usable) > 0) {
         for (const targetKey of ['surge', 'surge-mac'] as const) {
           const client = CLIENTS.find((item) => item.target === targetKey)
@@ -790,9 +838,22 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                 hostedBaseURL,
                 surgeTier: tier,
               }).text
-              if (!text.trim()) continue
-              surgeTiers[targetKey] ??= {}
-              surgeTiers[targetKey]![String(tier)] = text
+              if (text.trim()) {
+                surgeTiers[targetKey] ??= {}
+                surgeTiers[targetKey]![String(tier)] = text
+              }
+              const nodeText = generateConfig(client, usable, scheme, {
+                contentMode: 'nodes',
+                nameForNode,
+                remoteSubscriptions: [],
+                tailnets: [],
+                hostedBaseURL,
+                surgeTier: tier,
+              }).text
+              if (nodeText.trim()) {
+                surgeNodeTiers[targetKey] ??= {}
+                surgeNodeTiers[targetKey]![String(tier)] = nodeText
+              }
             } catch {
               // 单个档位生成失败不影响基线发布。
             }
@@ -808,7 +869,10 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           title: configName,
           formats,
           targets,
+          ...(Object.keys(nodeFormats).length ? { nodeFormats } : {}),
+          ...(Object.keys(nodeTargets).length ? { nodeTargets } : {}),
           ...(Object.keys(surgeTiers).length ? { surgeTiers } : {}),
+          ...(Object.keys(surgeNodeTiers).length ? { surgeNodeTiers } : {}),
           ...(anywhereAjson ? { anywhereAjson } : {}),
         }),
       })
@@ -1679,6 +1743,16 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                 <div className="sub-url-label">{target.name} 订阅地址（{subFormatFor(target)}）</div>
                 <input readOnly className="input" value={clientSubURL} style={{ fontFamily: '"IBM Plex Mono", ui-monospace, monospace', fontSize: 12 }} />
               </div>
+              {clientNodeSubURL && (
+                <div className="sub-url-wrap" style={{ marginTop: 10 }}>
+                  <div className="sub-url-label">仅节点订阅地址（content=nodes）</div>
+                  <input readOnly className="input" value={clientNodeSubURL} style={{ fontFamily: '"IBM Plex Mono", ui-monospace, monospace', fontSize: 12 }} />
+                  <div className="hint" style={{ marginTop: 6 }}>
+                    只下发节点、不写规则；Surge 测试版会按请求 UA 返回带 VLESS / HTTPUpgrade 的仅节点列表。
+                    旧链接若提示没有该变体，点「同步节点到链接」重新发布即可。
+                  </div>
+                </div>
+              )}
               {canImport && (
                 <div className="sub-url-wrap" style={{ marginTop: 10 }}>
                   <div className="sub-url-label">一键导入链接（deep link）</div>
@@ -1716,6 +1790,11 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                 <button className="btn ghost" onClick={() => copyText('sub', clientSubURL)}>
                   {copiedField === 'sub' ? '已复制订阅地址' : '复制订阅地址'}
                 </button>
+                {clientNodeSubURL && (
+                  <button className="btn ghost" onClick={() => copyText('nodes', clientNodeSubURL)}>
+                    {copiedField === 'nodes' ? '已复制仅节点地址' : '复制仅节点地址'}
+                  </button>
+                )}
                 {canImport && (
                   <button className="btn ghost" onClick={() => copyText('import', clientImportURL)}>
                     {copiedField === 'import' ? '已复制导入链接' : '复制导入链接'}
