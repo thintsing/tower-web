@@ -108,15 +108,57 @@ check('示例模式禁止服务端写操作，并给出可理解的提示', () =
   assert.equal(demoBlocksServerWrites(true), true)
   assert.equal(demoBlocksServerWrites(false), false)
   assert.match(DEMO_PUBLISH_NOTE, /不生成服务端订阅链接/)
+  assert.match(DEMO_PUBLISH_NOTE, /持久链接/)
+  assert.match(DEMO_PUBLISH_NOTE, /一次性分享链接/)
 })
 
-check('导出页与设置弹窗在示例模式走隔离分支', () => {
+check('导出页在示例模式同时拦截持久订阅与一次性分享链接', () => {
   const exportTab = readFileSync(new URL('../src/pages/ExportTab.tsx', import.meta.url), 'utf8')
   const publishGuards = exportTab.match(/demoBlocksServerWrites\(DEMO_MODE\)/g) ?? []
   assert.ok(publishGuards.length >= 2, `导出页至少应拦截发布与分享，实际 ${publishGuards.length} 处`)
   assert.ok(exportTab.includes('DEMO_PUBLISH_NOTE'), '导出页应展示示例模式说明')
   assert.ok(exportTab.includes("if (DEMO_MODE) return"), '示例模式不应请求 /api/network')
 
+  // 两个写端点都必须在示例守卫之后才可能出现。
+  for (const endpoint of ['/api/share', '/api/subscribe']) {
+    const guard = exportTab.lastIndexOf('demoBlocksServerWrites(DEMO_MODE)', exportTab.indexOf(endpoint))
+    assert.ok(guard >= 0, `${endpoint} 之前应有示例模式守卫`)
+  }
+})
+
+check('退出示例后按真实键恢复，演示数据不会顶替真实工作区', () => {
+  const storage = new MemoryStorage()
+  const real = demoStorageKeys(false)
+  const demo = demoStorageKeys(true)
+  storage.setItem(real.store, 'real-workspace')
+  storage.setItem(real.subToken, 'real-token')
+  storage.setItem(demo.store, 'demo-workspace')
+
+  // 在示例里恢复数据，再退出（应用重新按 demo=false 选键）。
+  resetDemoWorkspace(storage, true)
+  assert.equal(demoStorageKeys(false).store, real.store)
+  assert.equal(storage.getItem(real.store), 'real-workspace')
+  assert.equal(storage.getItem(real.subToken), 'real-token')
+
+  // 再次进入示例：读到的是空演示空间，不会拿真实数据顶替。
+  assert.equal(storage.getItem(demoStorageKeys(true).store), null)
+  assert.notEqual(demoStorageKeys(true).store, demoStorageKeys(false).store)
+})
+
+check('入口只跳过工作区同步，退出示例后重新回到真实工作区', () => {
+  const main = readFileSync(new URL('../src/main.tsx', import.meta.url), 'utf8')
+  assert.match(main, /if \(DEMO_MODE\) enterDemoMode\(\)/)
+  assert.match(main, /else void initWorkspaceSync\(\)/)
+
+  const store = readFileSync(new URL('../src/store.ts', import.meta.url), 'utf8')
+  assert.ok(store.includes('name: STORE_KEY'), 'persist 名称必须跟随示例/真实键')
+
+  const sync = readFileSync(new URL('../src/workspaceSync.ts', import.meta.url), 'utf8')
+  const enterDemo = sync.slice(sync.indexOf('export function enterDemoMode'))
+  assert.match(enterDemo, /mode: 'local'/, '示例模式应处于本地模式，不连接服务端工作区')
+})
+
+check('导出页与设置弹窗在示例模式走隔离分支', () => {
   const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8')
   assert.ok(app.includes('{!DEMO_MODE && <LANAccessGate />}'), '示例模式不应经过局域网访问门')
   assert.ok(app.includes('restoreDemoWorkspace'), '示例横幅应提供恢复示例数据')
