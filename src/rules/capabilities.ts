@@ -101,6 +101,12 @@ export function targetSupportsRule(target: ClientTarget | undefined, type: strin
   return set ? set.has(type.toUpperCase()) : true
 }
 
+/** 客户端支持的全部规则类型；导出页诊断展示用。 */
+export function targetRuleTypes(target: ClientTarget): string[] {
+  const set = ruleSetFor(target)
+  return set ? [...set].sort() : []
+}
+
 // ---------- 客户端方言归一化 ----------
 // 同一语义在不同客户端拼写不同：Surge / Loon 用 PROTOCOL，mihomo 用 NETWORK；
 // Loon 用 DEST-PORT，Shadowrocket 用 DST-PORT。规则进入生成器前先归一化，

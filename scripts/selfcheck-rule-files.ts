@@ -1,8 +1,10 @@
 // 自检：独立规则文件导出（.list / .yaml / .json）。
 // 用法：npm run selfcheck:rule-files
 import assert from 'node:assert/strict'
-import type { RuleScheme } from '../src/models/types'
+import { CLIENTS, type RuleScheme } from '../src/models/types'
 import { generateRuleFile } from '../src/generator/ruleFiles'
+import { analyzeRuleCompatibility } from '../src/generator/compatibility'
+import { targetRuleTypes } from '../src/rules/capabilities'
 
 let failures = 0
 
@@ -116,6 +118,27 @@ check('没有规则时输出空载体而不是崩溃', () => {
   assert.equal(list.ruleCount, 0)
   const yaml = generateRuleFile(empty, { target: 'clash-verge', format: 'yaml' })
   assert.match(yaml.text, /payload: \[\]/)
+})
+
+check('按客户端诊断列出规则白名单与跳过类型', () => {
+  const surge = CLIENTS.find((client) => client.target === 'surge')
+  const mihomo = CLIENTS.find((client) => client.target === 'clash-verge')
+  const v2box = CLIENTS.find((client) => client.target === 'v2box')
+  assert.ok(surge && mihomo && v2box)
+
+  const report = analyzeRuleCompatibility(surge!, scheme, { contentMode: 'full', preferRuleSets: false })
+  assert.ok(report.skipped >= 1)
+  assert.ok(report.unsupportedTypes.includes('GEOSITE'))
+  assert.ok(report.note?.includes('GEOSITE'))
+
+  const surgeTypes = targetRuleTypes('surge')
+  assert.ok(surgeTypes.includes('DOMAIN-SUFFIX'))
+  assert.equal(surgeTypes.includes('GEOSITE'), false)
+  assert.ok(targetRuleTypes('clash-verge').includes('GEOSITE'))
+
+  const nodeReport = analyzeRuleCompatibility(v2box!, scheme, { contentMode: 'nodes' })
+  assert.equal(nodeReport.nodeOnly, true)
+  assert.equal(nodeReport.skipped, 0)
 })
 
 console.log(failures === 0 ? '\n全部规则文件自检通过' : `\n${failures} 项规则文件自检失败`)

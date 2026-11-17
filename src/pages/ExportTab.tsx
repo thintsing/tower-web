@@ -38,6 +38,7 @@ import { DEMO_MODE, DEMO_PUBLISH_NOTE, SUB_TOKEN_KEY, SUB_UPDATED_AT_KEY, SUB_UR
 import { markExported } from '../flow/prefs'
 import { READONLY_NOTE, writeGuard } from '../util/readOnlyUi'
 import { AdvancedSection } from '../components/AdvancedSection'
+import { ClientRuleDiagnostics } from '../components/ClientRuleDiagnostics'
 import { ConfirmDialog } from '../components/ConfirmDialog'
 import { Highlight } from '../components/Highlight'
 import { QRCodeDialog } from '../components/QRCodeDialog'
@@ -1710,6 +1711,24 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           </>
         ) : (
           <div className="hint rule-export-note">规则方案加载中，稍后显示兼容性。</div>
+        )}
+        {scheme && (
+          <AdvancedSection
+            scope="export-client-rule-diagnostics"
+            title="按客户端规则诊断"
+            summary={`${visibleClients.length} 个客户端 · 规则白名单与跳过原因`}
+          >
+            <ClientRuleDiagnostics
+              clients={visibleClients}
+              scheme={scheme}
+              nodes={usable}
+              preferRuleSets={preferRuleSets}
+              exportContentMode={exportContentMode}
+              exportContentModes={exportContentModes}
+              ruleSetExclusions={ruleSetExclusions}
+              hostedBaseURL={hostedBaseURL}
+            />
+          </AdvancedSection>
         )}
         <div className="row" style={{ gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
           <button className="btn ghost" onClick={() => downloadRuleFile('list')}>导出规则 .list</button>
