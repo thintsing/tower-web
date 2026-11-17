@@ -21,7 +21,7 @@ import { useScheme } from '../rules/useScheme'
 import { resolveHostedBaseURL } from '../rules/remoteFormats'
 import { formatSupportsProxyCollections, prepareSchemeForExport } from '../generator/groups'
 import { analyzeRuleCompatibility } from '../generator/compatibility'
-import { describeSubscriptionFormatFailures, generateConfig, generateSubscriptionFormatsDetailed } from '../generator'
+import { describeSubscriptionFormatFailures, generateConfig, generateSubscriptionFormatsDetailed, SUBSCRIPTION_FORMAT_TITLES } from '../generator'
 import { generateRuleFile, type RuleFileFormat } from '../generator/ruleFiles'
 import { anywhereAjsonCount, anywhereAjsonDocument } from '../generator/anywhere'
 import { surgeBetaNodeCount } from '../generator/surgeCapabilities'
@@ -56,6 +56,99 @@ const CLIENT_GROUPS: { key: ClientGroupKey; label: string }[] = [
   { key: 'json', label: 'sing-box / JSON' },
   { key: 'base64', label: '手机订阅 / Base64' },
 ]
+
+interface VariantPreview {
+  formats: { format: SubFormat; bytes: number }[]
+  failures: { format: SubFormat; reason: string }[]
+  surgeTiers: { platform: 'surge' | 'surge-mac'; tier: string; bytes: number }[]
+  surgeNodeTiers: { platform: 'surge' | 'surge-mac'; tier: string; bytes: number }[]
+  nodeFormatCount: number
+  nodeTargetCount: number
+  anywhere: { bytes: number; count: number } | null
+  totalBytes: number
+}
+
+type SurgeTierMap = Partial<Record<'surge' | 'surge-mac', Record<string, string>>>
+
+function utf8Bytes(text: string): number {
+  return new TextEncoder().encode(text).length
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
+function surgeTierRows(tiers: SurgeTierMap): VariantPreview['surgeTiers'] {
+  const rows: VariantPreview['surgeTiers'] = []
+  for (const platform of ['surge', 'surge-mac'] as const) {
+    for (const tier of ['1', '2', '3']) {
+      const text = tiers[platform]?.[tier]
+      if (text) rows.push({ platform, tier, bytes: utf8Bytes(text) })
+    }
+  }
+  return rows
+}
+
+function VariantPreviewPanel({ preview }: { preview: VariantPreview }) {
+  return (
+    <div style={{ marginTop: 14 }}>
+      <div className="row between" style={{ marginBottom: 8 }}>
+        <strong>发布变体预检</strong>
+        <span className="meta">总大小 {formatBytes(preview.totalBytes)}</span>
+      </div>
+      <div className="rule-export-facts">
+        <div className="rule-export-fact">
+          <span>基线载体</span>
+          <strong className="num">{preview.formats.length}</strong>
+        </div>
+        <div className="rule-export-fact">
+          <span>Surge 档位</span>
+          <strong className="num">{preview.surgeTiers.length}</strong>
+        </div>
+        <div className="rule-export-fact">
+          <span>仅节点载体</span>
+          <strong className="num">{preview.nodeFormatCount}</strong>
+        </div>
+        <div className="rule-export-fact">
+          <span>仅节点目标</span>
+          <strong className="num">{preview.nodeTargetCount}</strong>
+        </div>
+      </div>
+      {preview.failures.length > 0 ? (
+        <div className="error" style={{ marginTop: 8 }}>
+          失败载体：{preview.failures
+            .map((failure) => `${SUBSCRIPTION_FORMAT_TITLES[failure.format]}（${failure.reason}）`)
+            .join('；')}
+        </div>
+      ) : (
+        <div className="hint" style={{ marginTop: 8 }}>所有基线载体已生成成功，可以发布。</div>
+      )}
+      <div className="hint" style={{ marginTop: 6 }}>
+        {preview.formats
+          .map((row) => `${SUBSCRIPTION_FORMAT_TITLES[row.format]} ${formatBytes(row.bytes)}`)
+          .join(' · ')}
+      </div>
+      {preview.surgeTiers.length > 0 && (
+        <div className="hint" style={{ marginTop: 6 }}>
+          Surge 测试版：{preview.surgeTiers
+            .map((row) => `${row.platform === 'surge' ? 'iOS' : 'Mac'} tier${row.tier} ${formatBytes(row.bytes)}`)
+            .join(' · ')}（按请求 UA 返回）
+        </div>
+      )}
+      {preview.anywhere && (
+        <div className="hint" style={{ marginTop: 6 }}>
+          Anywhere AJSON：{preview.anywhere.count} 个节点 · {formatBytes(preview.anywhere.bytes)}
+        </div>
+      )}
+      <div className="hint" style={{ marginTop: 6 }}>
+        仅节点变体：{preview.nodeFormatCount} 种载体、{preview.nodeTargetCount} 个客户端目标
+        {preview.surgeNodeTiers.length > 0 ? `、${preview.surgeNodeTiers.length} 个 Surge 档位` : ''}。
+      </div>
+    </div>
+  )
+}
 
 function clientGroupKey(client: ClientInfo): ClientGroupKey {
   switch (subFormatFor(client)) {
@@ -202,6 +295,7 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const [checking, setChecking] = useState(false)
   const [checkResult, setCheckResult] = useState<{ ok: boolean; text: string } | null>(null)
   const [ruleFileNotice, setRuleFileNotice] = useState<{ ok: boolean; text: string } | null>(null)
+  const [variantPreview, setVariantPreview] = useState<VariantPreview | null>(null)
   /** 撤销链接失败时保留 token 与地址，显示原因并提供重试。 */
   const [revokeError, setRevokeError] = useState('')
   const [copiedField, setCopiedField] = useState<'sub' | 'nodes' | 'import' | 'lan' | null>(null)
@@ -661,9 +755,10 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     }
   }
 
-  /** 发布当前节点到订阅地址；返回可用的绝对地址（不含 format 参数）。 */
-  const publishNow = async (): Promise<string | null> => {
-    if (demoBlocksServerWrites(DEMO_MODE)) {
+  /** 发布当前节点到订阅地址；dryRun 只生成并展示变体，不写服务端。 */
+  const publishNow = async (dryRun = false): Promise<string | null> => {
+    // 预检只生成文本、不写服务端，示例工作区也可以使用。
+    if (!dryRun && demoBlocksServerWrites(DEMO_MODE)) {
       setCheckResult({ ok: false, text: DEMO_PUBLISH_NOTE })
       return null
     }
@@ -728,7 +823,7 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       )
       // 订阅链接对所有客户端共用；任何目标载体缺失都意味着对应客户端会收到
       // 406，不能把半成品地址发出去。失败原因必须逐条展示，不能只报「发布失败」。
-      if (failures.length > 0) {
+      if (failures.length > 0 && !dryRun) {
         throw new Error(
           `以下 ${failures.length} 个载体没有生成成功，已停止发布：`
           + `${describeSubscriptionFormatFailures(failures)}。`
@@ -889,6 +984,42 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           }
         }
       }
+      if (dryRun) {
+        const formatRows = (Object.entries(formats) as [SubFormat, string][])
+          .filter(([, text]) => text.trim())
+          .map(([format, text]) => ({ format, bytes: utf8Bytes(text) }))
+        const surgeRows = surgeTierRows(surgeTiers)
+        const surgeNodeRows = surgeTierRows(surgeNodeTiers)
+        const anywhereCount = anywhereAjsonCount(usable)
+        const totalBytes = [
+          ...formatRows.map((row) => row.bytes),
+          ...Object.values(targets).map((text) => utf8Bytes(text ?? '')),
+          ...Object.values(nodeFormats).map((text) => utf8Bytes(text ?? '')),
+          ...Object.values(nodeTargets).map((text) => utf8Bytes(text ?? '')),
+          ...surgeRows.map((row) => row.bytes),
+          ...surgeNodeRows.map((row) => row.bytes),
+          ...(anywhereAjson ? [utf8Bytes(anywhereAjson)] : []),
+        ].reduce((sum, bytes) => sum + bytes, 0)
+        setVariantPreview({
+          formats: formatRows,
+          failures,
+          surgeTiers: surgeRows,
+          surgeNodeTiers: surgeNodeRows,
+          nodeFormatCount: Object.keys(nodeFormats).length,
+          nodeTargetCount: Object.keys(nodeTargets).length,
+          anywhere: anywhereAjson ? { bytes: utf8Bytes(anywhereAjson), count: anywhereCount } : null,
+          totalBytes,
+        })
+        setCheckResult({
+          ok: failures.length === 0,
+          text: failures.length
+            ? `预检发现 ${failures.length} 个载体失败：${describeSubscriptionFormatFailures(failures)}`
+            : `预检通过：${formatRows.length} 种基线载体、${surgeRows.length} 个 Surge 档位`
+              + `${anywhereAjson ? `、Anywhere AJSON（${anywhereCount} 个节点）` : ''}`
+              + `、${Object.keys(nodeFormats).length} 种仅节点载体。`,
+        })
+        return null
+      }
       const query = new URLSearchParams({ title: configName })
       if (subToken) query.set('token', subToken)
       const res = await apiFetch(`/api/subscribe?${query.toString()}`, {
@@ -924,7 +1055,7 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       markExported()
       return abs
     } catch (e: unknown) {
-      setCheckResult({ ok: false, text: `发布失败：${e instanceof Error ? e.message : String(e)}` })
+      setCheckResult({ ok: false, text: `${dryRun ? '预检' : '发布'}失败：${e instanceof Error ? e.message : String(e)}` })
       return null
     } finally {
       setSubRefreshing(false)
@@ -1768,7 +1899,13 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         </div>
         <div className="field" style={{ marginTop: 14 }}>
           {DEMO_MODE ? (
-            <div className="hint">{DEMO_PUBLISH_NOTE}</div>
+            <>
+              <div className="hint">{DEMO_PUBLISH_NOTE}</div>
+              <button className="btn ghost" style={{ marginTop: 8 }} disabled={subRefreshing || !hasExportable} onClick={() => void publishNow(true)}>
+                {subRefreshing ? '预检中…' : '预检发布变体'}
+              </button>
+              {variantPreview && <VariantPreviewPanel preview={variantPreview} />}
+            </>
           ) : (
             <>
           {serverMode && net && !net.publicUrl && (
@@ -1826,6 +1963,9 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
               <div className="row sub-actions" style={{ gap: 8, marginTop: 10 }}>
                 <button className="btn primary" disabled={subRefreshing || !hasExportable || readOnly} title={readOnly ? READONLY_NOTE : undefined} onClick={publishSubscription}>
                   {subRefreshing ? '同步中…' : '同步节点到链接'}
+                </button>
+                <button className="btn ghost" disabled={subRefreshing || !hasExportable} onClick={() => void publishNow(true)}>
+                  {subRefreshing ? '预检中…' : '预检发布变体'}
                 </button>
                 <button className="btn ghost" disabled={checking || !hasExportable} onClick={checkSubscription}>
                   {checking ? '检查中…' : '检查链接'}
@@ -1943,6 +2083,9 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
               <button className="btn primary sub-publish-start" disabled={subRefreshing || !hasExportable || readOnly} title={readOnly ? READONLY_NOTE : undefined} onClick={publishSubscription}>
                 {subRefreshing ? '生成中…' : '生成订阅链接'}
               </button>
+              <button className="btn ghost" style={{ marginTop: 8 }} disabled={subRefreshing || !hasExportable} onClick={() => void publishNow(true)}>
+                {subRefreshing ? '预检中…' : '预检发布变体'}
+              </button>
               {!hasExportable && <div className="error" style={{ marginTop: 8 }}>{emptyReason}</div>}
               <div className="next-steps">
                 <div className="next-steps-title">生成后会得到什么</div>
@@ -1954,6 +2097,7 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
               </div>
             </>
           )}
+          {variantPreview && <VariantPreviewPanel preview={variantPreview} />}
             </>
           )}
         </div>
