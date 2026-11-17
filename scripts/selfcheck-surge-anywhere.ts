@@ -289,6 +289,15 @@ try {
     const betaNodes = await get('?format=surge&target=surge&content=nodes', 'Surge iOS/4026')
     assert.equal(await betaNodes.text(), 'NODE-TIER2')
 
+    // 导出页巡检用 tier 强制档位；缺少档位必须明确 406。
+    const forced = await get('?format=surge&target=surge&tier=2')
+    assert.equal(await forced.text(), 'FULL-TIER2')
+    assert.equal(forced.headers.get('x-tower-tier'), '2')
+    const forcedNodes = await get('?format=surge&target=surge&content=nodes&tier=2')
+    assert.equal(await forcedNodes.text(), 'NODE-TIER2')
+    const missingTier = await get('?format=surge&target=surge-mac&tier=3')
+    assert.equal(missingTier.status, 406)
+
     // 旧订阅没有仅节点变体时必须明确 406，不能悄悄回退完整配置。
     const missing = await get('?format=base64&content=nodes')
     assert.equal(missing.status, 406)

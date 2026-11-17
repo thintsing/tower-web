@@ -69,6 +69,14 @@ interface VariantPreview {
   totalBytes: number
 }
 
+interface LinkCheckRow {
+  key: string
+  label: string
+  ok: boolean
+  status: number
+  detail: string
+}
+
 type SurgeTierMap = Partial<Record<'surge' | 'surge-mac', Record<string, string>>>
 
 function utf8Bytes(text: string): number {
@@ -297,6 +305,8 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const [checkResult, setCheckResult] = useState<{ ok: boolean; text: string } | null>(null)
   const [ruleFileNotice, setRuleFileNotice] = useState<{ ok: boolean; text: string } | null>(null)
   const [variantPreview, setVariantPreview] = useState<VariantPreview | null>(null)
+  const [checkingAll, setCheckingAll] = useState(false)
+  const [linkCheckRows, setLinkCheckRows] = useState<LinkCheckRow[] | null>(null)
   /** 撤销链接失败时保留 token 与地址，显示原因并提供重试。 */
   const [revokeError, setRevokeError] = useState('')
   const [copiedField, setCopiedField] = useState<'sub' | 'nodes' | 'import' | 'lan' | null>(null)
@@ -1122,6 +1132,113 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       setCheckResult({ ok: false, text: `请求失败：${err instanceof Error ? err.message : String(err)}` })
     } finally {
       setChecking(false)
+    }
+  }
+
+  /** 请求单个变体，读取服务端返回的格式 / 内容模式 / 字节数。 */
+  const probeVariant = async (url: string, headers?: Record<string, string>) => {
+    try {
+      const res = await apiFetch(url, { cache: 'no-store', headers })
+      const body = await res.text()
+      const format = res.headers.get('x-tower-format') ?? '—'
+      const content = res.headers.get('x-tower-content') ?? '—'
+      const tier = res.headers.get('x-tower-tier')
+      return {
+        ok: res.ok && !!body.trim(),
+        status: res.status,
+        detail: `HTTP ${res.status} · ${format}/${content}${tier ? ` · tier${tier}` : ''} · ${body.length} 字节`,
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        status: 0,
+        detail: error instanceof Error ? error.message : String(error),
+      }
+    }
+  }
+
+  /** 巡检完整配置 / 仅节点 / Surge 档位 / Anywhere AJSON 的实际响应。 */
+  const checkAllVariants = async () => {
+    if (!subURL) {
+      setCheckResult({ ok: false, text: '还没有订阅地址，请先点「生成订阅链接」' })
+      return
+    }
+    if (!hasExportable) {
+      setCheckResult({ ok: false, text: emptyReason })
+      return
+    }
+    setCheckingAll(true)
+    setLinkCheckRows(null)
+    try {
+      const tasks: {
+        key: string
+        label: string
+        run: () => Promise<{ ok: boolean; status: number; detail: string }>
+      }[] = []
+      const push = (key: string, label: string, url: string, headers?: Record<string, string>) => {
+        if (!url) return
+        tasks.push({ key, label, run: () => probeVariant(url, headers) })
+      }
+      const representativeTargets: ClientTarget[] = [
+        'clash-verge', 'egern', 'surge', 'loon', 'quanx', 'sing-box', 'v2box',
+        'surge-mac', 'shadowrocket', 'karing', 'hiddify',
+      ]
+      for (const targetKey of representativeTargets) {
+        const client = CLIENTS.find((item) => item.target === targetKey)
+        if (!client) continue
+        push(`${targetKey}:full`, `${client.name} · 完整`, clientSubscriptionURL(client))
+        push(`${targetKey}:nodes`, `${client.name} · 仅节点`, clientSubscriptionURL(client, true))
+      }
+      if (surgeBetaNodeCount(usable) > 0) {
+        for (const platform of ['surge', 'surge-mac'] as const) {
+          const client = CLIENTS.find((item) => item.target === platform)
+          if (!client) continue
+          const fullBase = clientSubscriptionURL(client)
+          const nodesBase = clientSubscriptionURL(client, true)
+          if (!fullBase || !nodesBase) continue
+          for (const tier of ['1', '2', '3']) {
+            const fullURL = new URL(fullBase)
+            fullURL.searchParams.set('tier', tier)
+            const nodesURL = new URL(nodesBase)
+            nodesURL.searchParams.set('tier', tier)
+            const label = `${platform === 'surge' ? 'Surge iOS' : 'Surge Mac'} tier${tier}`
+            push(`${platform}:${tier}:full`, `${label} · 完整`, fullURL.href)
+            push(`${platform}:${tier}:nodes`, `${label} · 仅节点`, nodesURL.href)
+          }
+        }
+      }
+      if (anywhereAjsonCount(usable) > 0) {
+        const anywhere = CLIENTS.find((item) => item.target === 'anywhere')
+        if (anywhere) {
+          push('anywhere:ajson', 'Anywhere · AJSON', clientSubscriptionURL(anywhere), {
+            'x-anywhere-format': 'ajson/1',
+          })
+        }
+      }
+      const rows: LinkCheckRow[] = new Array(tasks.length)
+      let cursor = 0
+      const worker = async () => {
+        while (true) {
+          const index = cursor
+          cursor += 1
+          if (index >= tasks.length) return
+          const task = tasks[index]
+          rows[index] = { key: task.key, label: task.label, ...await task.run() }
+        }
+      }
+      await Promise.all(Array.from({ length: Math.min(4, tasks.length) }, () => worker()))
+      setLinkCheckRows(rows)
+      const failed = rows.filter((row) => !row.ok).length
+      setCheckResult({
+        ok: failed === 0,
+        text: failed === 0
+          ? `巡检通过：${rows.length} 个变体均可访问。`
+          : `巡检发现 ${failed}/${rows.length} 个变体异常，展开下方明细查看。`,
+      })
+    } catch (error) {
+      setCheckResult({ ok: false, text: `巡检失败：${error instanceof Error ? error.message : String(error)}` })
+    } finally {
+      setCheckingAll(false)
     }
   }
 
@@ -1989,6 +2106,9 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                 <button className="btn ghost" disabled={checking || !hasExportable} onClick={checkSubscription}>
                   {checking ? '检查中…' : '检查链接'}
                 </button>
+                <button className="btn ghost" disabled={checkingAll || !subURL || !hasExportable} onClick={() => void checkAllVariants()}>
+                  {checkingAll ? '巡检中…' : '巡检全部变体'}
+                </button>
                 <button className="btn ghost" onClick={() => copyText('sub', clientSubURL)}>
                   {copiedField === 'sub' ? '已复制订阅地址' : '复制订阅地址'}
                 </button>
@@ -2034,6 +2154,24 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                       重新生成链接
                     </button>
                   )}
+                </div>
+              )}
+              {linkCheckRows && (
+                <div style={{ marginTop: 10 }}>
+                  <div className="row between" style={{ marginBottom: 6 }}>
+                    <strong>变体巡检</strong>
+                    <span className="meta">
+                      {linkCheckRows.filter((row) => row.ok).length}/{linkCheckRows.length} 正常
+                    </span>
+                  </div>
+                  <div style={{ maxHeight: 240, overflow: 'auto' }}>
+                    {linkCheckRows.map((row) => (
+                      <div key={row.key} className="row between" style={{ gap: 8, padding: '3px 0' }}>
+                        <span className={row.ok ? 'hint' : 'error'}>{row.label}</span>
+                        <span className="hint">{row.detail}</span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
               <div className="next-steps">

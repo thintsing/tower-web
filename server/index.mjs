@@ -2627,9 +2627,22 @@ const server = createServer(async (req, res) => {
         })
       }
       // Surge 测试版：请求方 UA 的构建号决定拿哪一档 VLESS / XHTTP / HTTPUpgrade。
-      const surgePayload = fmt === 'surge'
-        ? surgeVariantFor(nodesOnly ? sub.surgeNodeTiers : sub.surgeTiers, req.headers['user-agent'])
+      // `tier=1|2|3` 是给导出页巡检使用的强制档位；正常客户端仍按 UA 选择。
+      const tierSource = nodesOnly ? sub.surgeNodeTiers : sub.surgeTiers
+      const forcedTier = String(url.searchParams.get('tier') ?? '').trim()
+      const tierPlatform = requestedTarget === 'surge' || requestedTarget === 'surge-mac'
+        ? requestedTarget
         : undefined
+      const forcedSurge = fmt === 'surge' && tierPlatform && ['1', '2', '3'].includes(forcedTier)
+        ? tierSource?.[tierPlatform]?.[forcedTier]
+        : undefined
+      if (fmt === 'surge' && tierPlatform && ['1', '2', '3'].includes(forcedTier) && !forcedSurge) {
+        return send(res, 406, `该订阅没有 ${tierPlatform} tier${forcedTier} 变体。`, {
+          'content-type': 'text/plain; charset=utf-8',
+        })
+      }
+      const surgePayload = forcedSurge
+        ?? (fmt === 'surge' ? surgeVariantFor(tierSource, req.headers['user-agent']) : undefined)
       const targetSource = nodesOnly ? sub.nodeTargets : sub.targets
       const variant = surgePayload
         ? surgePayload
@@ -2666,6 +2679,7 @@ const server = createServer(async (req, res) => {
         'cache-control': 'no-store',
         'x-tower-format': servedFormat,
         'x-tower-content': nodesOnly ? 'nodes' : 'full',
+        ...(forcedSurge ? { 'x-tower-tier': forcedTier } : {}),
         'profile-title': asciiName,
         'profile-update-interval': '24',
         // 让客户端识别这是订阅而非普通文本
