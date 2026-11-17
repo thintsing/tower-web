@@ -26,6 +26,10 @@ type SingBoxDNSServer = Record<string, unknown>
 const CHINA_RULE_SET_TAG = 'tower-geoip-cn'
 const REMOTE_CN_TAG = 'remote-cn'
 
+/** `masque-client` endpoint 需要 sing-box 1.15；App Store 的 sing-box MT 仍是 1.14，
+ *  未知 endpoint 会让整份配置加载失败。等 MT 跟进后再把 sing-box 加回这里。 */
+const MASQUE_ENDPOINT_TARGETS = new Set<ClientTarget>()
+
 /** sing-box 的 port / port_range 取值：443、8000-8100、>1000，多个用 / 分隔。 */
 function portBounds(value: string): { ports: number[]; ranges: string[] } | undefined {
   const ports: number[] = []
@@ -389,6 +393,23 @@ function masqueBasicEndpoint(node: ProxyNode, name: string): Outbound | undefine
   return endpoint
 }
 
+/** 目标客户端门禁：sing-box MT 跟进 1.15 前不写 masque-client endpoint。 */
+function masqueEndpointForTarget(
+  node: ProxyNode,
+  name: string,
+  target: ClientTarget,
+): Outbound | undefined {
+  if (!MASQUE_ENDPOINT_TARGETS.has(target)) return undefined
+  return masqueBasicEndpoint(node, name)
+}
+
+/** 分享用：不受客户端门禁影响，仍输出单节点 endpoints JSON。 */
+export function singboxMasqueShareText(node: ProxyNode): string | undefined {
+  const endpoint = masqueBasicEndpoint(node, node.name)
+  if (!endpoint) return undefined
+  return JSON.stringify({ endpoints: [endpoint] }, null, 2)
+}
+
 function csvValues(value: string | undefined): string[] {
   return (value ?? '').split(',').map((item) => item.trim()).filter(Boolean)
 }
@@ -722,9 +743,9 @@ export function generateSingBox(
   const emitted = new Set<string>()
   for (const node of usable) {
     const name = displayName(node)
-    // sing-box MT（1.11+）把 CONNECT-IP 与 WireGuard 写在顶层 endpoints；Hiddify 不写。
+    // sing-box MT（1.11+）把 WireGuard 写在顶层 endpoints；MASQUE 等客户端 1.15 后再打开。Hiddify 不写。
     const endpoint = options.target === 'sing-box'
-      ? (masqueBasicEndpoint(node, name) ?? singboxWireGuardEndpoint(node, name))
+      ? (masqueEndpointForTarget(node, name, options.target) ?? singboxWireGuardEndpoint(node, name))
       : undefined
     if (endpoint) {
       endpoints.push(endpoint)

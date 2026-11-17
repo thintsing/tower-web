@@ -4,7 +4,7 @@
 import type { ProxyNode, RuleScheme } from '../models/types'
 import { canonicalNodeURI } from './base64Sub'
 import { generateClashYAML } from './clashYaml'
-import { generateSingBox } from './singbox'
+import { singboxMasqueShareText } from './singbox'
 import { generateSurge } from './surge'
 
 const SHARE_SCHEME: RuleScheme = {
@@ -37,14 +37,6 @@ function nodesOnlySurge(node: ProxyNode): string | undefined {
   return result.skipped === 0 && text ? text : undefined
 }
 
-function nodesOnlySingBox(node: ProxyNode): string | undefined {
-  const result = generateSingBox([node], SHARE_SCHEME, {
-    contentMode: 'nodes',
-    target: 'sing-box',
-  })
-  return result.skipped === 0 ? result.text.trim() : undefined
-}
-
 /**
  * Prefer the provider's original link. When it is missing or only a private
  * placeholder, fall back to the same portable snippet the native app shares.
@@ -63,7 +55,7 @@ export function nodeShareText(node: ProxyNode): string | undefined {
       // Basic CONNECT-IP exists only as a sing-box endpoint; key mode is a
       // mihomo proxy entry. Surge's local MASQUE line has no portable URI form.
       return (node.masque?.mode === 'basicConnectIP'
-        ? nodesOnlySingBox(node)
+        ? singboxMasqueShareText(node)
         : nodesOnlyClash(node)) ?? original
     default:
       return canonicalNodeURI(node) ?? original

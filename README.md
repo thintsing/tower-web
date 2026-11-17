@@ -47,7 +47,7 @@
 
 - **订阅与节点**：支持订阅 URL、Base64、Clash YAML、Surge / Loon / Quantumult X 配置、sing-box endpoint JSON 和单节点 URI；支持批量添加、刷新、停用、节点排除、搜索、订阅公告、已用 / 剩余流量和到期日展示。并发刷新同一订阅时以最后一次为准，同一 URL 共享请求、同一 host 排队，批量刷新会显示完成进度。
 - **协议**：Shadowsocks / SSR / VMess / VLESS / Trojan / Hysteria / Hysteria 2 / TUIC / WireGuard / AnyTLS / Snell / SOCKS5 / HTTP / SSH / TrustTunnel / MASQUE；按客户端能力自动跳过无法表达的节点。ShadowTLS、SIP003 `v2ray-plugin`、SS cipher 白名单、Snell / VLESS 版本限制和 Stash 证书 pin 都会按目标客户端校验。
-- **自有节点**：可从链接、配置文本、文件导入，也可逐协议手动新建 / 编辑；MASQUE 支持 mihomo 密钥 CONNECT-IP 与 sing-box basic CONNECT-IP 两套方言。节点不随订阅刷新，可单独启用、停用、改名、删除和标记地区。
+- **自有节点**：可从链接、配置文本、文件导入，也可逐协议手动新建 / 编辑；MASQUE 可导入 mihomo 密钥 CONNECT-IP、sing-box basic CONNECT-IP 与 Surge 方言，导出现在只写 mihomo 与 Surge（sing-box basic 等内核 1.15）。节点不随订阅刷新，可单独启用、停用、改名、删除和标记地区。
 - **测速与健康**：本机 TCP / ICMP 测速；订阅页汇总正常、异常、未测节点，可重测失败节点，并在节点详情显示来源、地区、ASN 网络组织和 TLS 信息。
 - **分布地图**：按四档延迟（≤100 / ≤200 / ≤350 / >350ms）给国家着色；支持按钮 / Ctrl+滚轮缩放、放大后拖动、低倍率地区聚合圆点、地区清单、地图上的全部测速按钮，以及选中地区节点列表内的一键分享。
 - **规则方案**：内置 ACL4SSR 与 Loyalsoldier 规则集；支持粘贴、文件或 URL 导入 INI、Clash / mihomo、Surge、Egern 和 sing-box 方案，也可一键导入 Self-Configuration 预设。外部方案里的规则集引用会按实际内容判断 domain / ipcidr / classical，缺少 behavior 的 provider 不会在导出后退回 classical。策略组可新建、删除、改名、按节点名正则建组、改类型、编辑候选、调整匹配顺序；导入来源方案支持全文编辑，复制自内置方案后还可恢复初始规则。条件组（Surge `subnet` / Egern `conditional`）和同方言标量参数会原样写回，其他客户端退回默认策略。
@@ -80,6 +80,8 @@
 - Surge 的仅节点输出是纯 `policy-path` 列表；Quantumult X 的仅节点作为 `server_remote` 资源导入；sing-box MT 完整配置提供「规则判定 / 全局代理 / 直接连接」三种模式。
 - Loon 3.5.3+ 支持 `DOMAIN-WILDCARD`：`*.example.com` 会写成排除 apex 的逻辑规则，其他 glob 原样写出；Reality 节点的指纹映射为 Loon 的 `tls-profile`（chrome / safari-ios18）。
 - Egern 2.21+ 可导出 ShadowsocksR，仅限流加密白名单和 Egern 支持的 protocol / obfs 组合；不支持的组合仍会跳过并计数。
+- sing-box / Hiddify 暂不导出 MASQUE：`masque-client` endpoint 需要 sing-box 1.15，App Store 的 sing-box MT 仍是 1.14，写入未知 endpoint 会导致整份配置加载失败；现在跳过并计数，等 MT 跟进后开放。
+- Snell v6 的 `mode` 只接受缺省或 `default`；`unshaped` / `unsafe-raw` 节点导入时拒绝并计数，带 `obfs` 的 v6 节点在 Surge 导出时跳过（v6 不支持 obfs）。
 - 经典规则列表会按目标客户端自动转换为二进制规则集：mihomo / Stash 用 MRS（domain + ipcidr 两份引用），sing-box / Hiddify 用 SRS；无法表达的规则类型继续内联。Karing、Shadowrocket 不读 MRS，仍引用经典列表。
 - Surge 订阅按请求 UA 返回对应测试版档位：iOS 4024 / 4026 / 4027 与 Mac 12820 / 12840 / 12860 分别开放 VLESS、VLESS Encryption / XHTTP、HTTPUpgrade；正式版和未知 UA 仍拿基线（不含测试版节点），这些节点在页面上标记为「仅一键导入」。订阅链接加 `content=nodes` 时只返回节点，测试版 Surge 同样按 UA 拿到带测试版节点的 policy-path 列表。
 - Anywhere 订阅在请求头 `X-Anywhere-Format: ajson/1` 时返回 AJSON：跳过证书校验的 VLESS（TLS + raw / HTTPUpgrade）、Trojan、AnyTLS 写成结构化代理，其余节点保持分享链接；无 TLS 的 WS / gRPC / XHTTP 无法保真，整体退回原 Base64 列表。

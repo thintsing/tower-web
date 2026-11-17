@@ -70,11 +70,13 @@ export function shadowsocksCipherSupported(node: ProxyNode, target?: ClientTarge
 export function snellVersionSupported(node: ProxyNode, target?: ClientTarget): boolean {
   if (node.kind !== 'snell') return true
   const version = node.version ?? (target === 'clash' ? 1 : 4)
+  const obfs = (node.obfs ?? '').trim().toLowerCase()
+  // Snell v6 不支持 obfs（Surge 手册），带混淆的 v6 节点导出后连不上。
+  if (version >= 6 && obfs && obfs !== 'none') return false
   if (target === 'clash') return version >= 1 && version <= 3
   if (target && MIHOMO_TARGETS.has(target)) return version >= 1 && version <= 5
   if (target === 'sing-box') {
     if (![4, 5].includes(version)) return false
-    const obfs = (node.obfs ?? '').toLowerCase()
     return !obfs || obfs === 'none' || obfs === 'http'
   }
   return true

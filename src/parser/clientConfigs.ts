@@ -12,6 +12,7 @@ import {
   normalizedHost,
   normalizedTransport,
   parseEndpoint,
+  snellModeIsDefault,
 } from './util'
 
 export interface ClientProxyParseResult {
@@ -510,6 +511,7 @@ function parseSnell(
   if (!target) return undefined
   const psk = option(options, 'psk', 'password')
   if (!psk) return undefined
+  if (!snellModeIsDefault(option(options, 'mode'))) return undefined
   const node = makeNode('snell', name, target.host, target.port, raw, sourceID)
   node.password = psk
   node.version = numberOption(options, 'version')

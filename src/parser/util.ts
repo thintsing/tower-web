@@ -38,6 +38,12 @@ export function boolString(value: string | undefined | null): boolean {
   return ['true', '1', 'yes', 'tls'].includes(value.toLowerCase())
 }
 
+/** Snell v6 `mode` 必须与服务端一致；塔台不保存 mode，只接受默认值或缺省。 */
+export function snellModeIsDefault(value: string | undefined | null): boolean {
+  const mode = (value ?? '').trim().toLowerCase()
+  return !mode || mode === 'default'
+}
+
 /**
  * Share links encode the name form-style, so `+` is a space. Strictly a URI
  * fragment keeps `+` literal, but every airport writes it the other way.

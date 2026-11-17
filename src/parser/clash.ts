@@ -3,7 +3,7 @@
 // parseClashYAML semantics (field names, plugin handling, rejections).
 import { parse as parseYAML } from 'yaml'
 import type { MASQUEOptions, ProxyKind, ProxyNode, ShadowTLSOptions } from '../models/types'
-import { boolString, mbps, nextNodeID, normalizedHost, normalizedName, normalizedTransport } from './util'
+import { boolString, mbps, nextNodeID, normalizedHost, normalizedName, normalizedTransport, snellModeIsDefault } from './util'
 
 const CLASH_KINDS: Record<string, ProxyKind> = {
   ss: 'ss',
@@ -68,6 +68,8 @@ function clashProxy(entry: unknown, sourceID?: string): ProxyNode | undefined {
   // AmneziaWG changes the handshake; as plain WireGuard the node would
   // import cleanly and never connect.
   if (kind === 'wireguard' && Object.keys(d).some((k) => AMNEZIA_KEYS.has(k))) return undefined
+  // Snell v6 的 mode 必须与服务端一致；塔台不保存 mode，只接受默认值。
+  if (kind === 'snell' && !snellModeIsDefault(str(d['mode']))) return undefined
   if (kind === 'ssh') {
     const username = str(d['username'])
     const password = str(d['password'])

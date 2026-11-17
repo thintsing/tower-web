@@ -159,6 +159,22 @@ const SNELL: ProxyNode = {
   rawURI: '',
 }
 
+const SNELL_V6: ProxyNode = {
+  ...SNELL,
+  id: 'snell-v6-node',
+  name: 'Snell v6',
+  version: 6,
+  obfs: '',
+  obfsParam: undefined,
+}
+
+const SNELL_V6_OBFS: ProxyNode = {
+  ...SNELL,
+  id: 'snell-v6-obfs',
+  name: 'Snell v6 Obfs',
+  version: 6,
+}
+
 const SHADOW_TLS: ProxyNode = {
   id: 'shadowtls-node',
   kind: 'ss',
@@ -497,6 +513,27 @@ function main(): void {
     assert.equal(parsed.rejectedLineCount, 1)
   })
 
+  check('Snell v6 非默认 mode 在 Surge / Clash 导入时拒绝', () => {
+    const surge = parse('[Proxy]\nDefault = snell, 1.2.3.4, 443, psk=abc, version=6, mode=default\nImplicit = snell, 1.2.3.5, 443, psk=abc, version=6\n')
+    assert.equal(surge.nodes.length, 2)
+    assert.equal(surge.rejectedLineCount, 0)
+    const surgeBad = parse('[Proxy]\nUnshaped = snell, 1.2.3.4, 443, psk=abc, version=6, mode=unshaped\nUnsafe = snell, 1.2.3.5, 443, psk=abc, version=6, mode=unsafe-raw\n')
+    assert.equal(surgeBad.nodes.length, 0)
+    assert.equal(surgeBad.rejectedLineCount, 2)
+    const clashBad = parse('proxies:\n  - name: Snell v6\n    type: snell\n    server: snell.example.com\n    port: 443\n    psk: abc\n    version: 6\n    mode: unshaped\n')
+    assert.equal(clashBad.nodes.length, 0)
+    assert.equal(clashBad.rejectedLineCount, 1)
+  })
+
+  check('Surge 跳过带 obfs 的 Snell v6', () => {
+    const skipped = generateSurge([SNELL_V6_OBFS], scheme)
+    assert.equal(skipped.skipped, 1)
+    assert.ok(!skipped.text.includes('Snell v6 Obfs'))
+    const ok = generateSurge([SNELL_V6], scheme)
+    assert.equal(ok.skipped, 0)
+    assert.ok(ok.text.includes('version=6'))
+  })
+
   check('sing-box masque-client 可导入为 basic CONNECT-IP', () => {
     const parsed = parse(SINGBOX_ENDPOINTS)
     assert.equal(parsed.rejectedLineCount, 0)
@@ -527,42 +564,24 @@ function main(): void {
     assert.equal(parsed.nodes[0].masque?.mode, 'basicConnectIP')
   })
 
-  check('sing-box MT 把 basic MASQUE 写成 endpoints', () => {
+  check('sing-box MT 暂不写 basic MASQUE endpoint（等 1.15）', () => {
     const node = parse(SINGBOX_ENDPOINTS).nodes[0]
     const result = generateSingBox([node], scheme, { target: 'sing-box' })
-    assert.equal(result.skipped, 0)
+    assert.equal(result.skipped, 1)
     const config = JSON.parse(result.text)
-    assert.equal(config.endpoints.length, 1)
-    const endpoint = config.endpoints[0]
-    assert.equal(endpoint.type, 'masque-client')
-    assert.equal(endpoint.tag, 'MASQUE Basic')
-    assert.equal(endpoint.server, 'masque-basic.example.com')
-    assert.equal(endpoint.server_port, 443)
-    assert.equal(endpoint.username, 'basic-user')
-    assert.equal(endpoint.password, 'basic-pass')
-    assert.equal(endpoint.path, '/connect')
-    assert.equal(endpoint.version, 2)
-    assert.equal(endpoint.mtu, 1400)
-    assert.deepEqual(endpoint.headers, { 'X-Test': 'demo' })
-    assert.equal(endpoint.disable_version_fallback, true)
-    assert.deepEqual(endpoint.tls, {
-      enabled: true,
-      insecure: true,
-      server_name: 'masque-basic.example.com',
-      certificate: ['-----BEGIN CERTIFICATE-----demo'],
-      alpn: ['h2'],
-    })
-    assert.ok(!config.outbounds.some((item: { tag?: string }) => item.tag === 'MASQUE Basic'))
+    assert.ok(!config.endpoints)
   })
 
-  check('basic MASQUE 不写入 mihomo 或 Hiddify', () => {
+  check('basic MASQUE 不写入 mihomo、sing-box 或 Hiddify', () => {
     const node = parse(SINGBOX_ENDPOINTS).nodes[0]
     assert.equal(clashSkippedCount([node], 'clash-verge'), 1)
     const clash = generateClashYAML([node], scheme, { target: 'clash-verge' })
     assert.ok(!clash.includes('MASQUE Basic'))
-    const hiddify = generateSingBox([node], scheme, { target: 'hiddify' })
-    assert.equal(hiddify.skipped, 1)
-    assert.ok(!JSON.parse(hiddify.text).endpoints)
+    for (const target of ['sing-box', 'hiddify'] as const) {
+      const result = generateSingBox([node], scheme, { target })
+      assert.equal(result.skipped, 1)
+      assert.ok(!JSON.parse(result.text).endpoints)
+    }
   })
 
   check('非法或未支持的 masque-client 字段不会被静默降级', () => {
