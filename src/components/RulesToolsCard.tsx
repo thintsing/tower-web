@@ -499,7 +499,12 @@ function DiffPanel({
 }) {
   const withUrls = localRuleSets
   const [mode, setMode] = useState<'history' | 'sets'>('history')
-  const history = useMemo(() => readRuleSetHistory(), [localRuleSets, revision])
+  // 规则集或 revision 变化后重新读取本地历史；两个依赖只用于触发刷新。
+  const history = useMemo(() => {
+    void localRuleSets
+    void revision
+    return readRuleSetHistory()
+  }, [localRuleSets, revision])
   const historySets = withUrls.filter((set) => history[set.id]?.previous)
   const historyKeyCount = Object.keys(history).length
   const orphanHistoryCount = historyKeyCount - historySets.length

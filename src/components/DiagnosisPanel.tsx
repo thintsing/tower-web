@@ -163,10 +163,13 @@ export function DiagnosisPanel({
     return { issues, summary: lintSummary(issues) }
   }, [scheme, result, nodes, policySelections, localRuleSets, preferRuleSets, ruleSetExclusions, hostedBaseURL])
 
-  const history = useMemo<RuleSetHistory>(
-    () => (versionHistoryEnabled ? readRuleSetHistory() : {}),
-    [versionHistoryEnabled, historyRevision, scheme?.id, scheme?.updatedAt],
-  )
+  const history = useMemo<RuleSetHistory>(() => {
+    // 这几个依赖用于在历史或方案变化后重新读取 localStorage，本身不参与计算。
+    void historyRevision
+    void scheme?.id
+    void scheme?.updatedAt
+    return versionHistoryEnabled ? readRuleSetHistory() : {}
+  }, [versionHistoryEnabled, historyRevision, scheme?.id, scheme?.updatedAt])
 
   const matchedSet = result && scheme ? findMatchedRuleSet(scheme, result.match?.rule) : undefined
   const change = result && scheme

@@ -1960,7 +1960,7 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       failedIds: failed.map((n) => n.id),
       failedRegions: [...failedRegions.values()].sort((a, b) => b.count - a.count),
     }
-  }, [enabled, latencyRecord, probeErrors])
+  }, [enabled, latencyRecord])
 
   const needsTest = health.untested.length > 0
   const testingAny = testingIds.length > 0
@@ -2611,7 +2611,7 @@ export function App() {
           measureStorage(),
         )
       : ''),
-    [showStorageFull, workspaceStatus.mode, workspaceStatus.state, storageState.serial],
+    [showStorageFull, workspaceStatus.mode, workspaceStatus.state],
   )
 
   // 四步主线需要跨页读取同一份数据；方案本身仍然走缓存加载。
@@ -2666,7 +2666,11 @@ export function App() {
   const published = (() => {
     try { return !!window.localStorage.getItem(SUB_TOKEN_KEY) } catch { return false }
   })()
-  const exportedAt = useMemo(() => readExportedAt(), [exportTick])
+  // exportTick 只用于在导出事件后重新读取时间戳，本身不参与计算。
+  const exportedAt = useMemo(() => {
+    void exportTick
+    return readExportedAt()
+  }, [exportTick])
 
   useEffect(() => {
     const handler = () => setExportTick((value) => value + 1)

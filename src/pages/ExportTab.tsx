@@ -459,7 +459,10 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const supportsProxyCollections = target.target !== 'shadowrocket'
     && formatSupportsProxyCollections(targetFormat)
     && contentMode === 'full'
-  const previewRemoteSubscriptions = supportsProxyCollections ? remoteSubscriptions : []
+  const previewRemoteSubscriptions = useMemo(
+    () => (supportsProxyCollections ? remoteSubscriptions : []),
+    [supportsProxyCollections, remoteSubscriptions],
+  )
   const contentModeByFormat = useMemo(() => {
     const modes: Partial<Record<SubFormat, ExportContentMode>> = {}
     for (const format of ['yaml', 'egern', 'surge', 'loon', 'quanx', 'json'] as SubFormat[]) {

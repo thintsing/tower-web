@@ -82,8 +82,9 @@ function TailnetEditorDialog({
   const [confirmDelete, setConfirmDelete] = useState(false)
 
   useEffect(() => {
-    ref.current?.showModal()
-    return () => ref.current?.close()
+    const dialog = ref.current
+    dialog?.showModal()
+    return () => dialog?.close()
   }, [])
 
   const save = () => {
