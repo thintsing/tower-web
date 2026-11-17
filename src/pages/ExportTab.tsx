@@ -22,6 +22,8 @@ import { resolveHostedBaseURL } from '../rules/remoteFormats'
 import { formatSupportsProxyCollections, prepareSchemeForExport } from '../generator/groups'
 import { analyzeRuleCompatibility } from '../generator/compatibility'
 import { describeSubscriptionFormatFailures, generateConfig, generateSubscriptionFormatsDetailed } from '../generator'
+import { anywhereAjsonCount, anywhereAjsonDocument } from '../generator/anywhere'
+import { surgeBetaNodeCount } from '../generator/surgeCapabilities'
 import { maskTailnetAuthKeys, tailnetSupports } from '../generator/tailnet'
 import { tailnetPolicyName } from '../models/tailnet'
 import { clientsInOrder, configFileStem, effectiveContentMode, filterNodesByName } from '../util/exportSelection'
@@ -352,7 +354,14 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     ? exportedNodeCount
     : Math.max(0, usable.length - skipped)
   const hasRemoteExportable = remoteSourceCount > 0
-  const hasExportable = exportableCount > 0 || hasRemoteExportable
+  // Surge 测试版 / Anywhere AJSON 的节点不在基线配置里，但仍可通过一键导入使用。
+  const surgeOneTapCount = target.target === 'surge' || target.target === 'surge-mac'
+    ? surgeBetaNodeCount(usable)
+    : 0
+  const anywhereOneTapCount = target.target === 'anywhere' ? anywhereAjsonCount(usable) : 0
+  const hasOneTapOnly = surgeOneTapCount > 0 || anywhereOneTapCount > 0
+  const baselineExportable = exportableCount > 0 || hasRemoteExportable
+  const hasExportable = baselineExportable || hasOneTapOnly
   const noEnabledNodes = enabled.length === 0
   const nameFilterEmpty = !noEnabledNodes && nameFilterResult.nodes.length === 0
   const filterEmpty = !noEnabledNodes && !nameFilterEmpty && usable.length === 0
@@ -655,12 +664,18 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         hostedBaseURL,
       })
       const formats = generated.formats
+      // Anywhere 的 AJSON 变体只在有跳过证书校验节点时生成；它不替代基线
+      // 链接列表，旧版 Anywhere 仍按原格式读取。
+      const anywhereAjson = anywhereAjsonDocument(usable, configName)
+      const failures = generated.failures.filter(
+        (failure) => !(failure.format === 'base64' && anywhereAjson),
+      )
       // 订阅链接对所有客户端共用；任何目标载体缺失都意味着对应客户端会收到
       // 406，不能把半成品地址发出去。失败原因必须逐条展示，不能只报「发布失败」。
-      if (generated.failures.length > 0) {
+      if (failures.length > 0) {
         throw new Error(
-          `以下 ${generated.failures.length} 个载体没有生成成功，已停止发布：`
-          + `${describeSubscriptionFormatFailures(generated.failures)}。`
+          `以下 ${failures.length} 个载体没有生成成功，已停止发布：`
+          + `${describeSubscriptionFormatFailures(failures)}。`
           + '请检查节点 / 规则方案后重试；缺失载体的客户端会收到 406。',
         )
       }
@@ -750,12 +765,52 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           }).text
         }
       }
+      // Surge 测试版变体：按构建号分档，服务端根据请求 UA 返回。
+      // 正式版仍拿基线载体，不会被未知参数破坏。
+      const surgeTiers: Partial<Record<'surge' | 'surge-mac', Record<string, string>>> = {}
+      if (surgeBetaNodeCount(usable) > 0) {
+        for (const targetKey of ['surge', 'surge-mac'] as const) {
+          const client = CLIENTS.find((item) => item.target === targetKey)
+          if (!client) continue
+          for (const tier of [1, 2, 3] as const) {
+            try {
+              const prepared = prepareSchemeForExport(scheme, policySelections, {
+                preferRuleSets,
+                format: 'surge',
+                target: targetKey,
+                ruleSetExclusions,
+                hostedBaseURL,
+              })
+              const mode = effectiveContentMode(client, exportContentModes, exportContentMode)
+              const text = generateConfig(client, usable, prepared, {
+                contentMode: mode,
+                nameForNode,
+                remoteSubscriptions,
+                tailnets: mode === 'full' ? activeTailnets : [],
+                hostedBaseURL,
+                surgeTier: tier,
+              }).text
+              if (!text.trim()) continue
+              surgeTiers[targetKey] ??= {}
+              surgeTiers[targetKey]![String(tier)] = text
+            } catch {
+              // 单个档位生成失败不影响基线发布。
+            }
+          }
+        }
+      }
       const query = new URLSearchParams({ title: configName })
       if (subToken) query.set('token', subToken)
       const res = await apiFetch(`/api/subscribe?${query.toString()}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json; charset=utf-8' },
-        body: JSON.stringify({ title: configName, formats, targets }),
+        body: JSON.stringify({
+          title: configName,
+          formats,
+          targets,
+          ...(Object.keys(surgeTiers).length ? { surgeTiers } : {}),
+          ...(anywhereAjson ? { anywhereAjson } : {}),
+        }),
       })
       if (!res.ok) {
         const detail = await res.text().catch(() => '')
@@ -788,9 +843,10 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     if (url) {
       const remoteLabel = remoteSubscriptions.length > 0 ? ` · ${remoteSubscriptions.length} 个代理集合` : ''
       const tailnetLabel = activeTailnets.length > 0 ? ` · ${activeTailnets.length} 个 Tailscale 内网` : ''
+      const oneTap = surgeOneTapCount || anywhereOneTapCount
       setCheckResult({
         ok: true,
-        text: `已发布 · ${exportableCount} 个本地节点${remoteLabel}${tailnetLabel} · 各载体按对应客户端设置生成`,
+        text: `已发布 · ${exportableCount} 个本地节点${oneTap ? ` · ${oneTap} 个仅一键导入` : ''}${remoteLabel}${tailnetLabel} · 各载体按对应客户端设置生成`,
       })
     }
   }
@@ -1491,14 +1547,30 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           </div>
         )}
         <div className="row" style={{ gap: 8, marginBottom: 14 }}>
-          <button className="btn" disabled={!scheme || !hasExportable || exportBlocked} onClick={download}>{downloaded ? '已下载' : '下载文件'}</button>
-          <button className="btn ghost" disabled={!hasExportable || !generated || exportBlocked} onClick={copy}>{copied ? '已复制' : '复制'}</button>
+          <button className="btn" disabled={!scheme || !baselineExportable || !generated || exportBlocked} onClick={download}>{downloaded ? '已下载' : '下载文件'}</button>
+          <button className="btn ghost" disabled={!baselineExportable || !generated || exportBlocked} onClick={copy}>{copied ? '已复制' : '复制'}</button>
           {canImport && !DEMO_MODE && (
             <button className="btn ghost" disabled={importing || !hasExportable || readOnly || exportBlocked} title={readOnly ? READONLY_NOTE : undefined} onClick={importIntoClient}>
               {importing ? '生成链接…' : `导入到 ${target.name}`}
             </button>
           )}
         </div>
+        {surgeOneTapCount > 0 && (
+          <div className="inline-notice" style={{ marginBottom: 10 }}>
+            <span>
+              其中 {surgeOneTapCount} 个节点仅 Surge 测试版可用。下载文件和复制文本不包含它们；
+              一键导入 / 订阅链接会按请求方 Surge 构建号自动返回测试版档位。
+            </span>
+          </div>
+        )}
+        {anywhereOneTapCount > 0 && (
+          <div className="inline-notice" style={{ marginBottom: 10 }}>
+            <span>
+              其中 {anywhereOneTapCount} 个跳过证书校验的节点仅 Anywhere 一键导入（AJSON）可用；
+              复制的文本和下载文件不包含它们。
+            </span>
+          </div>
+        )}
         {exportBlocked && (
           <div className="inline-notice error" style={{ marginBottom: 10 }}>
             <span>{exportBlockNote}</span>
@@ -1572,8 +1644,12 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           )
         ) : (
           <div className="preview-empty">
-            <strong>当前配置不含可用节点</strong>
-            <span>{noEnabledNodes ? '添加订阅或启用节点后，这里会显示生成的配置。' : nameFilterEmpty ? '清除名称筛选，或换一组关键词后再导出。' : filterEmpty ? '清除协议筛选，或选择其他协议后再导出。' : '换一个支持这些协议的客户端，或排除不兼容节点后再导出。'}</span>
+            <strong>{surgeOneTapCount > 0 ? '仅 Surge 测试版可用' : anywhereOneTapCount > 0 ? '仅 Anywhere 一键导入可用' : '当前配置不含可用节点'}</strong>
+            <span>{surgeOneTapCount > 0
+              ? '这些节点无法写入正式版 Surge 文件；请使用一键导入或订阅链接，Surge 测试版会自动拿到对应档位。'
+              : anywhereOneTapCount > 0
+                ? '这些节点只在 Anywhere 声明 AJSON 时通过订阅链接返回；下载文件与复制文本不包含它们。'
+                : noEnabledNodes ? '添加订阅或启用节点后，这里会显示生成的配置。' : nameFilterEmpty ? '清除名称筛选，或换一组关键词后再导出。' : filterEmpty ? '清除协议筛选，或选择其他协议后再导出。' : '换一个支持这些协议的客户端，或排除不兼容节点后再导出。'}</span>
           </div>
         )}
       </div>

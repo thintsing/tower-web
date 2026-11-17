@@ -101,6 +101,13 @@ function anywhereLink(uri: string, node: ProxyNode): string | undefined {
   return url.href
 }
 
+/** Anywhere 的节点链接；不支持的目标返回 undefined。 */
+export function anywhereShareLink(node: ProxyNode, displayName: string): string | undefined {
+  if (anywhereUnsupported(node)) return undefined
+  const uri = nodeURI(node, displayName, 'anywhere')
+  return uri ? anywhereLink(uri, node) : undefined
+}
+
 function b64urlSafe(value: string): string {
   return encodeBase64String(value).replace(/=+$/, '')
 }

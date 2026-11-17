@@ -20,6 +20,7 @@ import { inlineRuleSetMetadata } from '../rules/inlineSets'
 import { reorderRulesByMatchingOrder } from '../rules/matchingOrder'
 import { applyRuleOrder, insertRuleSetBlocks, sortSupplementRules, type RuleSetBlock } from '../rules/ruleOrder'
 import { conditionalDefaultPolicy, effectiveGroupType } from '../rules/capabilities'
+import type { SurgeTier } from './surgeCapabilities'
 
 /** 所有客户端生成器共用的导出选项。 */
 export interface OutputOptions {
@@ -36,6 +37,8 @@ export interface OutputOptions {
   tailnets?: TailnetExport[]
   /** Surge 自更新首行 `#!MANAGED-CONFIG` 的目标地址；留空则不写。 */
   managedConfigURL?: string
+  /** Surge 测试版档位；缺省为正式版基线（不写 VLESS / XHTTP / HTTPUpgrade）。 */
+  surgeTier?: SurgeTier
   /**
    * 服务端托管规则集的对外基础地址（例如 TOWER_PUBLIC_URL）。
    * 空字符串表示明确没有可达地址：provider 引用不能退回 localhost。

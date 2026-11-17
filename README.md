@@ -56,7 +56,7 @@
 - **规则集**：内置 ACL4SSR 快照与 871 个在线列表；支持本地 / 在线规则集、刷新、暂停、跨客户端引用或展开。开启「优先引用规则集」后，经典列表会自动压成 mihomo / Stash 的 MRS 与 sing-box / Hiddify 的 SRS 二进制规则集，表达不了的类型保持逐条内联；sing-box DNS 投影会额外引用同一列表的 domain-only SRS。sing-box / Hiddify 的 `GEOIP` 会写成塔台托管的国家 CIDR 规则集（服务端从随包离线国家表生成 SRS），`IP-ASN` 同理从离线 ASN 表展开成 CIDR 规则集，`LAN` / `PRIVATE` 使用内核内置的私有地址字段；离线表里没有的代码返回零规则 SRS，客户端仍能正常下载，只是这条规则永不命中，不会反复报下载失败。
 - **固化与屏蔽**：内置 ACL4SSR 方案可「更新并固化」到上游同一 commit 的 INI 与全部列表（任一列表失败整次放弃，原厂快照始终保留）；固化历史保留原厂 + 最近 2 版，可在方案页「回退至此版」，只改本机与同步工作区，不会回滚已导出的客户端配置。固化后的内置方案在规则页显示为「只读」规则集，可按条目「屏蔽 / 解除屏蔽」并「撤销上次屏蔽 / 解除」；被屏蔽条目标记为「已屏蔽 N 条 · 仅编译期生效」，刷新或回退快照后屏蔽仍生效。
 - **DNS 与 ECS**：普通 / 国内 / 远程 DNS，跟随方案 / 标准保护 / 严格保护；mihomo 和 sing-box 使用纯节点解析组、DNS 投影与中国子网（ECS）。GEOIP / Surge IP 规则会补 `no-resolve`，仅在 DNS 已走代理时释放末尾 GEOIP 的该选项。
-- **导出与分享**：一次生成 7 种载体，按客户端设置完整配置 / 仅节点、地区 / 协议筛选、排序和命名；支持代理集合、Tailscale 内网、二维码和 `clash://` / `surge://` 一键导入。
+- **导出与分享**：一次生成 7 种载体，按客户端设置完整配置 / 仅节点、地区 / 协议筛选、排序和命名；支持代理集合、Tailscale 内网、二维码和 `clash://` / `surge://` 一键导入。Surge 测试版按构建号分档返回 VLESS / VLESS Encryption / HTTPUpgrade；Anywhere 声明 `X-Anywhere-Format: ajson/1` 时会拿到保留跳过证书校验节点的 AJSON。
 - **局域网与访问密钥**：可关闭局域网访问；也可生成管理 API 密钥，局域网页面用 `?key=` 打开一次后自动记住。订阅、一次性分享和托管规则集仍是独立凭证。
 - **服务器版（可选）**：`TOWER_MODE=server` 时订阅源、节点、规则方案 / 规则集、当前方案选择和 Tailscale（含 Auth Key）保存在服务端 `workspace.json`，任何设备打开都是同一份工作区；服务端离线时只读，多设备并发按版本号检测并提示重新载入。
 - **备份**：导出 / 恢复本机 JSON；覆盖恢复前自动保存，本机保留最近 3 份版本；支持一键重置所有本机配置。
@@ -69,16 +69,18 @@
 | --- | --- |
 | Clash / YAML | Clash Verge、Mihomo Party、FlClash、Clash Mi、Clash、ClashMac、Stash、Karing、Shadowrocket |
 | Egern YAML | Egern |
-| Surge | Surge、Surge Mac |
+| Surge | Surge、Surge Mac（含测试版 VLESS 档位） |
 | Loon / Quantumult X | Loon、Quantumult X |
 | sing-box JSON | sing-box、Hiddify |
-| Base64 节点订阅 | V2Box、Anywhere |
+| Base64 节点订阅 | V2Box、Anywhere（AJSON 一键导入） |
 
 - sing-box 没有 SSR 出站，SSR 节点不会写入 JSON。
 - 发布订阅时，YAML / Surge / Loon / QuanX / Egern 会按各自规则白名单过滤，避免把其他客户端的规则写进去。
 - mihomo 的 ECS 需要较新内核并支持 `#代理组` DNS 后缀；sing-box 的 ECS 需要官方 1.14+，Hiddify 1.13 会跳过 ECS 提示。
 - Surge 的仅节点输出是纯 `policy-path` 列表；Quantumult X 的仅节点作为 `server_remote` 资源导入；sing-box MT 完整配置提供「规则判定 / 全局代理 / 直接连接」三种模式。
 - 经典规则列表会按目标客户端自动转换为二进制规则集：mihomo / Stash 用 MRS（domain + ipcidr 两份引用），sing-box / Hiddify 用 SRS；无法表达的规则类型继续内联。Karing、Shadowrocket 不读 MRS，仍引用经典列表。
+- Surge 订阅按请求 UA 返回对应测试版档位：iOS 4024 / 4026 / 4027 与 Mac 12820 / 12840 / 12860 分别开放 VLESS、VLESS Encryption / XHTTP、HTTPUpgrade；正式版和未知 UA 仍拿基线（不含测试版节点），这些节点在页面上标记为「仅一键导入」。
+- Anywhere 订阅在请求头 `X-Anywhere-Format: ajson/1` 时返回 AJSON：跳过证书校验的 VLESS（TLS + raw / HTTPUpgrade）、Trojan、AnyTLS 写成结构化代理，其余节点保持分享链接；无 TLS 的 WS / gRPC / XHTTP 无法保真，整体退回原 Base64 列表。
 - 订阅默认请求没有解析到节点时，会自动用 `clash.meta` 兼容 UA 重试；流量或到期信息缺失时，会按 Clash 方言补探测响应头（最多 6 次、只取响应头不下载正文，命中过的变体会记住）。
 - 闭源客户端按规则白名单和引用完整性自检，仍建议在目标客户端实际导入确认。
 
@@ -288,6 +290,7 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 | `npm run selfcheck:dns` | 校验 DNS 投影、纯节点组与 ECS |
 | `npm run selfcheck:importers` | 校验规则方案导入 |
 | `npm run selfcheck:demo` | 校验示例工作区隔离：演示命名空间、真实工作区不被清除、发布操作被禁用 |
+| `npm run selfcheck:surge-anywhere` | 校验 Surge 测试版分档与 Anywhere AJSON 变体 |
 | `npm run selfcheck:protocols` | 校验协议解析与降级 |
 | `npm run selfcheck:provider-rulesets` | 校验 Loyalsoldier provider 方案、托管转换与本地模式导出 |
 | `npm run selfcheck:workspace` | 校验服务器版工作区接口、版本号、密钥与并发写 |
@@ -295,7 +298,7 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 | `npm run selfcheck:upstream-status` | 校验服务端上游定时检查、失败退避与工作区隔离 |
 
 <details>
-<summary>全部 44 项自检</summary>
+<summary>全部 45 项自检</summary>
 
 ```text
 selfcheck:asn         离线 IP / ASN 查询
@@ -331,6 +334,7 @@ selfcheck:rule-impact 自定义规则保存前的影响面
 selfcheck:rule-order  规则逐条排序与撤销
 selfcheck:sub-formats 订阅载体格式：单载体失败不留空
 selfcheck:sub-token   固定订阅 token / 地址规范 / 重置语义
+selfcheck:surge-anywhere Surge 测试版分档与 Anywhere AJSON
 selfcheck:upstream    上游方案更新：成功 / 部分失败 / 全部失败 / 空列表
 selfcheck:upstream-status 服务端上游检查：结果文件 / 已固化与 pin / 退避 / 开关 / 不写工作区
 selfcheck:workspace   服务器版工作区：版本 / 304 / 409 / 密钥 / 坏文件 / 并发
@@ -344,7 +348,7 @@ selfcheck:workspace-overwrite 覆盖恢复不丢未保存改动
 selfcheck:yaml        Clash YAML 结构
 ```
 
-自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建、运行 ESLint 并执行全部 44 项自检；`package.json` 与 `.github/workflows/ci.yml` 的清单逐条对齐。`selfcheck:kernels` 会下载固定版本的 sing-box / mihomo 真实校验生成产物（Linux 上自动取二进制；其他平台用 `SING_BOX_BIN` / `MIHOMO_BIN` 指定，否则跳过；GitHub Actions 下两个内核缺一即失败）。
+自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建、运行 ESLint 并执行全部 45 项自检；`package.json` 与 `.github/workflows/ci.yml` 的清单逐条对齐。`selfcheck:kernels` 会下载固定版本的 sing-box / mihomo 真实校验生成产物（Linux 上自动取二进制；其他平台用 `SING_BOX_BIN` / `MIHOMO_BIN` 指定，否则跳过；GitHub Actions 下两个内核缺一即失败）。
 
 </details>
 
@@ -360,6 +364,7 @@ selfcheck:yaml        Clash YAML 结构
 - 仍不支持的节点段：Loon 的 TUIC / SSH / Snell / MASQUE / TrustTunnel / AnyTLS；Quantumult X 的 Hysteria2 / TUIC / WireGuard / Snell / SSH / AnyTLS / TrustTunnel / MASQUE（这些客户端本身没有对应节点语法）；Surge TUIC v4 的 `token` 模式；Surge / Loon WireGuard 多 peer 配置（内部模型只保存一个 peer，整节会跳过）；Quantumult X 的 `tls13` 等握手展示字段。Surge SSH 的 Keystore 私钥引用只记录密码登录，无法导入实际私钥。
 - 手动编辑 SSH 节点时表单只保留密码登录；导入时携带的私钥和口令不会回填到表单，保存后会丢失，请重新导入。
 - SSR、部分协议和部分规则类型只在支持它的客户端保留，导出页会列出跳过项。
+- Surge 测试版节点依赖请求方构建号：低于档位门槛的 Surge、或直接下载 / 复制文本时不会包含它们，页面上会提示「仅一键导入」。Anywhere AJSON 只覆盖跳过证书校验的 VLESS（TLS + raw / HTTPUpgrade）、Trojan 和 AnyTLS；无 TLS 的 WS / gRPC / XHTTP 无法保真，整份文档退回原 Base64 链接列表。
 - 规则兼容性、协议能力、Tailscale 和 DNS / ECS 的具体限制随客户端不同，导出前请查看页面提示。
 - **Loon 会丢 `no-resolve`（行为降级，不是 bug）**：托管转换的 classic 正文按 Surge 手册「每行是一条不带策略的规则声明」产出，不带参数；Loon 的 `[Remote Rule]` 行也没有 `no-resolve` 参数位。因此 `lancidr` / `cncidr` / `telegramcidr` 在 Loon 上会多一次 DNS 解析，规则本身不会丢。
 - **Shadowrocket 会跳过 `applications`（行为降级，不是 bug）**：Shadowrocket 的经典文本口径不含 `PROCESS-NAME`，与它同一套口径的 Clash YAML 路径也不引用 `applications`；其余 12 个 provider 正常引用，导出页会点名被省略的列表。

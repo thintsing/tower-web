@@ -2,6 +2,7 @@
 // ConfigurationGenerator.swift. These checks keep Tower from emitting a
 // configuration that a client accepts but can never connect with.
 import type { ClientTarget, ProxyNode } from '../models/types'
+import { surgeAcceptsVLESS, surgeAcceptsVLESSEncryption, type SurgeTier } from './surgeCapabilities'
 
 const MIHOMO_TARGETS = new Set<ClientTarget>([
   'clash-verge', 'clashmac', 'flclash', 'mihomo-party', 'clash-mi', 'clash-apple',
@@ -79,9 +80,16 @@ export function snellVersionSupported(node: ProxyNode, target?: ClientTarget): b
   return true
 }
 
-/** Xray VLESS encryption is only verified on mihomo-family targets. */
-export function vlessEncryptionSupported(node: ProxyNode, target?: ClientTarget): boolean {
+/** Xray VLESS encryption is only verified on mihomo-family targets and Surge betas. */
+export function vlessEncryptionSupported(
+  node: ProxyNode,
+  target?: ClientTarget,
+  surgeTier?: SurgeTier,
+): boolean {
   if (node.kind !== 'vless' || !node.vlessEncryption) return true
+  if (target === 'surge' || target === 'surge-mac') {
+    return !!surgeTier && surgeTier >= 2 && surgeAcceptsVLESSEncryption(node.vlessEncryption)
+  }
   return !target || MIHOMO_TARGETS.has(target)
 }
 
@@ -186,10 +194,17 @@ export function v2rayPluginSupported(node: ProxyNode, target?: ClientTarget): bo
  * Common gate used by every text / sing-box writer. It covers the checks that
  * are independent of a client's transport/format implementation.
  */
-export function nodeSupportedForTarget(node: ProxyNode, target?: ClientTarget): boolean {
+export function nodeSupportedForTarget(
+  node: ProxyNode,
+  target?: ClientTarget,
+  surgeTier?: SurgeTier,
+): boolean {
+  if (node.kind === 'vless' && (target === 'surge' || target === 'surge-mac')) {
+    if (!surgeTier || !surgeAcceptsVLESS(node, surgeTier)) return false
+  }
   return shadowsocksCipherSupported(node, target)
     && snellVersionSupported(node, target)
-    && vlessEncryptionSupported(node, target)
+    && vlessEncryptionSupported(node, target, surgeTier)
     && nativeShadowsocksTLSSupported(node, target)
     && shadowTLSSupported(node, target)
     && v2rayPluginSupported(node, target)

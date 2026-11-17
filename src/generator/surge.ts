@@ -12,6 +12,7 @@ import { inlineSetReference, surgeInlinePayload } from '../rules/inlineSets'
 import { supportsRuleSetReference } from '../rules/remoteFormats'
 import { effectiveNetworkSettings, latencyTestURL } from '../models/networkSettings'
 import { nodeSupportedForTarget } from './nodeCapabilities'
+import { surgeAcceptsVLESS, surgeAcceptsVLESSEncryption, type SurgeTier } from './surgeCapabilities'
 import { withPolicyGroupIcons } from './groupIcons'
 
 function wireGuardSectionName(node: ProxyNode): string {
@@ -66,11 +67,11 @@ function surgeWireGuardSections(nodes: ProxyNode[]): string[] {
   return out
 }
 
-function surgeNode(node: ProxyNode, name: string, target?: ClientTarget): string | undefined {
+function surgeNode(node: ProxyNode, name: string, target?: ClientTarget, surgeTier?: SurgeTier): string | undefined {
   // Surge Mac 与 iOS 的能力表不同（例如 Hysteria 2 Salamander 只在 Mac 文档
   // 中出现）；不能一律按 iOS 检查。
   const capabilityTarget: ClientTarget = target === 'surge-mac' ? 'surge-mac' : 'surge'
-  if (!nodeSupportedForTarget(node, capabilityTarget)) return undefined
+  if (!nodeSupportedForTarget(node, capabilityTarget, surgeTier)) return undefined
   const n = confName(name)
   const server = node.server.includes(':') ? `[${node.server}]` : node.server
   const tlsFlags = () => {
@@ -108,13 +109,16 @@ function surgeNode(node: ProxyNode, name: string, target?: ClientTarget): string
       return parts.join(', ')
     }
     case 'vmess': {
+      const transport = (node.transport ?? 'tcp').toLowerCase()
+      if (transport === 'httpupgrade' && (!surgeTier || surgeTier < 3)) return undefined
       const parts = [`${n} = vmess, ${server}, ${node.port}`, `username=${node.uuid ?? ''}`,
         `vmess-aead=${node.alterID === 0 || node.alterID === undefined}`]
       if (node.cipher && ['aes-128-gcm', 'chacha20-ietf-poly1305'].includes(node.cipher.toLowerCase())) {
         parts.push(`encrypt-method=${node.cipher}`)
       }
-      if (node.transport === 'ws') {
+      if (transport === 'ws' || transport === 'httpupgrade') {
         parts.push('ws=true')
+        if (transport === 'httpupgrade') parts.push('ws-http-upgrade=true')
         parts.push(`ws-path=${node.path || '/'}`)
         if (node.hostHeader) parts.push(`ws-headers=Host:${node.hostHeader}`)
       }
@@ -124,12 +128,49 @@ function surgeNode(node: ProxyNode, name: string, target?: ClientTarget): string
       return parts.join(', ')
     }
     case 'trojan': {
+      const transport = (node.transport ?? 'tcp').toLowerCase()
+      if (transport === 'httpupgrade' && (!surgeTier || surgeTier < 3)) return undefined
       const parts = [`${n} = trojan, ${server}, ${node.port}`, `password=${node.password ?? ''}`]
       parts.push(...tlsFlags())
-      if (node.transport === 'ws') {
+      if (transport === 'ws' || transport === 'httpupgrade') {
         parts.push('ws=true')
+        if (transport === 'httpupgrade') parts.push('ws-http-upgrade=true')
         parts.push(`ws-path=${node.path || '/'}`)
         if (node.hostHeader) parts.push(`ws-headers=Host:${node.hostHeader}`)
+      }
+      return parts.join(', ')
+    }
+    case 'vless': {
+      if (!surgeTier || !surgeAcceptsVLESS(node, surgeTier)) return undefined
+      const parts = [`${n} = vless, ${server}, ${node.port}`, `username=${node.uuid ?? ''}`]
+      if (node.flow) parts.push(`flow=${node.flow}`)
+      if (node.vlessEncryption && surgeAcceptsVLESSEncryption(node.vlessEncryption)) {
+        parts.push(`encryption=${node.vlessEncryption}`)
+      }
+      if (node.realityPublicKey) {
+        if (node.sni) parts.push(`sni=${node.sni}`)
+        parts.push(`reality-public-key=${node.realityPublicKey}`)
+        if (node.realityShortID) parts.push(`reality-short-id=${node.realityShortID}`)
+        if (node.alpn) parts.push(`alpn=${node.alpn}`)
+      } else {
+        parts.push(...(node.tls ? ['tls=true'] : []), ...tlsFlags())
+      }
+      const transport = (node.transport ?? 'tcp').toLowerCase()
+      if (transport === 'ws' || transport === 'httpupgrade') {
+        parts.push('ws=true')
+        if (transport === 'httpupgrade') parts.push('ws-http-upgrade=true')
+        parts.push(`ws-path=${node.path || '/'}`)
+        if (node.hostHeader) parts.push(`ws-headers=Host:${node.hostHeader}`)
+      } else if (transport === 'grpc') {
+        parts.push('grpc=true')
+        if (node.path) parts.push(`grpc-service-name=${node.path}`)
+        if (node.hostHeader) parts.push(`grpc-authority=${node.hostHeader}`)
+      } else if (transport === 'xhttp') {
+        parts.push('xhttp=true')
+        if (node.path) parts.push(`xhttp-path=${node.path}`)
+        if (node.hostHeader) parts.push(`xhttp-host=${node.hostHeader}`)
+        const mode = (node.transportMode ?? '').trim().toLowerCase()
+        if (mode && mode !== 'auto') parts.push(`xhttp-mode=${mode}`)
       }
       return parts.join(', ')
     }
@@ -283,7 +324,7 @@ export function generateSurge(
       skipped += 1
       continue
     }
-    const line = surgeNode(node, displayName(node), options.target)
+    const line = surgeNode(node, displayName(node), options.target, options.surgeTier)
     if (line) {
       proxyLines.push(line)
       emitted.add(node.id)

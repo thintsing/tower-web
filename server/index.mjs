@@ -20,6 +20,7 @@ import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib'
 import { convertRuleSet, RuleSetConversionError } from './ruleset-convert.mjs'
 import { assertAllowedTarget, blockedRuleSetAddress, BLOCKED_TARGET_MESSAGE, isBlockedRuleSetTarget } from './net-guard.mjs'
 import { safeContentType } from './content-type.mjs'
+import { acceptsAnywhereAjson, surgeVariantFor } from './surge-capabilities.mjs'
 import { asnCIDRs, loadIPASNData, organizationForAddress } from './ip-asn.mjs'
 import { countryCIDRs, loadIPCountryData } from './ip-country.mjs'
 import { createUpstreamChecker } from './upstream-status.mjs'
@@ -2468,6 +2469,8 @@ const server = createServer(async (req, res) => {
       let title = normalizeSubscriptionTitle(url.searchParams.get('title'))
       let formats
       let targets = {}
+      let surgeTiers = {}
+      let anywhereAjson = ''
       if (contentType.includes('application/json')) {
         let parsed
         try {
@@ -2483,7 +2486,6 @@ const server = createServer(async (req, res) => {
         for (const key of SUB_FORMATS) {
           if (typeof src[key] === 'string' && src[key].length > 0) formats[key] = src[key]
         }
-        if (Object.keys(formats).length === 0) return json(res, 400, { error: '没有可用格式' })
         // 目标专属变体（Stash / Surge Mac / 不支持 Tailscale 的客户端）。
         const srcTargets = parsed?.targets
         if (srcTargets && typeof srcTargets === 'object' && !Array.isArray(srcTargets)) {
@@ -2491,6 +2493,26 @@ const server = createServer(async (req, res) => {
             const key = canonicalSubTarget(rawKey)
             if (key && typeof value === 'string' && value.length > 0) targets[key] = value
           }
+        }
+        // Surge 测试版变体：按 UA 构建号返回对应档位。
+        const srcSurge = parsed?.surgeTiers
+        if (srcSurge && typeof srcSurge === 'object' && !Array.isArray(srcSurge)) {
+          for (const platform of ['surge', 'surge-mac']) {
+            const tiers = srcSurge[platform]
+            if (!tiers || typeof tiers !== 'object' || Array.isArray(tiers)) continue
+            const kept = {}
+            for (const tier of ['1', '2', '3']) {
+              if (typeof tiers[tier] === 'string' && tiers[tier].length > 0) kept[tier] = tiers[tier]
+            }
+            if (Object.keys(kept).length > 0) surgeTiers[platform] = kept
+          }
+        }
+        if (typeof parsed?.anywhereAjson === 'string' && parsed.anywhereAjson.trim()) {
+          anywhereAjson = parsed.anywhereAjson
+        }
+        if (Object.keys(formats).length === 0
+          && Object.keys(surgeTiers).length === 0 && !anywhereAjson) {
+          return json(res, 400, { error: '没有可用格式' })
         }
       } else {
         // 兼容旧客户端：纯文本 body 视为 base64 节点列表
@@ -2518,6 +2540,8 @@ const server = createServer(async (req, res) => {
       subscriptions.set(token, {
         formats,
         targets,
+        ...(Object.keys(surgeTiers).length ? { surgeTiers } : {}),
+        ...(anywhereAjson ? { anywhereAjson } : {}),
         updatedAt: Date.now(),
         title,
       })
@@ -2556,9 +2580,21 @@ const server = createServer(async (req, res) => {
       // （Clash 收到 base64 会报“订阅创建失败”，错误信息反而不如 406 清楚）。
       const requestedTarget = canonicalSubTarget(url.searchParams.get('target'))
         ?? subTargetFromUserAgent(req.headers['user-agent'])
-      const variant = requestedTarget && SUB_TARGET_FORMAT[requestedTarget] === fmt
-        ? sub.targets?.[requestedTarget]
-        : undefined
+      // Anywhere 的 AJSON 变体：只在请求头明确声明时返回，旧版客户端继续拿链接列表。
+      if (sub.anywhereAjson && fmt === 'base64' && acceptsAnywhereAjson(req.headers['x-anywhere-format'])) {
+        return send(res, 200, sub.anywhereAjson, {
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store',
+          'x-tower-format': 'anywhere-ajson',
+        })
+      }
+      // Surge 测试版：请求方 UA 的构建号决定拿哪一档 VLESS / XHTTP / HTTPUpgrade。
+      const surgePayload = fmt === 'surge' ? surgeVariantFor(sub.surgeTiers, req.headers['user-agent']) : undefined
+      const variant = surgePayload
+        ? surgePayload
+        : requestedTarget && SUB_TARGET_FORMAT[requestedTarget] === fmt
+          ? sub.targets?.[requestedTarget]
+          : undefined
       // 旧版 Egern 链接请求的是 yaml，新链接请求 egern；旧发布记录没有
       // egern 载体时回退到 yaml，避免升级后旧链接直接 406。
       let payload = variant ?? sub.formats[fmt]
