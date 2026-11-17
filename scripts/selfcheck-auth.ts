@@ -241,6 +241,32 @@ async function main(): Promise<void> {
       }
     })
 
+    await check('持久订阅达到 64 条后拒绝新 token，刷新已有 token 仍可用', async () => {
+      const prefix = `cap-${Math.random().toString(36).slice(2, 8)}-`
+      const tokens = Array.from({ length: 64 }, (_, index) => `${prefix}${index}`.padEnd(24, 'x'))
+      const publishes = await Promise.all(tokens.map((item) => fetch(`${LOCAL}/api/subscribe?token=${item}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ title: item, formats: { yaml: 'proxies: []\n' } }),
+      })))
+      assert.equal(publishes.filter((res) => res.status === 200).length, tokens.length)
+
+      const extra = await fetch(`${LOCAL}/api/subscribe?token=${`${prefix}extra`.padEnd(24, 'y')}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ title: 'extra', formats: { yaml: 'proxies: []\n' } }),
+      })
+      assert.equal(extra.status, 429)
+      assert.equal((await extra.json() as { code?: string }).code, 'too_many_subscriptions')
+
+      const refreshed = await fetch(`${LOCAL}/api/subscribe?token=${tokens[0]}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ title: 'refresh', formats: { yaml: 'proxies: []\n' } }),
+      })
+      assert.equal(refreshed.status, 200)
+    })
+
     if (!lanBase) {
       console.log('… 当前环境没有可用的非本机地址，跳过局域网请求检查')
       return

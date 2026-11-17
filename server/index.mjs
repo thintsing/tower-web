@@ -116,6 +116,8 @@ function pruneShares(now = Date.now()) {
 
 /** token -> { formats, updatedAt, title } */
 const subscriptions = new Map()
+// 持久订阅上限：达到后拒绝新 token，已有链接保持可用；可调用 DELETE /api/sub/:token 清理。
+const MAX_SUBSCRIPTIONS = 64
 
 /** 转换后的规则集产物：key -> { body, contentType, ruleCount, updatedAt } */
 const rulesetArtifacts = new Map()
@@ -2638,6 +2640,13 @@ const server = createServer(async (req, res) => {
         }
         isRefresh = !!token
         if (!token) token = randomBytes(16).toString('base64url')
+      }
+      if (!subscriptions.has(token) && subscriptions.size >= MAX_SUBSCRIPTIONS) {
+        return json(res, 429, {
+          error: `持久订阅最多保留 ${MAX_SUBSCRIPTIONS} 条，请先删除不用的订阅链接`,
+          code: 'too_many_subscriptions',
+          limit: MAX_SUBSCRIPTIONS,
+        })
       }
       subscriptions.set(token, {
         formats,
