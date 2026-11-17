@@ -553,8 +553,8 @@ async function main(): Promise<void> {
         { expireAt: now - 86_400_000, totalBytes: 10, usedBytes: 10 },
         now,
       )
+      assert.notEqual(summary.health, 'urgent')
       assert.equal(summary.health, 'expired')
-      assert.equal(summary.health !== 'urgent', true)
       const html = renderToStaticMarkup(UsageHealthBadge({ summary }))
       assert.ok(html.includes('已过期'), `应显示已过期文案：${html}`)
       assert.ok(html.includes('usage-health expired'), `应使用 expired 样式：${html}`)

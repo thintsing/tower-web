@@ -3,11 +3,8 @@
 import assert from 'node:assert/strict'
 import { inflateSync, zstdDecompressSync } from 'node:zlib'
 import { fileURLToPath } from 'node:url'
-// @ts-expect-error server converter is plain ESM and not part of the src tsconfig
 import { convertRuleSet, RuleSetConversionError } from '../server/ruleset-convert.mjs'
-// @ts-expect-error server module is plain ESM and not part of the src tsconfig
 import { cidrsForRange, countryCIDRs, loadIPCountryData } from '../server/ip-country.mjs'
-// @ts-expect-error server module is plain ESM and not part of the src tsconfig
 import { asnCIDRs, loadIPASNData } from '../server/ip-asn.mjs'
 import type { RoutingRule, SchemeRuleSet } from '../src/models/types'
 import { mihomoBinaryPlan, singBoxBinaryPlan } from '../src/rules/binaryRuleSets'
@@ -169,7 +166,7 @@ const makeSet = (overrides: Partial<SchemeRuleSet> = {}): SchemeRuleSet => ({
 
 function main(): void {
   check('QuanX：输出 host / ip-cidr / geoip，丢弃 no-resolve', () => {
-    const output = convertRuleSet(DOMAIN_AND_IP, 'quanx').text
+    const output = String(convertRuleSet(DOMAIN_AND_IP, 'quanx').text)
     assert.match(output, /^host, example\.com, proxy$/m)
     assert.match(output, /host-suffix, foo\.com, proxy/)
     assert.match(output, /ip-cidr, 1\.2\.3\.0\/24, proxy/)
@@ -178,7 +175,7 @@ function main(): void {
   })
 
   check('Egern：统一 no_resolve 并生成集合键', () => {
-    const output = convertRuleSet(DOMAIN_AND_IP, 'egern').text
+    const output = String(convertRuleSet(DOMAIN_AND_IP, 'egern').text)
     assert.match(output, /^no_resolve: true$/m)
     assert.match(output, /^domain_set:$/m)
     assert.match(output, /^domain_suffix_set:$/m)
@@ -188,7 +185,7 @@ function main(): void {
   })
 
   check('sing-box：生成 source format v2 JSON', () => {
-    const output = convertRuleSet(WITHOUT_GEOIP, 'singbox').text
+    const output = String(convertRuleSet(WITHOUT_GEOIP, 'singbox').text)
     const payload = JSON.parse(output)
     assert.equal(payload.version, 2)
     assert.equal(Array.isArray(payload.rules), true)
@@ -227,10 +224,11 @@ function main(): void {
 
   check('SRS domain：DNS 专用列表只编码域名与关键词', () => {
     const output = convertRuleSet(DOMAIN_AND_IP, 'srs-domain')
-    assert.ok(Buffer.isBuffer(output.text))
-    assert.equal(output.text.subarray(0, 4).toString('hex'), '53525302')
+    const binary = output.text as Buffer
+    assert.ok(Buffer.isBuffer(binary))
+    assert.equal(binary.subarray(0, 4).toString('hex'), '53525302')
     assert.equal(output.ruleCount, 3)
-    const plain = inflateSync(output.text.subarray(4))
+    const plain = inflateSync(binary.subarray(4))
     let position = 0
     const readUvarint = (): number => {
       let value = 0
@@ -266,9 +264,10 @@ function main(): void {
   })
   check('SRS：生成 sing-box binary v2', () => {
     const output = convertRuleSet(WITHOUT_GEOIP, 'srs')
-    assert.ok(Buffer.isBuffer(output.text))
-    assert.equal(output.text.subarray(0, 4).toString('hex'), '53525302')
-    const plain = inflateSync(output.text.subarray(4))
+    const binary = output.text as Buffer
+    assert.ok(Buffer.isBuffer(binary))
+    assert.equal(binary.subarray(0, 4).toString('hex'), '53525302')
+    const plain = inflateSync(binary.subarray(4))
     let position = 0
     const readUvarint = (): number => {
       let value = 0
@@ -752,7 +751,8 @@ function main(): void {
       'srs',
     )
     assert.ok(Buffer.isBuffer(srs.text))
-    assert.equal(srs.text.subarray(0, 4).toString('hex'), '53525302')
+    const binary = srs.text as Buffer
+    assert.equal(binary.subarray(0, 4).toString('hex'), '53525302')
     assert.equal(srs.ruleCount, 5)
   })
 
@@ -770,16 +770,18 @@ function main(): void {
       'srs',
     )
     assert.ok(Buffer.isBuffer(srs.text))
-    assert.equal(srs.text.subarray(0, 4).toString('hex'), '53525302')
+    const binary = srs.text as Buffer
+    assert.equal(binary.subarray(0, 4).toString('hex'), '53525302')
     assert.equal(srs.ruleCount, 5)
   })
 
   check('GEOIP / IP-ASN：离线表里没有的代码返回零规则 SRS', () => {
     const output = convertRuleSet('', 'srs', { allowEmpty: true })
-    assert.equal(output.text.subarray(0, 4).toString('hex'), '53525302')
+    const binary = output.text as Buffer
+    assert.equal(binary.subarray(0, 4).toString('hex'), '53525302')
     assert.equal(output.ruleCount, 0)
     // 零规则 SRS 只有 RuleSet 版本号，没有任何 HeadlessRule。
-    assert.deepEqual([...inflateSync(output.text.subarray(4))], [1])
+    assert.deepEqual([...inflateSync(binary.subarray(4))], [1])
     // 其他格式没有合法的空规则集表达，仍然明确报错。
     assert.throws(() => convertRuleSet('', 'classic', { allowEmpty: true }), /没有解析到规则/)
     assert.throws(() => convertRuleSet('', 'srs'), /规则集内容为空/)

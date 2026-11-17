@@ -7,7 +7,6 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-// @ts-expect-error server metadata is plain ESM and not part of the src tsconfig
 import { BUILTIN_SCHEME_COUNT } from '../server/builtin-scheme-counts.mjs'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))

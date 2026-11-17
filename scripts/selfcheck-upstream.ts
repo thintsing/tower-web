@@ -266,7 +266,7 @@ const empty = await fetchUpstreamScheme(meta, {
 if (!empty) fail('空列表分支：应抛出错误')
 
 // ---------- 离线兜底：内置 meta 没有 file 时不尝试网络，也不返回结果 ----------
-const noFile = await fetchUpstreamScheme({ ...meta, file: undefined }, { fetchText: fetcher(), now })
+const noFile = await fetchUpstreamScheme({ ...meta, file: '' }, { fetchText: fetcher(), now })
   .then(() => null, (e) => e as UpstreamSchemeError)
 if (!noFile) fail('无 file 分支：应抛出错误')
 else if (!noFile.failures.some((line) => line.includes('没有对应的上游 INI'))) {

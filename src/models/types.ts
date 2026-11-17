@@ -154,7 +154,8 @@ export interface ProxyNode {
   wireGuardMTU?: number
   wireGuardPersistentKeepalive?: number
   wireGuardDNS?: string
-  rawURI: string
+  /** 原始分享链接；手动节点或仅从配置导入的节点可能没有。 */
+  rawURI?: string
   /** Quota / expiry / announcement pseudo-nodes from the provider. */
   isSubscriptionMetadata?: boolean
   /** User-selected region override (ISO code). */

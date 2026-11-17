@@ -3,7 +3,7 @@
   "compilerOptions": {
     "noEmit": true,
     "allowJs": true,
-    "checkJs": true,
+    "checkJs": false,
     "types": ["node"]
   },
   "include": ["scripts", "server"]

@@ -69,6 +69,7 @@ const DATA: PersistedData = {
   exportContentModes: { surge: 'nodes' },
   embedRemoteSubscriptions: false,
   exportProtocols: ['ss'],
+  exportRegions: [],
   exportConfigName: '家用',
   appendSourceName: true,
   clientOrder: [],
@@ -76,6 +77,8 @@ const DATA: PersistedData = {
   nodeNameFilter: { include: '', exclude: '', useRegex: false, caseSensitive: false },
   filterSubscriptionInfoNodes: false,
   renewalRemindersEnabled: true,
+  showGroupEmoji: true,
+  ruleSetVersionHistory: true,
   latencyTestMode: 'automatic',
   tailnets: [],
 }

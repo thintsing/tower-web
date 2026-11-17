@@ -187,7 +187,10 @@ check('未知顶层字段往返不丢', () => {
     futureList: [1, 2, 3],
   })
   // 模拟推送时把未知字段拼回顶层；再次载入必须仍然认得出来。
-  const wire = { ...first.unknown, ...plain(first.data) }
+  const wire = {
+    ...(first.unknown as Record<string, unknown>),
+    ...(plain(first.data) as Record<string, unknown>),
+  }
   const second = normalizeWorkspaceDataDetailed(wire)
   assert.deepEqual(second.unknown, first.unknown)
   assert.deepEqual(plain(second.data), plain(first.data))
@@ -197,7 +200,7 @@ check('已知记录内部的未知字段也不被抹掉', () => {
   const raw = clone(GOOD) as unknown as { sources: Array<Record<string, unknown>> }
   raw.sources[0].futureSourceField = 'keep-me'
   const result = normalizeWorkspaceDataDetailed(raw)
-  assert.equal((result.data.sources[0] as Record<string, unknown>).futureSourceField, 'keep-me')
+  assert.equal((result.data.sources[0] as unknown as Record<string, unknown>).futureSourceField, 'keep-me')
 })
 
 check('旧版内联固化升级为快照 + 指针，且幂等', () => {

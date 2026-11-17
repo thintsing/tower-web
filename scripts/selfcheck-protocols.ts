@@ -480,8 +480,8 @@ function main(): void {
     })
     assert.ok(!config.outbounds.some((item: { type?: string }) => item.type === 'wireguard'))
     assert.ok(config.outbounds.some((item: { type?: string }) => item.type === 'anytls'))
-    assert.ok(config.outbounds.some((item: { type?: string }) => item.type === 'snell' && item.psk === 'snell-psk' && item.version === 4))
-    assert.ok(config.outbounds.some((item: { type?: string }) => item.type === 'hysteria' && item.auth_str === 'hy1-pass'))
+    assert.ok(config.outbounds.some((item: Record<string, unknown>) => item.type === 'snell' && item.psk === 'snell-psk' && item.version === 4))
+    assert.ok(config.outbounds.some((item: Record<string, unknown>) => item.type === 'hysteria' && item.auth_str === 'hy1-pass'))
     const keySsh = config.outbounds.find((item: { type?: string; private_key?: string }) =>
       item.type === 'ssh' && item.private_key)
     assert.ok(keySsh)

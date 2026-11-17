@@ -207,8 +207,9 @@ async function main(): Promise<void> {
     const loaded = readUpstreamStatusFile(dir)
     assert.equal(loaded.corrupt, false)
     assert.equal(loaded.status?.checkedAt, NOW)
-    assert.equal(loaded.status?.results['acl4ssr-online'].status, 'update')
-    assert.equal(loaded.status?.results['acl4ssr-online'].behindBy, 3)
+    const results = loaded.status?.results as Record<string, { status: string; behindBy?: number }>
+    assert.equal(results['acl4ssr-online'].status, 'update')
+    assert.equal(results['acl4ssr-online'].behindBy, 3)
   })
 
   await check('结果文件损坏：读取标记 corrupt，服务仍可启动', async () => {

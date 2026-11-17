@@ -549,7 +549,7 @@ globalThis.fetch = (async (input: RequestInfo | URL) => {
       }
       const auth = Buffer.from('aes-256-gcm:pass').toString('base64').replace(/=+$/, '')
       // 通用链接不带用量头；只有 clash=1 变体返回用量，且正文固定为一个节点。
-      const headers = new URL(target).searchParams.get('clash') === '1'
+      const headers: Record<string, string> = new URL(target).searchParams.get('clash') === '1'
         ? { 'x-subscription-userinfo': QUOTA_HEADER }
         : {}
       return new Response(`ss://${auth}@1.2.3.4:8388#配额节点`, { status: 200, headers })

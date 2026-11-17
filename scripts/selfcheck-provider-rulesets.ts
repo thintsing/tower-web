@@ -6,9 +6,7 @@ import { createServer, type Server } from 'node:http'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-// @ts-expect-error server converter is plain ESM and not part of the src tsconfig
 import { convertRuleSet, RuleSetConversionError } from '../server/ruleset-convert.mjs'
-// @ts-expect-error server metadata is plain ESM and not part of the src tsconfig
 import { BUILTIN_PROGRAMMATIC_SCHEMES } from '../server/builtin-scheme-counts.mjs'
 import { CLIENTS, type ProxyNode } from '../src/models/types'
 import { generateConfig } from '../src/generator'
@@ -153,9 +151,9 @@ async function main(): Promise<void> {
     const classic = convertRuleSet(text, 'classic', { provider: 'yaml', behavior: 'ipcidr' }).text
     // Surge 手册：规则集文件每行是不带策略的规则声明；no-resolve 写在 RULE-SET 行。
     assert.equal(classic, 'IP-CIDR,1.0.1.0/24\nIP-CIDR6,2001:db8::/32\n')
-    const quanx = convertRuleSet(text, 'quanx', { provider: 'yaml', behavior: 'ipcidr' }).text
+    const quanx = String(convertRuleSet(text, 'quanx', { provider: 'yaml', behavior: 'ipcidr' }).text)
     assert.match(quanx, /ip-cidr, 1\.0\.1\.0\/24, proxy/)
-    const singbox = JSON.parse(convertRuleSet(text, 'singbox', { provider: 'yaml', behavior: 'ipcidr' }).text)
+    const singbox = JSON.parse(String(convertRuleSet(text, 'singbox', { provider: 'yaml', behavior: 'ipcidr' }).text))
     assert.deepEqual(singbox.rules, [{ ip_cidr: ['1.0.1.0/24', '2001:db8::/32'] }])
   })
 
@@ -329,7 +327,7 @@ async function main(): Promise<void> {
   await check('三种口径一致：规则匹配器 / 远程引用解释 / 确定度映射对进程规则都只标可能命中', () => {
     const target = parseQuery('www.google.com')
     // 1) 普通 PROCESS-* 规则：规则匹配器判 skip。
-    const direct = evaluateRule({ type: 'PROCESS-NAME', value: 'git', group: 'x' }, target)
+    const direct = evaluateRule({ type: 'PROCESS-NAME', value: 'git' }, target)
     assert.equal(direct.status, 'skip')
     assert.equal(certaintyFor(direct), 'possible-match')
     // 2) providerOnly 进程类远程引用：解释器同样判 skip，而不是 confirmed-miss。
@@ -399,7 +397,7 @@ async function main(): Promise<void> {
   })
 
   await check('规则集卡片副标题：格式标签只出现一次', () => {
-    const provider = scheme.ruleSets.find((set) => set.providerName === 'google')!
+    const provider = (scheme.ruleSets ?? []).find((set) => set.providerName === 'google')!
     const line = ruleSetSummary(provider, 'Clash provider YAML')
     assert.equal(line, '远程引用（不保存正文） · 导出为 RULE-SET · Clash provider YAML')
     assert.equal(line.split('Clash provider YAML').length - 1, 1)

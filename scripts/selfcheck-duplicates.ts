@@ -600,7 +600,7 @@ function main(): void {
     const source = scheme([
       rule('DOMAIN-SUFFIX', 'a.example', '节点选择'),
       rule('FINAL', '', 'DIRECT'),
-    ], { id: 'acl4ssr-online', name: 'ACL4SSR 在线', sourceKind: 'builtin' })
+    ], { id: 'acl4ssr-online', name: 'ACL4SSR 在线', sourceKind: 'url' })
     const copy = createEditableSchemeCopy(source, { id: 'copy-test', now: 1 })
     assert.equal(copy.id, 'copy-test')
     assert.equal(copy.name, 'ACL4SSR 在线 · 自定义')

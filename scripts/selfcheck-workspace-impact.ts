@@ -35,7 +35,7 @@ function node(id: string, isSubscriptionMetadata = false): ProxyNode {
 }
 
 function source(id: string) {
-  return { id, name: id, url: `https://example.com/${id}` }
+  return { id, name: id, url: `https://example.com/${id}`, excludedNodeKeys: [] }
 }
 
 check('只改订阅时也要报告恢复数量', () => {

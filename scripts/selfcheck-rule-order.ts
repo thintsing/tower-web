@@ -61,7 +61,7 @@ function remoteSet(id: string, name: string, groupName: string, value: string, p
     id,
     name,
     group: groupName,
-    rules: providerName ? [] : [{ type: 'DOMAIN', value, sourceName: name }],
+    rules: providerName ? [] : [{ type: 'DOMAIN', value, group: groupName, sourceName: name }],
     sourceKind: 'url',
     sourceRef: `https://rules.example.com/${providerName ?? id}.yaml`,
     format: 'yaml',
@@ -88,10 +88,10 @@ function insertionScheme(sets: SchemeRuleSet[]): RuleScheme {
 
 function main(): void {
   check('兜底锚点：GEOIP / FINAL / MATCH 不可手动移动', () => {
-    assert.equal(isUnmovableRule({ type: 'GEOIP', group: 'A' }), true)
-    assert.equal(isUnmovableRule({ type: 'FINAL', group: 'A' }), true)
-    assert.equal(isUnmovableRule({ type: 'MATCH', group: 'A' }), true)
-    assert.equal(isUnmovableRule({ type: 'DOMAIN', value: 'a.com', group: 'A' }), false)
+    assert.equal(isUnmovableRule({ type: 'GEOIP' }), true)
+    assert.equal(isUnmovableRule({ type: 'FINAL' }), true)
+    assert.equal(isUnmovableRule({ type: 'MATCH' }), true)
+    assert.equal(isUnmovableRule({ type: 'DOMAIN' }), false)
   })
 
   check('没有 ruleOrder 时保持自定义前置 + 原规则顺序', () => {

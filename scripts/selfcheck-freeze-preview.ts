@@ -24,7 +24,7 @@ const current: Pick<RuleScheme, 'rules' | 'ruleSets'> = {
     { type: 'FINAL', group: '漏网之鱼' },
   ],
   ruleSets: [
-    { id: 'upstream-set-a', name: 'set-a', group: '国外媒体', rules: [], sourceRef: 'https://example.com/a.list' },
+    { id: 'upstream-set-a', name: 'set-a', group: '国外媒体', rules: [], sourceKind: 'url', sourceRef: 'https://example.com/a.list' },
   ],
 }
 
@@ -74,9 +74,9 @@ check('引用了旧规则集 id / 源地址的自定义方案会被列出', () =
     currentScheme: current,
     content,
     customSchemes: [
-      { name: '引用 id', ruleSets: [{ id: 'upstream-set-a', name: 'x', group: 'g', rules: [] }] },
-      { name: '引用源地址', ruleSets: [{ id: 'local-1', name: 'y', group: 'g', rules: [], sourceRef: 'https://example.com/a.list' }] },
-      { name: '无关方案', ruleSets: [{ id: 'local-2', name: 'z', group: 'g', rules: [] }] },
+      { name: '引用 id', ruleSets: [{ id: 'upstream-set-a', name: 'x', group: 'g', rules: [], sourceKind: 'local' }] },
+      { name: '引用源地址', ruleSets: [{ id: 'local-1', name: 'y', group: 'g', rules: [], sourceKind: 'url', sourceRef: 'https://example.com/a.list' }] },
+      { name: '无关方案', ruleSets: [{ id: 'local-2', name: 'z', group: 'g', rules: [], sourceKind: 'local' }] },
     ],
   })
   assert.deepEqual(plan.affectedSchemes, ['引用 id', '引用源地址'])
