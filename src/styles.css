@@ -1608,15 +1608,15 @@ dialog.freeze-dialog { width: min(560px, 94vw); }
   object-fit: contain;
   image-rendering: -webkit-optimize-contrast;
 }
-/* macOS 图标（Surge Mac / Clash Verge / ClashMac / Mihomo Party）有透明外圈，填到 tile 里略放大 */
+/* macOS 图标（Surge Mac / Clash Verge / ClashMac / Clash Party）有透明外圈，填到 tile 里略放大 */
 .client-card .ctile:has(img[alt="Surge Mac"]) .cicon,
 .client-card .ctile:has(img[alt="Clash Verge"]) .cicon,
 .client-card .ctile:has(img[alt="ClashMac"]) .cicon,
-.client-card .ctile:has(img[alt="Mihomo Party"]) .cicon,
+.client-card .ctile:has(img[alt="Clash Party"]) .cicon,
 .client-card.active .ctile:has(img[alt="Surge Mac"]) .cicon,
 .client-card.active .ctile:has(img[alt="Clash Verge"]) .cicon,
 .client-card.active .ctile:has(img[alt="ClashMac"]) .cicon,
-.client-card.active .ctile:has(img[alt="Mihomo Party"]) .cicon {
+.client-card.active .ctile:has(img[alt="Clash Party"]) .cicon {
   width: 46px; height: 46px;
 }
 

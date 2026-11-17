@@ -67,7 +67,7 @@
 
 | 载体 | 客户端 |
 | --- | --- |
-| Clash / YAML | Clash Verge、Mihomo Party、FlClash、Clash Mi、Clash、ClashMac、Stash、Karing、Shadowrocket |
+| Clash / YAML | Clash Verge、Clash Party、FlClash、Clash Mi、Clash、ClashMac、Stash、Karing、Shadowrocket |
 | Egern YAML | Egern（2.21+ 支持 ShadowsocksR） |
 | Surge | Surge、Surge Mac（含测试版 VLESS 档位） |
 | Loon / Quantumult X | Loon、Quantumult X |

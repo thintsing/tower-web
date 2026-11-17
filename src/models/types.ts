@@ -763,7 +763,7 @@ export const CLIENTS: ClientInfo[] = [
   },
   {
     target: 'mihomo-party',
-    name: 'Mihomo Party',
+    name: 'Clash Party',
     subtitle: 'Clash / mihomo YAML',
     icon: 'mihomo-party.png', color: '#2F82F7',
     contentMode: 'full', format: 'yaml',

@@ -19,7 +19,7 @@
 | `clash-verge.png` | Clash Verge Rev | Clash Verge Rev contributors；<https://github.com/clash-verge-rev/clash-verge-rev> |
 | `clashmac.png` | ClashMac | ClashMac developers；<https://github.com/666OS/ClashMac> |
 | `flclash.png` | FlClash | FlClash contributors；<https://github.com/chen08209/FlClash> |
-| `mihomo-party.png` | Mihomo Party | Mihomo Party contributors；<https://github.com/mihomo-party-org/mihomo-party> |
+| `mihomo-party.png` | Clash Party（原 Mihomo Party） | Mihomo Party contributors；<https://github.com/mihomo-party-org/mihomo-party> |
 | `sing-box.png` | sing-box | sing-box / SagerNet contributors；<https://github.com/SagerNet/sing-box> |
 | `v2box.jpg` | V2Box | V2Box 权利人；App Store |
 | `clash-apple.png` | Clash | Clash 相应权利人；App Store / 上游发行版 |
