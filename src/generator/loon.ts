@@ -32,6 +32,25 @@ function loonTlsParts(node: ProxyNode, overTls: boolean): string[] {
   return parts
 }
 
+/** Loon 的 Reality 指纹只认这几个 tls-profile；其他 uTLS 名称交给 Loon 默认值。 */
+function loonTLSProfile(node: ProxyNode): string | undefined {
+  switch ((node.fingerprint ?? '').toLowerCase()) {
+    case 'chrome': return 'chrome'
+    case 'safari':
+    case 'ios': return 'safari-ios18'
+    default: return undefined
+  }
+}
+
+function loonRealityParts(node: ProxyNode): string[] {
+  if (!node.realityPublicKey) return []
+  const parts = [`public-key=${loonQuoted(node.realityPublicKey)}`]
+  if (node.realityShortID) parts.push(`short-id=${node.realityShortID}`)
+  const profile = loonTLSProfile(node)
+  if (profile) parts.push(`tls-profile=${profile}`)
+  return parts
+}
+
 function loonTransportParts(node: ProxyNode): string[] {
   const parts: string[] = []
   if (node.transport === 'ws') {
@@ -89,12 +108,15 @@ function loonNode(node: ProxyNode, name: string): string | undefined {
     case 'vless': {
       const parts = [`${n} = VLESS, ${host}, ${node.port}`, loonQuoted(node.uuid ?? '')]
       parts.push(...loonTransportParts(node))
+      if (node.flow) parts.push(`flow=${node.flow}`)
+      parts.push(...loonRealityParts(node))
       parts.push(...loonTlsParts(node, node.tls))
       return parts.join(', ')
     }
     case 'trojan': {
       const parts = [`${n} = Trojan, ${host}, ${node.port}`, loonQuoted(node.password ?? '')]
       parts.push(...loonTransportParts(node))
+      parts.push(...loonRealityParts(node))
       parts.push(...loonTlsParts(node, false))
       if (node.udpRelayEnabled !== undefined) parts.push(`udp=${node.udpRelayEnabled}`)
       return parts.join(', ')

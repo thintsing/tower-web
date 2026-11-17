@@ -40,9 +40,9 @@ const surge = new Set([
 ])
 
 const loon = new Set([
-  'DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD', 'IP-CIDR', 'IP-CIDR6',
-  'GEOIP', 'IP-ASN', 'URL-REGEX', 'USER-AGENT', 'SRC-PORT',
-  'DEST-PORT', 'PROTOCOL',
+  'DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD', 'DOMAIN-WILDCARD',
+  'IP-CIDR', 'IP-CIDR6', 'GEOIP', 'IP-ASN', 'URL-REGEX', 'USER-AGENT',
+  'SRC-PORT', 'DEST-PORT', 'PROTOCOL',
   ...logical, 'RULE-SET', 'FINAL', 'MATCH',
 ])
 
@@ -258,6 +258,25 @@ function normalizeCondition(
  */
 export function normalizeRuleForTarget<T extends RuleLike>(rule: T, target?: ClientTarget): T | undefined {
   if (!target) return rule
+  // Loon 3.5.3 起支持 DOMAIN-WILDCARD。`*.example.com` 还要排除 apex：
+  // 直接写 DOMAIN-WILDCARD 会连 example.com 一起匹配，改用逻辑规则保持语义；
+  // 其他含 * / ? 的 glob 交给 Loon 原生通配。
+  if (target === 'loon' && !rule.raw && rule.type.toUpperCase() === 'DOMAIN-WILDCARD') {
+    const value = (rule.value ?? '').trim()
+    if (!value.includes('*') && !value.includes('?')) {
+      return { ...rule, type: 'DOMAIN', value }
+    }
+    if (value.startsWith('*.') && !/[?*[\]]/.test(value.slice(2))) {
+      const apex = value.slice(2)
+      return {
+        ...rule,
+        type: 'AND',
+        value: undefined,
+        raw: `AND,((DOMAIN-SUFFIX,${apex}),(NOT,(DOMAIN,${apex})))`,
+      }
+    }
+    if (value.includes('[') || value.includes(']')) return undefined
+  }
   if (rule.raw || ['AND', 'OR', 'NOT'].includes(rule.type.toUpperCase())) {
     const parsed = parseRuleCondition(rule.raw ?? `${rule.type},${rule.value ?? ''}`)
     if (!parsed) return undefined

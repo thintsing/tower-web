@@ -91,7 +91,8 @@ export function supportsRuleSetReference(
 }
 
 const LOON_REMOTE_RULE_TYPES = new Set([
-  'DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD', 'IP-CIDR', 'IP-CIDR6',
+  'DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD', 'DOMAIN-WILDCARD',
+  'IP-CIDR', 'IP-CIDR6',
   'GEOIP', 'IP-ASN', 'USER-AGENT', 'URL-REGEX',
 ])
 

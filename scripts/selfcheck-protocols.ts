@@ -716,6 +716,52 @@ function main(): void {
     assert.equal(JSON.parse(shared).endpoints[0].type, 'masque-client')
   })
 
+  check('Loon 通配规则：*. 排除 apex，其余 glob 走 DOMAIN-WILDCARD', () => {
+    const wildcardScheme: RuleScheme = {
+      ...scheme,
+      rules: [
+        { type: 'DOMAIN-WILDCARD', value: '*.wild.example', group: '节点选择' },
+        { type: 'DOMAIN-WILDCARD', value: 'api-*.example.com', group: '节点选择' },
+        { type: 'DOMAIN-WILDCARD', value: 'literal.example', group: '节点选择' },
+        { type: 'DOMAIN-WILDCARD', value: 'bad[ab]*.example', group: '节点选择' },
+        { type: 'FINAL', group: '节点选择' },
+      ],
+    }
+    const result = generateLoon([], wildcardScheme, { target: 'loon' })
+    assert.match(result.text, /AND,\(\(DOMAIN-SUFFIX,wild\.example\),\(NOT,\(DOMAIN,wild\.example\)\)\)/)
+    assert.match(result.text, /DOMAIN-WILDCARD,api-\*\.example\.com/)
+    assert.match(result.text, /DOMAIN,literal\.example/)
+    assert.doesNotMatch(result.text, /bad\[ab\]/)
+  })
+
+  check('Loon VLESS Reality 写出 public-key / short-id / tls-profile', () => {
+    const reality = {
+      id: 'loon-reality',
+      kind: 'vless',
+      name: 'Loon Reality',
+      server: 'reality.example.com',
+      port: 443,
+      uuid: '11111111-1111-4111-8111-111111111111',
+      tls: true,
+      sni: 'www.example.com',
+      realityPublicKey: 'pubkey',
+      realityShortID: 'abcd',
+      fingerprint: 'chrome',
+      flow: 'xtls-rprx-vision',
+      skipCertificateVerification: false,
+    } as ProxyNode
+    const result = generateLoon([reality], scheme, { target: 'loon' })
+    assert.equal(result.skipped, 0)
+    assert.match(result.text, /public-key="pubkey"/)
+    assert.match(result.text, /short-id=abcd/)
+    assert.match(result.text, /tls-profile=chrome/)
+    assert.match(result.text, /flow=xtls-rprx-vision/)
+    assert.match(result.text, /tls-name=www\.example\.com/)
+
+    const safari = generateLoon([{ ...reality, fingerprint: 'safari' }], scheme, { target: 'loon' })
+    assert.match(safari.text, /tls-profile=safari-ios18/)
+  })
+
   if (failures) {
     console.error(`\n${failures} 项检查失败`)
     process.exit(1)
