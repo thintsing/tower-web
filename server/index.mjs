@@ -105,6 +105,14 @@ function lanUrls(port) {
 /** token -> { body, contentType, expiresAt, used } */
 const shares = new Map()
 const SHARE_TTL_MS = 3 * 60 * 1000
+// 临时分享最多保留 16 条；每次创建前清掉已用 / 过期条目，避免无上限吃内存。
+const MAX_SHARES = 16
+
+function pruneShares(now = Date.now()) {
+  for (const [token, share] of shares) {
+    if (share.used || share.expiresAt <= now) shares.delete(token)
+  }
+}
 
 /** token -> { formats, updatedAt, title } */
 const subscriptions = new Map()
@@ -576,9 +584,9 @@ async function archiveWorkspace(snapshot, afterData, source, trigger, restoredFr
     }
     const bodyPath = historyBodyPath(id)
     const metaPath = historyMetaPath(id)
-    await writeFile(`${bodyPath}.tmp`, body, 'utf8')
+    await writeFile(`${bodyPath}.tmp`, body, { encoding: 'utf8', mode: 0o600 })
     await rename(`${bodyPath}.tmp`, bodyPath)
-    await writeFile(`${metaPath}.tmp`, JSON.stringify(meta), 'utf8')
+    await writeFile(`${metaPath}.tmp`, JSON.stringify(meta), { encoding: 'utf8', mode: 0o600 })
     await rename(`${metaPath}.tmp`, metaPath)
     return { id, version: snapshot.version, bytes }
   } catch (error) {
@@ -736,7 +744,7 @@ function persistServerSettings() {
   try {
     mkdirSync(DATA_DIR, { recursive: true })
     const temp = `${SETTINGS_FILE}.tmp`
-    writeFileSync(temp, JSON.stringify(serverSettings), 'utf8')
+    writeFileSync(temp, JSON.stringify(serverSettings), { encoding: 'utf8', mode: 0o600 })
     renameSync(temp, SETTINGS_FILE)
   } catch (error) {
     console.error('[tower] 服务端设置保存失败:', error?.message ?? error)
@@ -773,6 +781,30 @@ function requestHostname(req) {
   }
 }
 
+function isLoopbackHostname(hostname) {
+  return ['127.0.0.1', 'localhost', '::1'].includes(String(hostname).toLowerCase())
+}
+
+/**
+ * 浏览器跨站请求：有 Origin 时要求与 Host 同源；Vite 开发代理的
+ * localhost:5173 → 127.0.0.1:8787 属于同一台机器的回环互通。
+ * 没有 Origin 的请求（订阅客户端、CLI、自检）不在此限制内。
+ */
+function isCrossSiteRequest(req) {
+  const fetchSite = String(req.headers['sec-fetch-site'] ?? '').toLowerCase()
+  if (fetchSite === 'cross-site') return true
+  const origin = String(req.headers.origin ?? '').trim()
+  if (!origin) return false
+  try {
+    const originHost = new URL(origin).hostname.toLowerCase().replace(/^\[|\]$/g, '')
+    const host = requestHostname(req)
+    if (originHost === host) return false
+    return !(isLoopbackHostname(originHost) && isLoopbackHostname(host))
+  } catch {
+    return true
+  }
+}
+
 function isPrivateAddress(address) {
   if (!address) return false
   if (address.startsWith('10.') || address.startsWith('192.168.') || address.startsWith('169.254.')) return true
@@ -789,12 +821,15 @@ function isPrivateAddress(address) {
  * 读取 settings.json 里的密钥。
  */
 function canManageSettings(req, url, action = 'write') {
-  if (isLoopbackRequest(req)) return true
+  // 回环连接还必须配回环 Host，避免 DNS rebinding 用外域 Host 读取密钥。
+  if (isLoopbackRequest(req) && isLoopbackHostname(requestHostname(req))) return true
+  if (isLoopbackRequest(req)) {
+    // 外域 Host + 回环连接：只允许已经带对密钥的请求。
+    return !!serverSettings.apiToken && apiTokenMatches(presentedAPIToken(req, url))
+  }
   if (!isContainerHostLocalRequest(req)) return false
-  // 容器内只能看到「私有地址 + Host: localhost」，局域网客户端可以伪造
-  // Host。没有管理密钥时，不能仅凭 Host 头创建/轮换密钥，否则任何局域网
-  // 用户都能先设置密钥并接管实例。首次密钥请用 TOWER_API_TOKEN 或容器内
-  // 回环请求创建。
+  // 容器宿主机可以读取 / 修改共享开关；创建首个密钥仍必须用 TOWER_API_TOKEN
+  // 或容器内回环请求，避免仅凭伪造 Host 接管实例。
   if (action === 'token' && !serverSettings.apiToken) return false
   return apiTokenMatches(presentedAPIToken(req, url))
 }
@@ -994,7 +1029,7 @@ async function persistSubscriptions() {
         mkdirSync(DATA_DIR, { recursive: true })
         // 先写临时文件再替换，避免进程在写入中途退出时留下半截 JSON。
         const temp = `${SUBS_FILE}.tmp`
-        await writeFile(temp, JSON.stringify(Object.fromEntries(subscriptions)), 'utf8')
+        await writeFile(temp, JSON.stringify(Object.fromEntries(subscriptions)), { encoding: 'utf8', mode: 0o600 })
         await replaceFile(temp, SUBS_FILE)
       } catch (err) {
         console.error('[tower] 订阅落盘失败:', err.message)
@@ -1037,7 +1072,7 @@ function flushSubscriptionsSync() {
   try {
     mkdirSync(DATA_DIR, { recursive: true })
     const temp = `${SUBS_FILE}.tmp`
-    writeFileSync(temp, JSON.stringify(Object.fromEntries(subscriptions)), 'utf8')
+    writeFileSync(temp, JSON.stringify(Object.fromEntries(subscriptions)), { encoding: 'utf8', mode: 0o600 })
     renameSync(temp, SUBS_FILE)
   } catch (err) {
     console.error('[tower] 订阅落盘失败:', err.message)
@@ -1068,7 +1103,7 @@ function workspaceHasData() {
 async function writeWorkspaceFile(next) {
   mkdirSync(DATA_DIR, { recursive: true })
   const temp = `${WORKSPACE_FILE}.tmp`
-  await writeFile(temp, JSON.stringify(next), 'utf8')
+  await writeFile(temp, JSON.stringify(next), { encoding: 'utf8', mode: 0o600 })
   // 覆盖前留一份上一版，误覆盖或恢复备份后还能找回。
   if (existsSync(WORKSPACE_FILE)) {
     try {
@@ -1846,7 +1881,12 @@ async function handleIPCountry(url, res) {
 }
 
 function send(res, status, body, headers = {}) {
-  res.writeHead(status, { 'x-content-type-options': 'nosniff', ...headers })
+  res.writeHead(status, {
+    'x-content-type-options': 'nosniff',
+    'x-frame-options': 'DENY',
+    'referrer-policy': 'no-referrer',
+    ...headers,
+  })
   res.end(body)
 }
 
@@ -2269,8 +2309,22 @@ const server = createServer(async (req, res) => {
     }
     const loopbackRequest = isLoopbackRequest(req)
     const containerHostRequest = isContainerHostLocalRequest(req)
+    const localRequest = loopbackRequest && isLoopbackHostname(requestHostname(req))
+    // DNS rebinding：连接来自回环，但 Host 是外域。不能当作本机信任。
+    const rebindingRequest = loopbackRequest && !localRequest
+    const crossSite = isCrossSiteRequest(req)
+    const sensitiveRead = url.pathname === '/api/settings'
+      || url.pathname === '/api/fetch'
+      || url.pathname === '/api/probe'
+      || url.pathname === '/api/network'
+    const stateChanging = !['GET', 'HEAD', 'OPTIONS'].includes(req.method)
+    if (url.pathname.startsWith('/api/')
+      && crossSite
+      && (stateChanging || sensitiveRead)) {
+      return json(res, 403, { error: '跨站请求被拒绝', code: 'cross_site_request' })
+    }
     // 带正确密钥的请求顺手种下 cookie，让局域网里打开的页面后续 fetch 自动带上密钥。
-    if (!loopbackRequest && serverSettings.apiToken && apiTokenMatches(presentedAPIToken(req, url))) {
+    if (!localRequest && serverSettings.apiToken && apiTokenMatches(presentedAPIToken(req, url))) {
       rememberAPIToken(res)
     }
     if (url.pathname.startsWith('/api/')) {
@@ -2303,12 +2357,21 @@ const server = createServer(async (req, res) => {
       const containerHostRecoveryPath = url.pathname === '/api/settings'
         || url.pathname === '/api/auth-status'
         || url.pathname === '/api/health'
-      if (!loopbackRequest
+      if (!localRequest
         && !serverSettings.lanSharing
         && url.pathname !== '/api/auth-status'
         && url.pathname !== '/api/health'
         && !(containerHostRequest && containerHostRecoveryPath)) {
         return json(res, 403, { error: '局域网共享已关闭', code: 'lan_disabled' })
+      }
+      if (rebindingRequest
+        && !serverSettings.apiToken
+        && url.pathname !== '/api/auth-status'
+        && url.pathname !== '/api/health') {
+        return json(res, 403, {
+          error: '请通过 localhost 访问，或先配置访问密钥',
+          code: 'host_not_allowed',
+        })
       }
       if (workspacePath) {
         if (!SERVER_MODE) {
@@ -2330,7 +2393,7 @@ const server = createServer(async (req, res) => {
         resetAuthFailures(req)
       } else if (serverSettings.apiToken
         && !authExempt
-        && !loopbackRequest
+        && !localRequest
         && !apiTokenMatches(presentedAPIToken(req, url))) {
         // 容器内 Host: localhost 只能用来识别宿主机页面，不能代替管理密钥；
         // 否则局域网客户端伪造 Host 就能读取 settings.json 里的密钥。
@@ -2439,6 +2502,13 @@ const server = createServer(async (req, res) => {
     if (url.pathname === '/api/share' && req.method === 'POST') {
       const body = await readBody(req)
       if (body.length === 0) return json(res, 400, { error: '内容为空' })
+      pruneShares()
+      if (shares.size >= MAX_SHARES) {
+        return json(res, 429, {
+          error: '临时分享数量过多，请稍后再试',
+          code: 'too_many_shares',
+        })
+      }
       const token = randomBytes(12).toString('base64url')
       shares.set(token, {
         body,
@@ -2728,7 +2798,13 @@ const server = createServer(async (req, res) => {
 
     // Static files (production build).
     if (existsSync(distDir)) {
-      let filePath = normalize(join(distDir, decodeURIComponent(url.pathname)))
+      let decodedPath
+      try {
+        decodedPath = decodeURIComponent(url.pathname)
+      } catch {
+        return send(res, 400, 'bad request')
+      }
+      let filePath = normalize(join(distDir, decodedPath))
       // 使用 sep 校验，避免 dist-evil 之类的同前缀兄弟目录被误判为 dist 内部。
       if (filePath !== distDir && !filePath.startsWith(distDir + sep)) {
         return send(res, 403, 'forbidden')

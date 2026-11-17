@@ -11,9 +11,13 @@ Tower Web 是一个本地优先的工具，默认设计用于本机或可信局�
   - `/api/subscribe` 可写入订阅 token；
   - `/api/sub/:token` 可读取已发布配置。
 - 可以在「订阅设置 → 局域网与访问密钥」关闭局域网共享，或生成管理 API 访问密钥。启用后，非本机请求调用管理 API 必须带 `key` / `X-Tower-Key` / Bearer；页面用 `?key=` 打开会种下 HttpOnly cookie。默认本地模式下本机 `127.0.0.1` / `::1` 不需要密钥；服务器模式没有这个豁免，见下节。
+- 浏览器跨站请求会被拒绝：状态变更请求，以及 `/api/settings`、`/api/fetch`、`/api/probe`、`/api/network` 的读取，如果带 `Origin` / `Sec-Fetch-Site` 且与当前 Host 不同源，直接返回 403。没有 Origin 的订阅客户端、CLI 和自检不受影响。
+- 回环连接必须使用 `localhost` / `127.0.0.1` / `::1` 作为 Host 才按本机处理；外域 Host 即使连到 127.0.0.1 也会按非本机处理。未设置密钥时，这类请求除 `/api/health`、`/api/auth-status` 外直接 403；设置密钥后按非本机请求要求密钥，防 DNS rebinding 读取工作区或代理内网。反向代理部署请保留 Host 并配置访问密钥。
+- 所有响应带 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY` 和 `Referrer-Policy: no-referrer`，避免 `?key=` 通过 Referer 泄漏或被第三方页面嵌套。
 - Docker 下宿主机页面通常以私有地址 + `Host: localhost` 出现，服务端据此识别宿主机。启用密钥后，这类请求同样必须带正确密钥，伪造 Host 不能读取 `settings.json` 或管理密钥；没有密钥时也不能仅凭伪造 Host 创建首个密钥，首次密钥请用 `TOWER_API_TOKEN` 或在容器内对回环地址调用 `/api/settings/token`。关闭共享时该识别只保留 `/api/settings`、`/api/auth-status`、`/api/health` 以便宿主机恢复设置，订阅、规则集和代理端点仍拒绝；但它不能替代网络隔离。
 - 免管理密钥但仍受局域网共享开关约束的端点：`/api/health`、`/api/auth-status`、`/api/ruleset`，以及 GET `/api/sub/:token`、GET `/api/s/:token`。订阅 / 分享 token 和托管规则集地址本身是独立凭证，拿到即可读取对应内容。
 - `/api/ruleset?url=` 只接受 http/https，并拒绝链路本地（`169.254.0.0/16`、`fd00:ec2::254`、`100.100.100.200`）与云元数据主机名；私有网段仍然允许，供自建 NAS 规则集使用。DNS rebinding 不在防护范围内。
+- `/api/share` 的一次性导入链接最多保留 16 条，创建新链接前会清理已使用 / 过期条目；超过上限返回 429。持久订阅仍会按发布次数累积，长期使用请定期清理不再使用的订阅地址。
 - 密钥只保护管理 API，不是公网级身份认证；公开部署前至少需要：反向代理 + 身份验证、网络访问控制、限流、审计日志，以及为订阅管理增加用户隔离。
 - 不需要局域网访问时，用 `HOST=127.0.0.1` 启动，或在设置页关闭局域网共享。
 

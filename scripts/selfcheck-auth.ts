@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
-import { createServer } from 'node:http'
+import { createServer, request } from 'node:http'
 import { networkInterfaces, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AddressInfo } from 'node:net'
@@ -40,6 +40,24 @@ async function waitFor(url: string, timeoutMs = 8000): Promise<boolean> {
     await new Promise((resolve) => setTimeout(resolve, 120))
   }
   return false
+}
+
+/** 模拟 DNS rebinding：连接 127.0.0.1，但 Host 是外域。 */
+function rawRequest(pathname: string, headers: Record<string, string>): Promise<{ status: number }> {
+  return new Promise((resolve, reject) => {
+    const req = request({
+      hostname: '127.0.0.1',
+      port: PORT,
+      path: pathname,
+      method: 'GET',
+      headers,
+    }, (res) => {
+      res.resume()
+      res.on('end', () => resolve({ status: res.statusCode ?? 0 }))
+    })
+    req.on('error', reject)
+    req.end()
+  })
 }
 
 let failures = 0
@@ -96,6 +114,33 @@ async function main(): Promise<void> {
       assert.match(token, /^[A-Za-z0-9_-]{32}$/)
       const saved = JSON.parse(readFileSync(join(dataDir, 'settings.json'), 'utf8'))
       assert.equal(saved.apiToken, token)
+    })
+
+    await check('跨站请求与 DNS rebinding 的 Host 被拒绝', async () => {
+      const crossShare = await fetch(`${LOCAL}/api/share`, {
+        method: 'POST',
+        headers: { 'content-type': 'text/plain', origin: 'https://evil.example' },
+        body: 'x',
+      })
+      assert.equal(crossShare.status, 403)
+      const crossSettings = await fetch(`${LOCAL}/api/settings`, {
+        headers: { origin: 'https://evil.example' },
+      })
+      assert.equal(crossSettings.status, 403)
+      const crossFetch = await fetch(
+        `${LOCAL}/api/fetch?url=${encodeURIComponent('http://127.0.0.1:1/')}`,
+        { headers: { origin: 'https://evil.example' } },
+      )
+      assert.equal(crossFetch.status, 403)
+      const rebinding = await rawRequest('/api/settings', { host: `evil.example:${PORT}` })
+      assert.ok([401, 403].includes(rebinding.status), `rebinding status ${rebinding.status}`)
+      // 同源浏览器请求仍可用；Vite 开发代理的 localhost ↔ 127.0.0.1 也放行。
+      const sameOrigin = await fetch(`${LOCAL}/api/share`, {
+        method: 'POST',
+        headers: { 'content-type': 'text/plain', origin: LOCAL },
+        body: 'x',
+      })
+      assert.equal(sameOrigin.status, 200)
     })
 
     await check('/api/fetch 超过 32MB 上限时拒绝且不拖垮服务', async () => {
