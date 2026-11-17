@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict'
 import { CLIENTS, type RuleScheme } from '../src/models/types'
 import { generateRuleFile } from '../src/generator/ruleFiles'
+import { refreshRuleSetReferencesWith } from '../src/rules/importers'
 import { analyzeRuleCompatibility } from '../src/generator/compatibility'
 import { targetRuleTypes } from '../src/rules/capabilities'
 
@@ -11,6 +12,17 @@ let failures = 0
 function check(label: string, run: () => void): void {
   try {
     run()
+    console.log(`✓ ${label}`)
+  } catch (error) {
+    failures += 1
+    console.error(`✗ ${label}`)
+    console.error(`  ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+async function checkAsync(label: string, run: () => Promise<void>): Promise<void> {
+  try {
+    await run()
     console.log(`✓ ${label}`)
   } catch (error) {
     failures += 1
@@ -139,6 +151,29 @@ check('按客户端诊断列出规则白名单与跳过类型', () => {
   const nodeReport = analyzeRuleCompatibility(v2box!, scheme, { contentMode: 'nodes' })
   assert.equal(nodeReport.nodeOnly, true)
   assert.equal(nodeReport.skipped, 0)
+})
+
+await checkAsync('已导入方案缺少 behavior 时按内容重新探测', async () => {
+  const imported: RuleScheme = {
+    ...scheme,
+    rules: [{
+      type: 'RULE-SET',
+      value: 'https://example.com/ai.list',
+      group: '节点选择',
+      ruleSetFormat: 'classical',
+    }],
+  }
+  const result = await refreshRuleSetReferencesWith(imported, async () =>
+    'payload:\n  - "+.openai.com"\n')
+  assert.equal(result.changed, 1)
+  assert.equal(result.scheme.rules[0].ruleSetFormat, 'yaml')
+  assert.equal(result.scheme.rules[0].ruleSetBehavior, 'domain')
+
+  const unchanged = await refreshRuleSetReferencesWith({
+    ...imported,
+    rules: [{ ...imported.rules[0], ruleSetFormat: 'yaml', ruleSetBehavior: 'domain' }],
+  }, async () => '')
+  assert.equal(unchanged.changed, 0)
 })
 
 console.log(failures === 0 ? '\n全部规则文件自检通过' : `\n${failures} 项规则文件自检失败`)

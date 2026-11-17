@@ -656,6 +656,36 @@ async function loadRuleSetReference(url: string): Promise<string> {
   return response.ok ? await response.text() : ''
 }
 
+export interface RuleSetRefreshResult {
+  scheme: RuleScheme
+  changed: number
+}
+
+/** 对已导入的方案重新探测缺失 behavior 的规则集引用。 */
+export async function refreshRuleSetReferencesWith(
+  scheme: RuleScheme,
+  load: (url: string) => Promise<string>,
+): Promise<RuleSetRefreshResult> {
+  const rules = await enrichRuleSetReferences(scheme.rules, load)
+  let changed = 0
+  for (let index = 0; index < rules.length; index += 1) {
+    const before = scheme.rules[index]
+    const after = rules[index]
+    if (before?.ruleSetFormat !== after.ruleSetFormat
+      || before?.ruleSetBehavior !== after.ruleSetBehavior) {
+      changed += 1
+    }
+  }
+  return {
+    scheme: changed ? { ...scheme, rules, updatedAt: Date.now() } : scheme,
+    changed,
+  }
+}
+
+export function refreshRuleSetReferences(scheme: RuleScheme): Promise<RuleSetRefreshResult> {
+  return refreshRuleSetReferencesWith(scheme, loadRuleSetReference)
+}
+
 // ---------------- Surge ----------------
 
 function surgeSections(textBody: string): Map<string, string[]> {

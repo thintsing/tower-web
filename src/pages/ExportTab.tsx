@@ -23,6 +23,7 @@ import { formatSupportsProxyCollections, prepareSchemeForExport } from '../gener
 import { analyzeRuleCompatibility } from '../generator/compatibility'
 import { describeSubscriptionFormatFailures, generateConfig, generateSubscriptionFormatsDetailed, SUBSCRIPTION_FORMAT_TITLES } from '../generator'
 import { generateRuleFile, type RuleFileFormat } from '../generator/ruleFiles'
+import { refreshRuleSetReferences } from '../rules/importers'
 import { anywhereAjsonCount, anywhereAjsonDocument } from '../generator/anywhere'
 import { surgeBetaNodeCount } from '../generator/surgeCapabilities'
 import { maskTailnetAuthKeys, tailnetSupports } from '../generator/tailnet'
@@ -201,6 +202,8 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   // 服务器模式的订阅地址由服务端固定；本地模式仍跟随当前访问地址。
   const serverMode = workspaceStatus.mode === 'server'
   const scheme = useScheme()
+  const customSchemes = useStore((s) => s.customSchemes)
+  const addCustomScheme = useStore((s) => s.addCustomScheme)
   const policySelections = useStore((s) => s.policySelections)
   const preferRuleSets = useStore((s) => s.preferRuleSets)
   const setPreferRuleSets = useStore((s) => s.setPreferRuleSets)
@@ -304,6 +307,7 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const [checking, setChecking] = useState(false)
   const [checkResult, setCheckResult] = useState<{ ok: boolean; text: string } | null>(null)
   const [ruleFileNotice, setRuleFileNotice] = useState<{ ok: boolean; text: string } | null>(null)
+  const [detectingRuleSets, setDetectingRuleSets] = useState(false)
   const [variantPreview, setVariantPreview] = useState<VariantPreview | null>(null)
   const [checkingAll, setCheckingAll] = useState(false)
   const [linkCheckRows, setLinkCheckRows] = useState<LinkCheckRow[] | null>(null)
@@ -674,6 +678,35 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       ok: true,
       text: `已导出 ${result.ruleCount} 条规则${result.skipped ? `，跳过 ${result.skipped} 条` : ''}${result.referencedRuleSets ? `，保留 ${result.referencedRuleSets} 个规则集引用` : ''}。`,
     })
+  }
+
+  /** 对已导入方案重新探测缺失 behavior 的规则集引用。 */
+  const refreshRuleSetTypes = async () => {
+    if (!scheme) {
+      setRuleFileNotice({ ok: false, text: '规则方案还没加载完成，稍后再试' })
+      return
+    }
+    if (!customSchemes.some((item) => item.id === scheme.id)) {
+      setRuleFileNotice({ ok: false, text: '内置方案没有需要重新探测的 provider 引用。' })
+      return
+    }
+    setDetectingRuleSets(true)
+    try {
+      const result = await refreshRuleSetReferences(scheme)
+      if (result.changed === 0) {
+        setRuleFileNotice({ ok: true, text: '规则集类型没有变化，无需修正。' })
+        return
+      }
+      addCustomScheme(result.scheme)
+      setRuleFileNotice({ ok: true, text: `已按实际内容修正 ${result.changed} 条规则集引用。` })
+    } catch (error) {
+      setRuleFileNotice({
+        ok: false,
+        text: `探测失败：${error instanceof Error ? error.message : String(error)}`,
+      })
+    } finally {
+      setDetectingRuleSets(false)
+    }
   }
 
   const copyNow = async () => {
@@ -1851,6 +1884,9 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           <button className="btn ghost" onClick={() => downloadRuleFile('list')}>导出规则 .list</button>
           <button className="btn ghost" onClick={() => downloadRuleFile('yaml')}>导出规则 .yaml</button>
           <button className="btn ghost" onClick={() => downloadRuleFile('json')}>导出规则 .json</button>
+          <button className="btn ghost" disabled={detectingRuleSets || !scheme} onClick={() => void refreshRuleSetTypes()}>
+            {detectingRuleSets ? '探测中…' : '重新探测规则集类型'}
+          </button>
         </div>
         {ruleFileNotice && (
           <div className={ruleFileNotice.ok ? 'hint' : 'error'} style={{ marginTop: 8 }} role="status">
@@ -1860,6 +1896,7 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         <div className="hint" style={{ marginTop: 8 }}>
           独立规则文件只含规则行，不含客户端配置、策略列和 FINAL；按 {target.name} 的规则能力过滤。
           .yaml 为 Clash classical provider 的 payload 写法，无法展开的远程规则集会跳过并计入提示。
+          已导入方案缺少 behavior 时可用「重新探测规则集类型」，会请求原始规则集内容并按实际格式补全。
         </div>
       </div>
 
