@@ -4,7 +4,7 @@ import type { ClientTarget, ProxyNode, RoutingRule, RuleScheme, RuleSchemeNetwor
 import { yaml, yamlMultiline } from './naming'
 import { compileRuleLine, resolveGroups, uniqueDisplayNames, type OutputOptions, type ResolvedGroup } from './groups'
 import { effectiveGroupType, filterRulesForTarget } from '../rules/capabilities'
-import { nodeSupportedForTarget } from './nodeCapabilities'
+import { mihomoTarget, nodeSupportedForTarget } from './nodeCapabilities'
 import { clashInlinePayload, inlineSetReference } from '../rules/inlineSets'
 import { ruleSetFormatOfRule, supportsRuleSetReference } from '../rules/remoteFormats'
 import {
@@ -88,6 +88,10 @@ function clashDNSSection(
   dnsGroup?: string,
 ): string[] {
   const lines = ['dns:', '  enable: true']
+  // mihomo 的 dns.ipv6 默认 false；只有明确开启时才写，和顶层 ipv6 保持一致。
+  if ((target === undefined || mihomoTarget(target)) && (network.ipv6Enabled ?? true)) {
+    lines.push('  ipv6: true')
+  }
   if (network.dnsProtectionMode !== 'follow-scheme') {
     lines.push(
       '  enhanced-mode: fake-ip',
@@ -585,8 +589,14 @@ export function generateClashYAML(
       }
       if (kind === 'load-balance') {
         const strategy = group.algorithm?.trim().toLowerCase()
-        if (strategy && ['random', 'round-robin', 'consistent-hashing'].includes(strategy)) {
+        if (strategy && ['random', 'round-robin', 'consistent-hashing', 'sticky-sessions'].includes(strategy)) {
           out.push(`    strategy: ${yaml(strategy)}`)
+          // hash-key 只在哈希策略下有效；round-robin 带它会让 mihomo 拒绝加载。
+          const hashKey = group.hashKey?.trim()
+          if (hashKey && ['consistent-hashing', 'sticky-sessions'].includes(strategy)
+            && (options.target === undefined || mihomoTarget(options.target))) {
+            out.push(`    hash-key: ${yaml(hashKey)}`)
+          }
         }
       }
       const inlineMembers = members.filter((member) => !remoteNameToSource.has(member))

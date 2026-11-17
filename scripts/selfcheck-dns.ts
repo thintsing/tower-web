@@ -80,7 +80,16 @@ function main(): void {
     assert.equal(config.dns.nameserver.length, 1)
     assert.ok(config.dns['direct-nameserver'])
     assert.equal(config.dns.fallback, undefined)
+    assert.equal(config.dns.ipv6, true)
     assert.equal(groupNamed(config, 'DNS 自动选择'), undefined)
+  })
+
+  check('Clash 关闭 IPv6 时不写 dns.ipv6', () => {
+    const source = scheme(true, 'standard')
+    source.networkSettings = { ...NETWORK_STANDARD, ipv6Enabled: false }
+    const config = clash('clash-verge', source)
+    assert.equal(config.dns.ipv6, undefined)
+    assert.equal(config.ipv6, false)
   })
 
   check('Clash 没有纯节点组时补隐藏的 DNS 自动选择组', () => {

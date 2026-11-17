@@ -437,6 +437,8 @@ export interface PolicyGroup {
   tolerance?: number
   /** 负载均衡算法（random / hash / round-robin / consistent-hashing …）。 */
   algorithm?: string
+  /** mihomo load-balance 的哈希 key（如 `in-user`），随方案导入导出原样保留。 */
+  hashKey?: string
   /** 导入方案保留的客户端专属组参数（conditional rules、priorities 等）。 */
   parameters?: Record<string, string>
   /** 生成配置时由界面选择注入的首选成员（组名、DIRECT/REJECT 或节点名）。 */

@@ -372,6 +372,7 @@ function clashGroup(raw: unknown): PolicyGroup | undefined {
   group.interval = duration(item.interval ?? item['check-interval'], 'seconds')
   group.tolerance = duration(item.tolerance, 'milliseconds')
   group.algorithm = text(item.strategy) || text(item.algorithm) || undefined
+  group.hashKey = text(item['hash-key']) || undefined
   const rules = array(item.rules).map(scalar).filter(Boolean)
   if (rules.length) group.parameters = { rules: JSON.stringify(rules) }
   return group

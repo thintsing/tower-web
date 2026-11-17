@@ -5,6 +5,7 @@ import { detectRuleSchemeFormat, enrichRuleSetReferences, parseRuleSchemeText } 
 import { parsePlainRulesetText, subconverterRulesetReference } from '../src/rules/scheme'
 import { parseRuleSetContent } from '../src/rules/ruleSets'
 import { validateSchemePolicy } from '../src/rules/policyValidation'
+import { generateClashYAML } from '../src/generator/clashYaml'
 import type { PolicyGroup, RuleScheme } from '../src/models/types'
 
 let failures = 0
@@ -68,6 +69,13 @@ proxy-groups:
   - name: 负载
     type: load-balance
     strategy: round-robin
+    url: http://probe.example/204
+    interval: 60
+    proxies: [节点A]
+  - name: 哈希负载
+    type: load-balance
+    strategy: consistent-hashing
+    hash-key: in-user
     url: http://probe.example/204
     interval: 60
     proxies: [节点A]
@@ -245,6 +253,12 @@ async function main(): Promise<void> {
     assert.equal(group(clash, '负载').type, 'load-balance')
     assert.equal(group(clash, '负载').algorithm, 'round-robin')
     assert.equal(group(clash, '负载').interval, 60)
+    assert.equal(group(clash, '哈希负载').algorithm, 'consistent-hashing')
+    assert.equal(group(clash, '哈希负载').hashKey, 'in-user')
+    const exported = generateClashYAML([], clash, { target: 'clash-verge' })
+    assert.match(exported, /strategy: "?consistent-hashing"?/)
+    assert.match(exported, /hash-key: "?in-user"?/)
+    assert.doesNotMatch(exported, /strategy: "?round-robin"?\n\s+hash-key/)
   })
   check('Clash: 规则策略列与 no-resolve', () => {
     assert.equal(clash.rules.length, 5)
