@@ -56,7 +56,7 @@
 - **规则集**：内置 ACL4SSR 快照与 871 个在线列表；支持本地 / 在线规则集、刷新、暂停、跨客户端引用或展开。开启「优先引用规则集」后，经典列表会自动压成 mihomo / Stash 的 MRS 与 sing-box / Hiddify 的 SRS 二进制规则集，表达不了的类型保持逐条内联；sing-box DNS 投影会额外引用同一列表的 domain-only SRS。sing-box / Hiddify 的 `GEOIP` 会写成塔台托管的国家 CIDR 规则集（服务端从随包离线国家表生成 SRS），`IP-ASN` 同理从离线 ASN 表展开成 CIDR 规则集，`LAN` / `PRIVATE` 使用内核内置的私有地址字段；离线表里没有的代码返回零规则 SRS，客户端仍能正常下载，只是这条规则永不命中，不会反复报下载失败。
 - **固化与屏蔽**：内置 ACL4SSR 方案可「更新并固化」到上游同一 commit 的 INI 与全部列表（任一列表失败整次放弃，原厂快照始终保留）；固化历史保留原厂 + 最近 2 版，可在方案页「回退至此版」，只改本机与同步工作区，不会回滚已导出的客户端配置。固化后的内置方案在规则页显示为「只读」规则集，可按条目「屏蔽 / 解除屏蔽」并「撤销上次屏蔽 / 解除」；被屏蔽条目标记为「已屏蔽 N 条 · 仅编译期生效」，刷新或回退快照后屏蔽仍生效。
 - **DNS 与 ECS**：普通 / 国内 / 远程 DNS，跟随方案 / 标准保护 / 严格保护；mihomo 和 sing-box 使用纯节点解析组、DNS 投影与中国子网（ECS）。GEOIP / Surge IP 规则会补 `no-resolve`，仅在 DNS 已走代理时释放末尾 GEOIP 的该选项。
-- **导出与分享**：一次生成 7 种载体，按客户端设置完整配置 / 仅节点、地区 / 协议筛选、排序和命名；支持代理集合、Tailscale 内网、二维码和 `clash://` / `surge://` 一键导入。Surge 测试版按构建号分档返回 VLESS / VLESS Encryption / HTTPUpgrade；Anywhere 声明 `X-Anywhere-Format: ajson/1` 时会拿到保留跳过证书校验节点的 AJSON。发布后的订阅链接还提供 `content=nodes` 仅节点地址，不重新发布也能给客户端单独下发节点；「所有客户端链接」可一次复制 18 个客户端的完整配置 / 仅节点地址。
+- **导出与分享**：一次生成 7 种载体，按客户端设置完整配置 / 仅节点、地区 / 协议筛选、排序和命名；支持代理集合、Tailscale 内网、二维码和 `clash://` / `surge://` 一键导入。Surge 测试版按构建号分档返回 VLESS / VLESS Encryption / HTTPUpgrade；Anywhere 声明 `X-Anywhere-Format: ajson/1` 时会拿到保留跳过证书校验节点的 AJSON。发布后的订阅链接还提供 `content=nodes` 仅节点地址，不重新发布也能给客户端单独下发节点；「所有客户端链接」可一次复制 18 个客户端的完整配置 / 仅节点地址。当前方案的规则也能在导出页单独导出为 `.list` / `.yaml` / `.json` 文件。
 - **局域网与访问密钥**：可关闭局域网访问；也可生成管理 API 密钥，局域网页面用 `?key=` 打开一次后自动记住。订阅、一次性分享和托管规则集仍是独立凭证。
 - **服务器版（可选）**：`TOWER_MODE=server` 时订阅源、节点、规则方案 / 规则集、当前方案选择和 Tailscale（含 Auth Key）保存在服务端 `workspace.json`，任何设备打开都是同一份工作区；服务端离线时只读，多设备并发按版本号检测并提示重新载入。
 - **备份**：导出 / 恢复本机 JSON；覆盖恢复前自动保存，本机保留最近 3 份版本；支持一键重置所有本机配置。
@@ -291,6 +291,7 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 | `npm run selfcheck:importers` | 校验规则方案导入与规则集类型的内容推断 |
 | `npm run selfcheck:demo` | 校验示例工作区隔离：演示命名空间、真实工作区不被清除、发布操作被禁用 |
 | `npm run selfcheck:surge-anywhere` | 校验 Surge 测试版分档、Anywhere AJSON 与 content=nodes 仅节点链接 |
+| `npm run selfcheck:rule-files` | 校验独立规则文件 .list / .yaml / .json 与跳过计数 |
 | `npm run selfcheck:protocols` | 校验协议解析与降级 |
 | `npm run selfcheck:provider-rulesets` | 校验 Loyalsoldier provider 方案、托管转换与本地模式导出 |
 | `npm run selfcheck:workspace` | 校验服务器版工作区接口、版本号、密钥与并发写 |
@@ -298,7 +299,7 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 | `npm run selfcheck:upstream-status` | 校验服务端上游定时检查、失败退避与工作区隔离 |
 
 <details>
-<summary>全部 45 项自检</summary>
+<summary>全部 46 项自检</summary>
 
 ```text
 selfcheck:asn         离线 IP / ASN 查询
@@ -331,6 +332,7 @@ selfcheck:remote      代理集合与远程规则集
 selfcheck:ruleset-exclusions 规则集屏蔽记录：孤儿清理与移除影响
 selfcheck:rulesets    规则集方言转换
 selfcheck:rule-impact 自定义规则保存前的影响面
+selfcheck:rule-files  独立规则文件 .list / .yaml / .json
 selfcheck:rule-order  规则逐条排序与撤销
 selfcheck:sub-formats 订阅载体格式：单载体失败不留空
 selfcheck:sub-token   固定订阅 token / 地址规范 / 重置语义
@@ -348,7 +350,7 @@ selfcheck:workspace-overwrite 覆盖恢复不丢未保存改动
 selfcheck:yaml        Clash YAML 结构
 ```
 
-自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建、运行 ESLint 并执行全部 45 项自检；`package.json` 与 `.github/workflows/ci.yml` 的清单逐条对齐。`selfcheck:kernels` 会下载固定版本的 sing-box / mihomo 真实校验生成产物（Linux 上自动取二进制；其他平台用 `SING_BOX_BIN` / `MIHOMO_BIN` 指定，否则跳过；GitHub Actions 下两个内核缺一即失败）。
+自检只使用虚构示例数据。GitHub Actions 会在 Node 22 上构建、运行 ESLint 并执行全部 46 项自检；`package.json` 与 `.github/workflows/ci.yml` 的清单逐条对齐。`selfcheck:kernels` 会下载固定版本的 sing-box / mihomo 真实校验生成产物（Linux 上自动取二进制；其他平台用 `SING_BOX_BIN` / `MIHOMO_BIN` 指定，否则跳过；GitHub Actions 下两个内核缺一即失败）。
 
 </details>
 

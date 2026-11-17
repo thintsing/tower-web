@@ -22,6 +22,7 @@ import { resolveHostedBaseURL } from '../rules/remoteFormats'
 import { formatSupportsProxyCollections, prepareSchemeForExport } from '../generator/groups'
 import { analyzeRuleCompatibility } from '../generator/compatibility'
 import { describeSubscriptionFormatFailures, generateConfig, generateSubscriptionFormatsDetailed } from '../generator'
+import { generateRuleFile, type RuleFileFormat } from '../generator/ruleFiles'
 import { anywhereAjsonCount, anywhereAjsonDocument } from '../generator/anywhere'
 import { surgeBetaNodeCount } from '../generator/surgeCapabilities'
 import { maskTailnetAuthKeys, tailnetSupports } from '../generator/tailnet'
@@ -200,6 +201,7 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   })
   const [checking, setChecking] = useState(false)
   const [checkResult, setCheckResult] = useState<{ ok: boolean; text: string } | null>(null)
+  const [ruleFileNotice, setRuleFileNotice] = useState<{ ok: boolean; text: string } | null>(null)
   /** 撤销链接失败时保留 token 与地址，显示原因并提供重试。 */
   const [revokeError, setRevokeError] = useState('')
   const [copiedField, setCopiedField] = useState<'sub' | 'nodes' | 'import' | 'lan' | null>(null)
@@ -538,6 +540,36 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   }
 
   const download = () => guardExport(downloadNow)
+
+  /** 独立规则文件只含规则行，不含客户端配置、策略列与 FINAL。 */
+  const downloadRuleFile = (format: RuleFileFormat) => {
+    if (!scheme) {
+      setRuleFileNotice({ ok: false, text: '规则方案还没加载完成，稍后再试' })
+      return
+    }
+    const result = generateRuleFile(scheme, {
+      target: target.target,
+      format,
+      name: configName,
+      ruleSetExclusions,
+    })
+    if (result.ruleCount === 0) {
+      setRuleFileNotice({ ok: false, text: '当前方案没有可导出的规则。' })
+      return
+    }
+    const blob = new Blob([result.text], { type: result.mime })
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = `${fileStem}-rules.${result.extension}`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    window.setTimeout(() => URL.revokeObjectURL(a.href), 1000)
+    setRuleFileNotice({
+      ok: true,
+      text: `已导出 ${result.ruleCount} 条规则${result.skipped ? `，跳过 ${result.skipped} 条` : ''}${result.referencedRuleSets ? `，保留 ${result.referencedRuleSets} 个规则集引用` : ''}。`,
+    })
+  }
 
   const copyNow = async () => {
     if (!hasExportable) {
@@ -1548,6 +1580,20 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         ) : (
           <div className="hint rule-export-note">规则方案加载中，稍后显示兼容性。</div>
         )}
+        <div className="row" style={{ gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
+          <button className="btn ghost" onClick={() => downloadRuleFile('list')}>导出规则 .list</button>
+          <button className="btn ghost" onClick={() => downloadRuleFile('yaml')}>导出规则 .yaml</button>
+          <button className="btn ghost" onClick={() => downloadRuleFile('json')}>导出规则 .json</button>
+        </div>
+        {ruleFileNotice && (
+          <div className={ruleFileNotice.ok ? 'hint' : 'error'} style={{ marginTop: 8 }} role="status">
+            {ruleFileNotice.text}
+          </div>
+        )}
+        <div className="hint" style={{ marginTop: 8 }}>
+          独立规则文件只含规则行，不含客户端配置、策略列和 FINAL；按 {target.name} 的规则能力过滤。
+          .yaml 为 Clash classical provider 的 payload 写法，无法展开的远程规则集会跳过并计入提示。
+        </div>
       </div>
 
       <div className="card">
