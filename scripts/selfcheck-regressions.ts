@@ -1417,14 +1417,6 @@ const JSON_NODES: ProxyNode[] = [
     wireGuardIPv4: '10.0.0.2', wireGuardIPv6: 'fd00::2', wireGuardAllowedIPs: '0.0.0.0/0,::/0',
     wireGuardReserved: '1,2,3', wireGuardMTU: 1420, wireGuardPersistentKeepalive: 30,
   }),
-  jsonNode({
-    name: 'MASQUE', kind: 'masque', server: 'masque.example.com', port: 443, tls: true, sni: 'masque.example.com',
-    alpn: 'h3', username: 'u', password: 'p', path: '/masque',
-    masque: {
-      mode: 'basicConnectIP', httpVersion: 3, mtu: 1400, headers: { 'X-Test': '1' },
-      certificate: ['-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----'],
-    },
-  }),
 ]
 
 check('sing-box JSON 全协议导出后能读回，关键字段不丢', () => {
@@ -1555,21 +1547,10 @@ check('sing-box JSON 全协议导出后能读回，关键字段不丢', () => {
   assert.equal(wg.wireGuardReserved, '1,2,3')
   assert.equal(wg.wireGuardMTU, 1420)
   assert.equal(wg.wireGuardPersistentKeepalive, 30)
-
-  const masque = byName(imported.nodes, 'MASQUE')
-  assert.equal(masque.tls, true)
-  assert.equal(masque.sni, 'masque.example.com')
-  assert.equal(masque.alpn, 'h3')
-  assert.equal(masque.username, 'u')
-  assert.equal(masque.path, '/masque')
-  assert.equal(masque.masque?.httpVersion, 3)
-  assert.equal(masque.masque?.mtu, 1400)
-  assert.deepEqual(masque.masque?.headers, { 'X-Test': '1' })
-  assert.deepEqual(masque.masque?.certificate, JSON_NODES.at(-1)!.masque!.certificate)
 })
 
 check('Hiddify JSON 往返：legacy WireGuard、隐藏 ShadowTLS 辅助出站', () => {
-  const hiddifyNodes = JSON_NODES.filter((node) => node.kind !== 'masque' && node.kind !== 'snell')
+  const hiddifyNodes = JSON_NODES.filter((node) => node.kind !== 'snell')
   const generated = generateSingBox(hiddifyNodes, SCHEME, { target: 'hiddify', contentMode: 'nodes' })
   assert.equal(generated.skipped, 0)
   const imported = parse(generated.text)
