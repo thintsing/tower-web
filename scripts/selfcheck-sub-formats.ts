@@ -1,7 +1,8 @@
 // 自检：发布前对比目标载体集合，单个载体生成失败必须留下原因，不能静默留空。
 // 用法：npm run selfcheck:sub-formats
 import assert from 'node:assert/strict'
-import type { ProxyNode, RuleScheme } from '../src/models/types'
+import { CLIENTS, type ProxyNode, type RuleScheme } from '../src/models/types'
+import { clientSubscriptionLink } from '../src/util/subscriptionLinks'
 import {
   SUBSCRIPTION_FORMAT_ORDER,
   describeSubscriptionFormatFailures,
@@ -84,6 +85,35 @@ check('只缺一个载体时其余载体仍然完整保留', () => {
       assert.ok(missingOnlyBase64.formats[format].length > 0, `${format} 未失败却为空`)
     }
   }
+})
+
+check('客户端链接补 format / target / content，服务器模式不改写 host', () => {
+  const base = 'http://127.0.0.1:8787/api/sub/token?name=tower'
+  const clash = CLIENTS.find((client) => client.target === 'clash-verge')
+  const surge = CLIENTS.find((client) => client.target === 'surge')
+  assert.ok(clash && surge)
+
+  const local = new URL(clientSubscriptionLink(base, clash!, {
+    serverMode: false,
+    origin: 'http://192.168.1.9:8787',
+  }))
+  assert.equal(local.host, '192.168.1.9:8787')
+  assert.equal(local.searchParams.get('format'), 'yaml')
+  assert.equal(local.searchParams.get('target'), 'clash-verge')
+  assert.equal(local.searchParams.get('name'), 'tower')
+
+  const nodes = new URL(clientSubscriptionLink(base, surge!, {
+    serverMode: true,
+    origin: 'http://10.0.0.2:8787',
+    nodesOnly: true,
+  }))
+  assert.equal(nodes.host, '127.0.0.1:8787')
+  assert.equal(nodes.searchParams.get('format'), 'surge')
+  assert.equal(nodes.searchParams.get('target'), 'surge')
+  assert.equal(nodes.searchParams.get('content'), 'nodes')
+
+  assert.equal(clientSubscriptionLink('', clash!, { serverMode: false, origin: 'http://x' }), '')
+  assert.equal(clientSubscriptionLink('http://[bad', clash!, { serverMode: false, origin: 'http://x' }), '')
 })
 
 if (failures > 0) {

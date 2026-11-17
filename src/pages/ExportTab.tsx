@@ -1,5 +1,5 @@
 // 导出页：客户端目标、内容模式、发布订阅与二维码。
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   CLIENTS,
   PROXY_KIND_TITLES,
@@ -27,6 +27,7 @@ import { surgeBetaNodeCount } from '../generator/surgeCapabilities'
 import { maskTailnetAuthKeys, tailnetSupports } from '../generator/tailnet'
 import { tailnetPolicyName } from '../models/tailnet'
 import { clientsInOrder, configFileStem, effectiveContentMode, filterNodesByName } from '../util/exportSelection'
+import { clientSubscriptionLink } from '../util/subscriptionLinks'
 import { lintScheme, lintSummary } from '../rules/schemeLint'
 import { filterNodesByRegionCodes, regionForNode } from '../models/region'
 import { apiFetch } from '../util/apiAuth'
@@ -202,6 +203,7 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   /** 撤销链接失败时保留 token 与地址，显示原因并提供重试。 */
   const [revokeError, setRevokeError] = useState('')
   const [copiedField, setCopiedField] = useState<'sub' | 'nodes' | 'import' | 'lan' | null>(null)
+  const [copiedClientLink, setCopiedClientLink] = useState<string | null>(null)
   const [importNotice, setImportNotice] = useState('')
 
   useEffect(() => {
@@ -244,6 +246,16 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     }
     setCopiedField(field)
     window.setTimeout(() => setCopiedField((v) => (v === field ? null : v)), 1600)
+  }
+
+  const copyClientLink = async (key: string, value: string) => {
+    const ok = await copyToClipboard(value)
+    if (!ok) {
+      setCheckResult({ ok: false, text: '这台机器不允许网页写剪贴板，请点输入框手动全选复制' })
+      return
+    }
+    setCopiedClientLink(key)
+    window.setTimeout(() => setCopiedClientLink((v) => (v === key ? null : v)), 1600)
   }
 
   const enabled = useMemo(() => enabledNodes({ sources, nodes }), [sources, nodes])
@@ -388,37 +400,22 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   //   yaml → Clash Verge / Mihomo / Stash …  ini → Surge / Loon / QuanX
   //   json → sing-box MT / Hiddify           base64 → V2Box / Anywhere
   //   yaml → Shadowrocket 也使用 Clash YAML；egern 使用独立 Egern 载体。
-  const clientSubURL = useMemo(() => {
-    if (!subURL) return ''
-    try {
-      const raw = new URL(subURL, window.location.origin)
-      // 服务器模式的地址由服务端固定（TOWER_PUBLIC_URL 或发布时的兜底 origin），
-      // 打开页面的入口不同也不能改写 host；本地模式保持原来的行为，
-      // 从 127.0.0.1 发布、之后用局域网地址打开时仍自动换成局域网地址。
-      const u = serverMode
-        ? new URL(raw.toString())
-        : new URL(raw.pathname, window.location.origin)
-      u.searchParams.set('format', subFormatFor(target))
-      // target 让服务端在存在客户端专属变体（如 Stash / Surge Mac）时选对写法。
-      u.searchParams.set('target', target.target)
-      return u.href
-    } catch {
-      // localStorage 里的旧地址被改坏时，别让整个导出页白屏。
-      return ''
-    }
-  }, [serverMode, target, subURL])
+  const clientSubscriptionURL = useCallback((client: ClientInfo, nodesOnly = false) => clientSubscriptionLink(subURL, client, {
+    serverMode,
+    origin: window.location.origin,
+    nodesOnly,
+  }), [serverMode, subURL])
+
+  const clientSubURL = useMemo(
+    () => clientSubscriptionURL(target),
+    [clientSubscriptionURL, target],
+  )
 
   /** 同一订阅的仅节点地址：服务端按 content=nodes 返回只含节点的载体。 */
-  const clientNodeSubURL = useMemo(() => {
-    if (!clientSubURL) return ''
-    try {
-      const u = new URL(clientSubURL)
-      u.searchParams.set('content', 'nodes')
-      return u.href
-    } catch {
-      return ''
-    }
-  }, [clientSubURL])
+  const clientNodeSubURL = useMemo(
+    () => clientSubscriptionURL(target, true),
+    [clientSubscriptionURL, target],
+  )
 
   const outputOptions = useMemo(
     () => ({
@@ -1851,6 +1848,49 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                   </div>
                 )}
               </div>
+              <AdvancedSection
+                scope="export-all-client-links"
+                title="所有客户端链接"
+                summary={`${visibleClients.length} 个客户端 · 完整配置 / 仅节点`}
+              >
+                {visibleClients.map((client) => {
+                  const fullURL = clientSubscriptionURL(client)
+                  const nodesURL = clientSubscriptionURL(client, true)
+                  const surgeBeta = client.target === 'surge' || client.target === 'surge-mac'
+                  return (
+                    <div key={client.target} className="sub-url-wrap" style={{ marginTop: 12 }}>
+                      <div className="sub-url-label">
+                        {client.name} · {FORMAT_LABELS[subFormatFor(client)]}
+                        {surgeBeta ? ' · 测试版按 UA 分档' : ''}
+                      </div>
+                      <div className="row" style={{ gap: 6, alignItems: 'center', marginTop: 6 }}>
+                        <span className="hint" style={{ minWidth: 56 }}>完整配置</span>
+                        <input
+                          readOnly
+                          className="input"
+                          value={fullURL}
+                          style={{ flex: 1, minWidth: 0, fontFamily: '"IBM Plex Mono", ui-monospace, monospace', fontSize: 12 }}
+                        />
+                        <button className="btn ghost" onClick={() => void copyClientLink(`${client.target}:full`, fullURL)}>
+                          {copiedClientLink === `${client.target}:full` ? '已复制' : '复制'}
+                        </button>
+                      </div>
+                      <div className="row" style={{ gap: 6, alignItems: 'center', marginTop: 6 }}>
+                        <span className="hint" style={{ minWidth: 56 }}>仅节点</span>
+                        <input
+                          readOnly
+                          className="input"
+                          value={nodesURL}
+                          style={{ flex: 1, minWidth: 0, fontFamily: '"IBM Plex Mono", ui-monospace, monospace', fontSize: 12 }}
+                        />
+                        <button className="btn ghost" onClick={() => void copyClientLink(`${client.target}:nodes`, nodesURL)}>
+                          {copiedClientLink === `${client.target}:nodes` ? '已复制' : '复制'}
+                        </button>
+                      </div>
+                    </div>
+                  )
+                })}
+              </AdvancedSection>
             </>
           ) : (
             <>
