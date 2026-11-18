@@ -33,6 +33,12 @@ export const Icon = {
       <path d="M5.3 4.9 7 10.3M10.7 4.9 9 10.3M5.7 4h4.6" />
     </svg>
   ),
+  Settings: () => (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" className="icn">
+      <circle cx="8" cy="8" r="2.2" />
+      <path d="M8 2.2v1.4M8 12.4v1.4M2.2 8h1.4M12.4 8h1.4M3.9 3.9l1 1M11.1 11.1l1 1M12.1 3.9l-1 1M4.9 11.1l-1 1" />
+    </svg>
+  ),
   Menu: () => (
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
       <path d="M3.5 4h9M3.5 8h9M3.5 12h9" />

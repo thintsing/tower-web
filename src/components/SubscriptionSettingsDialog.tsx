@@ -43,14 +43,17 @@ const REJECTION_KIND_TITLES: Record<BackupRejection['kind'], string> = {
   topLevel: '顶层字段',
 }
 
-export function SubscriptionSettingsDialog({
+export function SubscriptionSettings({
   open,
   onClose,
   onRestored,
+  variant = 'dialog',
 }: {
   open: boolean
-  onClose: () => void
+  onClose?: () => void
   onRestored?: (message: string) => void
+  /** dialog：订阅页弹出；page：侧栏独立设置页。两种形态共用同一套状态与数据。 */
+  variant?: 'dialog' | 'page'
 }) {
   const ref = useRef<HTMLDialogElement>(null)
   const backupRef = useRef<HTMLInputElement>(null)
@@ -224,22 +227,22 @@ export function SubscriptionSettingsDialog({
   }
 
   useEffect(() => {
-    if (open) {
-      ref.current?.showModal()
-      setPendingBackup(null)
-      setBackupBusy(false)
-      setBackupError('')
-      setBackupNotice('')
-      setResetConfirm(false)
-      setServerAccessError('')
-      setServerAccessNotice('')
-      // 示例工作区不读取、也不修改服务端的局域网与访问密钥设置。
-      if (!DEMO_MODE) void loadServerAccess()
-      refreshHistory()
-    } else {
-      ref.current?.close()
+    if (!open) {
+      if (variant === 'dialog') ref.current?.close()
+      return
     }
-  }, [open])
+    if (variant === 'dialog') ref.current?.showModal()
+    setPendingBackup(null)
+    setBackupBusy(false)
+    setBackupError('')
+    setBackupNotice('')
+    setResetConfirm(false)
+    setServerAccessError('')
+    setServerAccessNotice('')
+    // 示例工作区不读取、也不修改服务端的局域网与访问密钥设置。
+    if (!DEMO_MODE) void loadServerAccess()
+    refreshHistory()
+  }, [open, variant])
 
   const downloadBackup = (file: BackupFile) => {
     const blob = new Blob([JSON.stringify(file, null, 2)], { type: 'application/json' })
@@ -318,7 +321,10 @@ export function SubscriptionSettingsDialog({
     clearRuleSetHistory()
     setPendingBackup(null)
     refreshHistory()
-    onRestored?.(`已恢复 ${counts.sources} 个订阅、${counts.nodes} 个节点（含 ${counts.manualNodes} 个自有节点）、${counts.schemes} 个自定义方案和 ${counts.ruleSets} 个规则集。`)
+    const message = `已恢复 ${counts.sources} 个订阅、${counts.nodes} 个节点（含 ${counts.manualNodes} 个自有节点）、${counts.schemes} 个自定义方案和 ${counts.ruleSets} 个规则集。`
+    // 独立设置页没有弹窗可关，直接把结果留在页内提示。
+    if (onRestored) onRestored(message)
+    else setBackupNotice(message)
   }
 
   const pendingCounts = pendingBackup ? backupCounts(pendingBackup.data) : null
@@ -341,9 +347,9 @@ export function SubscriptionSettingsDialog({
       : '没有需要清除的损坏记录。')
   }
 
-  return (
-    <dialog ref={ref} onClose={onClose}>
-      <h3>订阅设置</h3>
+  const content = (
+    <>
+      {variant === 'dialog' && <h3>订阅设置</h3>}
       <div className="settings-body">
         <label className="setting-toggle">
           <input
@@ -804,9 +810,30 @@ export function SubscriptionSettingsDialog({
           </div>
         )}
       </div>
-      <div className="actions">
-        <button className="btn primary" onClick={onClose}>完成</button>
+      {variant === 'dialog' && (
+        <div className="actions">
+          <button className="btn primary" onClick={onClose}>完成</button>
+        </div>
+      )}
+    </>
+  )
+  if (variant === 'page') {
+    return (
+      <div>
+        <div className="page-head">
+          <div>
+            <div className="eyebrow">设置 · 06</div>
+            <h1>订阅设置</h1>
+            <div className="sub">刷新、提醒、局域网访问、数据备份与规则集历史</div>
+          </div>
+        </div>
+        <div className="card">{content}</div>
       </div>
+    )
+  }
+  return (
+    <dialog ref={ref} onClose={onClose}>
+      {content}
     </dialog>
   )
 }

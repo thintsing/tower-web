@@ -33,7 +33,7 @@ import { SourceUsage, shouldShowSourceUsage } from './components/SourceUsage'
 import { UserAgentField } from './components/UserAgentField'
 import { FlowRail } from './components/FlowRail'
 import { WorkspaceStatusBanner } from './components/WorkspaceStatusBanner'
-import { SubscriptionSettingsDialog } from './components/SubscriptionSettingsDialog'
+import { SubscriptionSettings } from './components/SubscriptionSettingsDialog'
 import { useWorkspaceStatus } from './workspaceSync'
 import { autoRefreshReady, buildRefreshReport, describeRefreshReport, dismissRefreshReport, publishRefreshReport, refreshFailureText, selectRefreshTargets, useRefreshReport, type RefreshOutcome } from './subscriptionRefreshReport'
 import { READONLY_NOTE, writeGuard } from './util/readOnlyUi'
@@ -1816,7 +1816,6 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const [flash, setFlash] = useState('')
   const [editingSource, setEditingSource] = useState<SubscriptionSource | null>(null)
   const [editingCountryNode, setEditingCountryNode] = useState<ProxyNode | null>(null)
-  const [settingsOpen, setSettingsOpen] = useState(false)
   const [addingManual, setAddingManual] = useState(false)
   const [manualEditor, setManualEditor] = useState<{ node?: ProxyNode } | null>(null)
   const [renamingManualNode, setRenamingManualNode] = useState<ProxyNode | null>(null)
@@ -2082,7 +2081,7 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         </div>
         <div className="row page-actions" style={{ gap: 8 }}>
           {sources.length > 0 && !manageMode && (
-            <button className="btn ghost" onClick={() => setSettingsOpen(true)}>订阅设置</button>
+            <button className="btn ghost" onClick={() => onGo?.('settings')}>订阅设置</button>
           )}
           {sources.length > 0 && !manageMode && (
             <button className="btn ghost" onClick={() => setManageMode(true)}>管理</button>
@@ -2200,7 +2199,7 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
               </span>
             ))}
           </div>
-          <button className="btn ghost" onClick={() => setSettingsOpen(true)}>订阅设置</button>
+          <button className="btn ghost" onClick={() => onGo?.('settings')}>订阅设置</button>
         </div>
       )}
 
@@ -2497,14 +2496,6 @@ function SubscriptionTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           onSaved={setFlash}
         />
       )}
-      <SubscriptionSettingsDialog
-        open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        onRestored={(message) => {
-          setSettingsOpen(false)
-          setFlash(message)
-        }}
-      />
       <NodeCountryDialog
         node={editingCountryNode}
         onClose={() => setEditingCountryNode(null)}
@@ -2579,6 +2570,7 @@ const TABS: { key: TabKey; label: string; short: string; Icon: () => ReactNode }
   { key: 'check', label: '规则诊断', short: '检查', Icon: Icon.Check },
   { key: 'export', label: '导出', short: '导出', Icon: Icon.Export },
   { key: 'tailnet', label: 'Tailscale', short: '内网', Icon: Icon.Network },
+  { key: 'settings', label: '订阅设置', short: '设置', Icon: Icon.Settings },
 ]
 
 export function App() {
@@ -3009,6 +3001,7 @@ export function App() {
           )}
           {tab === 'export' && <ExportTab onGo={switchTab} />}
           {tab === 'tailnet' && <TailnetTab />}
+          {tab === 'settings' && <SubscriptionSettings open variant="page" />}
         </div>
       </main>
     </div>
