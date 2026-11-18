@@ -97,6 +97,22 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`
 }
 
+/**
+ * 当前服务端是否已有这条订阅 token。
+ * 返回 null 表示无法确认（局域网匿名访问、未配置密钥、网络错误），此时不要改动本地状态。
+ */
+async function serverHasSubscription(token: string): Promise<boolean | null> {
+  try {
+    const res = await apiFetch('/api/subscriptions', { cache: 'no-store' })
+    if (!res.ok) return null
+    const body = await res.json() as { subscriptions?: unknown }
+    const list = Array.isArray(body?.subscriptions) ? body.subscriptions as Array<{ token?: unknown }> : []
+    return list.some((item) => item?.token === token)
+  } catch {
+    return null
+  }
+}
+
 function surgeTierRows(tiers: SurgeTierMap): VariantPreview['surgeTiers'] {
   const rows: VariantPreview['surgeTiers'] = []
   for (const platform of ['surge', 'surge-mac'] as const) {
@@ -1217,14 +1233,31 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
 
   // 之前发布过的 token 里存的是旧内容（例如修好 DNS 之前的 YAML）。
   // 进入导出页时静默同步一次，地址不变，用户 Clash 刷新订阅就能拿到修复后的配置。
+  // 但必须先确认这条 token 在当前服务端确实存在：服务端数据被清空或换了实例时，
+  // localStorage 里的旧 token 不能悄悄把订阅“复活”出来。
   const autoSyncedRef = useRef(false)
   useEffect(() => {
-    if (autoSyncedRef.current || DEMO_MODE) return
+    if (autoSyncedRef.current || DEMO_MODE || readOnly) return
     if (!subToken || !scheme || usable.length === 0) return
     autoSyncedRef.current = true
-    void publishNow()
+    void (async () => {
+      const exists = await serverHasSubscription(subToken)
+      // 无法确认（局域网匿名、未配置密钥、网络错误）时保持现状，不写入也不清空。
+      if (exists === null) return
+      if (!exists) {
+        setSubToken('')
+        setSubURL('')
+        setSubUpdatedAt(null)
+        localPrefs.removeItem(SUB_TOKEN_KEY)
+        localPrefs.removeItem(SUB_URL_KEY)
+        localPrefs.removeItem(SUB_UPDATED_AT_KEY)
+        setCheckResult({ ok: false, text: '本机保存的订阅链接在当前塔台服务端不存在，请重新发布生成。' })
+        return
+      }
+      void publishNow()
+    })()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [subToken, scheme, usable.length])
+  }, [subToken, scheme, usable.length, readOnly])
 
   /**
    * 检查链接：先探当前地址；若 404（多半是服务端重启前的旧 token），
@@ -2374,6 +2407,9 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
               <button className="btn ghost" style={{ marginTop: 8 }} disabled={subRefreshing || !hasExportable} onClick={() => void publishNow(true)}>
                 {subRefreshing ? '预检中…' : '预检发布变体'}
               </button>
+              {checkResult && !checkResult.ok && (
+                <div className="error" style={{ marginTop: 8 }}>{checkResult.text}</div>
+              )}
               {!hasExportable && <div className="error" style={{ marginTop: 8 }}>{emptyReason}</div>}
               <div className="next-steps">
                 <div className="next-steps-title">生成后会得到什么</div>
