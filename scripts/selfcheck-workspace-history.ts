@@ -160,7 +160,7 @@ async function check(label: string, run: () => Promise<void>): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const server = await startServer({ TOWER_MODE: 'server', TOWER_API_TOKEN: 'history-key' })
+  const server = await startServer({ TOWER_MODE: 'server', TOWER_API_TOKEN: 'history-key-000001' })
   try {
     await check('历史接口同样需要访问密钥', async () => {
       const response = await fetch(`${server.base}/api/workspace/history`)
@@ -170,9 +170,9 @@ async function main(): Promise<void> {
     })
 
     await check('首次创建不产生历史（没有旧版可归档）', async () => {
-      const created = await put(server.base, 'history-key', { version: 0, data: buildData('A', 5, 3) })
+      const created = await put(server.base, 'history-key-000001', { version: 0, data: buildData('A', 5, 3) })
       assert.equal(created.status, 200)
-      const history = await getHistory(server.base, 'history-key')
+      const history = await getHistory(server.base, 'history-key-000001')
       assert.equal(history.current.version, 1)
       assert.equal(history.entries.length, 0)
     })
@@ -181,12 +181,12 @@ async function main(): Promise<void> {
     await check('覆盖写前归档旧版并带来源与差异摘要', async () => {
       const response = await put(
         server.base,
-        'history-key',
+        'history-key-000001',
         { version: 1, data: buildData('B', 2, 1) },
         { 'user-agent': 'tower-history-selfcheck' },
       )
       assert.equal(response.status, 200)
-      const history = await getHistory(server.base, 'history-key')
+      const history = await getHistory(server.base, 'history-key-000001')
       assert.equal(history.current.version, 2)
       assert.equal(history.entries.length, 1)
       const entry = history.entries[0]
@@ -211,7 +211,7 @@ async function main(): Promise<void> {
     })
 
     await check('单版接口返回归档正文', async () => {
-      const response = await fetch(apiURL(server.base, 'history-key', `/api/workspace/history/${firstID}`))
+      const response = await fetch(apiURL(server.base, 'history-key-000001', `/api/workspace/history/${firstID}`))
       assert.equal(response.status, 200)
       const body = await response.json() as { version: number; data: { marker?: string } }
       assert.equal(body.version, 1)
@@ -219,25 +219,25 @@ async function main(): Promise<void> {
     })
 
     await check('非法历史 id 返回 404', async () => {
-      const response = await fetch(apiURL(server.base, 'history-key', '/api/workspace/history/not-a-version'))
+      const response = await fetch(apiURL(server.base, 'history-key-000001', '/api/workspace/history/not-a-version'))
       assert.equal(response.status, 404)
       const body = await response.json() as { code?: string }
       assert.equal(body.code, 'history_not_found')
     })
 
     await check('回滚必须带版本号，过期版本返回 409', async () => {
-      const missing = await restore(server.base, 'history-key', firstID)
+      const missing = await restore(server.base, 'history-key-000001', firstID)
       assert.equal(missing.status, 400)
       assert.equal(((await missing.json()) as { code?: string }).code, 'missing_version')
-      const stale = await restore(server.base, 'history-key', firstID, 1)
+      const stale = await restore(server.base, 'history-key-000001', firstID, 1)
       assert.equal(stale.status, 409)
-      const current = await getWorkspace(server.base, 'history-key')
+      const current = await getWorkspace(server.base, 'history-key-000001')
       assert.equal(current.version, 2)
       assert.equal(current.data.marker, 'B')
     })
 
     await check('回滚以旧版为基础生成新版本号（不退版本）', async () => {
-      const response = await restore(server.base, 'history-key', firstID, 2, true)
+      const response = await restore(server.base, 'history-key-000001', firstID, 2, true)
       assert.equal(response.status, 200)
       const result = await response.json() as {
         version: number
@@ -250,10 +250,10 @@ async function main(): Promise<void> {
       // 回滚前当前版 v2 应已归档，供撤销使用。
       assert.ok(result.previous)
       assert.equal(result.previous?.version, 2)
-      const current = await getWorkspace(server.base, 'history-key')
+      const current = await getWorkspace(server.base, 'history-key-000001')
       assert.equal(current.version, 3)
       assert.equal(current.data.marker, 'A')
-      const history = await getHistory(server.base, 'history-key')
+      const history = await getHistory(server.base, 'history-key-000001')
       assert.equal(history.entries.length, 2)
       const preRestore = history.entries.find((entry) => entry.version === 2)
       assert.ok(preRestore)
@@ -263,46 +263,46 @@ async function main(): Promise<void> {
     })
 
     await check('回滚的回滚可用：再回滚到 v2 恢复旧内容', async () => {
-      const history = await getHistory(server.base, 'history-key')
+      const history = await getHistory(server.base, 'history-key-000001')
       const target = history.entries.find((entry) => entry.version === 2)!
-      const response = await restore(server.base, 'history-key', target.id, 3)
+      const response = await restore(server.base, 'history-key-000001', target.id, 3)
       assert.equal(response.status, 200)
       assert.equal(((await response.json()) as { version: number }).version, 4)
-      const current = await getWorkspace(server.base, 'history-key')
+      const current = await getWorkspace(server.base, 'history-key-000001')
       assert.equal(current.version, 4)
       assert.equal(current.data.marker, 'B')
-      const after = await getHistory(server.base, 'history-key')
+      const after = await getHistory(server.base, 'history-key-000001')
       const restoredVersion = after.entries.find((entry) => entry.version === 3)
       assert.ok(restoredVersion)
       assert.equal(restoredVersion?.trigger, 'restore')
     })
 
     await check('并发回滚同一版本只有一个成功，另一个 409', async () => {
-      const history = await getHistory(server.base, 'history-key')
+      const history = await getHistory(server.base, 'history-key-000001')
       const first = history.entries.find((entry) => entry.version === 1)!
       const second = history.entries.find((entry) => entry.version === 2)!
       const responses = await Promise.all([
-        restore(server.base, 'history-key', first.id, 4),
-        restore(server.base, 'history-key', second.id, 4),
+        restore(server.base, 'history-key-000001', first.id, 4),
+        restore(server.base, 'history-key-000001', second.id, 4),
       ])
       const statuses = responses.map((response) => response.status).sort()
       assert.deepEqual(statuses, [200, 409], `实际状态：${statuses}`)
-      const current = await getWorkspace(server.base, 'history-key')
+      const current = await getWorkspace(server.base, 'history-key-000001')
       assert.equal(current.version, 5)
     })
 
     await check('损坏的历史文件不影响正常写入', async () => {
       const corruptID = 'v999-20260101T000000000Z'
       writeFileSync(join(server.dir, 'history', `${corruptID}.json`), '{ not json', 'utf8')
-      const before = await getWorkspace(server.base, 'history-key')
-      const response = await put(server.base, 'history-key', { version: before.version, data: buildData('C', 4, 2) })
+      const before = await getWorkspace(server.base, 'history-key-000001')
+      const response = await put(server.base, 'history-key-000001', { version: before.version, data: buildData('C', 4, 2) })
       assert.equal(response.status, 200)
-      const current = await getWorkspace(server.base, 'history-key')
+      const current = await getWorkspace(server.base, 'history-key-000001')
       assert.equal(current.version, before.version + 1)
       assert.equal(current.data.marker, 'C')
-      const list = await fetch(apiURL(server.base, 'history-key', '/api/workspace/history'))
+      const list = await fetch(apiURL(server.base, 'history-key-000001', '/api/workspace/history'))
       assert.equal(list.status, 200)
-      const broken = await fetch(apiURL(server.base, 'history-key', `/api/workspace/history/${corruptID}`))
+      const broken = await fetch(apiURL(server.base, 'history-key-000001', `/api/workspace/history/${corruptID}`))
       assert.equal(broken.status, 422)
       assert.equal(((await broken.json()) as { code?: string }).code, 'history_corrupt')
     })
@@ -311,23 +311,23 @@ async function main(): Promise<void> {
   }
 
   // 最近 10 版：连续覆盖后只保留 10 条，且当前版的前一版一定在。
-  const retention = await startServer({ TOWER_MODE: 'server', TOWER_API_TOKEN: 'retention-key' })
+  const retention = await startServer({ TOWER_MODE: 'server', TOWER_API_TOKEN: 'retention-key-0001' })
   try {
     await check('连续写入后只保留最近 10 版并保留当前版前一版', async () => {
-      const first = await put(retention.base, 'retention-key', { version: 0, data: buildData('v1', 5, 3) })
+      const first = await put(retention.base, 'retention-key-0001', { version: 0, data: buildData('v1', 5, 3) })
       assert.equal(first.status, 200)
       let version = 1
       for (let index = 2; index <= 14; index += 1) {
-        const response = await put(retention.base, 'retention-key', {
+        const response = await put(retention.base, 'retention-key-0001', {
           version,
           data: buildData(`v${index}`, 5 - (index % 3), 3),
         })
         assert.equal(response.status, 200)
         version += 1
       }
-      const current = await getWorkspace(retention.base, 'retention-key')
+      const current = await getWorkspace(retention.base, 'retention-key-0001')
       assert.equal(current.version, 14)
-      const history = await getHistory(retention.base, 'retention-key')
+      const history = await getHistory(retention.base, 'retention-key-0001')
       assert.equal(history.entries.length, 10)
       const versions = history.entries.map((entry) => entry.version)
       assert.deepEqual(versions, [13, 12, 11, 10, 9, 8, 7, 6, 5, 4])
@@ -342,7 +342,7 @@ async function main(): Promise<void> {
   // 体积上限：预置 7 个 8MB 历史（56MB），写入后必须压到 50MB 以内，
   // 且当前版前一版（刚归档的 v10）不能被删。
   const budget = await startServer(
-    { TOWER_MODE: 'server', TOWER_API_TOKEN: 'budget-key' },
+    { TOWER_MODE: 'server', TOWER_API_TOKEN: 'budget-key-0000001' },
     (dir) => {
       writeFileSync(
         join(dir, 'workspace.json'),
@@ -373,9 +373,9 @@ async function main(): Promise<void> {
   )
   try {
     await check('总占用超过 50MB 时从最旧删起，保留当前版前一版', async () => {
-      const response = await put(budget.base, 'budget-key', { version: 10, data: buildData('after', 3, 2) })
+      const response = await put(budget.base, 'budget-key-0000001', { version: 10, data: buildData('after', 3, 2) })
       assert.equal(response.status, 200)
-      const history = await getHistory(budget.base, 'budget-key')
+      const history = await getHistory(budget.base, 'budget-key-0000001')
       assert.ok(history.totalBytes <= MAX_HISTORY_BYTES, `总占用 ${history.totalBytes}`)
       const versions = history.entries.map((entry) => entry.version)
       assert.ok(versions.includes(10), '当前版前一版必须保留')

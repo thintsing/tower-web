@@ -165,7 +165,7 @@ services:
 
 `healthy` = **进程存活且数据目录可写**；任一不满足就是 `unhealthy`。`unhealthy` 只是警示，**不会自动重启容器**（`restart: unless-stopped` 只对进程退出生效）。可写探测结果缓存 10 秒：修好权限后最多 10 秒恢复 `healthy`，不需要重启容器。
 
-容器内无法可靠区分「宿主机浏览器」和伪造 `Host: localhost` 的局域网客户端。需要管理密钥时，建议启动时设置 `TOWER_API_TOKEN`。校验规则：本地模式要求 16–128 位 `A-Z/a-z/0-9/_/-`；服务器模式（`TOWER_MODE=server`）放宽为 1–128 个不含空白 / 换行 / 控制字符的字符。**两种模式都建议直接使用 ≥32 位随机值**（例如 `openssl rand -hex 32`），不要用可读短词：
+容器内无法可靠区分「宿主机浏览器」和伪造 `Host: localhost` 的局域网客户端。需要管理密钥时，建议启动时设置 `TOWER_API_TOKEN`。校验规则：本地模式要求 16–128 位 `A-Z/a-z/0-9/_/-`；服务器模式（`TOWER_MODE=server`）同样要求 16–128 个字符，但字符集更宽松（只排除空白 / 换行 / 控制字符）。**两种模式都建议直接使用 ≥32 位随机值**（例如 `openssl rand -hex 32`），不要用可读短词：
 
 ```bash
 docker run -d --name tower-web \
@@ -232,20 +232,20 @@ $env:HOST='127.0.0.1'; npm start
 默认 `TOWER_MODE=local`，工作区在浏览器 localStorage，行为不变。需要多台设备共用同一份订阅源、节点、规则方案 / 规则集和当前选择时，用服务器模式启动：
 
 ```bash
-TOWER_MODE=server TOWER_API_TOKEN='your-shared-key' npm start
+TOWER_MODE=server TOWER_API_TOKEN='replace-with-a-long-random-token' npm start
 
 # Windows PowerShell
-$env:TOWER_MODE='server'; $env:TOWER_API_TOKEN='your-shared-key'; npm start
+$env:TOWER_MODE='server'; $env:TOWER_API_TOKEN='replace-with-a-long-random-token'; npm start
 
 # Docker
 docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
-  -e TOWER_MODE=server -e TOWER_API_TOKEN='your-shared-key' \
+  -e TOWER_MODE=server -e TOWER_API_TOKEN='replace-with-a-long-random-token' \
   ghcr.io/thintsing/tower-web:latest
 ```
 
 - 工作区保存在 `TOWER_DATA_DIR/workspace.json`（默认 `server/workspace.json`，Docker 下 `/app/data/workspace.json`），结构为 `{ version, updatedAt, data }`。服务端已有数据时不要在运行中手工编辑这个文件。
 - 服务器模式下 `/api/workspace` 的所有请求都必须带访问密钥，`127.0.0.1` 也不例外；密钥来源沿用现有机制（`?key=`、`x-tower-key`、`Authorization: Bearer`、`tower_key` cookie）。
-- 服务器模式密钥放宽为 1–128 个不含空白 / 换行 / 控制字符的字符，首尾空白会 trim；本地模式仍要求 16–128 位 `A-Z/a-z/0-9/_/-`。服务端不强制长度，**请直接用 ≥32 位随机值**（`openssl rand -hex 32`）；短密钥能被穷举，隧道 / 公网场景还应叠加 Cloudflare Access 之类的访问控制。
+- 服务器模式密钥要求 16–128 个不含空白 / 换行 / 控制字符的字符，首尾空白会 trim；本地模式要求 16–128 位 `A-Z/a-z/0-9/_/-`。**请直接用 ≥32 位随机值**（`openssl rand -hex 32`）；短密钥能被穷举，隧道 / 公网场景还应叠加 Cloudflare Access 之类的访问控制。
 - 每台设备首次访问要授权一次：用带 `?key=<密钥>` 的地址打开，或在全屏「需要访问密钥」页里粘贴密钥。密钥存进**该浏览器**的 localStorage `tower-web-api-key`，不跨设备、不跨浏览器 profile；换域名、端口或 http/https 都算另一个来源，需要重新带一次 `?key=`。
 - 同一 IP 连续 10 次认证失败，服务端冷却 60 秒；认证成功会清零计数。注意 `/api/auth-status` 本身**不受冷却限制**（页面无密钥时也要能判断模式），带错误密钥时它会记录一次失败但仍正常响应——所以它可以被用来连续试探密钥，别把它当成防穷举的屏障。
 - 首次使用：服务端还没有 `workspace.json` 时，打开页面的客户端会把本机现有工作区上传创建，并提示「已上传本机工作区」。服务端已有数据后客户端只读取；要覆盖必须按当前版本号正常写入（例如覆盖恢复），不能静默清空。
@@ -362,7 +362,7 @@ selfcheck:yaml        Clash YAML 结构
 ## 已知限制
 
 - 服务端面向本机或可信局域网；可选管理 API 密钥和局域网共享开关，但没有用户隔离、公网级限流或公网级防护（只有按 IP 的认证失败节流，10 次 / 60 秒），`/api/health`、订阅 / 分享 / 托管规则集等 GET 端点仍按独立凭证或公开规则处理。
-- 服务器版是单用户模型：没有角色、多人合并和资源级权限；`/api/auth-status` 不受认证失败冷却限制，不能挡住密钥穷举。服务器模式密钥可以短到 1 字符，**建议 ≥32 位随机**，详见 [SECURITY.md](SECURITY.md)。
+- 服务器版是单用户模型：没有角色、多人合并和资源级权限；`/api/auth-status` 不受认证失败冷却限制，不能挡住密钥穷举。服务器模式密钥同样要求 ≥16 位，**建议 ≥32 位随机**，详见 [SECURITY.md](SECURITY.md)。
 - 不能部署到 GitHub Pages，需要 Node 运行环境；公网部署必须额外加安全层。
 - 订阅解析对 Surge / Loon / Quantumult X 节点段的覆盖：
   - Surge `[Proxy]`：Shadowsocks（simple-obfs / ShadowTLS）、ShadowsocksR、VMess（TLS / WebSocket）、VLESS、Trojan（TLS / WebSocket）、Hysteria2（Salamander / gecko 密码、端口跳跃）、TUIC v5（`tuic-v5`）、WireGuard（`[WireGuard <name>]`，单 peer）、HTTP / HTTPS、SOCKS5、Snell、SSH（密码登录）、AnyTLS、TrustTunnel、MASQUE。

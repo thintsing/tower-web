@@ -712,9 +712,9 @@ function normalizeWorkspaceSubscriptionToken(value) {
 function normalizeAPIToken(value) {
   const token = String(value ?? '').trim()
   if (SERVER_MODE) {
-    // 服务器版允许任意长度的短密钥（1 字符也可），但必须是非空、不含空白 /
-    // 换行 / 控制字符。短密钥的风险见 SECURITY.md。
-    return /^[^\s\x00-\x1f\x7f]{1,128}$/.test(token) ? token : ''
+    // 服务器版允许非字母数字字符，但同样要求至少 16 位：更短的密钥在
+    // 60 秒冷却窗口内就可能被穷举（见 SECURITY.md）。
+    return /^[^\s\x00-\x1f\x7f]{16,128}$/.test(token) ? token : ''
   }
   return /^[A-Za-z0-9_-]{16,128}$/.test(token) ? token : ''
 }
@@ -722,6 +722,11 @@ function normalizeAPIToken(value) {
 function loadServerSettings() {
   try {
     const data = JSON.parse(readFileSync(SETTINGS_FILE, 'utf8'))
+    const storedToken = String(data?.apiToken ?? '').trim()
+    // 旧的短密钥在提高下限后会被静默忽略；必须显式提示，否则用户会误以为仍在保护。
+    if (storedToken && !normalizeAPIToken(storedToken)) {
+      console.warn('[tower] settings.json 中的访问密钥不足 16 位或含非法字符，已忽略；请重新生成')
+    }
     serverSettings = {
       lanSharing: data?.lanSharing !== false,
       apiToken: normalizeAPIToken(data?.apiToken),
@@ -738,7 +743,7 @@ function loadServerSettings() {
   if (envTokenRaw) {
     const envToken = normalizeAPIToken(envTokenRaw)
     if (envToken) serverSettings.apiToken = envToken
-    else console.warn(`[tower] TOWER_API_TOKEN 格式无效（${SERVER_MODE ? '需 1–128 个不含空白 / 控制字符的字符' : '需 16–128 位 A-Z/a-z/0-9/_/-'}），已忽略`)
+    else console.warn(`[tower] TOWER_API_TOKEN 格式无效（${SERVER_MODE ? '需 16–128 个不含空白 / 控制字符的字符' : '需 16–128 位 A-Z/a-z/0-9/_/-'}），已忽略`)
   }
 }
 

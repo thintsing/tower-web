@@ -97,7 +97,7 @@ async function check(label: string, run: () => Promise<void>): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const server = await startServer({ TOWER_MODE: 'server', TOWER_API_TOKEN: 'a' })
+  const server = await startServer({ TOWER_MODE: 'server', TOWER_API_TOKEN: 'selfcheck-key-0001' })
 
   try {
     await check('auth-status 报告 server 模式', async () => {
@@ -123,18 +123,18 @@ async function main(): Promise<void> {
     })
 
     await check('四种密钥来源都可用（query / header / Bearer / cookie）', async () => {
-      const query = await fetch(workspaceURL(server.base, 'a'))
+      const query = await fetch(workspaceURL(server.base, 'selfcheck-key-0001'))
       assert.equal(query.status, 200)
-      const header = await fetch(workspaceURL(server.base), { headers: { 'x-tower-key': 'a' } })
+      const header = await fetch(workspaceURL(server.base), { headers: { 'x-tower-key': 'selfcheck-key-0001' } })
       assert.equal(header.status, 200)
-      const bearer = await fetch(workspaceURL(server.base), { headers: { authorization: 'Bearer a' } })
+      const bearer = await fetch(workspaceURL(server.base), { headers: { authorization: 'Bearer selfcheck-key-0001' } })
       assert.equal(bearer.status, 200)
-      const cookie = await fetch(workspaceURL(server.base), { headers: { cookie: 'tower_key=a' } })
+      const cookie = await fetch(workspaceURL(server.base), { headers: { cookie: 'tower_key=selfcheck-key-0001' } })
       assert.equal(cookie.status, 200)
     })
 
     await check('空工作区返回 version=0 且 data 为空对象', async () => {
-      const response = await fetch(workspaceURL(server.base, 'a'))
+      const response = await fetch(workspaceURL(server.base, 'selfcheck-key-0001'))
       const body = await response.json() as { version: number; updatedAt: number; data: unknown }
       assert.equal(body.version, 0)
       assert.deepEqual(body.data, {})
@@ -142,10 +142,10 @@ async function main(): Promise<void> {
     })
 
     await check('version=0 创建首份工作区并递增版本', async () => {
-      const response = await put(server.base, 'a', { version: 0, data: { marker: 'first', sources: [] } })
+      const response = await put(server.base, 'selfcheck-key-0001', { version: 0, data: { marker: 'first', sources: [] } })
       assert.equal(response.status, 200)
       assert.equal(((await response.json()) as { version: number }).version, 1)
-      const current = await (await fetch(workspaceURL(server.base, 'a'))).json() as {
+      const current = await (await fetch(workspaceURL(server.base, 'selfcheck-key-0001'))).json() as {
         version: number
         data: { marker?: string }
       }
@@ -155,22 +155,22 @@ async function main(): Promise<void> {
     })
 
     await check('GET 支持 If-None-Match 与 ?version= 命中 304', async () => {
-      const fresh = await fetch(workspaceURL(server.base, 'a'))
+      const fresh = await fetch(workspaceURL(server.base, 'selfcheck-key-0001'))
       const etag = fresh.headers.get('etag')!
-      const byETag = await fetch(workspaceURL(server.base, 'a'), { headers: { 'if-none-match': etag } })
+      const byETag = await fetch(workspaceURL(server.base, 'selfcheck-key-0001'), { headers: { 'if-none-match': etag } })
       assert.equal(byETag.status, 304)
-      const byWeak = await fetch(workspaceURL(server.base, 'a'), { headers: { 'if-none-match': `W/${etag}` } })
+      const byWeak = await fetch(workspaceURL(server.base, 'selfcheck-key-0001'), { headers: { 'if-none-match': `W/${etag}` } })
       assert.equal(byWeak.status, 304)
-      const byVersion = await fetch(workspaceURL(server.base, 'a', '/api/workspace') + '&version=1')
+      const byVersion = await fetch(workspaceURL(server.base, 'selfcheck-key-0001', '/api/workspace') + '&version=1')
       assert.equal(byVersion.status, 304)
-      const stale = await fetch(workspaceURL(server.base, 'a', '/api/workspace') + '&version=0')
+      const stale = await fetch(workspaceURL(server.base, 'selfcheck-key-0001', '/api/workspace') + '&version=0')
       assert.equal(stale.status, 200)
-      const probe = await (await fetch(workspaceURL(server.base, 'a', '/api/workspace/version'))).json() as { version: number }
+      const probe = await (await fetch(workspaceURL(server.base, 'selfcheck-key-0001', '/api/workspace/version'))).json() as { version: number }
       assert.equal(probe.version, 1)
     })
 
     await check('已有数据时 version=0 被拒绝（409 + 当前版本）', async () => {
-      const response = await put(server.base, 'a', { version: 0, data: { marker: 'overwrite' } })
+      const response = await put(server.base, 'selfcheck-key-0001', { version: 0, data: { marker: 'overwrite' } })
       assert.equal(response.status, 409)
       const body = await response.json() as { code?: string; version?: number }
       assert.equal(body.code, 'version_conflict')
@@ -178,14 +178,14 @@ async function main(): Promise<void> {
     })
 
     await check('版本不匹配返回 409，不覆盖数据', async () => {
-      const response = await put(server.base, 'a', { version: 7, data: { marker: 'wrong' } })
+      const response = await put(server.base, 'selfcheck-key-0001', { version: 7, data: { marker: 'wrong' } })
       assert.equal(response.status, 409)
-      const current = await (await fetch(workspaceURL(server.base, 'a'))).json() as { data: { marker?: string } }
+      const current = await (await fetch(workspaceURL(server.base, 'selfcheck-key-0001'))).json() as { data: { marker?: string } }
       assert.equal(current.data.marker, 'first')
     })
 
     await check('递增写入并保留上一版 .bak', async () => {
-      const response = await put(server.base, 'a', { version: 1, data: { marker: 'second' } })
+      const response = await put(server.base, 'selfcheck-key-0001', { version: 1, data: { marker: 'second' } })
       assert.equal(response.status, 200)
       assert.equal(((await response.json()) as { version: number }).version, 2)
       const backup = JSON.parse(readFileSync(join(server.dir, 'workspace.json.bak'), 'utf8')) as { version: number }
@@ -195,9 +195,9 @@ async function main(): Promise<void> {
 
     await check('请求体超过 16MB 返回 413 且工作区不变', async () => {
       const huge = 'x'.repeat(17 * 1024 * 1024)
-      const response = await put(server.base, 'a', { version: 2, data: { marker: 'huge', blob: huge } })
+      const response = await put(server.base, 'selfcheck-key-0001', { version: 2, data: { marker: 'huge', blob: huge } })
       assert.equal(response.status, 413)
-      const probe = await (await fetch(workspaceURL(server.base, 'a', '/api/workspace/version'))).json() as { version: number }
+      const probe = await (await fetch(workspaceURL(server.base, 'selfcheck-key-0001', '/api/workspace/version'))).json() as { version: number }
       assert.equal(probe.version, 2)
     })
 
@@ -206,11 +206,11 @@ async function main(): Promise<void> {
   }
 
   // 并发写单独开一个干净实例，避免上一条故意超限的请求影响连接池。
-  const concurrent = await startServer({ TOWER_MODE: 'server', TOWER_API_TOKEN: 'concurrent-key' })
+  const concurrent = await startServer({ TOWER_MODE: 'server', TOWER_API_TOKEN: 'concurrent-key-0001' })
   try {
     await check('50 个并发 PUT 只有一个成功，文件仍可解析', async () => {
       const responses = await Promise.all(
-        Array.from({ length: 50 }, (_, index) => put(concurrent.base, 'concurrent-key', {
+        Array.from({ length: 50 }, (_, index) => put(concurrent.base, 'concurrent-key-0001', {
           version: 0,
           data: { marker: `concurrent-${index}` },
         })),
@@ -222,7 +222,7 @@ async function main(): Promise<void> {
       const file = readWorkspaceFile(concurrent.dir)
       assert.equal(file.version, 1)
       assert.equal(file.data.marker, `concurrent-${winner}`)
-      const current = await (await fetch(workspaceURL(concurrent.base, 'concurrent-key'))).json() as {
+      const current = await (await fetch(workspaceURL(concurrent.base, 'concurrent-key-0001'))).json() as {
         version: number
         data: { marker?: string }
       }
@@ -235,12 +235,12 @@ async function main(): Promise<void> {
 
   // 坏文件：启动时必须改名保留现场，并让接口明确报错而不是当空工作区。
   const corrupt = await startServer(
-    { TOWER_MODE: 'server', TOWER_API_TOKEN: 'repair-key' },
+    { TOWER_MODE: 'server', TOWER_API_TOKEN: 'repair-key-000001' },
     (dir) => writeFileSync(join(dir, 'workspace.json'), '{ not json', 'utf8'),
   )
   try {
     await check('损坏的 workspace.json 改名为 .broken-* 并返回明确错误', async () => {
-      const response = await fetch(workspaceURL(corrupt.base, 'repair-key'))
+      const response = await fetch(workspaceURL(corrupt.base, 'repair-key-000001'))
       assert.equal(response.status, 500)
       const body = await response.json() as { code?: string; error?: string }
       assert.equal(body.code, 'workspace_corrupt')
@@ -248,7 +248,7 @@ async function main(): Promise<void> {
       const broken = readdirSync(corrupt.dir).filter((name) => name.startsWith('workspace.json.broken-'))
       assert.equal(broken.length, 1)
       assert.ok(!readdirSync(corrupt.dir).includes('workspace.json'))
-      const write = await put(corrupt.base, 'repair-key', { version: 0, data: {} })
+      const write = await put(corrupt.base, 'repair-key-000001', { version: 0, data: {} })
       assert.equal(write.status, 500)
     })
   } finally {
@@ -257,7 +257,7 @@ async function main(): Promise<void> {
 
   // 已有合法文件：启动读取成功并写 .bak。
   const existing = await startServer(
-    { TOWER_MODE: 'server', TOWER_API_TOKEN: 'existing-key' },
+    { TOWER_MODE: 'server', TOWER_API_TOKEN: 'existing-key-00001' },
     (dir) => writeFileSync(
       join(dir, 'workspace.json'),
       JSON.stringify({ version: 5, updatedAt: 123, data: { marker: 'persisted' } }),
@@ -266,7 +266,7 @@ async function main(): Promise<void> {
   )
   try {
     await check('启动载入已有工作区并写 .bak', async () => {
-      const body = await (await fetch(workspaceURL(existing.base, 'existing-key'))).json() as {
+      const body = await (await fetch(workspaceURL(existing.base, 'existing-key-00001'))).json() as {
         version: number
         data: { marker?: string }
       }
@@ -279,19 +279,31 @@ async function main(): Promise<void> {
     await existing.stop()
   }
 
-  // 密钥放宽：1 字符可用，首尾空白被 trim；内部空白 / 超长被拒绝。
-  const shortKey = await startServer({ TOWER_MODE: 'server', TOWER_API_TOKEN: ' b ' })
+  // 密钥下限：16 位；首尾空白被 trim，trim 后不足 16 位等同于未设置。
+  const shortKey = await startServer({ TOWER_MODE: 'server', TOWER_API_TOKEN: ' short-key ' })
   try {
-    await check('服务器模式允许 1 字符密钥并 trim 首尾空白', async () => {
-      const ok = await fetch(workspaceURL(shortKey.base, 'b'))
-      assert.equal(ok.status, 200)
-      const padded = await fetch(workspaceURL(shortKey.base, ' b '))
-      assert.equal(padded.status, 200)
-      const wrong = await fetch(workspaceURL(shortKey.base, 'c'))
-      assert.equal(wrong.status, 401)
+    await check('服务器模式拒绝 trim 后不足 16 位的密钥', async () => {
+      const status = await (await fetch(`${shortKey.base}/api/auth-status`)).json() as { requiresAuth?: boolean }
+      assert.equal(status.requiresAuth, false)
+      const response = await fetch(workspaceURL(shortKey.base, 'short-key'))
+      assert.equal(response.status, 401)
     })
   } finally {
     await shortKey.stop()
+  }
+
+  const paddedKey = await startServer({ TOWER_MODE: 'server', TOWER_API_TOKEN: '  selfcheck-key-0001  ' })
+  try {
+    await check('服务器模式 trim 首尾空白后按 16 位下限校验', async () => {
+      const ok = await fetch(workspaceURL(paddedKey.base, 'selfcheck-key-0001'))
+      assert.equal(ok.status, 200)
+      const padded = await fetch(workspaceURL(paddedKey.base, '  selfcheck-key-0001  '))
+      assert.equal(padded.status, 200)
+      const wrong = await fetch(workspaceURL(paddedKey.base, 'selfcheck-key-0002'))
+      assert.equal(wrong.status, 401)
+    })
+  } finally {
+    await paddedKey.stop()
   }
 
   const blankKey = await startServer({ TOWER_MODE: 'server', TOWER_API_TOKEN: 'a b' })
@@ -338,7 +350,7 @@ async function main(): Promise<void> {
   }
 
   // auth-status 也返回 valid，必须同样计入失败次数，否则就是无限试错 oracle。
-  const oracle = await startServer({ TOWER_MODE: 'server', TOWER_API_TOKEN: 'oracle-key' })
+  const oracle = await startServer({ TOWER_MODE: 'server', TOWER_API_TOKEN: 'oracle-key-000001' })
   try {
     await check('auth-status 带错误密钥也计入节流，不能无限试错', async () => {
       for (let index = 0; index < 10; index += 1) {
@@ -346,12 +358,12 @@ async function main(): Promise<void> {
         assert.equal(response.status, 200)
         assert.equal(((await response.json()) as { valid?: boolean }).valid, false)
       }
-      const blocked = await fetch(workspaceURL(oracle.base, 'oracle-key'))
+      const blocked = await fetch(workspaceURL(oracle.base, 'oracle-key-000001'))
       assert.equal(blocked.status, 429)
       // 状态接口本身仍可用：合法客户端还能判断模式，且带对密钥会清零计数。
-      const status = await (await fetch(`${oracle.base}/api/auth-status?key=oracle-key`)).json() as { valid?: boolean }
+      const status = await (await fetch(`${oracle.base}/api/auth-status?key=oracle-key-000001`)).json() as { valid?: boolean }
       assert.equal(status.valid, true)
-      const recovered = await fetch(workspaceURL(oracle.base, 'oracle-key'))
+      const recovered = await fetch(workspaceURL(oracle.base, 'oracle-key-000001'))
       assert.equal(recovered.status, 200)
     })
   } finally {
@@ -360,7 +372,7 @@ async function main(): Promise<void> {
 
   // 主文件损坏但有 .bak：自动从备份恢复，并保留坏文件现场。
   const backup = await startServer(
-    { TOWER_MODE: 'server', TOWER_API_TOKEN: 'backup-key' },
+    { TOWER_MODE: 'server', TOWER_API_TOKEN: 'backup-key-000001' },
     (dir) => {
       writeFileSync(join(dir, 'workspace.json'), '{"version":3,"data":{', 'utf8')
       writeFileSync(
@@ -372,13 +384,13 @@ async function main(): Promise<void> {
   )
   try {
     await check('workspace.json 损坏时自动回退到 .bak 并可继续写入', async () => {
-      const response = await fetch(workspaceURL(backup.base, 'backup-key'))
+      const response = await fetch(workspaceURL(backup.base, 'backup-key-000001'))
       assert.equal(response.status, 200)
       const body = await response.json() as { version: number; data: { marker?: string } }
       assert.equal(body.version, 2)
       assert.equal(body.data.marker, 'from-bak')
       assert.equal(readdirSync(backup.dir).filter((name) => name.startsWith('workspace.json.broken-')).length, 1)
-      const write = await put(backup.base, 'backup-key', { version: 2, data: { marker: 'after' } })
+      const write = await put(backup.base, 'backup-key-000001', { version: 2, data: { marker: 'after' } })
       assert.equal(write.status, 200)
       assert.equal(readWorkspaceFile(backup.dir).version, 3)
     })
@@ -388,7 +400,7 @@ async function main(): Promise<void> {
 
   // version=0 且已有数据（只会由手工编辑产生）：按 v1 继续，不被 version=0 覆盖。
   const zero = await startServer(
-    { TOWER_MODE: 'server', TOWER_API_TOKEN: 'zero-key' },
+    { TOWER_MODE: 'server', TOWER_API_TOKEN: 'zero-key-0000001' },
     (dir) => writeFileSync(
       join(dir, 'workspace.json'),
       JSON.stringify({ version: 0, updatedAt: 1, data: { marker: 'sneaky' } }),
@@ -397,15 +409,15 @@ async function main(): Promise<void> {
   )
   try {
     await check('version=0 但已有数据按 v1 处理，拒绝再次以 version=0 覆盖', async () => {
-      const body = await (await fetch(workspaceURL(zero.base, 'zero-key'))).json() as {
+      const body = await (await fetch(workspaceURL(zero.base, 'zero-key-0000001'))).json() as {
         version: number
         data: { marker?: string }
       }
       assert.equal(body.version, 1)
       assert.equal(body.data.marker, 'sneaky')
-      const conflict = await put(zero.base, 'zero-key', { version: 0, data: { marker: 'overwrite' } })
+      const conflict = await put(zero.base, 'zero-key-0000001', { version: 0, data: { marker: 'overwrite' } })
       assert.equal(conflict.status, 409)
-      const normal = await put(zero.base, 'zero-key', { version: 1, data: { marker: 'normal' } })
+      const normal = await put(zero.base, 'zero-key-0000001', { version: 1, data: { marker: 'normal' } })
       assert.equal(normal.status, 200)
       assert.equal(readWorkspaceFile(zero.dir).version, 2)
     })

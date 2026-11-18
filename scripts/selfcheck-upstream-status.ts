@@ -431,12 +431,12 @@ async function main(): Promise<void> {
   await check('服务端开关：TOWER_UPSTREAM_CHECK=off 时状态接口可用、手动检查 409', async () => {
     const server = await startServer({
       TOWER_MODE: 'server',
-      TOWER_API_TOKEN: 'selfcheck-key',
+      TOWER_API_TOKEN: 'selfcheck-key-0001',
       TOWER_UPSTREAM_CHECK: 'off',
     })
     try {
       const base = server.base
-      const key = 'selfcheck-key'
+      const key = 'selfcheck-key-0001'
       const statusRes = await fetch(`${base}/api/upstream-status?key=${key}`)
       assert.equal(statusRes.status, 200)
       const status = await statusRes.json() as { enabled: boolean; schemes: unknown[]; checking: boolean }
@@ -455,12 +455,12 @@ async function main(): Promise<void> {
   await check('HTTP 链路：检查前后工作区版本号不变', async () => {
     const server = await startServer({
       TOWER_MODE: 'server',
-      TOWER_API_TOKEN: 'selfcheck-key',
+      TOWER_API_TOKEN: 'selfcheck-key-0001',
       TOWER_UPSTREAM_CHECK: 'off',
     })
     try {
       const base = server.base
-      const key = 'selfcheck-key'
+      const key = 'selfcheck-key-0001'
       const put = await fetch(`${base}/api/workspace?key=${key}`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json; charset=utf-8' },

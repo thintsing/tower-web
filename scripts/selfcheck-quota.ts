@@ -146,7 +146,7 @@ async function waitForHealth(base: string): Promise<boolean> {
 async function startTower(): Promise<Tower> {
   const dir = mkdtempSync(join(tmpdir(), 'tower-quota-'))
   const port = 20000 + Math.floor(Math.random() * 30000)
-  const token = 'quota-test'
+  const token = 'quota-test-000001'
   const child = spawn(process.execPath, ['server/index.mjs'], {
     cwd: ROOT,
     env: {
