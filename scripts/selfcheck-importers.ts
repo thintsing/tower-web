@@ -6,6 +6,7 @@ import { parsePlainRulesetText, subconverterRulesetReference } from '../src/rule
 import { parseRuleSetContent } from '../src/rules/ruleSets'
 import { validateSchemePolicy } from '../src/rules/policyValidation'
 import { generateClashYAML } from '../src/generator/clashYaml'
+import { generateSurge } from '../src/generator/surge'
 import type { PolicyGroup, RuleScheme } from '../src/models/types'
 
 let failures = 0
@@ -104,7 +105,7 @@ ipv6 = false
 
 [Proxy Group]
 节点选择 = select, 直连节点, 自动选择
-自动选择 = url-test, 直连节点, url=http://probe.example/204, interval=300, tolerance=50
+自动选择 = url-test, 直连节点, url=http://probe.example/204, interval=300, tolerance=50, category=Media
 链式 = relay, 节点选择, 自动选择
 外部 = select, policy-path=https://example.com/sub, policy-regex-filter="HK|US"
 
@@ -346,6 +347,7 @@ rules:
     assert.equal(group(surge, '自动选择').type, 'url-test')
     assert.equal(group(surge, '自动选择').interval, 300)
     assert.equal(group(surge, '自动选择').tolerance, 50)
+    assert.equal(group(surge, '自动选择').category, 'Media')
     assert.equal(group(surge, '链式').type, 'relay')
     assert.deepEqual(group(surge, '链式').options, ['节点选择', '自动选择'])
     assert.equal(group(surge, '链2').type, 'relay')
@@ -362,6 +364,11 @@ rules:
     assert.equal(surge.rules[3].type, 'FINAL')
     assert.equal(surge.rules[4].type, 'RULE-SET')
     assert.equal(surge.rules[4].value, 'https://example.com/remote.list')
+  })
+  check('Surge: category 只写回 Surge，不泄漏到 Clash', () => {
+    const out = generateSurge([], surge, { target: 'surge' })
+    assert.match(out.text, /自动选择 = url-test.*category="?Media"?/)
+    assert.doesNotMatch(generateClashYAML([], surge, { target: 'clash-verge' }), /category=/)
   })
   check('Surge: General DNS / IPv6 / 测试地址', () => {
     assert.ok(surge.networkSettings)

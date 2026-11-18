@@ -426,6 +426,7 @@ export function generateSurge(
       const native = nativeGroupOptions(group.parameters, options.target)
       if (native.length) line += native.map(({ key, value }) => `, ${key}=${value}`).join('')
       if (group.icon) line += `, icon-url=${group.icon}`
+      if (group.category) line += `, category=${quote(group.category)}`
       out.push(line)
     }
     const filteredRules = filterRulesForTarget(scheme.rules, options.target)

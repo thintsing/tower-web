@@ -754,6 +754,10 @@ function surgeGroup(line: string): PolicyGroup | undefined {
       case 'policy-regex-filter':
         regexFilter = value
         break
+      case 'category':
+        // Surge iOS 5.23+ / Mac 6.10+ 的策略组界面分类；其它客户端不写。
+        group.category = value
+        break
       case 'timeout':
       case 'evaluate-before-use':
       case 'no-alert':

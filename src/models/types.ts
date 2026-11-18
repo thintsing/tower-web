@@ -446,6 +446,8 @@ export interface PolicyGroup {
   selected?: string
   /** 导出准备阶段写入的策略组图标 URL；只在支持图标的客户端出现。 */
   icon?: string
+  /** Surge 策略组分类（iOS 5.23+ / Mac 6.10+），只影响策略组界面分组，不影响路由。 */
+  category?: string
 }
 
 export type RuleSchemeDNSProtectionMode = 'follow-scheme' | 'standard' | 'strict'
