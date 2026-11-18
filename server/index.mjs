@@ -18,7 +18,16 @@ import { fileURLToPath } from 'node:url'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib'
 import { convertRuleSet, RuleSetConversionError } from './ruleset-convert.mjs'
-import { assertAllowedTarget, blockedRuleSetAddress, BLOCKED_TARGET_MESSAGE, isBlockedRuleSetTarget } from './net-guard.mjs'
+import {
+  assertAllowedTarget,
+  assertResolvedAddressAllowed,
+  BLOCKED_TARGET_MESSAGE,
+  PRIVATE_BLOCKED_MESSAGE,
+  isBlockedRuleSetTarget,
+  isPrivateAddress,
+  targetRequiresPrivateNetwork,
+  allowPrivateNetworkFor,
+} from './net-guard.mjs'
 import { safeContentType } from './content-type.mjs'
 import { acceptsAnywhereAjson, surgeVariantFor } from './surge-capabilities.mjs'
 import { asnCIDRs, loadIPASNData, organizationForAddress } from './ip-asn.mjs'
@@ -180,7 +189,7 @@ function ruleSetCacheKey(query) {
 }
 
 /** 读取内置规则文件或抓取远程列表，再转换成目标客户端方言。 */
-async function buildRuleSetArtifact(query) {
+async function buildRuleSetArtifact(query, lookupContext = { localRequest: false, allowPrivate: false }) {
   const format = String(query.get('format') ?? '').toLowerCase()
   if (!['classic', 'quanx', 'egern', 'singbox', 'sing-box', 'mrs', 'srs', 'srs-domain'].includes(format)) {
     throw new RuleSetConversionError('format 必须是 classic / quanx / egern / singbox / mrs / srs / srs-domain')
@@ -263,9 +272,12 @@ async function buildRuleSetArtifact(query) {
     if (isBlockedRuleSetTarget(target)) {
       throw new RuleSetConversionError(`规则集地址被拦截：${BLOCKED_TARGET_MESSAGE}`, 400)
     }
+    if (targetRequiresPrivateNetwork(target) && !allowPrivateNetworkFor(lookupContext.localRequest, lookupContext.allowPrivate)) {
+      throw new RuleSetConversionError(`规则集地址被拦截：${PRIVATE_BLOCKED_MESSAGE}`, 400)
+    }
     let response
     try {
-      response = await fetchWithDoH(target, 'clash-verge/v2.4.2', undefined, false, assertAllowedTarget)
+      response = await fetchWithDoH(target, 'clash-verge/v2.4.2', undefined, false, assertAllowedTarget, lookupContext)
     } catch (error) {
       throw new RuleSetConversionError(`规则集抓取失败：${error.message}`, 502)
     }
@@ -699,6 +711,13 @@ const DEFAULT_SERVER_SETTINGS = Object.freeze({
   apiToken: '',
   /** 服务器模式下按工作区固定的订阅 token；本地模式不使用。 */
   subscriptionToken: '',
+  /**
+   * 允许局域网请求让塔台代理私网 / 回环地址的订阅 / 规则集抓取。
+   * 关闭时只有本机请求能访问 10/8、172.16/12、192.168/16、127/8 等。
+   * 开启后能从 NAS / 自建服务拉规则集，但也允许同一 Wi-Fi 上的其他设备
+   * 通过塔台探测内网。默认 false。
+   */
+  allowPrivateNetworkFetch: false,
 })
 
 let serverSettings = { ...DEFAULT_SERVER_SETTINGS }
@@ -731,6 +750,7 @@ function loadServerSettings() {
       lanSharing: data?.lanSharing !== false,
       apiToken: normalizeAPIToken(data?.apiToken),
       subscriptionToken: normalizeWorkspaceSubscriptionToken(data?.subscriptionToken),
+      allowPrivateNetworkFetch: data?.allowPrivateNetworkFetch === true,
     }
   } catch (error) {
     if (error?.code !== 'ENOENT') {
@@ -744,6 +764,10 @@ function loadServerSettings() {
     const envToken = normalizeAPIToken(envTokenRaw)
     if (envToken) serverSettings.apiToken = envToken
     else console.warn(`[tower] TOWER_API_TOKEN 格式无效（${SERVER_MODE ? '需 16–128 个不含空白 / 控制字符的字符' : '需 16–128 位 A-Z/a-z/0-9/_/-'}），已忽略`)
+  }
+  const envPrivateFetch = String(process.env.TOWER_ALLOW_PRIVATE_FETCH ?? '').trim().toLowerCase()
+  if (envPrivateFetch) {
+    serverSettings.allowPrivateNetworkFetch = ['1', 'true', 'yes', 'on'].includes(envPrivateFetch)
   }
 }
 
@@ -771,7 +795,10 @@ function isLoopbackRequest(req) {
   return isLoopbackAddress(normalizedRemoteAddress(req))
 }
 
-/** 容器内看到的宿主机访问常是 172.x；用 Host 头区分宿主机浏览器。 */
+/**
+ * 容器内看到的宿主机访问常是 172.x；用 Host 头区分宿主机浏览器。
+ * 用 net-guard.mjs 统一的 isPrivateAddress。
+ */
 function isContainerHostLocalRequest(req) {
   return process.env.TOWER_CONTAINER === '1'
     && isPrivateAddress(normalizedRemoteAddress(req))
@@ -812,15 +839,7 @@ function isCrossSiteRequest(req) {
   }
 }
 
-function isPrivateAddress(address) {
-  if (!address) return false
-  if (address.startsWith('10.') || address.startsWith('192.168.') || address.startsWith('169.254.')) return true
-  if (address.startsWith('172.')) {
-    const second = Number(address.split('.')[1])
-    return second >= 16 && second <= 31
-  }
-  return address.startsWith('fc') || address.startsWith('fd') || address.startsWith('fe80:')
-}
+/** net-guard.mjs 里统一导出 isPrivateAddress；此处不再重复定义。 */
 
 /**
  * 设置接口允许本机直连；Docker 宿主机通过 Host 头识别，但一旦启用管理密钥，
@@ -2001,15 +2020,19 @@ function systemLookup(hostname, options, callback) {
  * 需要逐跳安全检查时使用：解析出的地址命中链路本地 / 云元数据就直接拒绝，
  * 避免域名指向内网地址绕过只按 hostname 的拦截。
  */
-function lookupWithGuard(endpoint) {
+function lookupWithGuard(endpoint, localRequest, allowPrivate) {
   const base = endpoint ? dohLookup(endpoint) : systemLookup
   return (hostname, options, callback) => {
     base(hostname, options, (error, address, family) => {
       if (error) return callback(error)
       const list = Array.isArray(address) ? address : [{ address, family }]
-      if (list.some((item) => blockedRuleSetAddress(item.address))) {
-        callback(new Error('规则集地址不能指向链路本地或云元数据服务'))
-        return
+      for (const item of list) {
+        try {
+          assertResolvedAddressAllowed(item.address, { localRequest, allowPrivate })
+        } catch (guardError) {
+          callback(new Error(guardError.message))
+          return
+        }
       }
       callback(null, address, family)
     })
@@ -2023,7 +2046,7 @@ function headerValue(headers, name) {
   return Array.isArray(value) ? value[0] : (value ?? null)
 }
 
-function requestOnce(target, userAgent, dohEndpoint, headersOnly = false, guard = undefined) {
+function requestOnce(target, userAgent, dohEndpoint, headersOnly = false, guard = undefined, lookupContext = { localRequest: false, allowPrivate: false }) {
   return new Promise((resolve, reject) => {
     const transport = target.protocol === 'https:' ? httpsRequest : httpRequest
     const req = transport({
@@ -2034,7 +2057,7 @@ function requestOnce(target, userAgent, dohEndpoint, headersOnly = false, guard 
       method: 'GET',
       agent: false,
       lookup: guard
-        ? lookupWithGuard(dohEndpoint)
+        ? lookupWithGuard(dohEndpoint, lookupContext.localRequest, lookupContext.allowPrivate)
         : (dohEndpoint ? dohLookup(dohEndpoint) : undefined),
       headers: {
         // Airports switch payloads on the UA; ask for the raw subscription.
@@ -2092,12 +2115,12 @@ function requestOnce(target, userAgent, dohEndpoint, headersOnly = false, guard 
  * 链路本地 / 云元数据。相对 Location 按当前地址解析；最多 5 跳。
  * 返回的是最终那一跳的响应，`subscription-userinfo` 等头自然来自最终响应。
  */
-async function fetchWithDoH(target, userAgent, dohEndpoint, headersOnly = false, guard = undefined) {
+async function fetchWithDoH(target, userAgent, dohEndpoint, headersOnly = false, guard = undefined, lookupContext = { localRequest: false, allowPrivate: false }) {
   let current = target
   for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
     let result
     try {
-      result = await requestOnce(current, userAgent, dohEndpoint, headersOnly, guard)
+      result = await requestOnce(current, userAgent, dohEndpoint, headersOnly, guard, lookupContext)
     } catch (error) {
       if (hop === 0) throw error
       throw new Error(`第 ${hop} 次跳转（${current.href}）失败：${error?.message ?? '网络错误'}`)
@@ -2125,7 +2148,7 @@ async function fetchWithDoH(target, userAgent, dohEndpoint, headersOnly = false,
   throw new Error(`订阅地址重定向超过 ${MAX_REDIRECT_HOPS} 跳，已停止`)
 }
 
-async function handleFetch(url, options, res) {
+async function handleFetch(url, options, res, lookupContext = { localRequest: false, allowPrivate: false }) {
   let target
   try {
     target = new URL(url)
@@ -2139,6 +2162,10 @@ async function handleFetch(url, options, res) {
     assertAllowedTarget(target)
   } catch (error) {
     return json(res, 400, { error: `订阅地址被拦截：${error?.message ?? BLOCKED_TARGET_MESSAGE}` })
+  }
+  // 字面 IP 目标的私网策略：非本机且未显式放行时直接拒绝，避免白跑 DNS。
+  if (targetRequiresPrivateNetwork(target) && !allowPrivateNetworkFor(lookupContext.localRequest, lookupContext.allowPrivate)) {
+    return json(res, 400, { error: `订阅地址被拦截：${PRIVATE_BLOCKED_MESSAGE}`, code: 'private_blocked' })
   }
 
   const userAgent = sanitizeUserAgent(options?.userAgent) || 'clash-verge/v2.4.2'
@@ -2155,7 +2182,7 @@ async function handleFetch(url, options, res) {
   // 有 DoH 时用 http(s).request + 自定义 lookup（Node 的 fetch 不暴露 DNS）；
   // 没有 DoH 也走同一条路径，这样重定向策略、逐跳守卫和体积上限只有一份实现。
   try {
-    upstream = await fetchWithDoH(target, userAgent, dohEndpoint, headersOnly, assertAllowedTarget)
+    upstream = await fetchWithDoH(target, userAgent, dohEndpoint, headersOnly, assertAllowedTarget, lookupContext)
   } catch (error) {
     return json(res, 502, { error: `订阅服务器无法访问：${error?.message ?? '网络错误'}` })
   }
@@ -2243,7 +2270,7 @@ async function probeOnce(host, port, timeout, signal) {
   }
 }
 
-async function handleProbe(url, res) {
+async function handleProbe(url, res, lookupContext = { localRequest: false, allowPrivate: false }) {
   const host = url.searchParams.get('host')?.trim()
   const portText = url.searchParams.get('port')
   const requested = Number(url.searchParams.get('timeout') ?? 5000) || 5000
@@ -2252,6 +2279,11 @@ async function handleProbe(url, res) {
   const mode = (url.searchParams.get('mode') ?? 'tcp').toLowerCase()
   if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
     return json(res, 400, { ok: false, error: 'host/port 无效' })
+  }
+  // 字面 IP 的私网探测入口层拦截：域名指向私网的情况 probe 暂不拦，
+  // 因为合法场景（用塔台测 NAS 端口）和探测内网的风险难以在域名层区分。
+  if (isIP(host) && isPrivateAddress(host) && !allowPrivateNetworkFor(lookupContext.localRequest, lookupContext.allowPrivate)) {
+    return json(res, 400, { ok: false, error: PRIVATE_BLOCKED_MESSAGE })
   }
   try {
     if (mode === 'icmp') {
@@ -2468,11 +2500,12 @@ const server = createServer(async (req, res) => {
     if (url.pathname === '/api/fetch' && req.method === 'GET') {
       const target = url.searchParams.get('url')
       if (!target) return json(res, 400, { error: '缺少 url 参数' })
+      const lookupContext = { localRequest, allowPrivate: serverSettings.allowPrivateNetworkFetch }
       return await handleFetch(target, {
         userAgent: url.searchParams.get('ua') ?? '',
         doh: url.searchParams.get('doh') ?? '',
         headersOnly: url.searchParams.get('headers') === '1',
-      }, res)
+      }, res, lookupContext)
     }
 
     // 规则集转换：把经典 Clash 列表托管成 QuanX / Egern / sing-box source 方言。
@@ -2484,7 +2517,8 @@ const server = createServer(async (req, res) => {
         // 自检与线上排查都依赖这个头确认缓存键是否真正命中。
         const cacheState = artifact ? 'hit' : 'miss'
         if (!artifact) {
-          artifact = await buildRuleSetArtifact(url.searchParams)
+          const lookupContext = { localRequest, allowPrivate: serverSettings.allowPrivateNetworkFetch }
+          artifact = await buildRuleSetArtifact(url.searchParams, lookupContext)
           cacheRuleSet(artifact.key, artifact)
         }
         return send(res, 200, artifact.body, {
@@ -2504,7 +2538,8 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname === '/api/probe' && req.method === 'GET') {
-      return await handleProbe(url, res)
+      const lookupContext = { localRequest, allowPrivate: serverSettings.allowPrivateNetworkFetch }
+      return await handleProbe(url, res, lookupContext)
     }
 
     if (url.pathname === '/api/ip-country' && req.method === 'GET') {

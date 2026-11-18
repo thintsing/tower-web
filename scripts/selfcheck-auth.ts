@@ -190,6 +190,50 @@ async function main(): Promise<void> {
       assert.equal(builtin.status, 200)
     })
 
+    await check('本机请求：/api/ruleset?url=私网 / 回环 地址仍放行', async () => {
+      // 私网入口层拦截只对非本机请求启用；本机请求仍可打回环 / 私网。
+      const fake = createServer((_req, res) => {
+        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' })
+        res.end('DOMAIN-SUFFIX,example.com,DIRECT')
+      })
+      await new Promise<void>((resolve) => fake.listen(0, '127.0.0.1', resolve))
+      const port = (fake.address() as AddressInfo).port
+      try {
+        const res = await fetch(
+          `${LOCAL}/api/ruleset?format=classic&url=${encodeURIComponent(`http://127.0.0.1:${port}/fake.list`)}`,
+        )
+        assert.equal(res.status, 200)
+      } finally {
+        fake.close()
+      }
+    })
+
+    if (LAN_CANDIDATES.length > 0) {
+      await check('局域网请求：/api/ruleset?url=私网地址默认拦截', async () => {
+        const lan = LAN_CANDIDATES[0]
+        const res = await fetch(
+          `${lan}/api/ruleset?format=classic&url=${encodeURIComponent('http://192.168.1.1/rules.list')}`,
+          { headers: { 'x-tower-key': token } },
+        )
+        assert.equal(res.status, 400)
+        assert.match(await res.text(), /私网|回环/)
+      })
+      await check('局域网请求：/api/fetch?url=127.0.0.1 默认拦截', async () => {
+        const lan = LAN_CANDIDATES[0]
+        const res = await fetch(
+          `${lan}/api/fetch?url=${encodeURIComponent('http://127.0.0.1:65080/sub')}&key=${encodeURIComponent(token)}`,
+        )
+        assert.equal(res.status, 400)
+        assert.match(await res.text(), /私网|回环/)
+      })
+      await check('局域网请求：/api/probe host=192.168.x.x 默认拦截', async () => {
+        const lan = LAN_CANDIDATES[0]
+        const res = await fetch(`${lan}/api/probe?host=192.168.1.1&port=443&key=${encodeURIComponent(token)}`)
+        assert.equal(res.status, 400)
+        assert.match(await res.text(), /私网|回环/)
+      })
+    }
+
     await check('发布订阅后 subscriptions.json 异步落盘', async () => {
       const publishToken = `audit-${Math.random().toString(36).slice(2, 10)}`.padEnd(32, 'x')
       const published = await fetch(`${LOCAL}/api/subscribe?token=${publishToken}`, {
