@@ -16,6 +16,7 @@ import { parseClashYAML } from '../src/parser/clash'
 import { canonicalNodeURI } from '../src/generator/base64Sub'
 import { generateSingBox } from '../src/generator/singbox'
 import { generateSurge } from '../src/generator/surge'
+import { applyTailnets } from '../src/generator/tailnet'
 import { generateConfig } from '../src/generator'
 import { uniqueDisplayNames } from '../src/generator/groups'
 import { clearTowerStorage, createSafeStorage, isStorageFull, onStorageFullChange } from '../src/util/localStore'
@@ -722,6 +723,20 @@ await checkAsync('只读模式只拦工作区字段，设备偏好保持可写',
   } finally {
     setWorkspaceReadOnly(false)
   }
+})
+
+// ---------- Tailscale：Stash 的 auth-key 可省略 ----------
+check('Stash 未填 Auth Key 时仍写 tailscale 节点，并提示客户端内认证', () => {
+  const connection = {
+    id: 'ts-stash', name: '家里', subnets: [], magicDNSSuffix: 'tail1234.ts.net', isEnabled: true,
+  }
+  const profile = 'proxies:\n  - name: 直连\n    type: direct\n\nproxy-groups:\nrules:\n'
+  const withoutKey = applyTailnets(profile, 'clash', 'full', [{ connection }])
+  assert.match(withoutKey.text, /type: tailscale/)
+  assert.doesNotMatch(withoutKey.text, /auth-key:/)
+  assert.ok(withoutKey.notes.some((note) => note.includes('auth-key 可省略')))
+  const withKey = applyTailnets(profile, 'clash', 'full', [{ connection, authKey: 'tskey-auth-test' }])
+  assert.match(withKey.text, /auth-key: "?tskey-auth-test"?/)
 })
 
 // ---------- 11b. 只读模式：逐类调用写入口，工作区与 Auth Key 缓存都不变 ----------

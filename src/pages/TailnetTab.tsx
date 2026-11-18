@@ -174,8 +174,8 @@ function TailnetEditorDialog({
               )}
             </div>
             <div className="hint">
-              Stash、Clash / mihomo 和 sing-box MT 需要它；Surge 在客户端里登录，不写 Key。
-              生成时打开 Reusable，设备加入后关闭 Key Expiry；只保存本机，不同步。
+              Stash 可留空，在客户端打开节点 → Tailscale → 开始认证；Clash / mihomo 和 sing-box 需要它。
+              Surge 在客户端里登录，不写 Key。生成时打开 Reusable，设备加入后关闭 Key Expiry；只保存本机，不同步。
             </div>
           </div>
           <div className="field" style={{ gridColumn: '1 / -1' }}>

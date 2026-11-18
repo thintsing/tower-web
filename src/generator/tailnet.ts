@@ -100,7 +100,10 @@ function tailnetNotes(profile: TailnetProfile, exportItem: TailnetExport, name: 
   if (profile.flavor === 'surge') return []
   const notes: string[] = []
   if (!exportItem.authKey) {
-    notes.push(`“${name}”没有 Auth Key：${profile.targetName} 暂时不能在客户端里登录 Tailscale，请在「内网」页填写 Auth Key。`)
+    notes.push(profile.flavor === 'stash'
+      // Stash 的 auth-key 是可选的：没有 Key 时可以走客户端内的交互登录。
+      ? `“${name}”没有 Auth Key：Stash 的 auth-key 可省略，在客户端打开该节点 → Tailscale → 开始认证即可；填写 Key 则自动接入。`
+      : `“${name}”没有 Auth Key：${profile.targetName} 暂时不能在客户端里登录 Tailscale，请在「内网」页填写 Auth Key。`)
   }
   if (profile.flavor === 'stash') notes.push(stashNote(exportItem, name, profile.targetName))
   return notes
