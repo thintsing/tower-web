@@ -721,6 +721,8 @@ const DEFAULT_SERVER_SETTINGS = Object.freeze({
 })
 
 let serverSettings = { ...DEFAULT_SERVER_SETTINGS }
+/** 环境变量一旦设置就压过 settings.json，界面上的开关需要说明且不能再改。 */
+let privateFetchEnvLocked = false
 
 /** 固定订阅 token 只接受足够强的格式；迁移时不把历史弱 token 提升为规范链接。 */
 function normalizeWorkspaceSubscriptionToken(value) {
@@ -768,6 +770,7 @@ function loadServerSettings() {
   const envPrivateFetch = String(process.env.TOWER_ALLOW_PRIVATE_FETCH ?? '').trim().toLowerCase()
   if (envPrivateFetch) {
     serverSettings.allowPrivateNetworkFetch = ['1', 'true', 'yes', 'on'].includes(envPrivateFetch)
+    privateFetchEnvLocked = true
   }
 }
 
@@ -991,6 +994,8 @@ function settingsPayload() {
     requiresAuth: !!serverSettings.apiToken,
     apiToken: serverSettings.apiToken,
     mobileURL,
+    allowPrivateNetworkFetch: serverSettings.allowPrivateNetworkFetch,
+    allowPrivateNetworkFetchLocked: privateFetchEnvLocked,
   }
 }
 
@@ -2480,6 +2485,18 @@ const server = createServer(async (req, res) => {
         }
         if (typeof payload?.lanSharing !== 'boolean') {
           return json(res, 400, { error: 'lanSharing 必须是布尔值' })
+        }
+        if (payload.allowPrivateNetworkFetch !== undefined) {
+          if (typeof payload.allowPrivateNetworkFetch !== 'boolean') {
+            return json(res, 400, { error: 'allowPrivateNetworkFetch 必须是布尔值' })
+          }
+          if (privateFetchEnvLocked) {
+            return json(res, 409, {
+              error: '当前由环境变量 TOWER_ALLOW_PRIVATE_FETCH 控制；请移除该变量并重启后再从界面修改',
+              code: 'env_locked',
+            })
+          }
+          serverSettings.allowPrivateNetworkFetch = payload.allowPrivateNetworkFetch
         }
         serverSettings.lanSharing = payload.lanSharing
         persistServerSettings()

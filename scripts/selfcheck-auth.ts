@@ -82,6 +82,8 @@ async function main(): Promise<void> {
       HOST: '0.0.0.0',
       TOWER_DATA_DIR: dataDir,
       TOWER_CONTAINER: '',
+      // 宿主机可能配置了放行私网；自检要固定从默认拒绝开始。
+      TOWER_ALLOW_PRIVATE_FETCH: '',
     },
     stdio: 'ignore',
   })
@@ -231,6 +233,33 @@ async function main(): Promise<void> {
         const res = await fetch(`${lan}/api/probe?host=192.168.1.1&port=443&key=${encodeURIComponent(token)}`)
         assert.equal(res.status, 400)
         assert.match(await res.text(), /私网|回环/)
+      })
+      await check('允许局域网访问私网：开关开启后放行，关闭后恢复拦截', async () => {
+        const lan = LAN_CANDIDATES[0]
+        const target = encodeURIComponent('http://127.0.0.1:1/sub')
+        const save = async (allowPrivateNetworkFetch: boolean) => {
+          const res = await fetch(`${LOCAL}/api/settings`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ lanSharing: true, allowPrivateNetworkFetch }),
+          })
+          assert.equal(res.status, 200)
+          return await res.json() as {
+            allowPrivateNetworkFetch?: boolean
+            allowPrivateNetworkFetchLocked?: boolean
+          }
+        }
+        const enabled = await save(true)
+        assert.equal(enabled.allowPrivateNetworkFetch, true)
+        assert.equal(enabled.allowPrivateNetworkFetchLocked, false)
+        // 已通过私网检查，失败在连接阶段（502），而不是被入口拦下（400）。
+        const allowed = await fetch(`${lan}/api/fetch?url=${target}&key=${encodeURIComponent(token)}`)
+        assert.equal(allowed.status, 502)
+        const disabled = await save(false)
+        assert.equal(disabled.allowPrivateNetworkFetch, false)
+        const blocked = await fetch(`${lan}/api/fetch?url=${target}&key=${encodeURIComponent(token)}`)
+        assert.equal(blocked.status, 400)
+        assert.match(await blocked.text(), /私网|回环/)
       })
     }
 

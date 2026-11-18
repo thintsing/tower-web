@@ -100,6 +100,8 @@ export function SubscriptionSettingsDialog({
     requiresAuth: boolean
     apiToken: string
     mobileURL?: string
+    allowPrivateNetworkFetch: boolean
+    allowPrivateNetworkFetchLocked: boolean
   } | null>(null)
   const [serverAccessError, setServerAccessError] = useState('')
   const [serverAccessNotice, setServerAccessNotice] = useState('')
@@ -137,6 +139,34 @@ export function SubscriptionSettingsDialog({
       }
       setServerAccess(await res.json())
       setServerAccessNotice(enabled ? '已开启局域网共享。' : '已关闭局域网共享；手机和其他设备将无法访问塔台。')
+    } catch (error) {
+      setServerAccessError(error instanceof Error ? error.message : '保存失败')
+    } finally {
+      setServerAccessBusy(false)
+    }
+  }
+
+  const savePrivateFetch = async (enabled: boolean) => {
+    if (!serverAccess) return
+    setServerAccessBusy(true)
+    setServerAccessError('')
+    try {
+      const res = await apiFetch('/api/settings', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({
+          lanSharing: serverAccess.lanSharing,
+          allowPrivateNetworkFetch: enabled,
+        }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}) as { error?: string })
+        throw new Error(body.error ?? `HTTP ${res.status}`)
+      }
+      setServerAccess(await res.json())
+      setServerAccessNotice(enabled
+        ? '已允许局域网请求访问私网；自建 NAS 等内网规则集现在可用。'
+        : '已恢复默认：局域网请求不能访问私网。')
     } catch (error) {
       setServerAccessError(error instanceof Error ? error.message : '保存失败')
     } finally {
@@ -469,6 +499,28 @@ export function SubscriptionSettingsDialog({
                 <small>关闭后，非本机设备无法打开塔台页面，也无法更新订阅或下载规则集；本机访问不受影响。</small>
               </span>
             </label>
+            <label className="setting-toggle">
+              <input
+                type="checkbox"
+                checked={serverAccess.allowPrivateNetworkFetch}
+                disabled={serverAccessBusy || serverAccess.allowPrivateNetworkFetchLocked}
+                onChange={(e) => void savePrivateFetch(e.target.checked)}
+              />
+              <span>
+                <strong>允许局域网请求访问私网</strong>
+                <small>
+                  开启后，手机 / 其他设备可以让塔台代理或探测 <span className="mono">10/8</span>、
+                  <span className="mono">172.16/12</span>、<span className="mono">192.168/16</span> 等内网地址，
+                  例如自建 NAS 上的规则集。本机访问始终允许；开启会增加同一 Wi-Fi 内横向探测的风险。
+                </small>
+              </span>
+            </label>
+            {serverAccess.allowPrivateNetworkFetchLocked && (
+              <div className="hint">
+                当前由环境变量 <span className="mono">TOWER_ALLOW_PRIVATE_FETCH</span> 控制；
+                移除该变量并重启后，才能在界面切换。
+              </div>
+            )}
             <div className="field">
               <label>管理 API 访问密钥</label>
               {serverAccess.requiresAuth ? (
