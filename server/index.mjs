@@ -2319,6 +2319,7 @@ const server = createServer(async (req, res) => {
     const browserRequest = !!req.headers.origin || !!req.headers['sec-fetch-site']
     const crossSite = isCrossSiteRequest(req)
     const sensitiveRead = url.pathname === '/api/settings'
+      || url.pathname === '/api/subscriptions'
       || url.pathname === '/api/fetch'
       || url.pathname === '/api/probe'
       || url.pathname === '/api/network'
@@ -2575,6 +2576,32 @@ const server = createServer(async (req, res) => {
         lanSharing: serverSettings.lanSharing,
         requiresAuth: !!serverSettings.apiToken,
       })
+    }
+
+    // 订阅管理列表会暴露 token，只允许本机页面或已认证的管理员读取。
+    // 局域网共享开启但未设密钥时，手机仍只能拿到已知 token 的订阅正文。
+    if (url.pathname === '/api/subscriptions' && req.method === 'GET') {
+      const tokenMatches = apiTokenMatches(presentedAPIToken(req, url))
+      const allowed = SERVER_MODE
+        ? !!serverSettings.apiToken && tokenMatches
+        : localRequest || (!!serverSettings.apiToken && tokenMatches)
+      if (!allowed) {
+        return json(res, 403, {
+          error: '订阅管理只允许在本机访问，或先配置访问密钥',
+          code: 'local_only',
+        })
+      }
+      const list = [...subscriptions.entries()]
+        .map(([token, record]) => ({
+          token,
+          title: normalizeSubscriptionTitle(record?.title) || '未命名订阅',
+          updatedAt: Number(record?.updatedAt) || 0,
+          formats: record?.formats && typeof record.formats === 'object'
+            ? Object.keys(record.formats)
+            : [],
+        }))
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+      return json(res, 200, { limit: MAX_SUBSCRIPTIONS, subscriptions: list })
     }
 
     // --- Persistent subscription URL: browser POSTs current node list,

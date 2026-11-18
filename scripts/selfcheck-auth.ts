@@ -249,6 +249,37 @@ async function main(): Promise<void> {
       }
     })
 
+    await check('订阅管理列表本机可读、可删除单条，局域网匿名请求被拒绝', async () => {
+      const prefix = `manage-${Math.random().toString(36).slice(2, 8)}-`
+      const tokens = ['first', 'second'].map((suffix) => `${prefix}${suffix}`.padEnd(24, 'x'))
+      for (const [index, item] of tokens.entries()) {
+        const published = await fetch(`${LOCAL}/api/subscribe?token=${item}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ title: `manage-${index}`, formats: { yaml: 'proxies: []\n' } }),
+        })
+        assert.equal(published.status, 200)
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      const list = await fetch(`${LOCAL}/api/subscriptions`).then((res) => res.json()) as {
+        limit: number
+        subscriptions: { token: string; title: string; updatedAt: number }[]
+      }
+      assert.equal(list.limit, 64)
+      assert.deepEqual(list.subscriptions.map((item) => item.title), ['manage-1', 'manage-0'])
+
+      const lan = await rawRequest('/api/subscriptions', { host: `192.168.1.50:${PORT}` })
+      assert.ok([401, 403].includes(lan.status), `局域网匿名请求应被拒绝，实际 ${lan.status}`)
+
+      const removed = await fetch(`${LOCAL}/api/sub/${tokens[0]}`, { method: 'DELETE' })
+      assert.equal(removed.status, 200)
+      const after = await fetch(`${LOCAL}/api/subscriptions`).then((res) => res.json()) as {
+        subscriptions: { title: string }[]
+      }
+      assert.deepEqual(after.subscriptions.map((item) => item.title), ['manage-1'])
+      await fetch(`${LOCAL}/api/sub/${tokens[1]}`, { method: 'DELETE' })
+    })
+
     await check('持久订阅达到 64 条后拒绝新 token，刷新已有 token 仍可用', async () => {
       const prefix = `cap-${Math.random().toString(36).slice(2, 8)}-`
       const tokens = Array.from({ length: 64 }, (_, index) => `${prefix}${index}`.padEnd(24, 'x'))

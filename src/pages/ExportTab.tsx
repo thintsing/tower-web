@@ -78,6 +78,13 @@ interface LinkCheckRow {
   detail: string
 }
 
+interface ManagedSubscription {
+  token: string
+  title: string
+  updatedAt: number
+  formats: string[]
+}
+
 type SurgeTierMap = Partial<Record<'surge' | 'surge-mac', Record<string, string>>>
 
 function utf8Bytes(text: string): number {
@@ -315,6 +322,12 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
   const [revokeError, setRevokeError] = useState('')
   const [copiedField, setCopiedField] = useState<'sub' | 'nodes' | 'import' | 'lan' | null>(null)
   const [copiedClientLink, setCopiedClientLink] = useState<string | null>(null)
+  const [copiedManagedToken, setCopiedManagedToken] = useState('')
+  const [managedSubs, setManagedSubs] = useState<ManagedSubscription[]>([])
+  const [managedLimit, setManagedLimit] = useState(64)
+  const [managedLoading, setManagedLoading] = useState(false)
+  const [managedError, setManagedError] = useState('')
+  const [pendingDeleteSub, setPendingDeleteSub] = useState<ManagedSubscription | null>(null)
   const [importNotice, setImportNotice] = useState('')
 
   useEffect(() => {
@@ -367,6 +380,83 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
     }
     setCopiedClientLink(key)
     window.setTimeout(() => setCopiedClientLink((v) => (v === key ? null : v)), 1600)
+  }
+
+  /** 持久订阅列表只在本机或已认证的管理页面可用；局域网匿名访问会被服务端拒绝。 */
+  const loadManagedSubscriptions = useCallback(async () => {
+    if (DEMO_MODE || serverMode) return
+    setManagedLoading(true)
+    setManagedError('')
+    try {
+      const response = await apiFetch('/api/subscriptions')
+      if (response.status === 401 || response.status === 403) {
+        setManagedSubs([])
+        setManagedError('订阅管理只允许在本机打开塔台，或先配置访问密钥。')
+        return
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const body = await response.json() as { limit?: unknown; subscriptions?: unknown }
+      const limit = Number(body.limit)
+      setManagedLimit(Number.isFinite(limit) && limit > 0 ? limit : 64)
+      const rows = Array.isArray(body.subscriptions) ? body.subscriptions : []
+      setManagedSubs(rows.flatMap((row): ManagedSubscription[] => {
+        if (!row || typeof row !== 'object') return []
+        const item = row as Record<string, unknown>
+        if (typeof item.token !== 'string' || !item.token) return []
+        return [{
+          token: item.token,
+          title: typeof item.title === 'string' && item.title ? item.title : '未命名订阅',
+          updatedAt: Number(item.updatedAt) || 0,
+          formats: Array.isArray(item.formats)
+            ? item.formats.filter((format): format is string => typeof format === 'string')
+            : [],
+        }]
+      }))
+    } catch (error) {
+      setManagedError(`读取订阅列表失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setManagedLoading(false)
+    }
+  }, [serverMode])
+
+  useEffect(() => {
+    if (DEMO_MODE || serverMode) return
+    void loadManagedSubscriptions()
+  }, [loadManagedSubscriptions, serverMode])
+
+  const copyManagedSubscription = async (item: ManagedSubscription) => {
+    const url = `${window.location.origin}/api/sub/${encodeURIComponent(item.token)}?name=${encodeURIComponent(item.title)}`
+    const ok = await copyToClipboard(url)
+    if (!ok) {
+      setManagedError('这台机器不允许网页写剪贴板，请手动复制订阅地址。')
+      return
+    }
+    setCopiedManagedToken(item.token)
+    window.setTimeout(() => setCopiedManagedToken((value) => (value === item.token ? '' : value)), 1600)
+  }
+
+  const deleteManagedSubscription = async (item: ManagedSubscription) => {
+    if (demoBlocksServerWrites(DEMO_MODE)) {
+      setManagedError(DEMO_PUBLISH_NOTE)
+      return
+    }
+    setManagedError('')
+    try {
+      const response = await apiFetch(`/api/sub/${encodeURIComponent(item.token)}`, { method: 'DELETE' })
+      if (!response.ok && response.status !== 404) throw new Error(`HTTP ${response.status}`)
+      setManagedSubs((rows) => rows.filter((row) => row.token !== item.token))
+      if (item.token === subToken) {
+        setSubToken('')
+        setSubURL('')
+        setSubUpdatedAt(null)
+        localPrefs.removeItem(SUB_TOKEN_KEY)
+        localPrefs.removeItem(SUB_URL_KEY)
+        localPrefs.removeItem(SUB_UPDATED_AT_KEY)
+      }
+      setCheckResult({ ok: true, text: `已删除订阅「${item.title}」，对应链接立即失效。` })
+    } catch (error) {
+      setManagedError(`删除失败：${error instanceof Error ? error.message : String(error)}。链接仍然有效。`)
+    }
   }
 
   const enabled = useMemo(() => enabledNodes({ sources, nodes }), [sources, nodes])
@@ -1100,6 +1190,7 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
       setSubUpdatedAt(now)
       localPrefs.setItem(SUB_UPDATED_AT_KEY, String(now))
       markExported()
+      void loadManagedSubscriptions()
       return abs
     } catch (e: unknown) {
       setCheckResult({ ok: false, text: `${dryRun ? '预检' : '发布'}失败：${e instanceof Error ? e.message : String(e)}` })
@@ -2299,6 +2390,7 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
           )}
         </div>
         {!DEMO_MODE && (
+        <>
         <details className="link-note">
           <summary>链接存储与有效期</summary>
           <div className="link-note-body">
@@ -2309,6 +2401,47 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
                   server 关闭期间客户端更新会失败，重新启动即可恢复。撤销或删除订阅会让对应链接立即失效。</>}
           </div>
         </details>
+        {!serverMode && (
+          <details className="link-note" onToggle={(event) => {
+            if ((event.currentTarget as HTMLDetailsElement).open) void loadManagedSubscriptions()
+          }}>
+            <summary>订阅管理 · {managedSubs.length}/{managedLimit}</summary>
+            <div className="link-note-body">
+              {managedLoading && <div className="hint">正在读取订阅列表…</div>}
+              {managedError && <div className="hint">{managedError}</div>}
+              {!managedLoading && !managedError && managedSubs.length === 0 && (
+                <div className="hint">还没有持久订阅。发布订阅链接后会出现在这里，方便删除不再使用的地址。</div>
+              )}
+              {managedSubs.map((item) => (
+                <div key={item.token} style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  padding: '8px 0',
+                  borderTop: '1px solid var(--line, rgba(127, 127, 127, 0.18))',
+                }}>
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.title}</div>
+                    <div className="hint">
+                      <span className="mono">{item.token.slice(0, 8)}…</span>
+                      {item.updatedAt > 0 ? ` · ${new Date(item.updatedAt).toLocaleString()}` : ''}
+                    </div>
+                  </div>
+                  <button className="btn ghost" onClick={() => void copyManagedSubscription(item)}>
+                    {copiedManagedToken === item.token ? '已复制' : '复制'}
+                  </button>
+                  <button className="btn ghost" disabled={readOnly} onClick={() => setPendingDeleteSub(item)}>
+                    删除
+                  </button>
+                </div>
+              ))}
+              <div className="hint" style={{ marginTop: 8 }}>
+                达到 {managedLimit} 条后会拒绝新的订阅 token，已有链接不受影响；删除后对应链接立即失效。
+              </div>
+            </div>
+          </details>
+        )}
+        </>
         )}
       </div>
 
@@ -2346,6 +2479,20 @@ export function ExportTab({ onGo }: { onGo?: (tab: TabKey) => void }) {
         confirmDisabled={readOnly}
         onCancel={() => setPendingRevoke(false)}
         onConfirm={() => { setPendingRevoke(false); void revokeSubscription() }}
+      />
+      <ConfirmDialog
+        open={!!pendingDeleteSub}
+        title={`删除订阅「${pendingDeleteSub?.title ?? ''}」？`}
+        body="删除后该订阅链接立即失效，已导入的客户端将无法再更新。节点和规则不会被删除。"
+        confirmLabel="删除订阅"
+        danger
+        confirmDisabled={readOnly}
+        onCancel={() => setPendingDeleteSub(null)}
+        onConfirm={() => {
+          const item = pendingDeleteSub
+          setPendingDeleteSub(null)
+          if (item) void deleteManagedSubscription(item)
+        }}
       />
       <QRCodeDialog
         open={qrOpen}
