@@ -108,6 +108,14 @@ async function main(): Promise<void> {
       assert.equal(settings.apiToken, '')
     })
 
+    await check('未设置密钥时，外域 Host 的浏览器请求被拒绝', async () => {
+      const rebinding = await rawRequest('/api/settings', {
+        host: `evil.example:${PORT}`,
+        origin: 'http://evil.example',
+      })
+      assert.equal(rebinding.status, 403)
+    })
+
     const token = await (await fetch(`${LOCAL}/api/settings/token`, { method: 'POST' })).json()
       .then((body: { apiToken?: string }) => body.apiToken ?? '')
     await check('生成本机访问密钥并持久化到 settings.json', async () => {

@@ -2314,6 +2314,9 @@ const server = createServer(async (req, res) => {
     const localRequest = loopbackRequest && isLoopbackHostname(requestHostname(req))
     // DNS rebinding：连接来自回环，但 Host 是外域。不能当作本机信任。
     const rebindingRequest = loopbackRequest && !localRequest
+    // 浏览器请求一定带 Origin 或 Sec-Fetch-Site；原生客户端可以自定 Host，
+    // 不把它们误判成 DNS rebinding。
+    const browserRequest = !!req.headers.origin || !!req.headers['sec-fetch-site']
     const crossSite = isCrossSiteRequest(req)
     const sensitiveRead = url.pathname === '/api/settings'
       || url.pathname === '/api/fetch'
@@ -2367,6 +2370,7 @@ const server = createServer(async (req, res) => {
         return json(res, 403, { error: '局域网共享已关闭', code: 'lan_disabled' })
       }
       if (rebindingRequest
+        && browserRequest
         && !serverSettings.apiToken
         && url.pathname !== '/api/auth-status'
         && url.pathname !== '/api/health') {
