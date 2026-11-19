@@ -15,7 +15,7 @@ const WRITES_ICONS = new Set<ClientTarget>([
   'flclash', 'mihomo-party', 'clash-mi', 'quanx', 'loon', 'egern',
 ])
 const DRAWS_ICONS = new Set<ClientTarget>([
-  'surge', 'surge-mac', 'clash', 'clash-verge', 'quanx', 'loon', 'egern',
+  'surge', 'surge-mac', 'clash', 'clash-apple', 'clash-verge', 'quanx', 'loon', 'egern',
 ])
 const CIRCLE_ICONS = new Set<ClientTarget>(['quanx'])
 /** Surge 会把组名开头的国旗画在图标位，再写一张国旗图标就重复了。 */

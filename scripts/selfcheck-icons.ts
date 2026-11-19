@@ -104,12 +104,13 @@ check('Clash Verge 写图标、去 Emoji 并同步引用', () => {
   assert.equal(result.rules[0].group, '节点选择')
 })
 
-check('Clash Apple 写 icon 但保留组名 Emoji', () => {
+check('Clash Apple 写 icon 并去掉组名 Emoji', () => {
   const result = withPolicyGroupIcons(SCHEME, 'clash-apple')
-  const rocket = result.groups.find((group) => group.name === '🚀 节点选择')
+  const rocket = result.groups.find((group) => group.name === '节点选择')
   assert.ok(rocket)
   assert.equal(rocket.icon, FLUENT_ROCKET)
-  assert.equal(result.rules[0].group, '🚀 节点选择')
+  assert.equal(result.rules[0].group, '节点选择')
+  assert.ok(result.groups.some((group) => group.name === '🇭🇰 香港节点'))
 })
 
 check('Surge 不写地区组图标，地区名保留国旗', () => {

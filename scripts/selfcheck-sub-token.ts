@@ -164,8 +164,8 @@ async function main(): Promise<void> {
         assert.equal(legacy.status, 404)
       })
 
-      await check('v2rayNG / v2rayN 的 UA 自动收到 Base64 节点列表', async () => {
-        for (const ua of ['v2rayNG/1.9.16', 'v2rayN/6.31']) {
+      await check('v2rayNG / v2rayN / V2Box 的 UA 自动收到 Base64 节点列表', async () => {
+        for (const ua of ['v2rayNG/1.9.16', 'v2rayN/6.31', 'V2Box/1.0.0']) {
           const response = await fetch(`${server.base}/api/sub/${canonical}`, { headers: { 'user-agent': ua } })
           assert.equal(response.status, 200)
           assert.match(response.headers.get('content-type') ?? '', /text\/plain/)
@@ -173,6 +173,15 @@ async function main(): Promise<void> {
         }
         const clash = await fetch(`${server.base}/api/sub/${canonical}`, { headers: { 'user-agent': 'clash-verge/v2.4.2' } })
         assert.match(clash.headers.get('content-type') ?? '', /yaml/)
+      })
+
+      await check('target=v2ray / v2rayng / v2rayn 返回 Base64', async () => {
+        for (const target of ['v2ray', 'v2rayng', 'v2rayn']) {
+          const response = await fetch(`${server.base}/api/sub/${canonical}?target=${target}`)
+          assert.equal(response.status, 200)
+          assert.match(response.headers.get('content-type') ?? '', /text\/plain/)
+          assert.equal(await response.text(), 'eA==')
+        }
       })
 
       await check('不同 Host 的 POST 返回同一绝对地址', async () => {

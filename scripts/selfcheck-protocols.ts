@@ -702,6 +702,16 @@ function main(): void {
     const snellV5: ProxyNode = { ...SNELL, id: 'snell-v5', version: 5 }
     assert.equal(clashSkippedCount([snellV5], 'clash'), 1)
     assert.equal(clashSkippedCount([snellV5], 'clash-verge'), 0)
+
+    // Snell v6 只给「Clash」App 1.0.18+（mihomo 1.19.34）；PSK 要 12–255 字节。
+    const snellV6: ProxyNode = { ...SNELL_V6, id: 'snell-v6', password: 'psk-0123456789ab' }
+    assert.equal(clashSkippedCount([snellV6], 'clash-apple'), 0)
+    assert.equal(clashSkippedCount([snellV6], 'clash-verge'), 1)
+    assert.equal(clashSkippedCount([snellV6], 'mihomo-party'), 1)
+    assert.equal(clashSkippedCount([SNELL_V6], 'clash-apple'), 1, 'v6 短 PSK 必须跳过')
+    assert.equal(clashSkippedCount([SNELL_V6_OBFS], 'clash-apple'), 1, 'v6 带 obfs 必须跳过')
+    const clashAppV6 = generateClashYAML([snellV6], scheme, { target: 'clash-apple' })
+    assert.ok(clashAppV6.includes('version: 6'))
     const snellBox = generateSingBox([snellV5], scheme, { target: 'sing-box' })
     assert.equal(snellBox.skipped, 0)
     assert.ok(JSON.parse(snellBox.text).outbounds.some((item: { version?: number }) => item.version === 4))

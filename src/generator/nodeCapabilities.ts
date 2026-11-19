@@ -66,7 +66,7 @@ export function shadowsocksCipherSupported(node: ProxyNode, target?: ClientTarge
   return !cipher || allowed.has(cipher)
 }
 
-/** Stash v1–3, mihomo v1–5, sing-box 4/5 with no unsupported obfs. */
+/** Stash v1–3、mihomo v1–5（Clash App v1–6）、sing-box 4/5，且 v6 不带 obfs。 */
 export function snellVersionSupported(node: ProxyNode, target?: ClientTarget): boolean {
   if (node.kind !== 'snell') return true
   const version = node.version ?? (target === 'clash' ? 1 : 4)
@@ -74,7 +74,19 @@ export function snellVersionSupported(node: ProxyNode, target?: ClientTarget): b
   // Snell v6 不支持 obfs（Surge 手册），带混淆的 v6 节点导出后连不上。
   if (version >= 6 && obfs && obfs !== 'none') return false
   if (target === 'clash') return version >= 1 && version <= 3
-  if (target && MIHOMO_TARGETS.has(target)) return version >= 1 && version <= 5
+  if (target && MIHOMO_TARGETS.has(target)) {
+    // v6 需要 mihomo 1.19.34；目前只有「Clash」App 1.0.18+ 带上，
+    // 其余内核遇到 version: 6 会整份配置加载失败。
+    const newest = target === 'clash-apple' ? 6 : 5
+    if (version < 1 || version > newest) return false
+    if (version === 6) {
+      // clash.md：v6 没有 HTTP/TLS obfs，PSK 必须是 12–255 字节；
+      // mihomo 1.19.34 对两者都会让整份配置校验失败。
+      const pskBytes = new TextEncoder().encode(node.password ?? '').length
+      return pskBytes >= 12 && pskBytes <= 255
+    }
+    return true
+  }
   if (target === 'sing-box') {
     if (![4, 5].includes(version)) return false
     return !obfs || obfs === 'none' || obfs === 'http'

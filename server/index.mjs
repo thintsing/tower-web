@@ -1624,6 +1624,9 @@ const SUB_TARGET_FORMAT = {
   shadowrocket: 'yaml',
   'shadow-rocket': 'yaml',
   v2box: 'base64',
+  v2ray: 'base64',
+  v2rayng: 'base64',
+  v2rayn: 'base64',
   anywhere: 'base64',
   loon: 'loon',
   quanx: 'quanx',
@@ -1727,6 +1730,8 @@ function subTargetFromUserAgent(userAgent) {
   if (agent.includes('surfboard')) return 'surge'
   if (agent.includes('surge')) return 'surge'
   if (agent.includes('loon')) return 'loon'
+  // v2rayNG / v2rayN / V2Box 只认 Base64 分享链接列表，读不了 Clash / sing-box。
+  if (agent.includes('v2rayng') || agent.includes('v2rayn') || agent.includes('v2box')) return 'v2ray'
   return null
 }
 
@@ -2774,7 +2779,7 @@ const server = createServer(async (req, res) => {
         req.headers['user-agent'],
       )
       if (!fmt) {
-        return send(res, 400, '无法识别客户端。请在链接中使用 target=clash、surge、surfboard、loon、quanx、shadowrocket、sing-box、hiddify 或 egern。', {
+        return send(res, 400, '无法识别客户端。请在链接中使用 target=clash、surge、surfboard、loon、quanx、shadowrocket、sing-box、hiddify、egern 或 v2ray。', {
           'content-type': 'text/plain; charset=utf-8',
         })
       }
