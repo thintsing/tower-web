@@ -97,6 +97,11 @@ export interface ProxyNode {
   kind: ProxyKind
   name: string
   server: string
+  /**
+   * Clash `hosts:` 表改写前的原始域名。机场轮换入口时 `server` 会指向新地址，
+   * 保留它才能让刷新前后的节点身份（排除项）继续对上。
+   */
+  hostsSourceServer?: string
   port: number
   cipher?: string
   password?: string

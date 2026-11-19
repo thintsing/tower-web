@@ -45,17 +45,20 @@ export function parseClashYAML(text: string, sourceID?: string): ClashParseResul
   const proxies = (doc as Record<string, unknown> | null)?.['proxies']
   if (!Array.isArray(proxies)) return { nodes: [], rejected: 1 }
 
+  // 顶层 hosts 表：机场轮换入口域名时，节点 server 不变，靠它指向新地址。
+  // mihomo 拨号前会查这张表；只读 proxies 会让所有节点拨已失效的旧域名。
+  const hosts = clashHosts(doc)
   const nodes: ProxyNode[] = []
   let rejected = 0
   for (const entry of proxies) {
-    const node = clashProxy(entry, sourceID)
+    const node = clashProxy(entry, sourceID, hosts)
     if (node) nodes.push(node)
     else rejected += 1
   }
   return { nodes, rejected: proxies.length === 0 ? 1 : rejected }
 }
 
-function clashProxy(entry: unknown, sourceID?: string): ProxyNode | undefined {
+function clashProxy(entry: unknown, sourceID?: string, hosts?: Map<string, string>): ProxyNode | undefined {
   if (typeof entry !== 'object' || entry === null) return undefined
   const d = flattenRecord(entry as Record<string, unknown>)
   const type = str(d['type'])?.toLowerCase()
@@ -138,11 +141,21 @@ function clashProxy(entry: unknown, sourceID?: string): ProxyNode | undefined {
   }
 
   const server = normalizedHost(rawServer)
+  // 原始域名命中 hosts 表时改拨新地址；旧域名保留给 SNI / HTTP Host。
+  const mappedServer = hosts && hosts.size > 0 && !isIPAddress(server)
+    ? resolveHostsTarget(server.toLowerCase(), hosts)
+    : undefined
   // Only treat `public-key` as REALITY when it came from `reality-opts`.
   const realityOpts = subRecord(d, 'reality-opts')
   const hasRealityOptions = !!realityOptions(d) || str(d['security'])?.toLowerCase() === 'reality'
 
   const transport = kind === 'masque' ? undefined : pluginTransport ?? normalizedTransport(str(d['network']))
+  // mihomo 在改写 server 后，TLS SNI 与 HTTP Host 仍默认使用原域名。
+  const mappedHostDefault = mappedServer
+    && transport !== undefined
+    && ['ws', 'httpupgrade', 'http', 'h2', 'xhttp'].includes(transport)
+    ? server
+    : undefined
 
   // Clash / mihomo 把 WebSocket、gRPC、HTTP/2、XHTTP 的路径和 Host 放在
   // 嵌套的 *-opts 里。只读顶层 host/path 会让订阅里的 ws 节点丢掉
@@ -173,12 +186,20 @@ function clashProxy(entry: unknown, sourceID?: string): ProxyNode | undefined {
             ? firstString(grpcOpts?.['grpc-service-name']) ?? firstString(grpcOpts?.['service-name'])
             : undefined
 
+  // TLS is part of Trojan / TrustTunnel / key-MASQUE / Hysteria / TUIC /
+  // AnyTLS themselves; mihomo 不会写 tls: true，导入时必须补回来，
+  // 否则再导出会变成明文协议。
+  const tls = kind === 'trojan' || kind === 'trusttunnel' || kind === 'masque'
+    || kind === 'hysteria' || kind === 'hysteria2' || kind === 'tuic'
+    || kind === 'anytls' || pluginTLS || boolString(str(d['tls']))
+
   const node: ProxyNode = {
     id: nextNodeID(),
     sourceID,
     kind,
     name: normalizedName(str(d['name']), server),
-    server,
+    server: mappedServer ?? server,
+    hostsSourceServer: mappedServer ? server : undefined,
     port,
     cipher: str(d['cipher']),
     // Hysteria 1 calls it `auth-str`; Snell calls it `psk`.
@@ -190,17 +211,12 @@ function clashProxy(entry: unknown, sourceID?: string): ProxyNode | undefined {
     plugin: sip003Plugin,
     pluginMux,
     shadowTLS,
-    // TLS is part of Trojan / TrustTunnel / key-MASQUE / Hysteria / TUIC /
-    // AnyTLS themselves; mihomo 不会写 tls: true，导入时必须补回来，
-    // 否则再导出会变成明文协议。
-    tls: kind === 'trojan' || kind === 'trusttunnel' || kind === 'masque'
-      || kind === 'hysteria' || kind === 'hysteria2' || kind === 'tuic'
-      || kind === 'anytls' || pluginTLS || boolString(str(d['tls'])),
-    sni: str(d['servername']) ?? str(d['sni']),
+    tls,
+    sni: str(d['servername']) ?? str(d['sni']) ?? (mappedServer && tls ? server : undefined),
     hostHeader:
       sip003Plugin === 'v2ray-plugin'
-        ? obfsHost
-        : nestedHost ?? str(d['authority']) ?? str(d['host']),
+        ? obfsHost ?? mappedHostDefault
+        : nestedHost ?? str(d['authority']) ?? str(d['host']) ?? mappedHostDefault,
     path:
       pluginPath
         ?? nestedPath
@@ -269,6 +285,70 @@ function vlessEncryption(value: string | undefined): string | undefined {
   const v = value?.trim()
   if (!v || v.toLowerCase() === 'none') return undefined
   return v
+}
+
+/** 顶层 `hosts:` 表：key 为域名规则，value 为目标主机名或 IP。 */
+function clashHosts(doc: unknown): Map<string, string> {
+  const raw = (doc as Record<string, unknown> | null)?.['hosts']
+  const table = new Map<string, string>()
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return table
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    const name = key.trim().toLowerCase()
+    const target = hostsTarget(Array.isArray(value) ? value[0] : value)
+    if (name && target) table.set(name, target)
+  }
+  return table
+}
+
+/** 只接受主机名或 IP；列表取第一项，避免把任意字符串写进 server。 */
+function hostsTarget(value: unknown): string | undefined {
+  const raw = str(value)?.trim().replace(/^["']|["']$/g, '')
+  if (!raw) return undefined
+  const host = normalizedHost(raw).toLowerCase()
+  if (!host) return undefined
+  if (isIPAddress(host)) return host
+  if (host.length > 253 || !host.includes('.') || host.startsWith('.') || host.startsWith('-')) return undefined
+  if (!/^[a-z0-9.-]+$/.test(host)) return undefined
+  return host
+}
+
+function isIPAddress(host: string): boolean {
+  return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) || host.includes(':')
+}
+
+/** mihomo 的域名 trie：精确 → `+.`（含自身与子域）→ `*.`（恰好一级）→ `.`（仅子域）。 */
+function hostsLookup(name: string, table: Map<string, string>): string | undefined {
+  const exact = table.get(name)
+  if (exact) return exact
+  const plus = table.get(`+.${name}`)
+  if (plus) return plus
+  const labels = name.split('.')
+  for (let index = 1; index < labels.length; index += 1) {
+    const parent = labels.slice(index).join('.')
+    if (index === 1) {
+      const star = table.get(`*.${parent}`)
+      if (star) return star
+    }
+    const parentPlus = table.get(`+.${parent}`)
+    if (parentPlus) return parentPlus
+    const dot = table.get(`.${parent}`)
+    if (dot) return dot
+  }
+  return undefined
+}
+
+/** 目标本身可能又是另一个 key（链式入口）；最多解析 8 跳，避免互相指向死循环。 */
+function resolveHostsTarget(name: string, table: Map<string, string>): string | undefined {
+  let current = name
+  let matched = false
+  for (let hop = 0; hop < 8; hop += 1) {
+    const next = hostsLookup(current, table)
+    if (!next) break
+    matched = true
+    if (next === current) break
+    current = next
+  }
+  return matched ? current : undefined
 }
 
 /** Nested maps like `plugin-opts: { mode: … }` stay records; lookup helper. */

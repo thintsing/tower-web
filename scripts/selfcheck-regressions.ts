@@ -139,6 +139,70 @@ check('Surge 名称里的 // 转成全角，避免被当成注释截断', () => 
   assert.equal(confName('US/LA'), 'US/LA')
 })
 
+check('Clash hosts 表改写 server，并保留原域名用于 SNI / Host', () => {
+  const text = [
+    'hosts:',
+    '  "old.example": 1.2.3.4',
+    '  "+.rot.example": 5.6.7.8',
+    '  "*.one.example": new.example',
+    '  "new.example": 9.9.9.9',
+    '  "v6.example": [ "2001:db8::1" ]',
+    'proxies:',
+    '  - name: A',
+    '    type: trojan',
+    '    server: old.example',
+    '    port: 443',
+    '    password: p',
+    '  - name: B',
+    '    type: vless',
+    '    server: sub.rot.example',
+    '    port: 443',
+    '    uuid: 00000000-0000-0000-0000-000000000000',
+    '    tls: true',
+    '    network: ws',
+    '    ws-opts:',
+    '      path: /ws',
+    '  - name: C',
+    '    type: vless',
+    '    server: a.one.example',
+    '    port: 443',
+    '    uuid: 00000000-0000-0000-0000-000000000001',
+    '    servername: pinned.example',
+    '    network: ws',
+    '    ws-opts:',
+    '      headers:',
+    '        Host: keep.example',
+    '      path: /ws',
+    '  - name: D',
+    '    type: vless',
+    '    server: v6.example',
+    '    port: 443',
+    '    uuid: 00000000-0000-0000-0000-000000000002',
+    '  - name: E',
+    '    type: vmess',
+    '    server: old.example',
+    '    port: 80',
+    '    uuid: 00000000-0000-0000-0000-000000000003',
+    '    network: ws',
+    '    ws-opts:',
+    '      path: /ws',
+  ].join('\n')
+  const { nodes } = parseClashYAML(text)
+  const byName = new Map(nodes.map((node) => [node.name, node]))
+  assert.equal(byName.get('A')?.server, '1.2.3.4')
+  assert.equal(byName.get('A')?.sni, 'old.example')
+  assert.equal(byName.get('A')?.hostsSourceServer, 'old.example')
+  assert.equal(byName.get('B')?.server, '5.6.7.8', '+. 规则应覆盖子域名')
+  assert.equal(byName.get('B')?.sni, 'sub.rot.example')
+  assert.equal(byName.get('B')?.hostHeader, 'sub.rot.example')
+  assert.equal(byName.get('C')?.server, '9.9.9.9', '链式 hosts 应解析到最终地址')
+  assert.equal(byName.get('C')?.sni, 'pinned.example', '显式 SNI 不能被覆盖')
+  assert.equal(byName.get('C')?.hostHeader, 'keep.example', '显式 Host 不能被覆盖')
+  assert.equal(byName.get('D')?.server, '2001:db8::1', '列表取第一项且支持 IPv6')
+  assert.equal(byName.get('E')?.sni, undefined, '明文节点不能凭空补 SNI')
+  assert.equal(byName.get('E')?.hostHeader, 'old.example')
+})
+
 check('多用户节点不会被当成重复项；SSH / Snell 的 userinfo 正确映射', () => {
   const socks = parse(
     'socks5://u1:p@s.example.com:1080#A\nsocks5://u2:p@s.example.com:1080#B',

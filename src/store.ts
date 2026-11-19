@@ -436,7 +436,7 @@ export function usageIsUsable(usage?: SubscriptionUsage): boolean {
  */
 function exactKey(node: ProxyNode): string {
   return [
-    node.kind, node.server.toLowerCase(), node.port,
+    node.kind, (node.hostsSourceServer ?? node.server).toLowerCase(), node.port,
     node.cipher ?? '', node.uuid ?? '', node.password ?? '',
     node.transport ?? '', node.sni ?? '', node.name,
   ].join('|')
@@ -444,7 +444,7 @@ function exactKey(node: ProxyNode): string {
 
 function looseKey(node: ProxyNode): string {
   return [
-    node.kind, node.server.toLowerCase(), node.port,
+    node.kind, (node.hostsSourceServer ?? node.server).toLowerCase(), node.port,
     node.cipher ?? '', node.uuid ?? '', node.password ?? '',
     node.transport ?? '', node.sni ?? '',
   ].join('|')
