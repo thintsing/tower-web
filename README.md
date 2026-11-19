@@ -17,7 +17,7 @@
 
 [GitHub 仓库](https://github.com/thintsing/tower-web) ·
 [快速开始](#快速开始) · [支持的客户端](#支持的客户端) ·
-[已知限制](#已知限制) · [常见问题](#常见问题) · [上游与许可](#上游与许可)
+[已知限制](#已知限制) · [常见问题](#常见问题) · [版本更新](#版本更新) · [上游与许可](#上游与许可)
 
 </div>
 
@@ -175,7 +175,13 @@ docker run -d --name tower-web \
   ghcr.io/thintsing/tower-web:latest
 ```
 
-未设置时，宿主机设置页不能创建首个密钥；可以在容器内对回环地址调用 `POST /api/settings/token`，或重启时设置 `TOWER_API_TOKEN`。
+未设置时，宿主机设置页不能创建首个密钥；可以在容器内对回环地址调用 `POST /api/settings/token`，或重启时设置 `TOWER_API_TOKEN`。容器已经跑起来时，用下面的命令生成并打印密钥：
+
+```bash
+docker exec -it tower-web node -e "fetch('http://127.0.0.1:8787/api/settings/token',{method:'POST'}).then(r=>r.json()).then(j=>console.log(j.apiToken))"
+```
+
+拿到密钥后打开 `http://<VPS-IP>:8787/?key=<密钥>` 一次即可。
 
 Docker 内看到的网卡地址不是宿主机地址；如果从本机打开页面又要复制订阅地址给手机，请把 `TOWER_PUBLIC_URL` 设为宿主机的局域网地址：
 
@@ -247,6 +253,7 @@ docker run -d --name tower-web -p 8787:8787 -v tower-data:/app/data \
 - 服务器模式下 `/api/workspace` 的所有请求都必须带访问密钥，`127.0.0.1` 也不例外；密钥来源沿用现有机制（`?key=`、`x-tower-key`、`Authorization: Bearer`、`tower_key` cookie）。
 - 服务器模式密钥要求 16–128 个不含空白 / 换行 / 控制字符的字符，首尾空白会 trim；本地模式要求 16–128 位 `A-Z/a-z/0-9/_/-`。**请直接用 ≥32 位随机值**（`openssl rand -hex 32`）；短密钥能被穷举，隧道 / 公网场景还应叠加 Cloudflare Access 之类的访问控制。
 - 每台设备首次访问要授权一次：用带 `?key=<密钥>` 的地址打开，或在全屏「需要访问密钥」页里粘贴密钥。密钥存进**该浏览器**的 localStorage `tower-web-api-key`，不跨设备、不跨浏览器 profile；换域名、端口或 http/https 都算另一个来源，需要重新带一次 `?key=`。
+- 规则页的「上游更新检查」等管理接口返回 **HTTP 401**，表示当前浏览器来源还没有带对密钥：用 `http://…/?key=<密钥>` 打开一次即可。查看容器当前密钥：环境变量注入时用 `docker exec tower-web printenv TOWER_API_TOKEN`，否则读取 `/app/data/settings.json` 里的 `apiToken`。轮换密钥后，其他设备需要重新授权。
 - 同一 IP 连续 10 次认证失败，服务端冷却 60 秒；认证成功会清零计数。注意 `/api/auth-status` 本身**不受冷却限制**（页面无密钥时也要能判断模式），带错误密钥时它会记录一次失败但仍正常响应——所以它可以被用来连续试探密钥，别把它当成防穷举的屏障。
 - 首次使用：服务端还没有 `workspace.json` 时，打开页面的客户端会把本机现有工作区上传创建，并提示「已上传本机工作区」。服务端已有数据后客户端只读取；要覆盖必须按当前版本号正常写入（例如覆盖恢复），不能静默清空。
 - 同步：页面可见时每 8 秒探测一次版本，窗口 `focus` / 标签页切换立即探测；本地改动 500ms 防抖后推送，内容没变不发送。
@@ -405,6 +412,20 @@ scripts/  自检脚本
 public/   客户端图标、ACL4SSR 规则、地图数据
 Dockerfile / docker-compose.yml  容器镜像与本地编排
 ```
+
+## 版本更新
+
+### v0.5.0（2026-11-19）
+
+- 订阅设置从弹窗改为独立页面；新增「允许局域网请求访问私网」开关，私网抓取默认只放行本机。
+- Clash 导入支持顶层 `hosts:` 表：精确、`+.`、`*.`、`.` 规则与链式解析，保留原域名用于 SNI / Host 和节点身份。
+- Snell v6 仅向「Clash」App 导出（PSK 12–255 字节、无 obfs）；「Clash」App 改为绘制策略组图标。
+- 订阅链接新增 `target=v2ray|v2rayng|v2rayn`，并识别 V2Box User-Agent，返回 Base64 分享链接列表。
+- Surge 保留策略组 `category`；节点名中的 `//` 转义为全角，避免被当成注释截断。
+- subconverter 包裹链接改为探测被包裹的机场地址；1 字节占位用量头视为没有。
+- 其他：Stash 的 Tailscale Auth Key 改为可选；本地服务加固 CSRF / DNS rebinding 防护。
+
+更早的版本见 [GitHub Releases](https://github.com/thintsing/tower-web/releases)。
 
 ## 上游与许可
 
