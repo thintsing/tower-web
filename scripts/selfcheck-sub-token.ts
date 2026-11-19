@@ -164,6 +164,17 @@ async function main(): Promise<void> {
         assert.equal(legacy.status, 404)
       })
 
+      await check('v2rayNG / v2rayN 的 UA 自动收到 Base64 节点列表', async () => {
+        for (const ua of ['v2rayNG/1.9.16', 'v2rayN/6.31']) {
+          const response = await fetch(`${server.base}/api/sub/${canonical}`, { headers: { 'user-agent': ua } })
+          assert.equal(response.status, 200)
+          assert.match(response.headers.get('content-type') ?? '', /text\/plain/)
+          assert.equal(await response.text(), 'eA==')
+        }
+        const clash = await fetch(`${server.base}/api/sub/${canonical}`, { headers: { 'user-agent': 'clash-verge/v2.4.2' } })
+        assert.match(clash.headers.get('content-type') ?? '', /yaml/)
+      })
+
       await check('不同 Host 的 POST 返回同一绝对地址', async () => {
         const a = await rawRequest(server.port, '/api/subscribe', {
           method: 'POST',

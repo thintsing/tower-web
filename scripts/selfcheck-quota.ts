@@ -321,6 +321,28 @@ async function main(): Promise<void> {
       assert.equal(state.expireAt, 1798761600000)
     })
 
+    await check('subconverter 链接改为探测被包裹的机场链接', async () => {
+      assert.deepEqual(
+        quotaProbeURLs('https://sub.example/sub?target=clash&url=https%3A%2F%2Fairport.example%2Fapi%3Ftoken%3Dt%26flag%3Dss'),
+        ['https://airport.example/api?token=t&flag=clash'],
+        '应探测被包裹的机场链接，并把它切到 clash 方言',
+      )
+      const multiple = quotaProbeURLs('https://sub.example/sub?target=clash&url=https%3A%2F%2Fa.example%2Fx%7Chttps%3A%2F%2Fb.example%2Fy')
+      assert.ok(
+        multiple.every((href) => href.startsWith('https://sub.example/sub?')),
+        '多个上游用 | 拼接时不应猜某一个机场，继续按原链接探测',
+      )
+    })
+
+    await check('subconverter 的 1 字节占位用量头视为没有', async () => {
+      assert.equal(parseUserinfoHeader('upload=0; download=1; total=1'), undefined)
+      assert.equal(
+        parseUserinfoHeader('upload=0; download=1; total=1; expire=1798761600')?.total,
+        1,
+        '带真实到期时间时保留用量，不能把合法的小套餐一并丢掉',
+      )
+    })
+
     await check('配额探测覆盖 flag=clash 与 ?clash=1 两种方言', async () => {
       assert.deepEqual(
         quotaProbeURLs('https://a.example/api/v1/client/subscribe?token=t&flag=ss'),

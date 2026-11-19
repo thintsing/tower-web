@@ -193,6 +193,7 @@ export function tailnetPolicyName(connection: TailnetConnection): string {
     .replace(/,/g, '，')
     .replace(/#/g, '＃')
     .replace(/;/g, '；')
+    .replace(/\/\//g, '／／')
     .replace(/\[/g, '［')
     .replace(/\]/g, '］')
     .replace(/"/g, '＂')

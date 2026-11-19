@@ -349,6 +349,25 @@ export function quotaProbeURLs(raw: string): string[] {
   } catch {
     return []
   }
+  // subconverter 链接（…?target=clash&url=<机场>）自己不转发机场的用量头，
+  // 也不识别 flag；改为探测它包裹的那一个机场链接。节点仍从原链接读取。
+  const wrappedKey = [...url.searchParams.keys()].find((key) => key.toLowerCase() === 'url')
+  const isConverter = [...url.searchParams.keys()].some((key) => key.toLowerCase() === 'target')
+  if (isConverter && wrappedKey) {
+    const wrappedRaw = (url.searchParams.get(wrappedKey) ?? '').trim()
+    // subconverter 用 `|` 拼接多个上游；有多个时不猜哪一个，按原链接探测。
+    if (wrappedRaw && !wrappedRaw.includes('|')) {
+      try {
+        const wrapped = new URL(wrappedRaw)
+        if ((wrapped.protocol === 'http:' || wrapped.protocol === 'https:') && wrapped.hostname) {
+          wrapped.searchParams.set('flag', 'clash')
+          return [wrapped.href]
+        }
+      } catch {
+        // 包裹地址不是合法 URL 时退回普通探测。
+      }
+    }
+  }
   const keys = [...url.searchParams.keys()]
   // 通用链接上的 `sub=1` 会压过 clash / flag=clash：真实机场在这种组合下
   // 返回空正文且不带用量头，所以只要还有 sub 就必须继续探测（去掉 sub）。

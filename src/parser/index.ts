@@ -219,6 +219,9 @@ export function parseUserinfoHeader(header: string | undefined | null): Subscrip
     usage[key] = bytes
     matched = true
   }
+  // 在线 subconverter 在没拿到机场用量头时会回 `upload=0; download=1; total=1`。
+  // 1 字节套餐不可能是真的；当作没有头，才能继续触发 flag=clash 探测。
+  if (usage.total === 1 && usage.expire === undefined) return undefined
   return matched ? usage : undefined
 }
 

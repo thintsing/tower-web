@@ -25,6 +25,9 @@ export function confName(value: string): string {
     .replace(/,/g, '，')
     .replace(/#/g, '＃')
     .replace(/;/g, '；')
+    // Surge 把行首或空格后的 `//` 当注释（profile format）；节点名里的
+    // 「HK // Backup」会截断代理行和所有策略组成员列表。
+    .replace(/\/\//g, '／／')
     // Square brackets open a section in every INI-style config.
     .replace(/\[/g, '［')
     .replace(/\]/g, '］')

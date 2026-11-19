@@ -17,6 +17,7 @@ import { canonicalNodeURI } from '../src/generator/base64Sub'
 import { generateSingBox } from '../src/generator/singbox'
 import { generateSurge } from '../src/generator/surge'
 import { applyTailnets } from '../src/generator/tailnet'
+import { confName } from '../src/generator/naming'
 import { generateConfig } from '../src/generator'
 import { uniqueDisplayNames } from '../src/generator/groups'
 import { clearTowerStorage, createSafeStorage, isStorageFull, onStorageFullChange } from '../src/util/localStore'
@@ -130,6 +131,12 @@ check('节点名里的空格不会被拆行截断，一行多条链接仍可拆�
   assert.deepEqual(one.map((node) => node.name), ['My Node'])
   const two = parse(`ss://${auth}@1.2.3.4:8388#A ss://${auth}@5.6.7.8:8388#B`).nodes
   assert.deepEqual(two.map((node) => node.name), ['A', 'B'])
+})
+
+check('Surge 名称里的 // 转成全角，避免被当成注释截断', () => {
+  assert.equal(confName('HK // Backup'), 'HK ／／ Backup')
+  // 单个斜杠不转义：它不构成注释。
+  assert.equal(confName('US/LA'), 'US/LA')
 })
 
 check('多用户节点不会被当成重复项；SSH / Snell 的 userinfo 正确映射', () => {
